@@ -1,4 +1,4 @@
-// MGPU Bridge — the private D3D12 device on the selected adapter (T3)
+// MGPU Bridge - the private D3D12 device on the selected adapter (T3)
 #include <windows.h>
 #include <combaseapi.h>
 #include <d3d12.h>
@@ -74,7 +74,7 @@ bool create_device(const adapter::selection_result &sel)
     LUID luid{};
     dev->GetAdapterLuid(&luid);
 
-    // The binding must be exactly what T2 selected — anything else is the
+    // The binding must be exactly what T2 selected - anything else is the
     // silent re-bind that makes every downstream result meaningless.
     if (luid.LowPart != sel.selected_luid.LowPart || luid.HighPart != sel.selected_luid.HighPart)
     {
@@ -98,20 +98,23 @@ bool create_device(const adapter::selection_result &sel)
         return false;
     }
 
-    // For the record only — P0 uses nothing cross-adapter. Whether this
-    // driver advertises cross-adapter row-major texture support.
-    D3D12_CROSS_ADAPTER_ROW_MAJOR_TEXTURE_SUPPORT_DESC fx{};
+    // For the record only; P0 uses nothing cross-adapter. Whether this
+    // driver advertises cross-adapter row-major texture support: a BOOL
+    // member of D3D12_FEATURE_DATA_D3D12_OPTIONS, queried via
+    // D3D12_FEATURE_D3D12_OPTIONS. There is no dedicated feature enum or
+    // result struct for it.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS fx{};
     HRESULT fxhr = dev->CheckFeatureSupport(
-        D3D12_FEATURE_CROSS_ADAPTER_ROW_MAJOR_TEXTURE_SUPPORT, &fx, sizeof(fx));
+        D3D12_FEATURE_D3D12_OPTIONS, &fx, sizeof(fx));
     if (SUCCEEDED(fxhr))
         snprintf(line, sizeof line,
                  "[MGPU][T3] CrossAdapterRowMajorTextureSupported hr=0x00000000 supported=%d "
-                 "node_mask=0x%X (record only)",
-                 fx.Supported ? 1 : 0, (unsigned)fx.NodeMask);
+                 "(record only)",
+                 fx.CrossAdapterRowMajorTextureSupported ? 1 : 0);
     else
         snprintf(line, sizeof line,
-                 "[MGPU][T3] CrossAdapterRowMajorTextureSupported hr=0x%08X (record only; driver or "
-                 "SDK may not expose the feature)",
+                 "[MGPU][T3] CrossAdapterRowMajorTextureSupported hr=0x%08X (record only; "
+                 "CheckFeatureSupport failed)",
                  (unsigned)fxhr);
     mgpu::diag::info(line);
 
