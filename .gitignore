@@ -4,3 +4,8 @@ ext/
 
 # CMake build output
 build/
+
+# CI download scratch (codeload tarball). The fetch step keeps downloads in
+# the workspace rather than /tmp: MSYS path translation on Windows runners
+# makes /tmp unreliable for curl/tar arguments.
+_dl/
