@@ -21,12 +21,18 @@
 // destroy_device - void (api::device *) - fired before
 // ID3D12Device::Release. Teardown is therefore driven from
 // destroy_device on the game's device.
+//
+// get_native() returns uint64_t: unwrapping it to ID3D12Device * needs
+// reinterpret_cast, not static_cast (integer to pointer is only
+// reinterpret_cast). GetAdapterLuid() takes no parameters and returns
+// the LUID by value - there is no SUCCEEDED to check.
 
 #include <windows.h>
 #include <d3d12.h>
 #include <reshade.hpp>
 
 #include "adapter.hpp"
+#include "diag.hpp"
 #include "worker.hpp"
 
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
@@ -74,11 +80,10 @@ static void on_destroy_device(reshade::api::device *device)
     if (sel.game_luid_known && device != nullptr &&
         device->get_api() == reshade::api::device_api::d3d12)
     {
-        if (auto *dev12 = static_cast<ID3D12Device *>(device->get_native()))
+        if (auto *dev12 = reinterpret_cast<ID3D12Device *>(device->get_native()))
         {
-            LUID luid{};
-            if (SUCCEEDED(dev12->GetAdapterLuid(&luid)) &&
-                luid.LowPart == sel.game_luid.LowPart &&
+            const LUID luid = dev12->GetAdapterLuid();
+            if (luid.LowPart == sel.game_luid.LowPart &&
                 luid.HighPart == sel.game_luid.HighPart)
             {
                 mgpu::diag::info("[MGPU][T3] game device released - signaling bridge thread "
