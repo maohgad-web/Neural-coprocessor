@@ -14,13 +14,27 @@ project(mgpu_bridge CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Source list follows the closed manifest (Agent_Task.md, section 05):
+# T2 adds diag/adapter, T3 adds worker/gpu1_context. runtime_probe lands
+# with its own task; assets/ is deployed by hand and never compiled.
 add_library(mgpu_bridge SHARED
     src/dllmain.cpp
+    src/diag.cpp
+    src/adapter.cpp
+    src/worker.cpp
+    src/gpu1_context.cpp
 )
 
 set_target_properties(mgpu_bridge PROPERTIES
     PREFIX ""
     SUFFIX ".addon64"
+    # $<1:...> suppresses the per-configuration subdirectory that
+    # multi-config generators (including "Visual Studio 17 2022", which
+    # CI uses) would otherwise append to RUNTIME_OUTPUT_DIRECTORY: the
+    # output is build/mgpu_bridge.addon64, not build/Release/...
+    # CI locates the artifact by name regardless; this makes the stated
+    # path true.
+    RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}>"
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -36,6 +50,12 @@ target_compile_definitions(mgpu_bridge PRIVATE
     _CRT_SECURE_NO_WARNINGS
     UNICODE
     _UNICODE
+)
+
+# dxgi: factory + EnumAdapters1 (T2). d3d12: the private device (T3).
+target_link_libraries(mgpu_bridge PRIVATE
+    dxgi
+    d3d12
 )
 
 # P0: warnings visible, not fatal. A compile error costs the same round
