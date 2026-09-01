@@ -12,6 +12,11 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 
+// get_native() returns uint64_t: unwrapping it to ID3D12Device * needs
+// reinterpret_cast, not static_cast (integer to pointer is only
+// reinterpret_cast). GetAdapterLuid() takes no parameters and returns
+// the LUID by value - there is no SUCCEEDED to check.
+
 namespace mgpu::adapter
 {
 namespace
@@ -64,14 +69,10 @@ bool run_once(::reshade::api::device *game_device, const char *trigger)
     if (game_device != nullptr &&
         game_device->get_api() == ::reshade::api::device_api::d3d12)
     {
-        if (auto *dev12 = static_cast<ID3D12Device *>(game_device->get_native()))
+        if (auto *dev12 = reinterpret_cast<ID3D12Device *>(game_device->get_native()))
         {
-            LUID luid{};
-            if (SUCCEEDED(dev12->GetAdapterLuid(&luid)))
-            {
-                S.result.game_luid = luid;
-                S.result.game_luid_known = true;
-            }
+            S.result.game_luid = dev12->GetAdapterLuid();
+            S.result.game_luid_known = true;
         }
     }
     if (S.result.game_luid_known)
@@ -326,8 +327,11 @@ void log_device_luid(const char *event, ::reshade::api::device *device)
     bool have = false;
     if (device != nullptr && device->get_api() == ::reshade::api::device_api::d3d12)
     {
-        if (auto *dev12 = static_cast<ID3D12Device *>(device->get_native()))
-            have = SUCCEEDED(dev12->GetAdapterLuid(&luid));
+        if (auto *dev12 = reinterpret_cast<ID3D12Device *>(device->get_native()))
+        {
+            luid = dev12->GetAdapterLuid();
+            have = true;
+        }
     }
     char line[256];
     if (have)
