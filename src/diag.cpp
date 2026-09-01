@@ -1,4 +1,4 @@
-// MGPU Bridge — structured diagnostic logging (brief, section 08)
+// MGPU Bridge - structured diagnostic logging (brief, section 08)
 #include <reshade.hpp>
 
 #include "diag.hpp"
