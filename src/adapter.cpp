@@ -1,4 +1,4 @@
-// MGPU Bridge — adapter enumeration and selection (T2)
+// MGPU Bridge - adapter enumeration and selection (T2)
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -34,7 +34,7 @@ namespace
     }
 
     // Called on the game thread, before the bridge thread is spawned and
-    // before run_once() — so the event is published without a race.
+    // before run_once() - so the event is published without a race.
     void ensure_init()
     {
         bool expected = false;
@@ -164,7 +164,7 @@ bool run_once(::reshade::api::device *game_device, const char *trigger)
     for (UINT i = 0; i < table.size(); i++)
     {
         if (S.result.game_luid_known && luid_eq(table[i].luid, S.result.game_luid))
-            continue;                 // the game's own adapter — never
+            continue;                 // the game's own adapter - never
         cand.push_back(i);
     }
     std::vector<UINT> headless;
