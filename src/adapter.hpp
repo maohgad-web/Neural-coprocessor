@@ -1,8 +1,8 @@
-// MGPU Bridge — adapter enumeration and selection (T2)
+// MGPU Bridge - adapter enumeration and selection (T2)
 //
 // Selection rule: the game's own adapter LUID is captured FIRST, from the
 // game's D3D12 device (the first init_device after add-on load), and the
-// bridge adapter is the one whose LUID differs from the game's — select
+// bridge adapter is the one whose LUID differs from the game's - select
 // by exclusion. Active output counts are logged for every adapter and
 // used only as a tie-break when more than two adapters are present (the
 // target topology may put a display on either card, so "headless" is
@@ -29,7 +29,7 @@ namespace mgpu::adapter
         bool game_luid_known = false;
         LUID game_luid{};
         LUID selected_luid{};
-        UINT selected_index = 0;          // log only — never used for binding
+        UINT selected_index = 0;          // log only - never used for binding
         UINT selected_outputs = 0;
         char selected_desc[128]{};
         const char *rule = "none";
@@ -53,7 +53,7 @@ namespace mgpu::adapter
     void   get_selection(selection_result &out);
 
     // T3 instrumentation: log the adapter LUID of any device event in the
-    // process (init_device / device_removed / device_restored) — including
-    // our own T3 device, which independently confirms the binding.
+    // process (init_device / destroy_device) - including our own T3
+    // device, which independently confirms the binding.
     void log_device_luid(const char *event, ::reshade::api::device *device);
 }
