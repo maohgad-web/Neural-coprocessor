@@ -2,7 +2,10 @@
 //
 // Thread creation uses _beginthreadex, not CreateThread: this thread uses
 // CRT facilities (snprintf, std::mutex, std::atomic), and CreateThread
-// skips the per-thread CRT initialization.
+// skips the per-thread CRT initialization. Signature (6 arguments):
+//   uintptr_t _beginthreadex(void *security, unsigned stack_size,
+//       unsigned (__stdcall *start_address)(void *), void *arglist,
+//       unsigned initflag, unsigned *thrdaddr);
 #include <windows.h>
 #include <process.h>
 #include <atomic>
@@ -84,7 +87,7 @@ void ensure_started()
     std::lock_guard<std::mutex> lk(st().cs);
     st().stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     unsigned tid = 0;
-    const uintptr_t th = _beginthreadex(nullptr, 0, bridge_main, nullptr, 0, &tid, nullptr);
+    const uintptr_t th = _beginthreadex(nullptr, 0, bridge_main, nullptr, 0, &tid);
     if (th == 0)
     {
         char line[160];
@@ -100,7 +103,7 @@ void ensure_started()
         st().started = false;   // allow a later device/swapchain event to retry
         return;
     }
-    st().thread = static_cast<HANDLE>(th);
+    st().thread = reinterpret_cast<HANDLE>(th);
     st().thread_id = static_cast<DWORD>(tid);
     char line[160];
     snprintf(line, sizeof line, "[MGPU][T3] bridge thread spawned (thread id 0x%X)",
