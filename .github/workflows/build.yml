@@ -1,12 +1,10 @@
-name: build
+name: P0 build
 
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
-# Cancel superseded runs on the same branch — keeps the iteration loop fast.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -15,20 +13,15 @@ permissions:
   contents: read
 
 env:
-  # ReShade v6.8.0. Mirrored in VENDOR_LOCK.md — change both together.
+  # Source of truth: VENDOR_LOCK.md. v6.8.0, RESHADE_API_VERSION 20.
   RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
-  ADDON_NAME: mgpu_bridge.addon64
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      # ---- Containment gate: runs before the build so drift fails fast ----
-      # grep exits 2 on a missing dir and 1 on no-match; bash runs with
-      # `set -eo pipefail` here, so both are handled explicitly.
       - name: P0 containment check
         shell: bash
         run: |
@@ -39,56 +32,59 @@ jobs:
             if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
           done
           if [ "$FOUND" -ne 0 ]; then
-            echo "::error::Out-of-scope symbol for P0 — see brief section 01"
+            echo "::error::Out-of-scope symbol for P0"
             exit 1
           fi
-          echo "Containment check passed."
 
-      # ---- Pinned ReShade headers, sparse: include/ only ----
-      - name: Fetch ReShade add-on headers
+      # Headers land FLATTENED at ext/reshade/reshade.hpp — that is the
+      # path CMakeLists.txt adds as an include directory. Downloads stay
+      # in the workspace; MSYS path translation makes /tmp unreliable here.
+      - name: Fetch ReShade headers at pinned SHA
         shell: bash
         run: |
-          git init ext/reshade
-          cd ext/reshade
-          git remote add origin https://github.com/crosire/reshade.git
-          git sparse-checkout init --cone
-          git sparse-checkout set include
-          git fetch --depth 1 origin "$RESHADE_SHA"
-          git checkout FETCH_HEAD
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/reshade.tar.gz \
+            "https://codeload.github.com/crosire/reshade/tar.gz/${RESHADE_SHA}"
+          tar -xzf _dl/reshade.tar.gz -C _dl "reshade-${RESHADE_SHA}/include"
+          rm -rf ext/reshade
+          mv "_dl/reshade-${RESHADE_SHA}/include" ext/reshade
+          test -f ext/reshade/reshade.hpp
 
-      # Guard against a pin that silently moves to a different API generation.
-      - name: Verify pinned API version
+      - name: Verify pin (RESHADE_API_VERSION 20)
         shell: bash
         run: |
-          HDR=ext/reshade/include/reshade.hpp
-          test -f "$HDR" || { echo "::error::reshade.hpp missing — bad SHA or sparse path"; exit 1; }
-          grep -q '#define RESHADE_API_VERSION 20' "$HDR" \
-            || { echo "::error::RESHADE_API_VERSION is not 20 at pinned SHA"; exit 1; }
+          grep -q 'define RESHADE_API_VERSION 20' ext/reshade/reshade.hpp || {
+            echo "::error::Pin drift - fetched tree does not define RESHADE_API_VERSION 20"
+            exit 1
+          }
 
       - name: Configure
-        run: cmake -B build -A x64 -DRESHADE_INCLUDE=ext/reshade/include
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Build
         run: cmake --build build --config Release
 
-      # The extension REPLACES .dll. A file named *.addon64.dll is never
-      # loaded by ReShade, and that failure is silent in-game — so assert here.
-      - name: Verify output filename
+      # Multi-config generators may append a per-config subdirectory, so
+      # locate by name rather than assuming a path. The extension must
+      # REPLACE .dll — a *.addon64.dll is CI-green and rig-dead.
+      - name: Verify artifact name
         shell: bash
         run: |
-          if [ -f "build/Release/$ADDON_NAME.dll" ]; then
-            echo "::error::Built $ADDON_NAME.dll — extension must replace .dll, not append"
+          if find build -name 'mgpu_bridge.addon64.dll' -type f | grep -q .; then
+            echo "::error::Built mgpu_bridge.addon64.dll - SUFFIX appended to .dll instead of replacing it"
             exit 1
           fi
-          test -f "build/Release/$ADDON_NAME" || {
-            echo "::error::Expected build/Release/$ADDON_NAME"
-            ls -la build/Release || true
+          ADDON=$(find build -name 'mgpu_bridge.addon64' -type f | head -n1)
+          if [ -z "$ADDON" ]; then
+            echo "::error::mgpu_bridge.addon64 not produced"
+            find build -maxdepth 3 -type f || true
             exit 1
-          }
-          echo "Output verified: $ADDON_NAME"
+          fi
+          echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
+          echo "Output verified: $ADDON"
 
       - uses: actions/upload-artifact@v4
         with:
           name: mgpu_bridge
-          path: build/Release/${{ env.ADDON_NAME }}
+          path: ${{ env.ADDON_PATH }}
           if-no-files-found: error
