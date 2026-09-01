@@ -1,3 +1,5 @@
+This document is the original P0 brief and is partially superseded. Where it conflicts with instructions relayed in-session, the relayed instruction wins. Section 04 (T6/T7 mechanism) and T2's selection rule are known stale — do not build from them without confirming.
+
 Multi-GPU DLSS-NR R&D · Milestone 0 · Gate P0
 
 **Cross-Adapter Bridge M0**
