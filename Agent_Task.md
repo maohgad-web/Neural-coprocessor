@@ -117,12 +117,26 @@ decision, not just the outcome.
 - `VENDOR_LOCK.md` — it records rig conditions only a human can observe. When T8
   needs values recorded, output them in your report and a human commits them.
 
-**Read declarations before using symbols.** Before using any Win32, D3D12, or
-ReShade symbol you have not personally read this session, read its declaration
-from `d3d12.h` / `dxgi.h` in the Windows SDK or from the pinned ReShade tree.
-Several round trips have been lost to symbols recalled from memory that do not
-exist. Section 09 records the ones already verified — trust that section, verify
-anything else.
+**Verify what you can reach; do not hunt for what you cannot.** Section 09
+records symbols already verified from primary sources — trust it. For anything
+else, apply this in order:
+
+1. **Reachable source → verify.** The pinned ReShade tree is always reachable via
+   GitHub and is mandatory for every ReShade symbol. Read the declaration; do not
+   recall it.
+2. **No reachable source → stop looking after one or two tool calls.** You have
+   GitHub read, and web search may be unavailable. The Windows SDK headers are
+   not reachable from here. Hunting for a mirror costs more than the thing it
+   prevents.
+3. **Then split by what the compiler can catch.** Struct field names, function
+   arity and type mismatches are all reported loudly by MSVC with a file and
+   line. For that class: state your assumption, write it, mark it with an
+   `// UNVERIFIED:` comment, flag it in your report, and let CI be the check.
+4. **Never guess behaviour.** Whether an event exists and fires, whether a value
+   is sticky, what a call actually does, whether an API means what its name
+   suggests — the compiler cannot check any of it, and a wrong guess produces a
+   green build that is silently wrong. If a behavioural fact is unverifiable,
+   stop and report rather than assuming.
 
 **A compiler error list is not a census.** MSVC reports the first thing it
 tripped on. A failed cast invalidates a variable's type, after which every later
@@ -305,9 +319,11 @@ tiebreaker when more than two hardware adapters are present.
 
 **Diagnostic logging (must not influence selection).** For each adapter,
 `QueryInterface` the `IDXGIAdapter1` for `IDXGIAdapter3` and call
-`QueryVideoMemoryInfo` (signature in section 09), logging current local-memory
-usage. With the game running, one card sits near 5 GB and the other near 2 GB,
-which maps DXGI indices to physical cards unambiguously against `nvidia-smi`.
+`QueryVideoMemoryInfo` with `DXGI_MEMORY_SEGMENT_GROUP_LOCAL` (full details in
+section 09), logging `CurrentUsage`. This is *this process's* usage on each
+adapter, so expect multi-GB on the adapter the game renders on and near-zero on
+every other one. That directly identifies which adapter the game is using,
+independently of output counts.
 
 **Acceptance:** the full adapter table, the game's adapter LUID and its source
 (swapchain or provisional), and one line naming the selected LUID with the rule
@@ -504,8 +520,13 @@ section. Verify anything not in it, and add what you verify.
 - `HRESULT IDXGIAdapter3::QueryVideoMemoryInfo(UINT NodeIndex,
   DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup, DXGI_QUERY_VIDEO_MEMORY_INFO
   *pVideoMemoryInfo)`. Obtain `IDXGIAdapter3` by `QueryInterface` from
-  `IDXGIAdapter1`. Read the struct's members from `dxgi1_4.h` — the method
-  signature is verified, the field names are not.
+  `IDXGIAdapter1`. The struct has four `UINT64` members: `Budget`,
+  `CurrentUsage`, `AvailableForReservation`, `CurrentReservation`.
+  **`CurrentUsage` is the calling application's usage on that adapter, not the
+  card's total** — queried from inside the game process it reads multi-GB on the
+  adapter the game renders on and near-zero on the other. It will not match
+  `nvidia-smi`'s system-wide figures, and near-zero is the signal that the game
+  is not using that adapter.
 - **`CreateThreadW` does not exist.** The API is `CreateThread` — it takes no
   strings, so there is no ANSI/Wide pair. `CreateEventW` does exist.
 - `_beginthreadex` takes **six** parameters: `(void *security, unsigned
