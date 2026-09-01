@@ -71,8 +71,7 @@ bool create_device(const adapter::selection_result &sel)
         return false;
     }
 
-    LUID luid{};
-    dev->GetAdapterLuid(&luid);
+    const LUID luid = dev->GetAdapterLuid();
 
     // The binding must be exactly what T2 selected - anything else is the
     // silent re-bind that makes every downstream result meaningless.
