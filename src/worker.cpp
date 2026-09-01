@@ -1,5 +1,10 @@
-// MGPU Bridge — the bridge thread (T3)
+// MGPU Bridge - the bridge thread (T3)
+//
+// Thread creation uses _beginthreadex, not CreateThread: this thread uses
+// CRT facilities (snprintf, std::mutex, std::atomic), and CreateThread
+// skips the per-thread CRT initialization.
 #include <windows.h>
+#include <process.h>
 #include <atomic>
 #include <cstdio>
 #include <mutex>
@@ -28,8 +33,9 @@ namespace
         return s;
     }
 
-    DWORD WINAPI bridge_main(LPVOID)
+    unsigned __stdcall bridge_main(void *arg)
     {
+        (void)arg;
         mgpu::diag::info("[MGPU][T3] bridge thread started - owns all GPU 1 objects "
                          "(window + message pump arrive with T4)");
 
@@ -70,19 +76,20 @@ void ensure_started()
     if (!st().started.compare_exchange_strong(expected, true))
         return;
 
-    // Publish the ready event before the thread exists — CreateThreadW is
-    // the happens-before edge, so the worker's first read of the handle is
-    // race-free.
+    // Publish the ready event before the thread exists: the _beginthreadex
+    // call is the happens-before edge, so the worker's first read of the
+    // handle is race-free.
     mgpu::adapter::ready_event();
 
     std::lock_guard<std::mutex> lk(st().cs);
     st().stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE h = CreateThreadW(nullptr, 0, bridge_main, nullptr, 0, &st().thread_id);
-    if (h == nullptr)
+    unsigned tid = 0;
+    const uintptr_t th = _beginthreadex(nullptr, 0, bridge_main, nullptr, 0, &tid, nullptr);
+    if (th == 0)
     {
         char line[160];
         snprintf(line, sizeof line,
-                 "[MGPU][T3] CreateThreadW failed (GetLastError=%lu) - bridge thread not started",
+                 "[MGPU][T3] _beginthreadex failed (GetLastError=%lu) - bridge thread not started",
                  (unsigned long)GetLastError());
         mgpu::diag::error(line);
         if (st().stop_event != nullptr)
@@ -93,28 +100,37 @@ void ensure_started()
         st().started = false;   // allow a later device/swapchain event to retry
         return;
     }
-    st().thread = h;
+    st().thread = static_cast<HANDLE>(th);
+    st().thread_id = static_cast<DWORD>(tid);
     char line[160];
-    snprintf(line, sizeof line, "[MGPU][T3] bridge thread spawned (thread id 0x%X)", st().thread_id);
+    snprintf(line, sizeof line, "[MGPU][T3] bridge thread spawned (thread id 0x%X)",
+             (unsigned)st().thread_id);
     mgpu::diag::info(line);
 }
 
 void stop()
 {
-    std::lock_guard<std::mutex> lk(st().cs);
-    if (!st().started.load())
-        return;
-    if (st().stop_event != nullptr)
-        SetEvent(st().stop_event);
-    if (st().thread != nullptr)
+    // Signal-only. Never wait:
+    //  - From DllMain we are under the loader lock, and a thread cannot
+    //    finish exiting without that lock (its exit dispatches
+    //    DLL_THREAD_DETACH to every loaded module): a join would deadlock,
+    //    and a timed-out join would leave a live thread pointing into a
+    //    DLL that is about to unmap.
+    //  - From a ReShade callback the game thread must never block.
+    // The mutex is never held across a wait (only to copy the handle).
+    //
+    // The bridge thread performs the actual teardown (device release,
+    // adapter release, final log lines) once it wakes. That is best
+    // effort: if the process exits before it wakes, the OS reclaims the
+    // GPU objects; if ReShade unloads this module dynamically first, the
+    // GPU 1 device is simply leaked. Explicitly in scope at P0 - a hang
+    // is not.
+    HANDLE ev = nullptr;
     {
-        const DWORD r = WaitForSingleObject(st().thread, 5000);
-        if (r == WAIT_TIMEOUT)
-            mgpu::diag::warn("[MGPU][T3] bridge thread did not exit within 5000 ms - not waiting "
-                             "longer (process is exiting)");
-        else
-            CloseHandle(st().thread);
-        st().thread = nullptr;
+        std::lock_guard<std::mutex> lk(st().cs);
+        ev = st().stop_event;
     }
+    if (ev != nullptr)
+        SetEvent(ev);
 }
 }
