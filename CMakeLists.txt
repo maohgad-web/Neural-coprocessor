@@ -1,8 +1,8 @@
-# MGPU Bridge — Cross-Adapter Bridge, Milestone 0 (Gate P0)
+# MGPU Bridge - Cross-Adapter Bridge, Milestone 0 (Gate P0)
 #
 # Target: mgpu_bridge.addon64  (a ReShade 64-bit add-on, API 20)
 #
-# The .addon64 extension REPLACES .dll — the output is NOT
+# The .addon64 extension REPLACES .dll - the output is NOT
 # mgpu_bridge.addon64.dll. ReShade loads *.addon64 files; a file with the
 # wrong name goes green in CI and silently never loads on the rig. CI
 # verifies the exact output name for this reason.
@@ -59,5 +59,5 @@ target_link_libraries(mgpu_bridge PRIVATE
 )
 
 # P0: warnings visible, not fatal. A compile error costs the same round
-# trip as a logic error and teaches less — keep the first-try bar low.
+# trip as a logic error and teaches less - keep the first-try bar low.
 target_compile_options(mgpu_bridge PRIVATE /W3)
