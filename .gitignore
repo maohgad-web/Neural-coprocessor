@@ -1,0 +1,6 @@
+# CI-fetched ReShade headers — created at build time by .github/workflows/build.yml
+# from crosire/reshade at the pinned SHA recorded in VENDOR_LOCK.md. Never committed.
+ext/
+
+# CMake build output
+build/
