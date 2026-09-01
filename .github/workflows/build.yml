@@ -1,0 +1,94 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch — keeps the iteration loop fast.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # ReShade v6.8.0. Mirrored in VENDOR_LOCK.md — change both together.
+  RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
+  ADDON_NAME: mgpu_bridge.addon64
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Containment gate: runs before the build so drift fails fast ----
+      # grep exits 2 on a missing dir and 1 on no-match; bash runs with
+      # `set -eo pipefail` here, so both are handled explicitly.
+      - name: P0 containment check
+        shell: bash
+        run: |
+          PATTERN='SHARED_CROSS_ADAPTER|HEAP_FLAG_SHARED|CreateSharedHandle|OpenSharedHandle|FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|NVSDK_NGX|nvngx|GetClockCalibration'
+          FOUND=0
+          for DIR in src assets; do
+            [ -d "$DIR" ] || continue
+            if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
+          done
+          if [ "$FOUND" -ne 0 ]; then
+            echo "::error::Out-of-scope symbol for P0 — see brief section 01"
+            exit 1
+          fi
+          echo "Containment check passed."
+
+      # ---- Pinned ReShade headers, sparse: include/ only ----
+      - name: Fetch ReShade add-on headers
+        shell: bash
+        run: |
+          git init ext/reshade
+          cd ext/reshade
+          git remote add origin https://github.com/crosire/reshade.git
+          git sparse-checkout init --cone
+          git sparse-checkout set include
+          git fetch --depth 1 origin "$RESHADE_SHA"
+          git checkout FETCH_HEAD
+
+      # Guard against a pin that silently moves to a different API generation.
+      - name: Verify pinned API version
+        shell: bash
+        run: |
+          HDR=ext/reshade/include/reshade.hpp
+          test -f "$HDR" || { echo "::error::reshade.hpp missing — bad SHA or sparse path"; exit 1; }
+          grep -q '#define RESHADE_API_VERSION 20' "$HDR" \
+            || { echo "::error::RESHADE_API_VERSION is not 20 at pinned SHA"; exit 1; }
+
+      - name: Configure
+        run: cmake -B build -A x64 -DRESHADE_INCLUDE=ext/reshade/include
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # The extension REPLACES .dll. A file named *.addon64.dll is never
+      # loaded by ReShade, and that failure is silent in-game — so assert here.
+      - name: Verify output filename
+        shell: bash
+        run: |
+          if [ -f "build/Release/$ADDON_NAME.dll" ]; then
+            echo "::error::Built $ADDON_NAME.dll — extension must replace .dll, not append"
+            exit 1
+          fi
+          test -f "build/Release/$ADDON_NAME" || {
+            echo "::error::Expected build/Release/$ADDON_NAME"
+            ls -la build/Release || true
+            exit 1
+          }
+          echo "Output verified: $ADDON_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_bridge
+          path: build/Release/${{ env.ADDON_NAME }}
+          if-no-files-found: error
