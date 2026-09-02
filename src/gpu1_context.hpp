@@ -20,6 +20,15 @@ namespace mgpu::gpu1
     bool create_device(const adapter::selection_result &sel);
 
     // Bridge thread only. Releases the device if one exists.
+    //
+    // T5 (extension, not replacement): first releases the present chain
+    // if one exists - waiting for the GPU to idle (one final fence signal
+    // + wait), then releasing the chain objects in reverse creation
+    // order - and only then the device, exactly as before. The chain goes
+    // first because the swapchain holds a reference to the window it was
+    // created against and must not outlive DestroyWindow (worker.cpp
+    // reorders its teardown accordingly). Still a no-op for the chain
+    // when none was created (the no-window path is unaffected).
     void shutdown();
 
     bool has_device();
@@ -36,4 +45,40 @@ namespace mgpu::gpu1
     // sticky once removed (brief section 09), so the caller logs only on the
     // transition away from S_OK.
     bool device_removed_reason(HRESULT &out);
+
+    // ---- T5: the present chain (brief section 06) ----
+    //
+    // All D3D12/DXGI objects live behind this door: the raw pointers never
+    // leave this translation unit - the same guarantee as the device, which
+    // is why they sit behind the same mutex. T6 will need the native device
+    // / queue / swapchain pointers for create_effect_runtime; the accessor
+    // for those is written with T6, not now.
+
+    // Bridge thread only. Creates, on the T3 device: the command queue
+    // (D3D12_COMMAND_LIST_TYPE_DIRECT), the DXGI swapchain against
+    // `hwnd` (FLIP_DISCARD, R8G8B8A8_UNORM, 2 buffers, windowed), the
+    // RTV heap, the command allocator, the command list, and the fence
+    // + event. Queries the window's client rect itself (the T5 window is
+    // non-resizable, so the size is fixed for the chain's lifetime). The
+    // swapchain lands on the queue's adapter - the T3 device's adapter -
+    // which is the entire mechanism that makes this a GPU 1 swapchain;
+    // there is no adapter parameter to get wrong. Returns false with
+    // everything released on any failure; every failure is logged with
+    // the failing call and its HRESULT.
+    bool create_present_chain(HWND hwnd);
+
+    // Bridge thread only. One frame: PRESENT -> RENDER_TARGET barrier,
+    // ClearRenderTargetView on the current backbuffer's RTV, the barrier
+    // back to PRESENT, Close, ExecuteCommandLists, Present(1, 0) (vsync -
+    // the loop's pacing), Signal, and a wait on the fence before
+    // returning (the command allocator is single, so the next frame may
+    // not Reset it until the GPU has finished this one). Returns false on
+    // the first failure of any step; that failure is logged once (the
+    // step, its HRESULT, and the removal reason) and later failures are
+    // silent - the caller stops presenting after the first.
+    bool present_frame(float r, float g, float b);
+
+    // Any thread (takes this file's lock). True when the present chain
+    // exists.
+    bool has_present_chain();
 }
