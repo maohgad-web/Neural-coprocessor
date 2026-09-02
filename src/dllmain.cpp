@@ -5,7 +5,8 @@
 //     device) and a one-time adapter-table enumeration; the selection
 //     itself is deferred to the swapchain-derived game LUID (init_swapchain)
 //     - the four rules of brief section 06 live in adapter.hpp/adapter.cpp.
-// T3: the bridge thread (spawned on the game thread here, never from
+// T3: the bridge thread (spawned on the game thread from
+//     on_init_swapchain only, never from on_init_device and never from
 //     DllMain) creates the private device on the selected adapter;
 //     destroy_device events are logged, and the game's own device
 //     release triggers the bridge thread's orderly teardown.
@@ -69,9 +70,21 @@ namespace mgpu
 // fire, so the enumeration's factory creation does not recurse into
 // add-on init. (Swapchain CREATION stays off the game thread entirely -
 // that is the re-entrancy hazard, handled in T4+.)
+// The bridge thread is deliberately NOT started here. UE5 probes every
+// adapter before settling, and ReShade loads and unloads this add-on once
+// per probe - five cycles per launch on this rig. A thread started here
+// would wait on a ready event that cannot be set (rule 2: no selection is
+// possible before a swapchain exists), and would then be torn down inside
+// ReShade's unload window. That killed the game process on the rig: the
+// module unmaps while the thread is still executing inside it and the
+// thread faults on unmapped code, with no log line possible because the
+// code that would write it is gone. It is a race - the same binary
+// launched cleanly minutes earlier - so the fix is to have no thread
+// during a probe cycle at all, not to make the teardown faster.
+// ensure_started() therefore lives only in on_init_swapchain, which fires
+// once, on the real render device.
 static void on_init_device(reshade::api::device *device)
 {
-    mgpu::worker::ensure_started();
     // Every device event is logged; the first d3d12 one also captures the
     // provisional game LUID and builds the adapter table. No selection
     // here - brief rule 2 defers it to the swapchain-derived game LUID
@@ -81,6 +94,11 @@ static void on_init_device(reshade::api::device *device)
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    // The only place the bridge thread is started - see the note above
+    // on_init_device. This event fires on the real render device, after
+    // the probe cycles are over, so the thread is never alive inside an
+    // add-on unload window. Started before on_swapchain so the thread is
+    // already waiting when the selection is decided.
     mgpu::worker::ensure_started();
     // The swapchain's device is the authoritative game render device. Its
     // LUID overrides the provisional init_device value and runs the
