@@ -46,20 +46,27 @@ revise them.** If something in T1–T3 looks wrong to you, say so in your report
 and stop — do not fix it. A change there invalidates a hardware result that cost
 a deploy cycle to obtain.
 
-**The freeze is repo-wide over T1–T3 code, not per-file.** T4 grants exactly four
-exceptions, and they are the only edits permitted anywhere outside T4's own work
-in `worker.*`:
+**The freeze is repo-wide over T1–T4 code, not per-file.** T5's work is confined
+to three files, and within them to the changes listed here. These are the only
+edits permitted anywhere in the repository:
 
-1. An `HMODULE` captured at `DLL_PROCESS_ATTACH` in `dllmain.cpp`, with an
-   accessor.
-2. The `CloseHandle` fix in `worker::rearm()`.
-3. The rewrite of `bridge_main`'s post-device wait.
-4. One new function in `gpu1_context.*` exposing the device-removal reason —
-   see T4 requirement 3 for its shape.
+1. **`gpu1_context.hpp`** — declare the three new functions T5 specifies, and
+   add `<dxgi1_4.h>` if the declarations need it.
+2. **`gpu1_context.cpp`** — implement them; add the DXGI include; extend
+   `shutdown()` to release the present chain before the device. Everything
+   already in this file, including `device_removed_reason()` and the LUID
+   verification, stays as it is.
+3. **`worker.cpp`** — the window style change, `ShowWindow`, the call into
+   `create_present_chain`, the render loop, and the teardown reorder. All five
+   are specified in T5. Nothing else in the file changes: `rearm()`, `stop()`,
+   `ensure_started()`, `bridge_wndproc` and the class-registration block are
+   finished code.
 
-Nothing else in any T1–T3 file changes. If T4 appears to require a fifth
-exception, that is a defect in this brief: report it and stop rather than
-deciding for yourself.
+**Untouched, entirely:** `dllmain.cpp`, `adapter.hpp`, `adapter.cpp`, `diag.hpp`,
+`diag.cpp`, `worker.hpp`, `CMakeLists.txt`, `README.md`, `.github/`.
+
+If T5 appears to require a fourth file or a change not listed above, that is a
+defect in this brief: report it and stop rather than deciding for yourself.
 
 **One latent condition, recorded so you do not trip over it and do not try to
 fix it.** The T2 selection is a one-shot latched by `S.decided`, and
@@ -429,8 +436,9 @@ What it guarantees:
 
 ### T4 — Window and message pump ✅ PASSED
 
-Implemented in `worker.cpp`, verified on the rig. **This is the thread and the
-loop T5 extends — read them, do not revise them.**
+Implemented in `worker.cpp`, verified on the rig. **T5 extends this loop, and
+section 00 lists exactly which parts it may change. Everything not on that list
+is finished code — read it, do not revise it.**
 
 What it guarantees:
 
@@ -571,6 +579,30 @@ same intent, one loop.
 
 **Keep the T4 no-window path exactly as it is.** When `pump` is false there is
 nothing to present, and its `MsgWaitForMultipleObjects` / 250 ms structure stays.
+
+#### Teardown order changes, and the GPU must be idle first
+
+T4's teardown runs `DestroyWindow` → `UnregisterClass` → `gpu1::shutdown()` →
+`adapter::shutdown()`. **That order is wrong once a swapchain exists**, because
+the swapchain holds a reference to the window it was created against and would
+outlive it. Reorder to:
+
+```
+gpu1::shutdown()      // present chain first, then the device
+DestroyWindow
+UnregisterClass
+adapter::shutdown()
+```
+
+`gpu1::shutdown()` remains callable when no present chain was created, so the
+no-window path is unaffected.
+
+**Before releasing anything in the present chain, wait for the GPU to finish.**
+`Present` is asynchronous: returning from it does not mean the queue has drained.
+Releasing the swapchain, queue or command list while work is in flight is
+undefined behaviour and presents as a crash or a hang at shutdown — the failure
+mode T4 spent a rig cycle eliminating. Signal the fence one final time, wait on
+it, and only then release, in reverse creation order.
 
 #### Two fixes folded in from T4's rig run
 
