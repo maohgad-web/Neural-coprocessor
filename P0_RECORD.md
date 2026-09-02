@@ -195,6 +195,27 @@ Each entry was read from a primary source — the pinned ReShade tree, the Windo
 SDK, or Microsoft's documentation — after a guess proved wrong. Trust this
 section. Verify anything not in it, and add what you verify.
 
+**Where to verify, when you cannot search the web.** Every signature below was
+confirmed against a primary source, and the same sources are readable as public
+repositories. Use them rather than writing a call from its apparent shape — that
+mistake cost six compile errors in one task, in code that read as correct:
+
+**Note the branch names — they differ, and a wrong branch is a 404.**
+
+| Need | Repo · branch | Path |
+|---|---|---|
+| Any D3D12 / DXGI signature, struct or enum | `microsoft/DirectX-Headers` · `main` | `include/directx/d3d12.h` — the authoritative declarations, not prose about them. Helper wrappers are `include/directx/d3dx12.h` and `include/directx/d3dx12_resource_helpers.h`. |
+| ReShade add-on API | `crosire/reshade` · SHA in `VENDOR_LOCK.md` | `include/` — CI fetches exactly this tree, so what you read is what compiles. Do not read `main`; it drifts from the pin. |
+| Cross-adapter transit, end to end | `microsoft/DirectX-Graphics-Samples` · `master` | `Samples/Desktop/D3D12HeterogeneousMultiadapter/src/` — a working two-adapter pipeline: shared heap, cross-adapter resource, shared fence, per-frame hand-off. The closest published thing to what the next milestone builds. |
+
+**`Samples/Desktop/D3D12LinkedGpus` is not applicable and will mislead you.** It
+is the *linked-node* case — one device with two nodes, addressed by node mask.
+This rig has two separate adapters and two separate devices. Node masks are not
+the mechanism here.
+
+Read the header before writing the call. A signature you recall is not a
+signature you verified.
+
 **ReShade, v6.8.0 / API 20**
 
 - Add-ons export `NAME` and `DESCRIPTION` as `extern "C" __declspec(dllexport)
