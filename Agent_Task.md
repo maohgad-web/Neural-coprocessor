@@ -37,10 +37,20 @@ revise them.** If something in T1–T3 looks wrong to you, say so in your report
 and stop — do not fix it. A change there invalidates a hardware result that cost
 a deploy cycle to obtain.
 
-T4 names three exceptions to that, and they are the only ones: an `HMODULE`
-capture added to `dllmain.cpp`, the `CloseHandle` fix in `worker::rearm()`, and
-the rewrite of `bridge_main`'s post-device wait. Everything else in those files
-stays as it is.
+**The freeze is repo-wide over T1–T3 code, not per-file.** T4 grants exactly four
+exceptions, and they are the only edits permitted anywhere outside T4's own work
+in `worker.*`:
+
+1. An `HMODULE` captured at `DLL_PROCESS_ATTACH` in `dllmain.cpp`, with an
+   accessor.
+2. The `CloseHandle` fix in `worker::rearm()`.
+3. The rewrite of `bridge_main`'s post-device wait.
+4. One new function in `gpu1_context.*` exposing the device-removal reason —
+   see T4 requirement 3 for its shape.
+
+Nothing else in any T1–T3 file changes. If T4 appears to require a fifth
+exception, that is a defect in this brief: report it and stop rather than
+deciding for yourself.
 
 **One latent condition, recorded so you do not trip over it and do not try to
 fix it.** The T2 selection is a one-shot latched by `S.decided`, and
@@ -161,6 +171,19 @@ acceptance item and the function that satisfies it.
   needs values recorded, output them in your report and a human commits them.
 - `Agent_Task.md` — this document. It is maintained and re-issued by a human, so
   any edit you made would be overwritten by the next re-issue without warning.
+
+**Before a task is written, its requirements are checked against the interfaces
+they assume.** Every requirement that says "call X on Y" presumes something
+already exposes Y. Twice now a requirement has been written against an interface
+that did not exist — the device-removal poll was specified with no way to reach
+the device from the bridge thread, and before that the same poll was recorded as
+implemented when nothing implemented it. Both are the same defect: a requirement
+validated against intent rather than against the headers. Whoever writes the next
+task reads the headers of every module the task will call into, and writes the
+missing accessor into the spec as a numbered exception rather than leaving the
+agent to discover it and decide alone. T5 creates a swapchain on the GPU 1
+device, so `gpu1_context`'s surface is the first thing to settle before T5 is
+written.
 
 **A milestone does not flip on a log alone.** After each rig run, a human reviews
 the source of the files the next task will modify, and of any file whose
@@ -438,8 +461,14 @@ still renders normally, `GetDeviceRemovedReason()` stays `S_OK`, clean shutdown.
 ### T4 — Window and message pump ⬅ ACTIVE TASK
 
 The bridge thread creates a visible **1280×720** window, runs a message loop, and
-shuts down cleanly when the game exits or the add-on unloads. All of it lives in
-`worker.*`, on the thread T3 already spawned. No new files.
+shuts down cleanly when the game exits or the add-on unloads. The window and the
+loop live in `worker.*`, on the thread T3 already spawned. **No new files** — the
+manifest in section 05 is closed.
+
+Two of the four exceptions in section 00 fall outside `worker.*`: the `HMODULE`
+capture in `dllmain.cpp` and the removal-reason function in `gpu1_context.*`.
+Both are required by T4 and both are already specified below. Nothing else
+outside `worker.*` changes.
 
 **The size is fixed at 1280×720 and is not a placeholder.** LumeniteFX builds an
 optical-flow pyramid whose coarsest level is `BUFFER_WIDTH/128 ×
@@ -472,10 +501,24 @@ previous cycle can still exist. A per-module name means a stale class from an
 unmapped module can never be reused — which would mean creating a window whose
 `lpfnWndProc` points into unmapped memory.
 
-Even so, **treat `RegisterClassExW` failing with `ERROR_CLASS_ALREADY_EXISTS` as
-success and proceed**: that case means this same still-mapped module registered
-it on an earlier cycle, so the class is ours and is valid. Any other failure is a
-stop-and-report.
+**`ERROR_CLASS_ALREADY_EXISTS` is safe to proceed on, and is also a defect
+report.** Those are not in conflict — they are the same fact seen from the code's
+side and from a human's side.
+
+The per-module class name is what makes them compatible. Windows unregisters a
+class automatically when the module that owns it unloads, and a reload at a
+different base produces a different name, so with that naming scheme the error
+has exactly one possible cause: this same still-mapped module registered the
+class on an earlier cycle and our teardown did not unregister it. The class is
+therefore ours, its `lpfnWndProc` is valid, and using it is correct.
+
+So: proceed with window creation, and log it at **error** level naming the prior
+cycle's missed `UnregisterClass` as the cause. It should never fire in a clean
+run. Do not add a retry, a delete-and-reregister, or a name fallback — the class
+is fine; the teardown is what needs fixing, and the log line is how a human
+learns that.
+
+Any other `RegisterClassExW` failure is a stop-and-report.
 
 **2. Create the window with `CreateWindowExW`**, `WS_OVERLAPPEDWINDOW |
 WS_VISIBLE`, client area exactly 1280×720. `CreateWindowExW`'s width and height
@@ -494,10 +537,24 @@ MsgWaitForMultipleObjects(1, &st().stop_event, FALSE, 250, QS_ALLINPUT)
 
 `WAIT_OBJECT_0` means shut down. `WAIT_OBJECT_0 + 1` means messages are waiting —
 drain them with `PeekMessage` / `TranslateMessage` / `DispatchMessage` until the
-queue is empty, then loop. `WAIT_TIMEOUT` is the poll tick: call
-`GetDeviceRemovedReason()` on the GPU 1 device and log **only on the transition
-away from `S_OK`**, since the value is sticky once removed. One loop, one thread.
-Do not spawn a second thread for the pump.
+queue is empty, then loop. `WAIT_TIMEOUT` is the poll tick. One loop, one thread. Do not spawn a second
+thread for the pump.
+
+**The poll needs a function that does not yet exist.** `gpu1_context` exposes
+`create_device`, `shutdown` and `has_device` — the `ID3D12Device *` itself never
+leaves that translation unit, and it must not start to. Handing the raw pointer
+out would put it outside the mutex that guards it, and `shutdown()` could release
+it between the caller's read and its use. Add instead:
+
+```cpp
+bool device_removed_reason(HRESULT &out);   // false when no device exists
+```
+
+implemented in `gpu1_context.cpp`, taking that file's existing lock and calling
+`GetDeviceRemovedReason()` inside it. The bridge thread calls it on each
+`WAIT_TIMEOUT` and logs **only on the transition away from `S_OK`**, since the
+value is sticky once removed. This is exception 4 in section 00; keep it to this
+one function.
 
 The 250 ms timeout is the poll interval, not a pump interval — messages wake the
 wait immediately regardless of it.
@@ -547,6 +604,31 @@ and focused while the game keeps rendering; the log shows the class name, the
 window handle, the client rect and the owning thread id; closing the window
 leaves the game running; unloading the add-on tears down without a hang and
 without a `DestroyWindow` failure in the log.
+
+**What "stop-and-report" means for the code here.** The thread cannot abort — it
+owns the GPU 1 device and it must still tear down cleanly. So on a window or
+class failure other than `ERROR_CLASS_ALREADY_EXISTS`: log at error level with
+`GetLastError()` and the owning thread id, do not create a window, and fall
+through to the same wait loop with the pump branch omitted — **keeping the 250 ms
+timeout**, because the device-removal poll still has to run. On shutdown, tear
+down whatever was actually created and exit.
+
+Do not retry, and do not let a failed cycle re-arm into another attempt. Log one
+line stating plainly that P0 cannot proceed past T4 in this run, so the log
+cannot be mistaken for a pass: a run with a live device and no window would
+otherwise look healthy while proving nothing.
+
+**Track what you actually created.** `CreateWindowExW` can fail after
+`RegisterClassExW` succeeded, so teardown must not assume both happened —
+`DestroyWindow(nullptr)` and unregistering a class that was never registered are
+both errors that will show up in the log as noise on top of the real failure.
+
+**Do not use `PostQuitMessage`, and do not treat `WM_QUIT` as the exit signal.**
+The stop event is the single shutdown signal for this thread. A `WM_QUIT` sitting
+in the queue would be drained by `PeekMessage` and dispatched to nothing, and the
+loop would keep waiting — a hang with no error anywhere. `WM_CLOSE` and
+`WM_DESTROY` signal the stop event; the loop exits on the event, never on a
+message.
 
 **Two conditions specific to this rig, both from section 09 — read them before
 you start.** First, the add-on is loaded and unloaded five times per launch while
