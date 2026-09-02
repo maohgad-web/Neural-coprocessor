@@ -12,8 +12,8 @@ this file, this file describes the run that worked.
 
 | | |
 |---|---|
-| Commit at close | `________` *(fill: final P0 commit SHA)* |
-| Last CI-verified build | `b307367a` — green, zero warnings at `/W3`, artifact `mgpu_bridge.addon64` |
+| Commit that built the passing binary | `b307367a` — green, zero warnings at `/W3`, artifact `mgpu_bridge.addon64`. **This is the SHA to reproduce from.** |
+| Commits after it | Documentation and CI packaging only. `src/` has not changed since `b307367a`; a later SHA builds the identical add-on. |
 | ReShade headers | `crosire/reshade` @ `18deaa52de0c425a78b329e9cb3c497281cd00ec` |
 | ReShade add-on API | 20 |
 | CI runner | `windows-latest` → Visual Studio 18 2026, MSVC 19.51.36256.0 |
@@ -53,9 +53,19 @@ sets `DXGI_ADAPTER_FLAG_SOFTWARE`. Both are excluded by vendor id `0x1414`.
 | Target game | Carnal Instinct v0.7.8 with HotFix — Unreal Engine 5, D3D12 |
 | Game swapchain | 2560×1440, `R10G10B10A2_UNORM`, 4 buffers, flip, windowed |
 | ReShade | **6.8.0.2155**, add-on-enabled build |
-| LumeniteFX | `________` *(fill: release/version as installed)* — `lumenite_QuantMotion.fx` reports version 2026.06.16 |
+| LumeniteFX | **There is no single LumeniteFX version number.** Each shader carries its own date and they differ across the pack — `lumenite_QuantMotion.fx` reports **2026.06.16**, `lumenite_Kernel.fx` reports **2026.07.28**. What is pinned is therefore the **pack release**, identified by its repository release date; the per-file dates below are how you confirm you have the right one. The installed pack necessarily postdates 2026.07.28, the latest file date observed in it. |
 | Deploy path | `<game>\Carnal_Instinct_UE5\Binaries\Win64\` — add-on beside `dxgi.dll` |
 | Shader path | `…\Binaries\Win64\reshade-shaders\Shaders\` |
+
+**Do not treat a per-file date as the pack version, and do not expect the two to
+agree.** LumeniteFX versions each shader independently. An agent that reads
+`2026.06.16` out of `lumenite_QuantMotion.fx` and goes looking for a
+"LumeniteFX 2026.06.16" release will not find one. The only shader P0's result
+depends on is `lumenite_QuantMotion.fx` at **2026.06.16**, and section 09 of
+`P0_RECORD.md` documents that exact file's behaviour — technique name, the
+`DEBUG_FLOW` pass, the pyramid levels, the `FRAME_COUNT == 0` black frame. If a
+later pack ships a different QuantMotion date, section 09 is the thing to
+re-verify against, not this table.
 
 ## Configuration that made P0 pass
 
@@ -120,9 +130,10 @@ so the *deltas* hold; the absolute frame rate does not represent a clean game.
 
 ## Reproducing
 
-1. Build via GitHub Actions at the commit above. Artifact is exactly
-   `mgpu_bridge.addon64` — the extension replaces `.dll`.
-2. Place it beside `dxgi.dll`. Place `gpu1.ini` in the same directory.
+1. Build via GitHub Actions at `b307367a` or any later commit on `main`. The
+   artifact zip contains exactly `mgpu_bridge.addon64` and `gpu1.ini` — the
+   add-on's extension replaces `.dll`.
+2. Place both beside `dxgi.dll`.
 3. Apply the `ReShade.ini` and `ReShade2.ini` settings above **with the game
    closed** — ReShade rewrites both on exit.
 4. Launch. Expect exactly **one** `bridge thread spawned` line; UE5's five

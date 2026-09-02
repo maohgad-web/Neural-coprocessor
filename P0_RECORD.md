@@ -6,8 +6,8 @@ Multi-GPU DLSS-NR R&D. Private, local, non-redistributed.
 > This document is a finished record of completed work. Every task in it passed
 > and every file it describes is already committed. **Do not implement anything
 > from it, do not edit it, and do not treat an item here as work to do.** Your
-> assignment is in `Agent_Task.md`; if that file does not exist, you have not
-> been given a task and should stop and say so rather than inferring one from
+> assignment is in `Agent_Task.md` — and if that file says no task is assigned,
+> then none is, and you should stop and say so rather than inferring one from
 > here. Read sections 09 and 10 when you need a verified fact — that is what
 > this document is for.
 
@@ -22,6 +22,22 @@ constraints, the rig conditions by reference — not the adapter-selection rules
 the Win32 window facts, which describe finished work.
 
 ---
+
+## Section numbering — for anyone following a source comment
+
+Comments throughout `src/` cite this document by its former name
+(`Agent_Task.md`) and by section numbers that no longer exist. Those references
+are historical and the code they annotate is frozen; they were deliberately not
+rewritten. Where they now point:
+
+| Comment says | Now in |
+|---|---|
+| section 05 — layout / closed manifest | **01** · The shipped artifact |
+| section 06 — task list, "four rules", "gotcha N" | **01** · invariants, and **09** for the underlying facts |
+| section 07 — containment | `.github/workflows/build.yml`, which enforces it |
+| section 08 — instrumentation | **01** · invariants; the log-line table lives in `README.md` |
+| section 00 "exception N" | Exceptions were per-task freeze carve-outs. They expired when P0 closed; **01** states the invariants they protected. |
+| section 09, section 10 | unchanged — same numbers |
 
 ## 00 · What P0 proved
 
@@ -274,12 +290,14 @@ section. Verify anything not in it, and add what you verify.
   client area can be a few pixels off the requested size;
   `AdjustWindowRectExForDpi` is the exact form. T4 logs the real `GetClientRect`,
   so the rig log is the check.
-- **`README.md` is stale and is not maintained by any task.** It still describes a
-  ~640×360 window (T4 fixes 1280×720) and a T7 pipeline of
+- **`README.md` was stale for most of P0 and was regenerated at close.**
+  ~~It still describes a ~640×360 window and a T7 pipeline of
   "pattern → Kernel → LumaFlow → mv_debug" with an `assets\mv_debug.fx` that the
-  closed manifest does not contain — the real assets are `pattern.fx` and
-  `gpu1.ini`, with `Lumenite_QuantMotion` and `DEBUG_FLOW=1`. Do not trust it over
-  this document, and do not edit it.
+  closed manifest does not contain.~~ **Superseded:** the README was rewritten
+  when P0 closed and now matches the shipped code — 1280×720, `gpu1.ini`,
+  `Lumenite_QuantMotion` with `DEBUG_FLOW=1`. Entry kept because the failure mode
+  it names is general: no task owned the README, so it drifted for eight tasks
+  without anyone noticing. Give the next milestone's documentation an owner.
 - **The `FreeLibrary`-versus-teardown race kills the process. It is not a leak.**
   Observed on the rig: with the add-on present the game died silently during the
   third of UE5's add-on load/unload probe cycles, the log ending at
@@ -637,7 +655,9 @@ is the first place to check for a pre-existing cause. Human-owned, like section
 ---
 
 **P0 exited on 2026-09-02.** `VENDOR_LOCK.md` carries the commit, driver
-version, ReBAR state and LumeniteFX release that made it pass. The roadmap from
+version, ReBAR state and shader provenance that made it pass — note that
+LumeniteFX has no single pack version number and that file explains how to
+identify the right one. The roadmap from
 here — P1 transit, P2 ring buffer, M2 the resolution sweep, M3 DLSS-NR — is
 inherited by P1's own document, and the notes below are written for it rather
 than for this milestone.

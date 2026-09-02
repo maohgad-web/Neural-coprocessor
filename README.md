@@ -13,6 +13,7 @@ transfer, no capture from GPU 0, no DLSS-NR/NGX.
 
 `P0_RECORD.md` is the P0 record and the technical reference.
 `VENDOR_LOCK.md` is the exact configuration that made it pass.
+`Agent_Task.md` is the current agent assignment, and only that.
 
 ## Status
 
@@ -79,8 +80,14 @@ GitHub Actions only — `.github/workflows/build.yml`. The P0 containment check
 runs first, then ReShade's `include/` is fetched at the pinned SHA, then the
 add-on compiles. There is no local build.
 
-The artifact is exactly **`mgpu_bridge.addon64`** — the extension *replaces*
-`.dll`; there is no `.addon64.dll`, and CI fails the build if one appears.
+The artifact zip is the **complete deploy set**: `mgpu_bridge.addon64` and
+`gpu1.ini`, both at the zip root, both destined for the same directory. The
+add-on's extension *replaces* `.dll` — there is no `.addon64.dll`, and CI fails
+the build if one appears.
+
+CI also copies `assets/gpu1.ini` into the artifact, so **that file must exist in
+the repository or the build fails.** That is deliberate: a deploy set missing its
+preset produces a bridge window that runs nothing, which looks like a code fault.
 
 ## Deploy
 
@@ -91,13 +98,16 @@ containing `dxgi.dll`.
    `VENDOR_LOCK.md`. Confirm a trivial add-on loads first; this one will not load
    under an add-on-disabled build, and that failure looks identical to a broken
    add-on.
-2. `mgpu_bridge.addon64` beside `dxgi.dll`.
-3. `assets\gpu1.ini` into the same directory — the GPU 1 preset.
-4. **LumeniteFX** in `…\Binaries\Win64\reshade-shaders\Shaders\`.
-5. Apply the `ReShade.ini` and `ReShade2.ini` settings from `VENDOR_LOCK.md`
+2. **Both files from the CI artifact zip** — `mgpu_bridge.addon64` and
+   `gpu1.ini` — beside `dxgi.dll`. `gpu1.ini` is the GPU 1 preset; without it
+   the bridge window presents but runs no effect.
+3. **LumeniteFX** in `…\Binaries\Win64\reshade-shaders\Shaders\`. See
+   `VENDOR_LOCK.md` on identifying the right pack — the shaders are dated
+   individually and there is no single pack version number.
+4. Apply the `ReShade.ini` and `ReShade2.ini` settings from `VENDOR_LOCK.md`
    **with the game closed** — ReShade rewrites both on exit, so edits made while
    it is running are lost.
-6. Launch. The bridge window appears; press **Home** with it focused for the
+5. Launch. The bridge window appears; press **Home** with it focused for the
    GPU 1 overlay.
 
 **`ReShade.log` is overwritten on every launch.** Copy it aside before relaunching
@@ -145,3 +155,7 @@ should appear in the whole log, at the real swapchain.
 
 The manifest is closed — see `P0_RECORD.md` section 01. `ext/reshade/` is
 created by CI at build time, is gitignored, and is never committed.
+
+`THIRD_PARTY.md` records the licensing: the ReShade headers (BSD-3-Clause, as
+elected) and LumeniteFX's status as an externally installed runtime asset that
+never enters the build.
