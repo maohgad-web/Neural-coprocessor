@@ -28,6 +28,7 @@
 // logs only on the transition away from S_OK (the value is sticky once
 // removed).
 #include <windows.h>
+#include <strsafe.h>
 #include <process.h>
 #include <atomic>
 #include <cstdio>
@@ -174,14 +175,21 @@ namespace
         // A window whose thread is about to exit is worse than no window.
         const DWORD tid = GetCurrentThreadId();
         char line[320];
-        char class_name[64];
         // The class name embeds the HMODULE so a stale class from an
         // unmapped module can never be reused (its lpfnWndProc would point
         // into unmapped memory). A reload at a different base produces a
         // different name; the same still-mapped module produces the same
         // name, which is what makes ERROR_CLASS_ALREADY_EXISTS unambiguous.
+        // Two encodings of the same ASCII name: the narrow form feeds the
+        // log lines (diag takes const char *); the wide form is what the
+        // W APIs register, create and unregister (WNDCLASSEXW.lpszClassName
+        // is LPCWSTR - a narrow char[] would not compile).
+        char class_name[64];
+        wchar_t class_name_w[64];
         snprintf(class_name, sizeof class_name, "MGPU_Bridge_Wnd_%p",
                  (void *)mgpu::module_handle());
+        StringCchPrintfW(class_name_w, 64, L"MGPU_Bridge_Wnd_%p",
+                         (void *)mgpu::module_handle());
 
         bool class_registered = false;
         HWND hwnd = nullptr;
@@ -201,7 +209,7 @@ namespace
             wc.hIcon = nullptr;
             wc.hbrBackground = nullptr;
             wc.lpszMenuName = nullptr;
-            wc.lpszClassName = class_name;
+            wc.lpszClassName = class_name_w;
             wc.hIconSm = nullptr;
 
             const ATOM atom = RegisterClassExW(&wc);
@@ -254,7 +262,7 @@ namespace
 
                 hwnd = CreateWindowExW(
                     0,
-                    class_name,
+                    class_name_w,
                     L"MGPU Bridge (GPU 1)",
                     WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                     CW_USEDEFAULT, CW_USEDEFAULT,
@@ -398,7 +406,7 @@ namespace
             // Unregister the class we registered (or that a prior cycle of
             // this same still-mapped module left behind). The class name is
             // per-module, so this targets exactly our class.
-            if (UnregisterClassW(class_name, mgpu::module_handle()) == FALSE)
+            if (UnregisterClassW(class_name_w, mgpu::module_handle()) == FALSE)
             {
                 // Not fatal: the OS unregisters a class automatically when
                 // the owning module unmaps, so it may already be gone. Log
