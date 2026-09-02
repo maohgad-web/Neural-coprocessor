@@ -12,10 +12,11 @@ relayed instruction wins and this document should be updated.
 
 Read this first — it tells you where the work actually is.
 
-**The build is green and T1–T3 have passed on hardware.** The add-on compiles in
-CI and has been deployed to the rig. Adapter selection, the bridge thread and the
-device on the second GPU are all done and verified. **T4 is the active task, and
-it is where you start.**
+**The build is green and T1–T4 have passed on hardware.** The add-on compiles in
+CI and has been deployed to the rig repeatedly. Adapter selection, the bridge
+thread, the device on the second GPU, and a window with a message pump on that
+thread are all done and verified. **T5 is the active task, and it is where you
+start.**
 
 - **T1 — PASSED.** The add-on loads under stock ReShade 6.8.0.2155 and logs
   `[MGPU][T1] ... API version 20`.
@@ -24,11 +25,8 @@ it is where you start.**
   non-game hardware adapter is selected by LUID. Both findings that made this
   work are recorded in section 09 — read them before touching adapter code.
 - **T3 — PASSED.** `D3D12CreateDevice` runs on the bridge thread against the
-  selected adapter and both LUID verifications pass. **One acceptance item was
-  not built:** the device-removal poll. `bridge_main`'s post-device wait is a
-  plain `WaitForSingleObject(stop_event, INFINITE)` and
-  `GetDeviceRemovedReason()` is never called. T4 rewrites that wait, so the poll
-  is folded into T4 rather than reopened as a separate task.
+  selected adapter and both LUID verifications pass. Its one unbuilt acceptance
+  item, the device-removal poll, was folded into T4 and now exists.
 - **T4 — PASSED.** The bridge thread creates a 1280×720 window on itself, pumps
   messages in the same loop that polls `GetDeviceRemovedReason()`, and tears down
   in order. Verified on the rig: client rect exactly 1280×720, no
@@ -40,11 +38,12 @@ it is where you start.**
   `init_swapchain`. Section 09 has the detail.
 - **T5 — ACTIVE. This is your task.** Nothing beyond it is started.
 
-You are joining an in-progress project. T1–T3 are working code that a human has
-verified on the rig: **read them to understand the shape of the codebase, do not
-revise them.** If something in T1–T3 looks wrong to you, say so in your report
-and stop — do not fix it. A change there invalidates a hardware result that cost
-a deploy cycle to obtain.
+You are joining an in-progress project. T1 through T4 are working code that a
+human has verified on the rig: **read them to understand the shape of the
+codebase, do not revise them beyond the exceptions listed below.** If something
+in them looks wrong to you, say so in your report and continue — do not fix it. A
+change there invalidates a hardware result that cost a deploy cycle to obtain,
+and T4's result in particular took several.
 
 **The freeze is repo-wide over T1–T4 code, not per-file.** T5's work is confined
 to three files, and within them to the changes listed here. These are the only
@@ -74,13 +73,13 @@ fix it.** The T2 selection is a one-shot latched by `S.decided`, and
 teardown the adapter table holds released pointers, and the latch is what stops a
 later event from dereferencing them. It works because on this rig the five probe
 cycles produce no swapchain, so no selection is ever decided before the real one.
-Do not add anything to T4 that re-enters `on_device` or `on_swapchain`, and do
+Do not add anything to T5 that re-enters `on_device` or `on_swapchain`, and do
 not "improve" the latch.
 
 Files in `src/`: `dllmain.cpp`, `diag.{hpp,cpp}`, `adapter.{hpp,cpp}`,
-`gpu1_context.{hpp,cpp}`, `worker.{hpp,cpp}`. T4 extends `worker.*` — the bridge
-thread already exists there. `runtime_probe.*` does not exist yet; it arrives
-with T6, not now.
+`gpu1_context.{hpp,cpp}`, `worker.{hpp,cpp}`. T5 extends `gpu1_context.*` and the
+loop in `worker.cpp`; both already exist. `runtime_probe.*` does not exist yet —
+it arrives with T6, not now.
 
 ### The rig
 
@@ -122,8 +121,8 @@ GPU 0.
 |---|---|
 | Add-on loads under a stock, unmodified ReShade | One log line at init ✅ |
 | The second adapter is enumerable and bindable by LUID inside the game process | Adapter table in the log ✅ |
-| **The correct adapter is selected** | Selected LUID is the non-game hardware adapter ❌ |
-| A private D3D12 device coexists with the game's on another card | Device-created log line, game unaffected |
+| **The correct adapter is selected** | Selected LUID is the non-game hardware adapter ✅ |
+| A private D3D12 device coexists with the game's on another card | Device-created log line, game unaffected ✅ |
 | A second ReShade effect runtime exists on that adapter | `create_effect_runtime` returns true |
 | Whether ReShade also auto-hooks our swapchain *(instrumentation, not a gate)* | `init_effect_runtime` count and LUIDs |
 | LumeniteFX compiles and runs on GPU 1 | A second window showing a live flow field |
