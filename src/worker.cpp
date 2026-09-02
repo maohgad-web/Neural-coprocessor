@@ -30,6 +30,7 @@
 #include <windows.h>
 #include <process.h>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 
@@ -204,6 +205,7 @@ namespace
         HWND hwnd = nullptr;
         bool pump = false;
         bool failed_permanently = false;
+        bool have_chain = false;   // T5: the present chain was created
 
         if (have_device)
         {
@@ -231,7 +233,7 @@ namespace
                     // still-mapped module registered it on an earlier
                     // cycle) and a defect report: our teardown missed
                     // UnregisterClass. Log at error; do not retry, do not
-                    // delete-and-reregister, do not fall back to a name.
+                    // delete-and-reregister, and do not fall back to a name.
                     snprintf(line, sizeof line,
                              "[MGPU][T4] ERROR_CLASS_ALREADY_EXISTS on class \"%s\" - a prior "
                              "cycle's teardown missed UnregisterClass (same still-mapped module); "
@@ -264,16 +266,31 @@ namespace
                 // dimensions, so compute them with AdjustWindowRect against
                 // the same style - otherwise the client area comes out
                 // smaller than 720 lines by the title bar and borders.
+                //
+                // T5 (brief section 06, gotcha 8): the style drops
+                // WS_THICKFRAME and WS_MAXIMIZEBOX - non-resizable and
+                // non-maximizable, which removes ResizeBuffers from P0
+                // entirely. The identical style value feeds AdjustWindowRect
+                // below: a style change in one place only would silently
+                // break the 1280x720 client rect that T4 fixed (load-bearing
+                // for the flow pyramid's coarsest level).
+                const DWORD wnd_style =
+                    WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
                 RECT rc{0, 0, 1280, 720};
-                AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+                AdjustWindowRect(&rc, wnd_style, FALSE);
                 const int width = rc.right - rc.left;
                 const int height = rc.bottom - rc.top;
 
+                // T5 (section 09): no WS_VISIBLE. A window created visible
+                // takes foreground activation from the game the moment it
+                // appears, and the game's borderless-fullscreen presentation
+                // drops to windowed-with-borders with the taskbar showing.
+                // The window is shown without activation below.
                 hwnd = CreateWindowExW(
                     0,
                     class_name_w,
                     L"MGPU Bridge (GPU 1)",
-                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    wnd_style,
                     CW_USEDEFAULT, CW_USEDEFAULT,
                     width, height,
                     nullptr, nullptr,
@@ -306,6 +323,34 @@ namespace
                              (unsigned)tid);
                     mgpu::diag::info(line);
                     pump = true;
+
+                    // T5 (section 09): show the window without stealing
+                    // activation. On a valid hwnd ShowWindow is expected to
+                    // succeed; if it fails the window stays hidden - a
+                    // swapchain presents to a hidden window fine - so log
+                    // the input and continue.
+                    if (ShowWindow(hwnd, SW_SHOWNOACTIVATE) == FALSE)
+                    {
+                        const DWORD gle = GetLastError();
+                        snprintf(line, sizeof line,
+                                 "[MGPU][T5] ShowWindow(SW_SHOWNOACTIVATE) failed (GetLastError=%lu) "
+                                 "hwnd=0x%p - the window stays hidden; the present chain still runs",
+                                 (unsigned long)gle, (void *)hwnd);
+                        mgpu::diag::error(line);
+                    }
+
+                    // T5: the present chain on the GPU 1 device, against
+                    // this hwnd (bridge thread only). Failure is not fatal
+                    // to the window: the pump must stay (a window whose
+                    // thread stops pumping stalls the shell - section 09),
+                    // and the loop falls back to the T4 250 ms structure
+                    // with nothing to present.
+                    if (mgpu::gpu1::create_present_chain(hwnd))
+                        have_chain = true;
+                    else
+                        mgpu::diag::error("[MGPU][T5] no present chain on this cycle - the window "
+                                          "stays up without presenting (see the [MGPU][T5] creation "
+                                          "lines for the failing call)");
                 }
             }
         }
@@ -326,9 +371,109 @@ namespace
         // WaitForSingleObject(INFINITE). One loop, one thread - no second
         // thread for the pump. The stop event is the single shutdown
         // signal; WM_QUIT is never the exit signal.
+        //
+        // T5 reshapes the pump path: with a present chain the loop is
+        // vsync-paced - Present(1, 0) blocks on vblank (~16 ms), so the
+        // 250 ms timed wait goes away for the present path. The stop event
+        // is checked non-blocking at the top of every frame, messages are
+        // drained every frame, and the device-removal poll moves from the
+        // 250 ms timer to a frame counter (every 60 frames, ~1 s: same
+        // intent, one loop). The no-chain path (no window, or a window
+        // whose present chain failed to create) keeps the T4 structure
+        // exactly as it was.
         bool removed_logged = false;
+        unsigned long long frame = 0;   // T5: completed presents
         for (;;)
         {
+            if (have_chain)
+            {
+                // T5: the present loop. Vsync (Present(1, 0)) is the
+                // pacing mechanism - there is no timed wait.
+                const DWORD sw = WaitForSingleObject(st().stop_event, 0);
+                if (sw == WAIT_OBJECT_0)
+                    break;   // shutdown
+                if (sw == WAIT_FAILED)
+                {
+                    // A failed wait is not transient (an invalid handle,
+                    // etc.); spinning would teach nothing. Log and tear
+                    // down cleanly (the T4 rule, kept).
+                    snprintf(line, sizeof line,
+                             "[MGPU][T5] wait failed (GetLastError=%lu) thread id 0x%X - tearing down",
+                             (unsigned long)GetLastError(), (unsigned)tid);
+                    mgpu::diag::error(line);
+                    break;
+                }
+
+                // Drain messages until the queue is empty, then present.
+                // WM_QUIT is never the exit signal (the stop event is) -
+                // discard it without dispatching, so a stray WM_QUIT cannot
+                // be mistaken for a shutdown.
+                MSG m;
+                while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
+                {
+                    if (m.message == WM_QUIT)
+                        continue;
+                    TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+
+                // The colour must animate: a static clear cannot
+                // distinguish "presenting" from "presented once and hung."
+                // Driven by the frame counter, not a clock: three
+                // phase-shifted sinusoids, 180 frames per revolution
+                // (~3 s at the vblank pace). The modulo keeps the argument
+                // to sin bounded.
+                constexpr unsigned long long REV_PERIOD = 180;
+                constexpr float TAU = 6.283185307179586f;
+                const float ph = TAU * static_cast<float>(frame % REV_PERIOD) /
+                                 static_cast<float>(REV_PERIOD);
+                const float cr = 0.5f + 0.5f * std::sin(ph);
+                const float cg = 0.5f + 0.5f * std::sin(ph + TAU / 3.0f);
+                const float cb = 0.5f + 0.5f * std::sin(ph + 2.0f * TAU / 3.0f);
+
+                if (!mgpu::gpu1::present_frame(cr, cg, cb))
+                {
+                    // The first failure is already logged with its step,
+                    // HRESULT and removal reason (one-shot, in
+                    // gpu1_context). Stop presenting: the loop exits to
+                    // the ordered teardown.
+                    break;
+                }
+                ++frame;
+                if (frame == 1)
+                {
+                    mgpu::diag::info("[MGPU][T5] first successful present (frame 1) - the "
+                                     "vsync-paced present loop is alive");
+                }
+                else if (frame % 600 == 0)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][T5] present loop alive: frame %llu thread id 0x%X",
+                             (unsigned long long)frame, (unsigned)tid);
+                    mgpu::diag::info(line);
+                }
+
+                // The device-removal poll, moved from the 250 ms timer to
+                // a frame counter (every 60 frames, ~1 s at vblank): same
+                // intent, one loop. T4's line verbatim - it identifies the
+                // T4 acceptance item, which this branch now hosts.
+                if (frame % 60 == 0)
+                {
+                    HRESULT reason = S_OK;
+                    if (mgpu::gpu1::device_removed_reason(reason) && reason != S_OK && !removed_logged)
+                    {
+                        snprintf(line, sizeof line,
+                                 "[MGPU][T4] device removed: GetDeviceRemovedReason hr=0x%08X (sticky - "
+                                 "logged once on the transition away from S_OK), thread id 0x%X",
+                                 (unsigned)reason, (unsigned)tid);
+                        mgpu::diag::error(line);
+                        removed_logged = true;
+                    }
+                }
+                continue;
+            }
+
+            // No present chain: the T4 structure, unchanged.
             DWORD wr;
             if (pump)
                 wr = MsgWaitForMultipleObjects(1, &st().stop_event, FALSE, 250, QS_ALLINPUT);
@@ -383,13 +528,20 @@ namespace
         }
 
         // Requirement 5: ordered teardown, on this same thread and in this
-        // order, before rearm(): DestroyWindow, UnregisterClass, the
-        // existing gpu1::shutdown() / adapter::shutdown(), the final log
-        // lines, and only then rearm(). Everything the thread owns is
-        // released before it re-arms, so a replacement thread's
-        // RegisterClassExW cannot race this thread's cleanup.
-        mgpu::diag::info("[MGPU][T4] shutdown - ordered teardown (DestroyWindow -> UnregisterClass "
-                         "-> gpu1::shutdown -> adapter::shutdown)");
+        // order, before rearm(). Everything the thread owns is released
+        // before it re-arms, so a replacement thread's RegisterClassExW
+        // cannot race this thread's cleanup.
+        //
+        // T5 reorders it: the present chain (and the device) go FIRST.
+        // The T4 order (DestroyWindow first) is wrong once a swapchain
+        // exists - the swapchain holds a reference to the window it was
+        // created against and would outlive it. gpu1::shutdown() drains
+        // the GPU before releasing the chain, and is a no-op for the chain
+        // when none was created (the no-window path is unaffected).
+        mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (gpu1::shutdown [present chain -> "
+                         "device] -> DestroyWindow -> UnregisterClass -> adapter::shutdown)");
+
+        mgpu::gpu1::shutdown();
 
         if (hwnd != nullptr)
         {
@@ -433,7 +585,6 @@ namespace
             class_registered = false;
         }
 
-        mgpu::gpu1::shutdown();
         mgpu::adapter::shutdown();
         mgpu::diag::info("[MGPU][T4] bridge thread exiting cleanly");
 
