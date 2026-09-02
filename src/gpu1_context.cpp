@@ -292,7 +292,7 @@ bool create_present_chain(HWND hwnd)
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         scd.BufferCount = 2;
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        scd.Scaling = 0;
+        scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
         scd.Flags = 0;
 
@@ -354,35 +354,39 @@ bool create_present_chain(HWND hwnd)
                                            reinterpret_cast<void **>(&back0));
         if (FAILED(hr0))
             return fail("GetBuffer(0)", hr0);
-        const HRESULT rtv0 = dev->CreateRenderTargetView(
+        // CreateRenderTargetView returns void - there is no HRESULT to
+        // check. A bad argument surfaces on the debug layer, not here.
+        dev->CreateRenderTargetView(
             back0, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
-        if (FAILED(rtv0))
-            return fail("CreateRenderTargetView(0)", rtv0);
         const HRESULT hr1 = sc3->GetBuffer(1, __uuidof(ID3D12Resource),
                                            reinterpret_cast<void **>(&back1));
         if (FAILED(hr1))
             return fail("GetBuffer(1)", hr1);
         D3D12_CPU_DESCRIPTOR_HANDLE h1{};
         h1.ptr = heap->GetCPUDescriptorHandleForHeapStart().ptr + rtv_size;
-        const HRESULT rtv1 = dev->CreateRenderTargetView(back1, nullptr, h1);
-        if (FAILED(rtv1))
-            return fail("CreateRenderTargetView(1)", rtv1);
+        dev->CreateRenderTargetView(back1, nullptr, h1);
     }
 
     // 4. Command allocator + command list. The allocator is single:
     // present_frame waits on the fence before returning, which is what
     // makes the next frame's Reset safe.
     {
-        D3D12_COMMAND_ALLOCATION_DESC ad{};
-        ad.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        ad.CreateFlags = D3D12_COMMAND_ALLOCATOR_FLAG_NONE;
-        const HRESULT hr = dev->CreateCommandAllocator(&ad, IID_PPV_ARGS(&allocator));
+        // CreateCommandAllocator takes the list type directly - there is
+        // no D3D12_COMMAND_ALLOCATION_DESC and no allocator flags enum.
+        const HRESULT hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(&allocator));
         if (FAILED(hr))
             return fail("CreateCommandAllocator", hr);
         const HRESULT clr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator,
                                                    nullptr, IID_PPV_ARGS(&cl));
         if (FAILED(clr))
             return fail("CreateCommandList", clr);
+        // CreateCommandList returns the list in the RECORDING state. The
+        // first frame calls Reset on it, and Reset on a recording list is
+        // invalid - so close it once here, immediately after creation.
+        const HRESULT cchr = cl->Close();
+        if (FAILED(cchr))
+            return fail("Close (initial)", cchr);
     }
 
     // 5. Fence + event. The event is auto-reset: SetEventOnCompletion
@@ -506,16 +510,15 @@ bool present_frame(float r, float g, float b)
     };
 
     // The current backbuffer by index (gotcha 6) - no hand tracking.
-    UINT index = 0;
+    // GetCurrentBackBufferIndex takes NO parameters and returns UINT
+    // directly; it is not an HRESULT call.
+    const UINT index = sc->GetCurrentBackBufferIndex();
+    if (index >= 2)
     {
-        const HRESULT hr = sc->GetCurrentBackBufferIndex(&index);
-        if (FAILED(hr) || index >= 2)
-        {
-            // index >= 2 cannot happen with BufferCount 2; if it did,
-            // the step string names it and the log carries the real
-            // HRESULT.
-            return fail("GetCurrentBackBufferIndex", static_cast<unsigned>(hr));
-        }
+        // Cannot happen with BufferCount 2. Guarded because the index
+        // feeds both a descriptor offset and backbuffer[], and a wrong
+        // one would be a silent out-of-bounds read.
+        return fail("GetCurrentBackBufferIndex (index out of range)", index);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
     rtv.ptr = heap->GetCPUDescriptorHandleForHeapStart().ptr +
@@ -523,10 +526,16 @@ bool present_frame(float r, float g, float b)
               dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     // The single command allocator is reused every frame: the fence wait
-    // at the end of this call is what makes the Reset below safe.
-    HRESULT hr = cl->Reset(allocator, nullptr);
+    // at the end of the PREVIOUS call is what makes these Resets safe.
+    // The allocator must be reset explicitly - resetting the command list
+    // does not reclaim the allocator's memory, so omitting this grows it
+    // without bound for as long as the loop runs.
+    HRESULT hr = allocator->Reset();
     if (FAILED(hr))
-        return fail("Reset", static_cast<unsigned>(hr));
+        return fail("CommandAllocator::Reset", static_cast<unsigned>(hr));
+    hr = cl->Reset(allocator, nullptr);
+    if (FAILED(hr))
+        return fail("CommandList::Reset", static_cast<unsigned>(hr));
 
     // Gotcha 7: barriers are mandatory. PRESENT -> RENDER_TARGET before
     // the clear, RENDER_TARGET -> PRESENT after it. Omitting them is a
@@ -551,7 +560,7 @@ bool present_frame(float r, float g, float b)
     if (FAILED(hr))
         return fail("Close", static_cast<unsigned>(hr));
 
-    const ID3D12CommandList *lists[1] = { cl };
+    ID3D12CommandList *const lists[1] = { cl };
     queue->ExecuteCommandLists(1, lists);
 
     // Signal the fence for this frame, present with vsync - Present(1, 0),
