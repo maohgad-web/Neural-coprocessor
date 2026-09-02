@@ -1,4 +1,4 @@
-// MGPU Bridge - the bridge thread (T3)
+// MGPU Bridge - the bridge thread (T3; window + message pump arrive with T4)
 //
 // Thread creation uses _beginthreadex, not CreateThread: this thread uses
 // CRT facilities (snprintf, std::mutex, std::atomic), and CreateThread
@@ -14,6 +14,19 @@
 // exited on a probe's teardown would otherwise never be replaced, and the
 // T2 selection (now deferred to the real device's swapchain) would have no
 // thread left to create the T3 device.
+//
+// T4: the window and the message pump. A window belongs to the thread that
+// called CreateWindowExW, and only that thread may pump its messages - so
+// register class, create window, PeekMessage/DispatchMessage, DestroyWindow
+// and UnregisterClass all happen on this thread. Nothing touches the window
+// from a ReShade callback, and nothing blocks the game thread waiting on it.
+// The stop event is the single shutdown signal for this thread; WM_QUIT is
+// never the exit signal (a WM_QUIT in the queue would be drained and
+// dispatched to nothing, and the loop would keep waiting - a hang with no
+// error anywhere). The device-removal poll T3 never built is folded into the
+// pump loop: a 250 ms timed wait that calls gpu1::device_removed_reason and
+// logs only on the transition away from S_OK (the value is sticky once
+// removed).
 #include <windows.h>
 #include <process.h>
 #include <atomic>
@@ -24,6 +37,12 @@
 #include "diag.hpp"
 #include "gpu1_context.hpp"
 #include "worker.hpp"
+
+// T4 (brief section 00, exception 1): the add-on's own module handle,
+// defined in dllmain.cpp and captured at DLL_PROCESS_ATTACH.
+// GetModuleHandle(nullptr) returns the game's module, not ours, so the
+// window class's hInstance must be this handle.
+namespace mgpu { HMODULE module_handle(); }
 
 namespace mgpu::worker
 {
@@ -73,6 +92,38 @@ namespace
         st().started = false;
     }
 
+    // T4, requirement 4: the window procedure stays minimal. WM_CLOSE and
+    // WM_DESTROY signal the same shutdown path the add-on unload uses
+    // (worker::stop - signal only, never waits). Everything else is passed
+    // to DefWindowProcW. The user closing this window must not close the
+    // game: we signal our own shutdown, tear down our side (in the ordered
+    // teardown after the loop exits), and leave the game running. No
+    // rendering, no D3D calls, no logging beyond these two messages.
+    //
+    // WM_CLOSE is handled here (not by DefWindowProcW) so the system does
+    // not DestroyWindow immediately: the window is destroyed by the ordered
+    // teardown on this same thread, which is what keeps "no DestroyWindow
+    // failure in the log" true.
+    LRESULT CALLBACK bridge_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        (void)wParam; (void)lParam;
+        switch (msg)
+        {
+        case WM_CLOSE:
+            mgpu::diag::info("[MGPU][T4] WM_CLOSE - the bridge window was closed by the user; "
+                             "signalling bridge shutdown (the game is not affected)");
+            stop();
+            return 0;
+        case WM_DESTROY:
+            mgpu::diag::info("[MGPU][T4] WM_DESTROY - the bridge window was destroyed; "
+                             "signalling bridge shutdown (the game is not affected)");
+            stop();
+            return 0;
+        default:
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+        }
+    }
+
     unsigned __stdcall bridge_main(void *arg)
     {
         (void)arg;
@@ -112,16 +163,280 @@ namespace
             rearm();
             return 0;
         }
-        mgpu::gpu1::create_device(sel);   // T3 gate; every outcome logged
+        // T3 gate; every outcome logged. The return value is whether a
+        // device exists now (created, or already present) - T4 gates the
+        // window on it.
+        const bool have_device = mgpu::gpu1::create_device(sel);
 
-        // T3: idle until shutdown. T4 replaces this wait with the window
-        // and the message pump (created on this thread, before the
-        // swapchain).
-        WaitForSingleObject(st().stop_event, INFINITE);
-        mgpu::diag::info("[MGPU][T3] shutdown requested - releasing GPU 1 objects");
+        // ---- T4: the window and the message pump (bridge thread only) ----
+        // The window is created only when the device exists - never on a
+        // cycle with no device, and only after create_device returns true.
+        // A window whose thread is about to exit is worse than no window.
+        const DWORD tid = GetCurrentThreadId();
+        char line[320];
+        char class_name[64];
+        // The class name embeds the HMODULE so a stale class from an
+        // unmapped module can never be reused (its lpfnWndProc would point
+        // into unmapped memory). A reload at a different base produces a
+        // different name; the same still-mapped module produces the same
+        // name, which is what makes ERROR_CLASS_ALREADY_EXISTS unambiguous.
+        snprintf(class_name, sizeof class_name, "MGPU_Bridge_Wnd_%p",
+                 (void *)mgpu::module_handle());
+
+        bool class_registered = false;
+        HWND hwnd = nullptr;
+        bool pump = false;
+        bool failed_permanently = false;
+
+        if (have_device)
+        {
+            // Requirement 1: register the window class on the bridge thread,
+            // hInstance = the add-on's own HMODULE (not the game's).
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.style = CS_HREDRAW | CS_VREDRAW;
+            wc.lpfnWndProc = bridge_wndproc;
+            wc.hInstance = mgpu::module_handle();
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hIcon = nullptr;
+            wc.hbrBackground = nullptr;
+            wc.lpszMenuName = nullptr;
+            wc.lpszClassName = class_name;
+            wc.hIconSm = nullptr;
+
+            const ATOM atom = RegisterClassExW(&wc);
+            if (atom == 0)
+            {
+                const DWORD gle = GetLastError();
+                if (gle == ERROR_CLASS_ALREADY_EXISTS)
+                {
+                    // Safe to proceed (the class is ours - this same
+                    // still-mapped module registered it on an earlier
+                    // cycle) and a defect report: our teardown missed
+                    // UnregisterClass. Log at error; do not retry, do not
+                    // delete-and-reregister, do not fall back to a name.
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] ERROR_CLASS_ALREADY_EXISTS on class \"%s\" - a prior "
+                             "cycle's teardown missed UnregisterClass (same still-mapped module); "
+                             "proceeding with the existing class, thread id 0x%X",
+                             class_name, (unsigned)tid);
+                    mgpu::diag::error(line);
+                    class_registered = true;   // the class exists; teardown will unregister it
+                }
+                else
+                {
+                    // Stop-and-report: any other RegisterClassExW failure.
+                    // No window is created; the wait loop runs with the pump
+                    // branch omitted but keeps the 250 ms timeout (the
+                    // device-removal poll still has to run).
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] RegisterClassExW failed (GetLastError=%lu) class=\"%s\" "
+                             "thread id 0x%X - no window will be created; P0 cannot proceed past "
+                             "T4 in this run",
+                             (unsigned long)gle, class_name, (unsigned)tid);
+                    mgpu::diag::error(line);
+                    failed_permanently = true;
+                }
+            }
+            else
+            {
+                class_registered = true;
+
+                // Requirement 2: create the window, client area exactly
+                // 1280x720. CreateWindowExW's width/height are the OUTER
+                // dimensions, so compute them with AdjustWindowRect against
+                // the same style - otherwise the client area comes out
+                // smaller than 720 lines by the title bar and borders.
+                RECT rc{0, 0, 1280, 720};
+                AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+                const int width = rc.right - rc.left;
+                const int height = rc.bottom - rc.top;
+
+                hwnd = CreateWindowExW(
+                    0,
+                    class_name,
+                    L"MGPU Bridge (GPU 1)",
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    CW_USEDEFAULT, CW_USEDEFAULT,
+                    width, height,
+                    nullptr, nullptr,
+                    mgpu::module_handle(),
+                    nullptr);
+                if (hwnd == nullptr)
+                {
+                    const DWORD gle = GetLastError();
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] CreateWindowExW failed (GetLastError=%lu) class=\"%s\" "
+                             "thread id 0x%X - the class is registered but no window exists; P0 "
+                             "cannot proceed past T4 in this run",
+                             (unsigned long)gle, class_name, (unsigned)tid);
+                    mgpu::diag::error(line);
+                    failed_permanently = true;
+                    // class_registered stays true; teardown will unregister it.
+                }
+                else
+                {
+                    // Log the class name, the window handle, the client
+                    // rect, and the owning thread id (acceptance).
+                    RECT cr{};
+                    GetClientRect(hwnd, &cr);
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4] window created: class=\"%s\" hwnd=0x%p client=%dx%d "
+                             "(%d,%d,%d,%d) thread id 0x%X (client area is the T4-fixed 1280x720)",
+                             class_name, (void *)hwnd,
+                             cr.right - cr.left, cr.bottom - cr.top,
+                             cr.left, cr.top, cr.right, cr.bottom,
+                             (unsigned)tid);
+                    mgpu::diag::info(line);
+                    pump = true;
+                }
+            }
+        }
+        else
+        {
+            // No device on this cycle (a terminal refusal). No window, no
+            // class. The wait loop runs without the pump branch but keeps
+            // the 250 ms timeout so the device-removal poll still runs (a
+            // no-op with no device, but the structure is uniform).
+            snprintf(line, sizeof line,
+                     "[MGPU][T4] no device on this cycle - no window created; waiting without the "
+                     "pump branch (thread id 0x%X)",
+                     (unsigned)tid);
+            mgpu::diag::info(line);
+        }
+
+        // Requirement 3: the pumping loop, replacing the post-device
+        // WaitForSingleObject(INFINITE). One loop, one thread - no second
+        // thread for the pump. The stop event is the single shutdown
+        // signal; WM_QUIT is never the exit signal.
+        bool removed_logged = false;
+        for (;;)
+        {
+            DWORD wr;
+            if (pump)
+                wr = MsgWaitForMultipleObjects(1, &st().stop_event, FALSE, 250, QS_ALLINPUT);
+            else
+                wr = WaitForSingleObject(st().stop_event, 250);
+
+            if (wr == WAIT_FAILED)
+            {
+                // A failed wait is not transient (an invalid handle, etc.);
+                // spinning would teach nothing. Log and tear down cleanly.
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] wait failed (GetLastError=%lu) thread id 0x%X - tearing down",
+                         (unsigned long)GetLastError(), (unsigned)tid);
+                mgpu::diag::error(line);
+                break;
+            }
+
+            if (wr == WAIT_OBJECT_0)
+                break;   // shutdown
+
+            if (pump && wr == WAIT_OBJECT_0 + 1)
+            {
+                // Messages are waiting: drain them until the queue is empty,
+                // then loop. WM_QUIT is never the exit signal (the stop
+                // event is) - discard it without dispatching, so a stray
+                // WM_QUIT cannot be mistaken for a shutdown.
+                MSG m;
+                while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
+                {
+                    if (m.message == WM_QUIT)
+                        continue;
+                    TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+                continue;
+            }
+
+            // WAIT_TIMEOUT: the poll tick (250 ms). Call the removal-reason
+            // accessor and log only on the transition away from S_OK - the
+            // value is sticky once removed (brief section 09), so a healthy
+            // device is silent by construction.
+            HRESULT reason = S_OK;
+            if (mgpu::gpu1::device_removed_reason(reason) && reason != S_OK && !removed_logged)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] device removed: GetDeviceRemovedReason hr=0x%08X (sticky - "
+                         "logged once on the transition away from S_OK), thread id 0x%X",
+                         (unsigned)reason, (unsigned)tid);
+                mgpu::diag::error(line);
+                removed_logged = true;
+            }
+        }
+
+        // Requirement 5: ordered teardown, on this same thread and in this
+        // order, before rearm(): DestroyWindow, UnregisterClass, the
+        // existing gpu1::shutdown() / adapter::shutdown(), the final log
+        // lines, and only then rearm(). Everything the thread owns is
+        // released before it re-arms, so a replacement thread's
+        // RegisterClassExW cannot race this thread's cleanup.
+        mgpu::diag::info("[MGPU][T4] shutdown - ordered teardown (DestroyWindow -> UnregisterClass "
+                         "-> gpu1::shutdown -> adapter::shutdown)");
+
+        if (hwnd != nullptr)
+        {
+            // DestroyWindow must be called from the thread that created the
+            // window (this thread); from any other thread it returns FALSE
+            // with ERROR_ACCESS_DENIED.
+            if (DestroyWindow(hwnd) == FALSE)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] DestroyWindow failed (GetLastError=%lu) hwnd=0x%p thread id 0x%X",
+                         (unsigned long)GetLastError(), (void *)hwnd, (unsigned)tid);
+                mgpu::diag::error(line);
+            }
+            else
+            {
+                mgpu::diag::info("[MGPU][T4] window destroyed");
+            }
+            hwnd = nullptr;
+        }
+
+        if (class_registered)
+        {
+            // Unregister the class we registered (or that a prior cycle of
+            // this same still-mapped module left behind). The class name is
+            // per-module, so this targets exactly our class.
+            if (UnregisterClassW(class_name, mgpu::module_handle()) == FALSE)
+            {
+                // Not fatal: the OS unregisters a class automatically when
+                // the owning module unmaps, so it may already be gone. Log
+                // for the record.
+                snprintf(line, sizeof line,
+                         "[MGPU][T4] UnregisterClassW returned FALSE (GetLastError=%lu) class=\"%s\" "
+                         "(not fatal - the class may already be gone)",
+                         (unsigned long)GetLastError(), class_name);
+                mgpu::diag::info(line);
+            }
+            else
+            {
+                mgpu::diag::info("[MGPU][T4] window class unregistered");
+            }
+            class_registered = false;
+        }
+
         mgpu::gpu1::shutdown();
         mgpu::adapter::shutdown();
-        mgpu::diag::info("[MGPU][T3] bridge thread exiting cleanly");
+        mgpu::diag::info("[MGPU][T4] bridge thread exiting cleanly");
+
+        if (failed_permanently)
+        {
+            // Do not re-arm: a failed cycle must not spawn a replacement
+            // thread and retry (the "P0 cannot proceed past T4" line was
+            // already logged at the failure site). Close the thread handle
+            // to avoid the per-cycle leak, but leave started = true so
+            // ensure_started() never spawns a replacement.
+            std::lock_guard<std::mutex> lk(st().cs);
+            if (st().thread != nullptr)
+            {
+                CloseHandle(st().thread);
+                st().thread = nullptr;
+            }
+            st().thread_id = 0;
+            return 0;
+        }
+
         rearm();
         return 0;
     }
@@ -181,12 +496,12 @@ void stop()
     //  - From a ReShade callback the game thread must never block.
     // The mutex is never held across a wait (only to copy the handle).
     //
-    // The bridge thread performs the actual teardown (device release,
-    // adapter release, final log lines, re-arm) once it wakes. That is
-    // best effort: if the process exits before it wakes, the OS reclaims
-    // the GPU objects; if ReShade unloads this module dynamically first,
-    // the GPU 1 device is simply leaked. Explicitly in scope at P0 - a
-    // hang is not.
+    // The bridge thread performs the actual teardown (T4: DestroyWindow,
+    // UnregisterClass, device release, adapter release, final log lines,
+    // re-arm) once it wakes. That is best effort: if the process exits
+    // before it wakes, the OS reclaims the GPU objects; if ReShade unloads
+    // this module dynamically first, the GPU 1 device is simply leaked.
+    // Explicitly in scope at P0 - a hang is not.
     HANDLE ev = nullptr;
     {
         std::lock_guard<std::mutex> lk(st().cs);
