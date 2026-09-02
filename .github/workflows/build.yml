@@ -1,4 +1,4 @@
-name: P0 build
+name: P1 build
 
 on:
   push:
@@ -25,17 +25,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: P0 containment check
+      # P1.0 moved exactly two symbols out of this pattern - NVSDK_NGX and
+      # nvngx - in the same commit that first used them. The other eight
+      # stay: this milestone's probe transits nothing, so none of them are
+      # needed, and widening the pattern to make a build pass would delete
+      # the guard rather than move it.
+      - name: P1 containment check
         shell: bash
         run: |
-          PATTERN='SHARED_CROSS_ADAPTER|HEAP_FLAG_SHARED|CreateSharedHandle|OpenSharedHandle|FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|NVSDK_NGX|nvngx|GetClockCalibration'
+          PATTERN='SHARED_CROSS_ADAPTER|HEAP_FLAG_SHARED|CreateSharedHandle|OpenSharedHandle|FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|GetClockCalibration'
           FOUND=0
           for DIR in src assets; do
             [ -d "$DIR" ] || continue
             if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
           done
           if [ "$FOUND" -ne 0 ]; then
-            echo "::error::Out-of-scope symbol for P0"
+            echo "::error::Out-of-scope symbol for P1"
             exit 1
           fi
 
