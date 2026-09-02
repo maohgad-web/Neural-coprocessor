@@ -1,8 +1,10 @@
 // MGPU Bridge - Cross-Adapter Bridge, Milestone 0 (Gate P0)
 //
 // T1: register the add-on with stock ReShade, write one init log line.
-// T2: one-shot adapter enumeration + LUID selection on the first
-//     device/swapchain (the selection rule lives in adapter.hpp).
+// T2: per device event, a provisional game-LUID capture (first d3d12
+//     device) and a one-time adapter-table enumeration; the selection
+//     itself is deferred to the swapchain-derived game LUID (init_swapchain)
+//     - the four rules of brief section 06 live in adapter.hpp/adapter.cpp.
 // T3: the bridge thread (spawned on the game thread here, never from
 //     DllMain) creates the private device on the selected adapter;
 //     destroy_device events are logged, and the game's own device
@@ -42,27 +44,28 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 #define MGPU_STR2(s) #s
 #define MGPU_STR(s) MGPU_STR2(s)
 
-// T2 trigger. Both init_device and init_swapchain are the game's own
-// separate API calls - ReShade's CreateDXGIFactory1 hook is fully unwound
-// when they fire, so creating a DXGI factory and enumerating adapters here
-// does not recurse into add-on init. (Swapchain CREATION stays off the
-// game thread entirely - that is the re-entrancy hazard, handled in T4+.)
+// T2: both init_device and init_swapchain are the game's own separate API
+// calls - ReShade's CreateDXGIFactory1 hook is fully unwound when they
+// fire, so the enumeration's factory creation does not recurse into
+// add-on init. (Swapchain CREATION stays off the game thread entirely -
+// that is the re-entrancy hazard, handled in T4+.)
 static void on_init_device(reshade::api::device *device)
 {
     mgpu::worker::ensure_started();
-    if (mgpu::adapter::run_once(device, "init_device"))
-        return;
-    // A later D3D12CreateDevice in the process - at P0 that is our own
-    // T3 device. Free, independent confirmation of the T3 binding.
-    mgpu::adapter::log_device_luid("init_device (subsequent)", device);
+    // Every device event is logged; the first d3d12 one also captures the
+    // provisional game LUID and builds the adapter table. No selection
+    // here - brief rule 2 defers it to the swapchain-derived game LUID
+    // (on_init_swapchain).
+    mgpu::adapter::on_device(device);
 }
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
-    (void)swapchain;
-    (void)resize;
     mgpu::worker::ensure_started();
-    mgpu::adapter::run_once(nullptr, "init_swapchain");
+    // The swapchain's device is the authoritative game render device. Its
+    // LUID overrides the provisional init_device value and runs the
+    // one-shot selection (or a terminal refusal) - see adapter.cpp.
+    mgpu::adapter::on_swapchain(swapchain, resize);
 }
 
 // T3 instrumentation: in a clean run, no destroy_device with the game's
@@ -114,7 +117,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         reshade::log::message(reshade::log::level::info,
             "[MGPU][T1] MGPU Bridge add-on registered - stock ReShade, add-on API version "
             MGPU_STR(RESHADE_API_VERSION));
-        // T2: one-shot enumeration + selection on the first device/swapchain.
+        // T2: per-event logging, provisional LUID capture, one-time table
+        // enumeration; the selection itself is deferred to the
+        // swapchain-derived game LUID.
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         // T3: device lifecycle instrumentation + teardown trigger.
