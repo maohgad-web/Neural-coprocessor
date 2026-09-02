@@ -56,7 +56,19 @@ namespace
         std::lock_guard<std::mutex> lk(st().cs);
         if (st().stop_event != nullptr)
             ResetEvent(st().stop_event);
-        st().thread = nullptr;
+        // _beginthreadex returns a handle the caller owns; dropping the
+        // pointer does not release it. UE5 loads and unloads the add-on
+        // once per adapter probe - five cycles per launch on this rig - so
+        // an unclosed handle here is a per-launch leak, not a theoretical
+        // one. Closing our own handle from inside the thread it refers to
+        // is safe: the handle keeps the kernel object alive independently
+        // of the thread, and nothing waits on it (see stop(): the teardown
+        // is signal-only and never joins).
+        if (st().thread != nullptr)
+        {
+            CloseHandle(st().thread);
+            st().thread = nullptr;
+        }
         st().thread_id = 0;
         st().started = false;
     }
