@@ -16,6 +16,8 @@ this file, this file describes the run that worked.
 | Commits after it | Documentation and CI packaging only. `src/` has not changed since `b307367a`; a later SHA builds the identical add-on. |
 | ReShade headers | `crosire/reshade` @ `18deaa52de0c425a78b329e9cb3c497281cd00ec` |
 | ReShade add-on API | 20 |
+| NGX headers (P1.0) | `NVIDIA/DLSS` @ `a291cc7d2cc642a51566f3dfd5376f635cd1b284` — fetched by CI to `ext/ngx/`, never committed. `nvsdk_ngx_d3d12.h` **does not exist** in this tree; the D3D12 entry points are declared in `nvsdk_ngx.h`. Licence in `THIRD_PARTY.md`. |
+| NGX header pin verified | build **#94**, green in 2 m 01 s — the fetch step ran in 45 s and the `NVSDK_NGX_Feature_Reserved18` check passed. Committed and validated before any NGX code existed. |
 | CI runner | `windows-latest` → Visual Studio 18 2026, MSVC 19.51.36256.0 |
 | Build command | `cmake -B build -A x64` — **no hardcoded generator**; the runner image has moved twice during P0 |
 | Link libraries | `dxgi`, `d3d12` only |
@@ -102,6 +104,28 @@ Observed timings on this rig: `Init_Ext` → `CreateFeature(Reserved18)` took
 **1.16 s**; private outputs are `2560×1440`, `format=24` (`R10G10B10A2_UNORM`),
 `flags=0x5` (RT|UAV), created lazily — one at init, three more about six seconds
 later, matching the game swapchain's `BufferCount=4`.
+
+**Two NGX facts established from the pinned header, not from that log.** Both
+were assumptions in P1.0's first draft and both turned out to be wrong or
+unconfirmed:
+
+- **`Shutdown1` is device-scoped.** The header states that passing a device
+  shuts down only that device's instance and that passing `nullptr` shuts down
+  all of them. The probe always passes the GPU 1 device, so the game's own NGX
+  session on GPU 0 is not touched. This closes what was an open risk.
+- **`Init_Ext` is a Core↔Snippet entry point, not an application-facing one.**
+  The header declares it only under `NGX_SNIPPET_BUILD` — the interface the
+  driver core uses to call a feature DLL. The application-facing name in
+  `_nvngx.dll` is plain `NVSDK_NGX_D3D12_Init`, whose signature differs (it
+  takes `NVSDK_NGX_FeatureCommonInfo *` where `Init_Ext` takes
+  `NVSDK_NGX_Parameter *`, in a different argument position). Read that way,
+  the reference log's *"using force-loaded NVIDIA parameter provider
+  `_nvngx.dll`"* + *"attached snippet `nvngx_dlssnr.dll`"* + *"Init_Ext
+  succeeded"* describes the core supplying **parameters** while the **snippet**
+  receives the init and the feature — which is what "DLSS-NR **direct**" means.
+  P1.0 therefore resolves every entry point from `_nvngx.dll` first and
+  `nvngx_dlssnr.dll` second, and logs which module answered. **That is an
+  inference from a log, not an export table; the first rig run settles it.**
 
 `ReShade2.ini` (GPU 1 runtime — **written by ReShade**, not by us):
 
