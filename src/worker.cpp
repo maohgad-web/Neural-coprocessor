@@ -346,7 +346,19 @@ namespace
                     // and the loop falls back to the T4 250 ms structure
                     // with nothing to present.
                     if (mgpu::gpu1::create_present_chain(hwnd))
+                    {
                         have_chain = true;
+
+                        // P1.0: the NGX probe. Once, here, on the bridge
+                        // thread - the chain exists and the present loop has
+                        // not started, so CreateFeature's ~1.16 s stalls
+                        // nothing. 1280x720 is the T4-fixed client size of
+                        // this window, which is also what the chain was
+                        // created against. The return value is deliberately
+                        // ignored: the probe logs its own verdict, and a
+                        // failure must not change how the bridge behaves.
+                        (void)mgpu::gpu1::ngx_probe(1280, 720);
+                    }
                     else
                         mgpu::diag::error("[MGPU][T5] no present chain on this cycle - the window "
                                           "stays up without presenting (see the [MGPU][T5] creation "

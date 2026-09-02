@@ -81,4 +81,32 @@ namespace mgpu::gpu1
     // Any thread (takes this file's lock). True when the present chain
     // exists.
     bool has_present_chain();
+
+    // ---- P1.0: the NGX probe ----
+    //
+    // Bridge thread only. Called exactly once, after create_present_chain()
+    // succeeds and before the present loop starts - nothing is presenting
+    // yet, so CreateFeature's ~1.16 s (measured on the reference run) stalls
+    // nothing.
+    //
+    // Answers one question: does NGX initialise and create a feature on a
+    // headless, non-game adapter? Everything downstream in this milestone
+    // assumes it does, and nothing had tested it.
+    //
+    // Resolves the entry points by hand - no static library, no new link
+    // library - from the driver's own _nvngx.dll (NGX Core) and, for names
+    // the core does not export, from nvngx_dlssnr.dll (the DLSS-NR feature
+    // snippet, which sits beside dxgi.dll). It then initialises NGX against
+    // the GPU 1 device, takes the capability parameter map, creates
+    // NVSDK_NGX_Feature_Reserved18 at the given size on a private command
+    // list, and tears all of it down again. The device pointer stays inside
+    // gpu1_context.cpp exactly as it does everywhere else - there is no
+    // accessor, and the probe runs where the pointer already is.
+    //
+    // Every NGX call's numeric result is logged before the next is
+    // attempted; every failure path releases what it created and returns
+    // false. A false return never stops the bridge: the window, the present
+    // loop and the teardown behave exactly as P0 shipped them. This is a
+    // probe, not a dependency.
+    bool ngx_probe(UINT width, UINT height);
 }
