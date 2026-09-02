@@ -83,8 +83,21 @@ jobs:
           echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
           echo "Output verified: $ADDON"
 
+      # The artifact is the complete deploy set: every file here goes into
+      # <game>\...\Binaries\Win64\ beside dxgi.dll, at the zip root.
+      # Staged into one directory on purpose — upload-artifact roots the zip
+      # at the least common ancestor of its inputs, so listing build/... and
+      # assets/... directly would preserve both paths instead of flattening.
+      - name: Stage deploy set
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp "$ADDON_PATH" _deploy/
+          cp assets/gpu1.ini _deploy/
+          ls -l _deploy
+
       - uses: actions/upload-artifact@v4
         with:
           name: mgpu_bridge
-          path: ${{ env.ADDON_PATH }}
+          path: _deploy/
           if-no-files-found: error
