@@ -30,9 +30,12 @@
 // pointer directly, so no LUID re-resolution is needed.
 #include <windows.h>
 #include <d3d12.h>
-#include <dxgi1_3.h>   // IDXGIAdapter3::QueryVideoMemoryInfo
 #include <dxgi1_4.h>   // IDXGIFactory4 (EnumAdapters1 is inherited from
-                      // IDXGIFactory1; the spec names factory 4)
+                      // IDXGIFactory1; the spec names factory 4) and the
+                      // DXGI 1.4 surface this file calls: IDXGIAdapter3 and
+                      // its QueryVideoMemoryInfo (DXGI_QUERY_VIDEO_MEMORY_INFO,
+                      // DXGI_MEMORY_SEGMENT_GROUP - all declared in dxgi1_4.h,
+                      // not dxgi1_3.h)
 #include <reshade.hpp>
 #include <atomic>
 #include <cstdio>
