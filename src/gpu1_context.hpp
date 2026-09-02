@@ -1,4 +1,5 @@
-// MGPU Bridge - the private D3D12 device on the selected adapter (T3)
+// MGPU Bridge - the private D3D12 device on the selected adapter (T3;
+// the device-removal poll accessor arrives with T4)
 //
 // Bridge thread only: every GPU 1 object is created, used and destroyed
 // on the bridge thread. T3 does exactly one thing - create the device
@@ -22,4 +23,17 @@ namespace mgpu::gpu1
     void shutdown();
 
     bool has_device();
+
+    // T4 (brief section 00, exception 4): poll the device's removal reason
+    // without exposing the ID3D12Device. The raw pointer never leaves this
+    // translation unit - handing it out would put it outside the mutex that
+    // guards it, and shutdown() could release it between the caller's read
+    // and its use. Returns false when no device exists (nothing to poll;
+    // `out` is set to S_OK). Returns true and sets `out` to
+    // ID3D12Device::GetDeviceRemovedReason() (S_OK when healthy, otherwise
+    // the removal reason) when a device exists. Takes this file's lock, so
+    // the call is made with the device pointer still guarded. The value is
+    // sticky once removed (brief section 09), so the caller logs only on the
+    // transition away from S_OK.
+    bool device_removed_reason(HRESULT &out);
 }
