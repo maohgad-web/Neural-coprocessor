@@ -29,7 +29,16 @@ it is where you start.**
   plain `WaitForSingleObject(stop_event, INFINITE)` and
   `GetDeviceRemovedReason()` is never called. T4 rewrites that wait, so the poll
   is folded into T4 rather than reopened as a separate task.
-- **T4 — ACTIVE. This is your task.** Nothing beyond it is started.
+- **T4 — PASSED.** The bridge thread creates a 1280×720 window on itself, pumps
+  messages in the same loop that polls `GetDeviceRemovedReason()`, and tears down
+  in order. Verified on the rig: client rect exactly 1280×720, no
+  `ERROR_CLASS_ALREADY_EXISTS` across all probe cycles, and closing the window
+  left the game running for a further 23 seconds until a human quit it. Fixing
+  T4's crash also closed a **pre-existing** process-killing race — the bridge
+  thread used to be spawned on every probe cycle and could be executing inside
+  the module when ReShade unmapped it. It is now started only from
+  `init_swapchain`. Section 09 has the detail.
+- **T5 — ACTIVE. This is your task.** Nothing beyond it is started.
 
 You are joining an in-progress project. T1–T3 are working code that a human has
 verified on the rig: **read them to understand the shape of the codebase, do not
@@ -151,6 +160,16 @@ first try: C++17, Windows SDK, no exotic dependencies, warnings not fatal.
 **You cannot see the rig.** A human deploys the binary and relays the ReShade
 log. The log is your only view of runtime behaviour, so log the *inputs* to every
 decision, not just the outcome.
+
+**When a choice is reversible and cheap, make it and move on.** You cannot ask
+questions mid-task, so an unresolved decision has no way to end except by your
+deciding it. Two outcomes that both compile, both behave correctly and differ
+only in style are not a question worth resolving — pick one, note the choice and
+the alternative in one line of your report, and continue. Stop-and-report is for
+decisions that are *irreversible* or that would take you outside this brief: a
+missing interface, a needed exception, a contradiction in these instructions.
+Re-deriving a decision you have already implemented is not progress, and the step
+budget it spends comes out of the task.
 
 **A green log is not a passed task.** Before reporting a task complete, walk its
 acceptance list item by item and point at the code that implements each one — not
@@ -364,99 +383,49 @@ DLL load.
 
 ### T2 — Adapter enumeration and selection ✅ PASSED
 
-Implemented in `adapter.*` and verified on the rig. Recorded here because T4
-onward depends on the selected adapter and on why it is selected the way it is.
-**Do not revise this code.**
+Implemented in `adapter.*`, verified on the rig. **Do not revise.** The rules and
+their reasoning are documented at length in `adapter.hpp`'s header comment — read
+that rather than a restatement here.
 
-`IDXGIFactory4::EnumAdapters1`; log every adapter. Bind **by LUID, not index**.
-Four rules, applied in this order so a partial application is always safe:
+What it guarantees to everything downstream:
 
-**1. Refuse rather than guess.** If after filtering there is not *exactly one*
-candidate, select nothing. Log loudly and let T3 skip device creation. A missing
-device is diagnosable; a device on the wrong adapter is not — it succeeds, logs
-cleanly, and proves nothing. This replaces the old last-in-enum-order fallback.
+- A selection exists **only** if a swapchain-derived game LUID was established.
+  `init_device` is provisional and never authorises a selection, because UE5
+  creates a probe device on every adapter before settling.
+- The selected adapter is hardware (not `DXGI_ADAPTER_FLAG_SOFTWARE`, not vendor
+  `0x1414`), is not the game's, and is unique. Anything else refuses and selects
+  nothing.
+- Binding is by LUID, never by enumeration index.
+- `selection_result::selected_adapter` is an AddRef'd `IDXGIAdapter1` owned by
+  `adapter::shutdown()`.
+- The decision is a one-shot latched by `S.decided`. That latch is load-bearing:
+  after teardown the adapter table holds released pointers, and the latch is what
+  stops a later event dereferencing them. Do not add anything that re-enters
+  `on_device` or `on_swapchain`.
 
-**2. The game LUID must come from the swapchain.** UE5's probe devices mean the
-first `init_device` is not reliably the game's renderer — one run captured a
-*software adapter* as the game LUID. The authoritative game render device is the
-one passed to `CreateSwapChainForHwnd`. Capture from `init_swapchain` via the
-swapchain's device; keep `init_device` only as a provisional value that a later
-swapchain-derived LUID overrides. **If no swapchain-derived game LUID has been
-established, refuse to select.**
-
-**3. Filter software adapters out of the candidate set.** The test must be a
-disjunction, because the flag alone is not reliable:
-
-```cpp
-const bool is_software =
-    (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
-    desc.VendorId == 0x1414;   // Microsoft — WARP / Basic Render Driver / virtual
-```
-
-A rig run proved this necessary: two "Microsoft Basic Render Driver" adapters
-with identical vendor, device ID, memory and description reported **different**
-`Flags` in the same session — `0x0` and `0x2`. The flag caught one and missed the
-other, leaving an unflagged WARP in the candidate set, which made the tiebreak
-ambiguous and correctly caused rule 1 to refuse. Vendor ID is the reliable
-backstop, since Microsoft ships no hardware GPU.
-
-**Do not gate on `DedicatedVideoMemory == 0`.** It separates both WARP entries on
-this rig, but integrated GPUs legitimately report zero dedicated memory and use
-shared system memory, so gating on it would exclude a real adapter elsewhere. Log
-it; never filter on it.
-
-Still enumerate and log software adapters — they simply cannot be selected. Log
-`Flags` in hex, `VendorId`, `DeviceId` and `DedicatedVideoMemory` for every
-adapter, and log which test rejected each candidate.
-
-**4. Output count is never the primary discriminator.** This project's own
-topology puts the display on the target card, and any rig with displays on both
-breaks an output-count rule silently. Log output counts; use them only as a
-tiebreaker when more than two hardware adapters are present.
-
-**Diagnostic logging (must not influence selection).** For each adapter,
-`QueryInterface` the `IDXGIAdapter1` for `IDXGIAdapter3` and call
-`QueryVideoMemoryInfo` with `DXGI_MEMORY_SEGMENT_GROUP_LOCAL` (full details in
-section 09), logging `CurrentUsage`. This is *this process's* usage on each
-adapter, so expect multi-GB on the adapter the game renders on and near-zero on
-every other one. That directly identifies which adapter the game is using,
-independently of output counts.
-
-**Acceptance:** the full adapter table, the game's adapter LUID and its source
-(swapchain or provisional), and one line naming the selected LUID with the rule
-that produced it. The selected adapter must be the non-game hardware adapter.
-
-### T3 — Bridge thread, and the device on it ✅ PASSED
+### T3 — Bridge thread and the GPU 1 device ✅ PASSED
 
 Implemented in `worker.*` and `gpu1_context.*`, verified on the rig. **This is
-the thread T4 builds on — read it, do not revise it.**
+the thread T5 builds on — read `worker.hpp` and `worker.cpp`'s header comment, do
+not revise them.**
 
-The bridge thread is spawned here. `D3D12CreateDevice` against the selected adapter
-**runs on that thread** — creating it inside a ReShade callback is the same
-re-entrancy class T2 avoids.
+What it guarantees:
 
-After creation, verify both directions: the new device's `GetAdapterLuid()`
-against the selected LUID (mismatch → release and stop) and against the game's
-LUID (equal → log FATAL, release, stop).
-
-`CrossAdapterRowMajorTextureSupported` is logged for the record. It reads `0` on
-this hardware — a P1 constraint, recorded in section 09. It does not affect P0.
-
-**One thing T3 has not demonstrated.** On the probe cycles the bridge thread
-logged `game device released` and `bridge thread exiting`. On the final, real
-cycle those lines are absent from the log — ReShade unregisters the add-on and
-the process exits without them. That may only mean late logging was dropped, but
-it has not been shown to be a clean join. T4 is where it stops being cosmetic: a
-window whose owning thread never exits hangs the game on close.
-
-**There is no device-removal event.** ReShade 6.8's `addon_event` enum has 80
-values and contains no `device_removed` or `device_restored`. Poll
-`ID3D12Device::GetDeviceRemovedReason()` from the bridge thread instead —
-replace its infinite idle wait with a timed wait — and log only on transition,
-since the value is sticky once removed.
-
-**Acceptance:** device created on the bridge thread on the correct adapter, game
-still renders normally, `GetDeviceRemovedReason()` stays `S_OK`, clean shutdown.
+- One bridge thread per launch, started **only** from `init_swapchain`. Starting
+  it from `init_device` spawned a thread per UE5 probe cycle that could be
+  executing inside the module when ReShade unmapped it, and killed the game
+  process. Section 09 has the detail. Do not move `ensure_started()`.
+- Every GPU 1 object is created, used and destroyed on that thread. The game
+  thread never blocks and never touches a GPU 1 object.
+- `worker::stop()` is signal-only and never joins — safe from `DllMain` under the
+  loader lock and from ReShade callbacks.
+- `D3D12CreateDevice` runs against the T2 selection and verifies the resulting
+  LUID in both directions. There is no fallback to the game's adapter.
+- The `ID3D12Device *` never leaves `gpu1_context.cpp`. `has_device()` and
+  `device_removed_reason()` are the guarded accessors, and they are callable from
+  other threads — which is why the mutex exists.
+- At process exit the teardown does not run and does not need to: Windows has
+  already terminated the thread and reclaims everything.
 
 ### T4 — Window and message pump ⬅ ACTIVE TASK
 
@@ -591,10 +560,11 @@ called from the game thread and from `DllMain`; it must stay signal-only. Do not
 add a `SendMessage` there — it would block the game thread on our pump, and from
 `DllMain` it would block under the loader lock.
 
-**Close the thread handle.** `rearm()` currently does `st().thread = nullptr`
-without `CloseHandle`, so every one of the five load cycles leaks a thread
-handle. Fix it in `rearm()` while you are there — it is the one leak the five-
-cycle behaviour turns from theoretical into per-launch.
+**The thread handle is already closed in `rearm()`** — `_beginthreadex` returns a
+handle the caller owns, and the five load cycles per launch turned that leak from
+theoretical into per-launch, so it was fixed ahead of T4. Rely on it; do not
+re-apply it. Any path that exits the thread *without* calling `rearm()` must
+close the handle itself.
 
 Section 06's T8 covers the full run report; here you only need this task's share
 of teardown to be clean.
@@ -645,92 +615,182 @@ question either way.
 Note the diagnostic pair in section 08: a window that appears and then freezes is
 a pump problem, not a rendering problem, and rendering does not arrive until T5.
 
-### T5 — Swapchain and a present loop
+### T5 — Swapchain and a present loop ⬅ ACTIVE TASK
 
-Create the swapchain on the adapter-1 device against that window. Each frame:
-clear to a slowly cycling colour and `Present`. This isolates "presentation works
-on GPU 1" from "the runtime was created".
+Create a swapchain on the GPU 1 device against T4's window and present a clear
+colour every frame. This isolates "presentation works on GPU 1" from "the runtime
+was created", so that when T6 fails you know which half broke.
+
+**Section 09 subsections you need:** D3D12 / DXGI / Win32, and Environment. The
+LumeniteFX subsections are not relevant to this task.
+
+#### Where the code goes, and why
+
+**All D3D12 objects live in `gpu1_context.*`. The window and the loop stay in
+`worker.cpp`.** That split already exists and T5 extends it rather than moving
+the line.
+
+The reason is not abstraction for its own sake. `gpu1_context`'s mutex exists
+because *other threads* call into it — `has_device()` and
+`device_removed_reason()` are reachable from the game thread — and `shutdown()`
+can release the device between another thread's read and its use. Handing the raw
+`ID3D12Device *` out to `worker.cpp` would put every future caller outside that
+guard. Everything T5 creates has the same property, so it goes behind the same
+door.
+
+Four functions, all **bridge thread only**:
+
+```cpp
+// Creates: command queue, swapchain (against hwnd), RTV heap, command
+// allocator, command list, fence + event. Queries the window's client
+// rect itself. Returns false with everything released on any failure.
+bool create_present_chain(HWND hwnd);
+
+// One frame: barrier to RENDER_TARGET, ClearRenderTargetView, barrier
+// back to PRESENT, execute, Present, wait on the fence.
+bool present_frame(float r, float g, float b);
+
+bool has_present_chain();
+
+// shutdown() is EXTENDED, not replaced: release the present chain in
+// reverse creation order, then the device as it does today.
+```
+
+Nothing else changes in `gpu1_context`'s surface. **T6 will need the native
+device, queue and swapchain pointers** to pass to `create_effect_runtime` — do
+not add that accessor now, but do not structure the code so it becomes awkward
+later.
+
+#### The eight things that will otherwise cost a rig cycle
+
+**1. `CreateSwapChainForHwnd`'s first object is the COMMAND QUEUE, not the
+device.** This is the single most common D3D12 swapchain error. The parameter is
+named `pDevice` and typed `IUnknown *`, and passing the device compiles, runs, and
+fails at runtime with an unhelpful `E_INVALIDARG`. Create the command queue
+first (`D3D12_COMMAND_LIST_TYPE_DIRECT`), pass **that**.
+
+**2. The swapchain lands on the queue's adapter.** That is the entire mechanism by
+which this swapchain is a *GPU 1* swapchain — there is no adapter parameter. The
+queue comes from the T3 device, so the binding is already correct; do not look
+for a way to specify the adapter.
+
+**3. D3D12 requires the flip model.** `DXGI_SWAP_EFFECT_FLIP_DISCARD`,
+`BufferCount = 2` or more, `SampleDesc.Count = 1`. The older `DISCARD` and
+`SEQUENTIAL` effects and any MSAA count fail outright. Use
+`DXGI_FORMAT_R8G8B8A8_UNORM`; `_SRGB` swapchain formats are not valid for the
+flip model.
+
+**4. `DXGI_SWAP_CHAIN_DESC1` is flat.** There is no `BufferDesc` member and no
+`OutputWindow` — the HWND is a parameter of `CreateSwapChainForHwnd`, and
+`Windowed` does not exist on this struct either (pass `nullptr` for
+`pFullscreenDesc` to get a windowed swapchain).
+
+**5. Call `factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)` after
+creating the swapchain.** Otherwise DXGI installs its own message hook on our
+window and Alt+Enter toggles it to fullscreen — on a window we do not want
+fullscreen, on the display the *game* is using.
+
+**6. `CreateSwapChainForHwnd` yields `IDXGISwapChain1`.** `QueryInterface` for
+`IDXGISwapChain3` to get `GetCurrentBackBufferIndex()`. Without it you are
+tracking the index by hand and will drift.
+
+**7. Barriers are mandatory.** `PRESENT → RENDER_TARGET` before the clear,
+`RENDER_TARGET → PRESENT` after it. Omitting them is a debug-layer error and
+undefined behaviour in release.
+
+**8. Make the window non-resizable, and use the same style in both places.**
+`WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)` removes resize and
+maximise, which removes `ResizeBuffers` from P0 entirely. **The identical style
+value must be passed to `AdjustWindowRect`** — T4's client rect is exactly
+1280×720 today and a style change in one place only would silently break it.
+That number is load-bearing (see T4).
+
+#### The loop changes shape
+
+T4's loop waits with a 250 ms timeout because it had nothing to do. A present
+loop cannot: vsync becomes the pacing mechanism.
+
+```
+for (;;) {
+    if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) break;
+    drain messages with PeekMessageW / PM_REMOVE   (WM_QUIT discarded, as T4)
+    present_frame(...)        // Present(1, 0) blocks on vblank, ~16 ms
+    every 60th frame: device_removed_reason(), log once on the transition
+}
+```
+
+`Present(1, 0)`, not `Present(0, 0)`: an uncapped loop would spin GPU 1 at full
+rate for a clear, burn power, and add a variable the M2 measurements would
+inherit. The device-removal poll moves from a 250 ms timer to a frame counter —
+same intent, one loop.
+
+**Keep the T4 no-window path exactly as it is.** When `pump` is false there is
+nothing to present, and its `MsgWaitForMultipleObjects` / 250 ms structure stays.
+
+#### Two fixes folded in from T4's rig run
+
+**Show the window without stealing activation.** Drop `WS_VISIBLE` from
+`CreateWindowExW` and call `ShowWindow(hwnd, SW_SHOWNOACTIVATE)` after creation.
+As shipped, the window takes foreground when it appears, the game loses focus and
+drops out of borderless-fullscreen to a bordered window with the taskbar showing.
+Cosmetic now; contaminating at M2, where a game that lost foreground may present
+differently. Section 09 has the detail.
+
+**Colour must animate.** A static clear cannot distinguish "presenting" from
+"presented once and hung". Cycle slowly — a few seconds per revolution, driven by
+a frame counter in `worker.cpp`, not by a clock.
+
+#### Logging
+
+One line at creation with the swapchain format, buffer count, client size, and
+the `HRESULT` of `CreateSwapChainForHwnd`. Then one line at the **first**
+successful present, and one every 600 frames after it carrying the frame count —
+enough to prove the loop is alive in a log a human reads afterwards, few enough
+not to drown the file. Log the first `Present` failure and stop presenting; do
+not log every frame's failure.
 
 **Acceptance:** the window shows a smoothly animating colour while the game runs
-on the other card.
+normally on the other card; the log carries the creation line with `hr=0x00000000`
+and a rising frame count; closing the window still tears down in order; and the
+game does not lose borderless-fullscreen when the window appears.
 
-### T6 — Create the second effect runtime
+**No new link libraries.** `dxgi` and `d3d12` are already in `CMakeLists.txt` and
+cover everything here. If something appears to need a third, re-read section 09
+before asking.
 
-**Primary:** `reshade::create_effect_runtime(device_api::d3d12, our_device,
-our_queue, our_swapchain, "gpu1.ini", &runtime)` from the bridge thread.
+### T6 — Create the second effect runtime · not yet specified
 
-**Alongside, as instrumentation:** register `init_effect_runtime` and log every
-runtime init with its adapter LUID. Add `init_swapchain` and `init_device`
-logging too. These do not conflict — the runtime we create is the one we drive.
+**Intent.** Call `reshade::create_effect_runtime(device_api::d3d12, device,
+queue, swapchain, "gpu1.ini", &runtime)` on the bridge thread and get a runtime
+whose device carries the selected LUID. This is the milestone P0 exists to test —
+everything before it is plumbing that only matters if this holds.
 
-**Acceptance:** `create_effect_runtime` returns true and yields a runtime whose
-device carries the selected LUID. The auto-hook log is recorded either way and
-gates nothing.
+Not written out yet, deliberately. It will be specified against `gpu1_context`'s
+actual surface once T5 has settled it, and against the pinned ReShade headers for
+the exact signature. Section 09 records what is already verified about
+`create_effect_runtime`.
 
-If explicit creation fails, report the arguments and result. Do not fall back to
-an auto-hooked runtime silently, and do not patch ReShade.
+**Free observation to collect while there.** Register `init_effect_runtime` and
+log every runtime ReShade initialises, with its adapter LUID. That answers, at no
+extra cost, whether ReShade's auto-hook also adopts our swapchain — and whether a
+*third-party* add-on installed alongside us sees our second runtime and tries to
+act on it. Whether other people's add-ons can ride this architecture is a real
+question for what the project becomes; T6 is where the evidence is free.
 
-### T7 — Drive LumeniteFX on GPU 1
+### T7 — Drive a shader on GPU 1 · not yet specified
 
-The preset arrives through `create_effect_runtime`'s `config_path`, so there is no
-separate preset-loading step.
+**Intent.** Execute an effect chain inside the T6 runtime, on GPU 1, driven by a
+synthetic scrolling pattern, and see a coherent motion field in the window.
 
-- Command list: `runtime->get_command_queue()->get_immediate_command_list()`.
-- Back buffer: `effect_runtime::get_current_back_buffer()` returns an
-  `api::resource`; make the RTV with `device->create_resource_view(...)`.
-- Drive: `update_and_present_effect_runtime(runtime)` is the intended driver for a
-  runtime we created, and it handles the present. `render_effects(cmd_list, rtv,
-  rtv_srgb)` only if explicit target control is needed; `render_technique` +
-  `find_technique` are the per-technique fallback.
-
-Technique handles from `find_technique` go stale on `reshade_reloaded_effects`.
-If the fallback is used, register that event and re-query rather than caching.
-
-The Kernel's flow is temporal — it compares the current luma against the previous
-frame's. Present every frame rather than discovering this as motion-vector
-garbage that looks like a shader bug.
-
-**Use `LUMENITE: QuantMotion`, not Kernel.** Preset order is `pattern.fx`, then
-`Lumenite_QuantMotion`. Nothing else.
-
-**One preprocessor definition:**
-
-```
-DEBUG_FLOW=1
-```
-
-QuantMotion has **no depth dependency of any kind** — not a switch that disables
-one, none to begin with. No `lumenite_Projections.fxh`, no `tDepth`/`tNormals`,
-no `PS_ReconstructNormals`, no `GetDepth()`. Its `ATrousFilter` gates purely on
-flow disagreement, and `PS_Confidence` uses luma and flow only. It includes
-exactly one header, `ReShade.fxh`. **This is why `pattern.fx` does not need to
-synthesise a depth buffer.**
-
-`DEBUG_FLOW=1` adds a single `PS_Debug` pass returning
-`MotionToColor(tex2D(sFlow, uv).xy)` — precisely the flow-field visualisation
-this milestone needs, written by the shader's author against its own internal
-target, with no extra includes. That is why there is no `mv_debug.fx` in the
-manifest: do not write one.
-
-QuantMotion is chosen over Kernel for three reasons: it is unconditionally
-depth-free rather than conditionally so, it needs no additional shader headers on
-the rig, and it is the motion source used in a known-working DLSS-NR pipeline —
-so P0 validates the component M3 will actually use.
-
-**The motion source is an input to this rig, not the subject of study.** It is
-selected by preset, so swapping it is configuration, not code. Kernel is analysed
-in section 09 not as a fallback but because comparing motion sources is a planned
-*output* of the finished instrument — see the M3 note at the end of this
-document. Do not substitute one for the other during P0.
-
-**Acceptance:** the window shows the scrolling test pattern transformed into a
-coherent motion-vector field, updating live, while the game runs on GPU 0.
-
-**Read hue, not magnitude, for ground truth.** `MotionToColor` normalises
-magnitude against 15 pixels, so 2 px/frame produces a dim colour — direction is
-the reliable readout. Note also that the angle is computed as
-`atan2(-motion.y, -motion.x)`, so hue encodes the inverse of the content's
-movement. A hue that looks "backwards" is correct, not a bug.
+The motion source is an **input to this rig, not the subject of study**, and it is
+selected by preset, so swapping it is configuration rather than code. LumeniteFX
+`Lumenite_QuantMotion` with `DEBUG_FLOW=1` is the current candidate: already
+installed, compiles on the rig every run, unconditionally depth-free, and ships
+its own flow visualisation. Section 09 has the full analysis. It is not a
+dependency. Writing our own pattern and flow visualiser is a live alternative
+with two advantages — exact ground truth, because we generate the motion, and a
+clean licence for anything later released. That choice is made when T7 is
+written.
 
 ### T8 — Teardown and the run report
 
@@ -887,6 +947,73 @@ section. Verify anything not in it, and add what you verify.
   bits given to `CreateWindowExW`, and `FALSE` for `bMenu`. `WS_VISIBLE` in the
   style is harmless here. Without this, a window created at 1280×720 has a client
   area roughly 1264×681 on default Windows metrics.
+- **`strsafe.h` is inline by default — but do not use it here.** The `StringCch*`
+  functions are declared `__inline` unless `STRSAFE_LIB` is defined before the
+  include, so they need no extra link library. That question does not need
+  answering, though: this codebase formats with `snprintf` throughout, and the
+  wide equivalent is `swprintf_s(buf, ARRAYSIZE(buf), L"...", ...)` from the CRT.
+  No new header, no new library, and consistent with every other log line in the
+  tree. `wsprintfW` is the one to avoid — it lives in `user32`/`gdi32` and would
+  add a link dependency.
+- **No task may add a link library.** `CMakeLists.txt` is T1 code and closed. If
+  a chosen API would require one, that is the signal to choose a different API,
+  not to request an exception — the CRT and the already-linked Windows libraries
+  cover everything P0 needs.
+- `AdjustWindowRect` computes frame metrics at **system** DPI, not per-monitor
+  DPI. In a per-monitor-DPI-aware process on a scaled display the resulting
+  client area can be a few pixels off the requested size;
+  `AdjustWindowRectExForDpi` is the exact form. T4 logs the real `GetClientRect`,
+  so the rig log is the check.
+- **`README.md` is stale and is not maintained by any task.** It still describes a
+  ~640×360 window (T4 fixes 1280×720) and a T7 pipeline of
+  "pattern → Kernel → LumaFlow → mv_debug" with an `assets\mv_debug.fx` that the
+  closed manifest does not contain — the real assets are `pattern.fx` and
+  `gpu1.ini`, with `Lumenite_QuantMotion` and `DEBUG_FLOW=1`. Do not trust it over
+  this document, and do not edit it.
+- **The `FreeLibrary`-versus-teardown race kills the process. It is not a leak.**
+  Observed on the rig: with the add-on present the game died silently during the
+  third of UE5's add-on load/unload probe cycles, the log ending at
+  `Unregistered add-on` with nothing after it; with the add-on renamed away the
+  same launch succeeded. ReShade unmaps the module while the bridge thread is
+  still executing inside it, and the thread faults on unmapped code — no log line
+  is possible, because the code that would write it is gone. It is a race, not a
+  determinism: the identical binary launched cleanly fifteen minutes earlier. The
+  giveaway is the log ordering — in the surviving cycles ReShade's
+  `was not unregistered` warning precedes `bridge thread exiting`; in the fatal
+  one the bridge thread got ahead of it.
+  **The cause is that a bridge thread exists at all during a probe cycle.**
+  `on_init_device` calls `ensure_started()`, so every probe spawns a thread that
+  waits on a ready event which cannot be set — by rule 2 no selection is possible
+  before a swapchain — and is then torn down inside the unload window. Only
+  `on_init_swapchain` should start the thread. Do **not** try to fix this by
+  pinning the module with `GET_MODULE_HANDLE_EX_FLAG_PIN`: the module would stay
+  mapped, but `DllMain` would stop running on subsequent loads, `register_addon`
+  would never be called again, and ReShade would drop the add-on after the first
+  cycle — a crash traded for silent non-function.
+- **The leak that remains after that fix is accepted.** Because
+  `stop()` is signal-only and the bridge thread performs its own teardown, a
+  dynamic unload that unmaps the module before the thread wakes leaks the GPU 1
+  device. T4 extends the same best-effort model to the window and class; it does
+  not introduce the race and must not try to close it. On the rig,
+  `destroy_device` fires before ReShade unregisters the add-on, so the thread
+  exits first.
+- **A visible window steals foreground activation from the game.** Creating the
+  bridge window with `WS_VISIBLE` pulls focus off the game the moment it appears,
+  and the game's borderless-fullscreen presentation drops to
+  windowed-with-borders with the taskbar showing; clicking back on the game
+  restores it. Cosmetic at P0. **Not cosmetic at M2** — a game that loses
+  foreground can change presentation mode, throttle, or take a different present
+  path, and every frame-timing number would inherit that. Create the window
+  without `WS_VISIBLE` and show it with
+  `ShowWindow(hwnd, SW_SHOWNOACTIVATE)`.
+- **At process exit the bridge thread's teardown never runs, and that is
+  correct.** `DllMain` receives `lpReserved != NULL`, meaning Windows has already
+  terminated every other thread, so the stop signal reaches nothing and the OS
+  reclaims the window and the device. Rig logs confirm a clean
+  `Finished exiting` with no teardown lines and no hang. Consequence for testing:
+  quitting the game does **not** exercise the ordered teardown. Only closing the
+  bridge window does. Do not read a clean exit log as evidence that teardown
+  works.
 - **A thread that owns a top-level window must pump messages.** Broadcasts such
   as `WM_SETTINGCHANGE` and `WM_DISPLAYCHANGE` are delivered with `SendMessage`
   semantics to every top-level window; a window whose thread is blocked in a
@@ -973,6 +1100,29 @@ redo.
 - UE5 picks its render adapter from the Windows per-app graphics preference. The
   NVIDIA app's "GPU App Assignment" is scoped to CUDA and AI-accelerated apps and
   is not the lever that moves it.
+
+---
+
+## 10 · Open observations
+
+Things seen on the rig and not explained. **None of them block a task.** They are
+here so they are not rediscovered, and so that when something breaks later this
+is the first place to check for a pre-existing cause. Human-owned, like section
+09 — report anything new, do not edit this.
+
+- **`Reference count for ID3D12CommandQueue0 object ... is inconsistent (7)`.**
+  ReShade logs this once at every game shutdown, immediately after
+  `SetFullscreenState(FALSE)` destroys the runtime environment. It appears in
+  runs with the add-on **renamed away**, so it is not ours. Worth settling before
+  T6, because once a second effect runtime exists this warning becomes a
+  candidate explanation for anything odd and we will waste a cycle on it. Would
+  be settled by: checking whether stock ReShade logs it on this game with no
+  add-ons present at all.
+- **A fifth `D3D12CreateDevice` with `riid = {77ACCE80-...}` and
+  `MinimumFeatureLevel = 1000`** fires after the game is up, on the game thread,
+  and produces no `[MGPU]` line. Harmless and consistent across every run.
+  Probably an NVIDIA or Streamline component. Recorded only so it is not mistaken
+  for one of ours.
 
 ---
 
