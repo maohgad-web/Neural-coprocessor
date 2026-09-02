@@ -253,7 +253,31 @@ wish, but do not re-analyse.
   resetting it, and `Close` it afterwards — a transition P0's shipped code already
   exercises. Note the concern in your report and move on.
 
-## 3.6 · Commit order for this task
+## 3.6 · What this task actually needs you to read
+
+Your token budget is spent mostly on reads. This list is what the task requires;
+everything beyond it is discretionary and should be justified against the budget.
+
+**Required:** this file · `P0_RECORD.md` sections 01, 02, 09, 10 · `src/gpu1_context.{hpp,cpp}`
+· the bridge-thread flow in `src/worker.cpp` · `src/diag.hpp` · `.github/workflows/build.yml`
+· `.gitignore` · `THIRD_PARTY.md` · `CMakeLists.txt` (read-only, to confirm the
+include path) · the NGX headers at the pinned SHA.
+
+**Not required, and expensive:** `VENDOR_LOCK.md` beyond the reference NGX
+configuration · `P1_INSTRUMENT.md` (does not apply to this task) · `README.md`
+until you write it · **anything in `clshortfuse/renodx`**. A previous run spent
+roughly a quarter of its budget searching that repository for one argument value,
+did not find it, and chose the default anyway. That default is now fixed below —
+do not go looking.
+
+**Settled, so you do not have to derive them:** `InApplicationId = 0`.
+`InApplicationDataPath` = the add-on module's own directory, from
+`GetModuleFileNameW` with the filename stripped — that is the deploy directory,
+and ReShade writes its own log and ini there, so it is known writable. Log both as
+inputs. If the driver rejects either, the result code says so and that is a clean,
+interpretable outcome.
+
+## 3.7 · Commit order for this task
 
 Two commits, and **the first one lands before you write any C++**:
 
