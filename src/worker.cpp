@@ -28,7 +28,6 @@
 // logs only on the transition away from S_OK (the value is sticky once
 // removed).
 #include <windows.h>
-#include <strsafe.h>
 #include <process.h>
 #include <atomic>
 #include <cstdio>
@@ -183,13 +182,23 @@ namespace
         // Two encodings of the same ASCII name: the narrow form feeds the
         // log lines (diag takes const char *); the wide form is what the
         // W APIs register, create and unregister (WNDCLASSEXW.lpszClassName
-        // is LPCWSTR - a narrow char[] would not compile).
+        // is LPCWSTR - a narrow char[] would not compile). The wide form is
+        // built with MultiByteToWideChar (kernel32, always linked) rather
+        // than StringCchPrintfW (strsafe.lib), which the closed CMakeLists
+        // does not link.
         char class_name[64];
         wchar_t class_name_w[64];
         snprintf(class_name, sizeof class_name, "MGPU_Bridge_Wnd_%p",
                  (void *)mgpu::module_handle());
-        StringCchPrintfW(class_name_w, 64, L"MGPU_Bridge_Wnd_%p",
-                         (void *)mgpu::module_handle());
+        const int converted = MultiByteToWideChar(CP_UTF8, 0, class_name, -1,
+                                                  class_name_w, 64);
+        if (converted == 0)
+        {
+            // Cannot happen for this ASCII input into a 64-wide buffer, but
+            // if it did, an empty class name would make RegisterClassExW
+            // fail and the stop-and-report path below would catch it.
+            class_name_w[0] = L'\0';
+        }
 
         bool class_registered = false;
         HWND hwnd = nullptr;
