@@ -66,28 +66,36 @@ the seal and the pixels ever disagree about which frame they are, that disagreem
 *is* the bug being hunted, and it is detectable rather than masked.
 
 ```c
-// 64 bytes. Fixed layout, fixed offset 0 of the shared buffer.
+// Fixed layout at offset 0 of the shared buffer. Field order is chosen so that
+// natural alignment introduces no padding; do not reorder without rechecking.
 struct MgpuSeal
 {
     uint32_t magic;         // 'MGPU' — distinguishes stale data from uninitialised
     uint32_t seal_version;  // bump when this struct changes; mismatch is a hard error
     uint64_t frame_index;   // monotonic, from GPU 0's present count. THE identity.
     uint64_t qpc_submit;    // QueryPerformanceCounter when the copy was submitted
+    uint64_t payload_bytes; // from the footprint
     uint32_t width;
     uint32_t height;
     uint32_t dxgi_format;   // as an integer, compared not trusted
     uint32_t row_pitch;     // the FOOTPRINT pitch, not width × bpp
-    uint64_t payload_bytes; // from the footprint
     uint32_t slot_index;    // which ring slot this claims to be
     uint32_t barcode;       // frame index as encoded into the pixels — see 03
+    uint32_t reserved[2];   // pads to 64; room to grow without a version bump
 };
+static_assert(sizeof(MgpuSeal) == 64, "seal layout changed");
 ```
+
+**Assert the size; do not trust a number in a document.** The fields above sum to
+56 without the padding — an earlier draft of this section asserted 64 while
+listing 56 bytes of fields, which is exactly the kind of arithmetic nobody
+re-checks. The `static_assert` is the requirement; the comment is a courtesy.
 
 **Why each field earns its place.** `magic` separates "nothing was written" from
 "something old was written" — those have different causes and the same appearance.
-`frame_index` is the identity that catches stale, dropped, duplicated and
-reordered, which is nine of the twelve quiet failures. `qpc_submit` yields
-end-to-end latency for free (section 02). The geometry fields turn a pitch or
+`frame_index` is the identity that catches dropped, reordered and producer stall,
+and it is what makes the reuse ratio measurable. `qpc_submit` yields end-to-end
+latency for free (section 02). The geometry fields turn a pitch or
 format disagreement into a checked mismatch at the header rather than a sheared
 image someone has to notice. `slot_index` catches ring aliasing. `barcode` closes
 the loop between the seal and the pixels (section 03).
@@ -129,21 +137,63 @@ The readback costs a map after a fence GPU 1 must wait on anyway. If it ever sho
 up in a measurement, check the seal for frame N−1 while consuming frame N —
 detection latency is irrelevant, only detection accuracy matters.
 
-### What GPU 1 checks, every frame
+### What GPU 1 checks — and why "same frame twice" is normal
+
+**The producer and the consumer run at different rates, and the checker must be
+built around that.** `VENDOR_LOCK.md` records the game at **45.9 fps** and the
+GPU 1 present loop at **210 fps** — the consumer is roughly **4.6× faster than the
+producer**. GPU 1 will therefore read the same `frame_index` four or five times in
+a row during entirely correct operation.
+
+A rule of the form *`frame_index` must increase every consume, else STALE* fires
+continuously on a healthy run. Repeat identity is the expected case, not the fault
+— **staleness is a property of time, not of repetition.**
+
+Per consume:
 
 ```
 magic == 'MGPU'                      → else: nothing arrived, or wrong offset
 seal_version == expected             → else: hard stop, the two ends disagree
-frame_index >  last_seen             → else: STALE (equal) or REORDERED (less)
-frame_index == last_seen + 1         → else: DROPPED, by the gap size
 slot_index == the slot we read       → else: RING ALIAS
 width/height/format/row_pitch/bytes  → else: CONTRACT MISMATCH, name the field
-qpc_now - qpc_submit                 → the latency sample
-barcode == frame_index               → else: PIXELS AND SEAL DISAGREE (section 03)
+
+frame_index == last_seen             → REUSE. Expected. Count it, do not warn.
+frame_index >  last_seen             → NEW frame: see below.
+frame_index <  last_seen             → REORDERED. Always an error.
 ```
 
-Eleven of the twelve quiet failures are caught by that block. The twelfth
-(sRGB) is a content failure and is section 03's.
+On a **new** frame only:
+
+```
+gap = frame_index - last_seen
+gap == 1                             → else: DROPPED, report the gap size
+qpc_now - qpc_submit                 → the latency sample
+barcode == frame_index               → else: PIXELS AND SEAL DISAGREE (section 03)
+last_new_qpc = qpc_now
+```
+
+**Sample latency only on new frames.** Re-reading the same seal yields a larger
+`qpc_now - qpc_submit` each time, so sampling every consume would smear the
+distribution by the reuse ratio and report a transit cost that is mostly consumer
+idle time. This is the same mistake as the staleness rule, one layer down.
+
+Staleness, correctly stated:
+
+```
+qpc_now - last_new_qpc > stall_threshold   → PRODUCER STALL
+```
+
+Derive the threshold from the observed producer period rather than hardcoding it —
+some generous multiple, so it fires on a real stop and not on a slow frame. The
+producer period is measurable from the seal stream itself.
+
+**The reuse ratio is a measurement, not an artefact.** Consumes divided by
+distinct frames is the producer/consumer rate ratio, and it should sit near the
+ratio of the two frame rates. A reuse ratio that drifts is telling you one side
+changed pace.
+
+That block catches every quiet failure in section 00 except sRGB, which is a
+content failure — see section 03 for what does and does not catch it.
 
 ---
 
@@ -184,9 +234,21 @@ reads back that block (a few hundred bytes) and decodes it.
 
 `barcode == frame_index` is then a genuine end-to-end integrity check: the pixels
 are provably the ones the seal describes. It costs a trivial shader on GPU 0 and a
-tiny readback on GPU 1, and it catches tearing, partial copies, stale pixels behind
-a fresh seal, and the sRGB case (a double conversion moves black/white cell values
-enough to detect if the decoder thresholds tightly rather than at 0.5).
+tiny readback on GPU 1, and it catches tearing, partial copies and stale pixels
+behind a fresh seal.
+
+**It does not catch sRGB double-conversion, and an earlier draft claimed it did.**
+Pure black and pure white are the fixed points of that transform — 0 stays 0 and
+1.0 stays 1.0 — so a black/white barcode is precisely the pattern that survives it
+unchanged. The claim was backwards.
+
+If colour-space integrity is worth checking, it needs mid-tones: a few reference
+cells at known intermediate values beside the barcode, compared on GPU 1 against
+what they were written as. Linear 0.5 and sRGB-encoded 0.5 differ by roughly 60
+levels in 8-bit, which is unmistakable. That is cheap to add and is **not**
+specified as a requirement here — the failure is cosmetic rather than structural,
+and nothing else in the pipeline depends on it. Add it when there is a reason to
+care, and until then treat colour space as unchecked rather than as covered.
 
 **This is what `pattern.fx` is for, and it earns its place twice.** Section 09
 records that P0 demonstrated QuantMotion *executing* on GPU 1 but not producing a
@@ -203,17 +265,30 @@ two milestones.
 unproven checker means nothing, which is the same error as "a green log is not a
 passed task", one level up.
 
-Build deliberate fault injection, selected by environment variable, and require
-that each one is *observed to trip the checker* before the instrument is trusted:
+Build deliberate fault injection and require that each fault is *observed to trip
+the checker* before the instrument is trusted.
 
-| `MGPU_FAULT=` | Injects | Must be reported as |
+**Select it from a file, not an environment variable.** `VENDOR_LOCK.md` records
+that the game is launched by double-clicking its executable; setting an
+environment variable for that on Windows is awkward enough that the negative
+control would get skipped, and skipping it is the one outcome this section exists
+to prevent. Read a small `mgpu.ini` beside `dxgi.dll` at startup — **absent means
+no fault**, so the shipped default is a clean run and a missing file is never an
+error.
+
+```
+[MGPU]
+Fault=stale
+```
+
+| `Fault=` | Injects | Must be reported as |
 |---|---|---|
-| `stale` | GPU 1 consumes the previous slot | `STALE` |
+| `stale` | GPU 1 consumes the previous slot | `PRODUCER STALL`, then `REORDERED` when the real frame returns |
 | `drop` | GPU 0 skips transit every 3rd frame | `DROPPED gap=2` |
 | `tear` | GPU 1 skips the fence wait | `barcode != frame_index`, intermittently |
 | `pitch` | GPU 0 writes `width × bpp` as `row_pitch` | `CONTRACT MISMATCH: row_pitch` |
 | `alias` | GPU 0 writes the wrong `slot_index` | `RING ALIAS` |
-| `none` (default) | nothing | clean run |
+| absent / `none` | nothing | clean run |
 
 **Acceptance for P1's first task is not "a clean run." It is a clean run plus one
 deliberately failed run per fault, each producing the named diagnosis.** Six rig
@@ -234,28 +309,43 @@ the verdict.** `transit OK` is worthless. The agent cannot see the rig, so the l
 is the entire channel between the run and the person reading it — and a verdict
 cannot be re-examined after the fact while numbers can.
 
-Per-frame, sampled (every Nth frame, plus every anomaly unconditionally):
+**Log on new frames, not on every consume.** At a 4.6× reuse ratio, per-consume
+logging is four fifths noise about frames already reported. Sample every Nth *new*
+frame, and log every anomaly unconditionally:
 
 ```
-[MGPU][SEAL] f=18432 slot=0 age=+1 lat=4.83ms pitch=5120 fmt=24 bytes=7372800 bc=18432 OK
-[MGPU][SEAL] f=18431 slot=1 age=0 lat=5.02ms  STALE (repeat=3, last_new=18431)
+[MGPU][SEAL] new f=18432 slot=0 gap=1 reuse=5 lat=4.83ms pitch=5120 fmt=24 bytes=7372800 bc=18432 OK
+[MGPU][SEAL] DROPPED f=18437 gap=3 (last_new=18434)
+[MGPU][SEAL] PRODUCER STALL: 84.2ms since f=18434 (threshold 65.0ms, producer period ~21.8ms)
 [MGPU][SEAL] CONTRACT MISMATCH row_pitch: seal=5120 expected=5100 (frame 18433)
 ```
+
+`reuse=` is how many times the previous frame was consumed before this one
+arrived. It should sit near the ratio of the two frame rates; printing it on every
+sampled line means a pacing change is visible without waiting for the summary.
 
 At teardown, unconditionally — **this is what catches quiet failures, because a
 quiet failure is a rate, not an event:**
 
 ```
-[MGPU][SEAL] summary: arrived=18600 unique=18600 stale=0 dropped=0 reordered=0
-[MGPU][SEAL] summary: bad_magic=0 contract_mismatch=0 ring_alias=0 barcode_mismatch=0
-[MGPU][SEAL] latency ms: min=3.91 p50=4.77 p90=5.31 p99=6.20 max=11.40 n=18600
-[MGPU][SEAL] fault_injection=none seal_version=1
+[MGPU][SEAL] summary: consumes=18600 new_frames=4043 reuse=4.60 dropped=0 reordered=0
+[MGPU][SEAL] summary: stalls=0 bad_magic=0 contract_mismatch=0 ring_alias=0 barcode_mismatch=0
+[MGPU][SEAL] latency ms: min=3.91 p50=4.77 p90=5.31 p99=6.20 max=11.40 n=4043
+[MGPU][SEAL] producer period ms: p50=21.80 (implies 45.9 fps) — compare to the game
+[MGPU][SEAL] fault=none seal_version=1
 ```
 
-`arrived != unique` is duplication. A `dropped` count against a known game frame
+`reuse` near the ratio of the two frame rates says both sides are pacing as
+expected; a drift in it says one changed. `dropped` against the game's own frame
 count is the drop rate. A p99 far above p50 is the intermittent race that a p50
-alone would hide. None of these are visible in any single frame, and all of them
-are visible in four lines.
+alone would hide. **`n` on the latency line is `new_frames`, not `consumes`** — if
+those two are ever equal, latency is being sampled per consume and the
+distribution is wrong.
+
+The producer-period line is a free cross-check: it should agree with the frame
+rate ReShade's own Statistics panel reports for the game. Disagreement means
+transit is not being submitted once per game frame, which no other counter
+reveals.
 
 **Log the fault-injection setting in the summary.** A fault-injected run that is
 later mistaken for a clean one is a self-inflicted false result, and this is a
@@ -327,3 +417,12 @@ Stated so it is not mistaken for complete:
   baseline *of*.
 - **Multi-slot ring behaviour under depth > 2.** `slot_index` catches aliasing at
   any depth, but nothing here says what depth is right.
+- **Colour space.** Section 03 explains why the barcode cannot detect an sRGB
+  double-conversion and what would. Until that is added, colour space is unchecked
+  — not covered.
+- **The consumer being slower than the producer.** Everything above assumes GPU 1
+  consumes faster than GPU 0 produces, which is true at the rates in
+  `VENDOR_LOCK.md`. If a neural workload later inverts that, the reuse ratio falls
+  below 1 and frames are being produced that nobody consumes — a different failure
+  needing a different counter. The reuse ratio is what makes the inversion
+  visible; noticing it is the point.
