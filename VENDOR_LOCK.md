@@ -76,6 +76,33 @@ re-verify against, not this table.
 DisabledAddons=Effect Runtime Sync
 ```
 
+**Drift observed 2026-09-02, after close:** a later rig run shows
+`DisabledAddons=Generic Depth,Effect Runtime Sync`. `Generic Depth` was disabled
+at some point during DLSS-NR testing and is not part of what made P0 pass. It is
+recorded here so a future run that differs is not mistaken for a regression.
+
+## Reference DLSS-NR configuration (single-GPU, GPU 0)
+
+Not part of P0. Recorded because it is the working NGX path on this exact rig and
+is the contract the next milestone imitates. From `reshade.ini` `[RENODX-DLSS]`:
+
+| Key | Value | Why it matters |
+|---|---|---|
+| `DirectNeuralRenderingForceNgxCore` | `1` | **Load-bearing.** Forces the driver's own `_nvngx.dll` to be used as parameter provider. Without it the log reports `NVNGX parameter module not found: nvngx.dll` and NR does not run. |
+| `DirectNeuralRenderingHookPoint` | `5` | |
+| `DirectNeuralRenderingIntensity` | `0.54` | |
+| `DirectNeuralRenderingStyle` | `2` | |
+
+`nvngx_dlssnr.dll` sits beside `dxgi.dll` in the game's `Binaries\Win64\`. NGX
+loads it itself; nothing calls into it directly. `nvngx_dlss.dll` and
+`sl.interposer.dll` were **absent** in that run — DLSS super-resolution and
+Streamline are not required for the NR path.
+
+Observed timings on this rig: `Init_Ext` → `CreateFeature(Reserved18)` took
+**1.16 s**; private outputs are `2560×1440`, `format=24` (`R10G10B10A2_UNORM`),
+`flags=0x5` (RT|UAV), created lazily — one at init, three more about six seconds
+later, matching the game swapchain's `BufferCount=4`.
+
 `ReShade2.ini` (GPU 1 runtime — **written by ReShade**, not by us):
 
 ```
