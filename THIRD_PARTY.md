@@ -49,14 +49,23 @@ POSSIBILITY OF SUCH DAMAGE.
 
 ## LumeniteFX
 
-LumeniteFX (kernel + LumaFlow) is **not contained in, referenced by, or
-distributed with this repository**. It is a runtime asset: the stock,
-unmodified release is installed by hand into the target game's ReShade
-shader path on the rig, exactly as any ReShade user would install a
-technique pack, and it executes inside the second effect runtime at run
-time. ReShade compiles `.fx` shaders at runtime, so LumeniteFX is never
-a build input and CI never sees it. The release installed on the rig is
-recorded in `VENDOR_LOCK.md`.
+LumeniteFX is **not contained in, referenced by, or distributed with this
+repository**. It is a runtime asset: the stock, unmodified pack is
+installed by hand into the target game's ReShade shader path on the rig,
+exactly as any ReShade user would install a technique pack, and it
+executes inside the second effect runtime at run time. ReShade compiles
+`.fx` shaders at runtime, so LumeniteFX is never a build input and CI
+never sees it.
+
+The shader P0's result depends on is `lumenite_QuantMotion.fx`
+(version 2026.06.16). `VENDOR_LOCK.md` records the shader provenance and
+explains how to identify the right pack — LumeniteFX dates each shader
+independently and publishes no single pack version number, so there is no
+release string to pin here.
+
+`assets/gpu1.ini` in this repository names the LumeniteFX technique
+`Lumenite_QuantMotion` as a configuration string. That is a reference to
+an externally installed asset, not a copy of it or a derivative of it.
 
 Nothing in this repository is a fork of LumeniteFX or of any other
 third-party repository.

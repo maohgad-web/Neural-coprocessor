@@ -26,27 +26,47 @@ the game unaffected. Nothing crosses between the adapters yet.
 - `VENDOR_LOCK.md` — the exact rig, driver, ReShade build and configuration that
   made P0 pass, and the measurements taken at close.
 - `README.md` — what the add-on does and how to deploy and read it.
+- `P1_INSTRUMENT.md` — a design, not verified fact: how cross-adapter transit
+  proves itself, and why P0's verification methods do not transfer. It applies to
+  tasks that move bytes and to no others. It does not set task order.
 
 ## Carried forward for whoever writes the next brief
 
-Two facts that must appear in the brief for cross-adapter transit, recorded here
-so they are not lost between milestones. They are notes to the author of that
-brief, not work:
+Facts that must appear in the next brief, recorded here so they are not lost
+between milestones. They are notes to the author of that brief, not work:
 
 1. **The containment check in `.github/workflows/build.yml` will fail the first
-   transit commit, by design.** Its pattern rejects `SHARED_CROSS_ADAPTER`,
-   `HEAP_FLAG_SHARED`, `CreateSharedHandle`, `OpenSharedHandle`,
-   `FENCE_FLAG_SHARED` and `COMMAND_LIST_TYPE_COPY` — six of the ten symbols it
-   greps for, and precisely the ones transit needs. (`NVSDK_NGX`, `nvngx`,
-   `GetClockCalibration` and `reshade_finish_effects` are the other four and stay
-   out of scope until later milestones.) The brief must name which symbols move
-   from forbidden to expected, and the workflow must be edited in the same
-   change. An agent that hits a red build without being told this will assume it
-   broke something.
+   commit of the next milestone, by design.** Its pattern greps for ten symbols.
+   Which ones bite depends on which task comes first:
+
+   | Task | Symbols it needs, all currently forbidden |
+   |---|---|
+   | NGX on the GPU 1 device | `NVSDK_NGX`, `nvngx` |
+   | Cross-adapter transit | `SHARED_CROSS_ADAPTER`, `HEAP_FLAG_SHARED`, `CreateSharedHandle`, `OpenSharedHandle`, `FENCE_FLAG_SHARED`, `COMMAND_LIST_TYPE_COPY` |
+
+   `GetClockCalibration` and `reshade_finish_effects` are the remaining two and
+   are not needed by either — transit latency is measured with
+   `QueryPerformanceCounter` at both ends, which needs no GPU/CPU timeline
+   correlation.
+
+   **The NGX experiment comes first, so `NVSDK_NGX` and `nvngx` are the first two
+   symbols to move**, not the transit six. The brief must name which symbols move
+   from forbidden to expected, and the workflow must be edited in the same commit
+   that first needs them — including its step name and error text, which still say
+   "P0". Move only the named symbols; do not widen the pattern to make a build
+   pass, and do not delete the check.
 
 2. **`CrossAdapterRowMajorTextureSupported = 0` on this hardware.** Shared
    textures are unavailable; transit must use a shared buffer with
    `GetCopyableFootprints` and placed footprints at both ends.
+
+3. **The first task is NGX on the GPU 1 device, and it moves no bytes.**
+   `NVSDK_NGX_D3D12_Init_Ext` then `CreateFeature(Reserved18)` against the device
+   T3 already creates, return codes logged. Section 09 records that whether NGX
+   initialises on a headless, non-game adapter is the load-bearing untested
+   assumption of the architecture: if it will not, every transit task is work on a
+   pipeline with no consumer. `P1_INSTRUMENT.md` covers how transit proves itself
+   and is orthogonal to this task — it does not apply until bytes cross.
 
 ## Working rules that carry forward
 

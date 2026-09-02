@@ -119,9 +119,12 @@ spatially uniform input.
 | GPU 1 present loop | 210.0 fps, vsync-locked | 600 frames per 2.857 s, two runs |
 | `CrossAdapterRowMajorTextureSupported` | **0** | read on the real adapter — P1 must use shared buffers with placed footprints |
 
-**No no-bridge baseline was taken.** Every figure above was measured with the
-bridge running. The cost of the add-on's mere presence, versus it being absent,
-is unmeasured and is the first thing P1 should establish.
+**No no-bridge baseline was taken, deliberately.** Every figure above was measured
+with the bridge running, so the cost of the add-on's mere presence is unmeasured.
+That is not an oversight to correct early: a baseline is worth taking once there
+is a neural workload for it to be a baseline *of*. Taken now, against a pipeline
+with no consumer, it would date before it was used. It is owed before any figure
+is quoted as a result, not before the next task.
 
 **The game's preset was contaminated during testing.** With the runtimes synced,
 enabling QuantMotion wrote it into `ReShadePreset.ini`, so the game carried the

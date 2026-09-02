@@ -168,24 +168,31 @@ launch** while probing adapters.
 
 ## 04 · What P1 inherits
 
-Read sections 09 and 10 before designing anything. The load-bearing items:
+Read sections 09 and 10 before designing anything. The load-bearing items, most
+decisive first:
 
+- **Untested and gating everything:** whether NGX will initialise and create a
+  feature on a **headless, non-game adapter**. That experiment costs almost
+  nothing — `Init_Ext` and `CreateFeature(Reserved18)` against the device T3
+  already creates, no transit, no game data — and it must precede any transit
+  work. If the answer is no, every transit task is work on a pipeline with no
+  consumer.
+- **The DLSS-NR path is public API and needs no effect runtime.**
+  `Init_Ext` → private outputs → `CreateFeature(Reserved18)` → `EvaluateFeature`,
+  with the driver's own `_nvngx.dll` as parameter provider. A working single-GPU
+  run had no ReShade effects loaded at all. P0 already produces every object that
+  path needs on GPU 1: device, queue, command list, fence, resources.
 - **`CrossAdapterRowMajorTextureSupported = 0`** on this hardware. Transit must
   use a shared **buffer** with `GetCopyableFootprints` and
   `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` at both ends. Rows pad to 256 bytes, so
   payload sizes come from the footprint, not from `width × height × bpp`.
-- **The DLSS-NR path is public API and needs no effect runtime.**
-  `Init_Ext` → private outputs → `CreateFeature(Reserved18)` → `EvaluateFeature`,
-  with the driver's own `_nvngx.dll` as parameter provider. A working single-GPU
-  run had no ReShade effects loaded at all.
-- **Untested and gating everything:** whether NGX will initialise and create a
-  feature on a headless, non-game adapter. That experiment costs almost nothing
-  and should precede any transit work.
 - **Motion vectors need not cross the bus.** QuantMotion derives flow from
   colour, costs 0.13–0.17 ms, and already runs on GPU 1. Its flow buffer is
   320×180 `RG16F`, **0.220 MiB** at 1440p.
-- **No no-bridge baseline exists.** Every frame-rate figure was taken with the
-  bridge running. The cost of the add-on's mere presence is unmeasured.
+- **No no-bridge baseline exists, and that is deliberate.** Every frame-rate
+  figure was taken with the bridge running. A baseline is owed before any figure
+  is quoted as a result — not before the next task, because it is only meaningful
+  once there is a neural workload for it to be a baseline of.
 
 ---
 
@@ -678,10 +685,10 @@ is the first place to check for a pre-existing cause. Human-owned, like section
 **P0 exited on 2026-09-02.** `VENDOR_LOCK.md` carries the commit, driver
 version, ReBAR state and shader provenance that made it pass — note that
 LumeniteFX has no single pack version number and that file explains how to
-identify the right one. The roadmap from
-here — P1 transit, P2 ring buffer, M2 the resolution sweep, M3 DLSS-NR — is
-inherited by P1's own document, and the notes below are written for it rather
-than for this milestone.
+identify the right one. The roadmap from here — P1 (NGX on GPU 1, then transit),
+P2 ring buffer, M2 the resolution sweep, M3 DLSS-NR — is inherited by P1's own
+documents, and the notes below are written for them rather than for this
+milestone.
 
 **Named M3 experiment — motion source versus transit bandwidth.** Once the rig
 measures, compare QuantMotion (no depth) against Kernel with `IMAGE_SPACE=0` (real
