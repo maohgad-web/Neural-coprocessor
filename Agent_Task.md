@@ -128,12 +128,43 @@ in this order, logging which one succeeded:
    cycles. A clean `NGX module not found` is a useful result — it tells us the
    probe needs a locator, which is then its own small task.
 
-Resolve at minimum `NVSDK_NGX_D3D12_Init_Ext`,
-`NVSDK_NGX_D3D12_GetCapabilityParameters` (or the current equivalent — **read the
-header**), `NVSDK_NGX_D3D12_CreateFeature`, `NVSDK_NGX_D3D12_ReleaseFeature` and
-`NVSDK_NGX_D3D12_Shutdown1`. Log each name with whether `GetProcAddress` returned
-non-null, **before** calling any of them. A missing export must be reported by
-name, not discovered as a crash.
+**`_nvngx.dll` is not on the DLL search path**, so step 2 will almost certainly
+fail: it lives in `C:\WINDOWS\system32\DriverStore\FileRepository\nv_dispi.inf_amd64_<hash>\`
+and nothing puts that directory on the loader's path. **Step 1 is therefore the
+one that has to work**, and it works only if something else in the process has
+already force-loaded the module.
+
+That is why the test procedure (section 6) requires the reference DLSS add-on to
+be present for the probe run: it force-loads `_nvngx.dll` at startup, so
+`GetModuleHandleW` finds it resident and the probe reaches the question it exists
+to answer. Run without it and the probe reports `module not found`, which is true
+and useless. **Say this explicitly in your test instructions.**
+
+Resolve these, log each name with whether `GetProcAddress` returned non-null
+**before** calling any of them, and report a missing export by name rather than
+discovering it as a crash:
+
+| Name | Required |
+|---|---|
+| `NVSDK_NGX_D3D12_Init_Ext` | one of these two |
+| `NVSDK_NGX_D3D12_Init` | one of these two |
+| `NVSDK_NGX_D3D12_GetCapabilityParameters` | yes |
+| `NVSDK_NGX_D3D12_CreateFeature` | yes |
+| `NVSDK_NGX_D3D12_ReleaseFeature` | yes |
+| `NVSDK_NGX_D3D12_DestroyParameters` | yes |
+| `NVSDK_NGX_D3D12_Shutdown1` | yes |
+
+**Resolve both init entry points and use whichever is present**, preferring
+`Init_Ext`. That `_nvngx.dll` exports `Init_Ext` is inferred from a log line in a
+third-party add-on, not from an export table — if the inference is wrong and only
+one name is resolved, the probe should still reach the adapter question instead of
+stopping at a missing export. Log which one you used and its full argument list.
+Their signatures differ; read both from the header.
+
+**`DestroyParameters` is required, not optional.** The capability map is allocated
+by the driver and the header says it must be freed this way — never with
+`delete`/`free`. Without it the probe leaks a driver allocation and fails "leaves
+nothing behind." An earlier draft of this brief omitted it; that was an error.
 
 ### 3.3 · The probe
 
@@ -175,6 +206,68 @@ transits nothing, so none of them are needed.
 The workflow's job name, step name and error text still say "P0". Update them to
 say P1 in the same commit, or the build will refuse code while naming the wrong
 milestone.
+
+## 3.5 · Known discrepancies in this brief — already found, do not re-derive
+
+An earlier run on this task established the following before it was cut off. They
+are recorded so you do not spend context rediscovering them. Verify cheaply if you
+wish, but do not re-analyse.
+
+- **`nvsdk_ngx_d3d12.h` does not exist** in `NVIDIA/DLSS` · `include/`. Section 3.1
+  lists it and section 3.1 is wrong. Fetch the whole `include/` directory as
+  instructed, `test -f` only the files that are actually there, and note it in your
+  report.
+- **`.gitignore` already has a blanket `ext/` line**, not an `ext/reshade/` line.
+  Section 3.1's "add `ext/ngx/` next to `ext/reshade/`" describes a file layout
+  that does not exist. `ext/` already satisfies acceptance item 6. Either leave it
+  alone or replace the blanket line with explicit `ext/reshade/` and `ext/ngx/`
+  lines — both are correct, the effect is identical, so **pick one and move on**.
+  `.gitignore` is in scope for this task by this instruction.
+- **The containment edit, in full.** Change the pattern from
+
+  `SHARED_CROSS_ADAPTER|HEAP_FLAG_SHARED|CreateSharedHandle|OpenSharedHandle|FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|NVSDK_NGX|nvngx|GetClockCalibration`
+
+  to
+
+  `SHARED_CROSS_ADAPTER|HEAP_FLAG_SHARED|CreateSharedHandle|OpenSharedHandle|FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|GetClockCalibration`
+
+  Eight remain. Also: `name: P0 build` → `P1 build`, `P0 containment check` →
+  `P1 containment check`, `Out-of-scope symbol for P0` → `...for P1`.
+- **The containment check scans `src` and `assets` only**, so neither `ext/ngx/`
+  nor `build.yml`'s own verify step can trip it. Confirmed; do not re-reason about
+  it.
+- **The verify step should grep the full enum constant**, not the bare substring.
+  Read the pinned header for how it is actually spelled and use that; report the
+  exact spelling.
+- **`CMakeLists.txt` is closed and cannot gain an include directory**, so the NGX
+  headers are reached with a quote include relative to the source file:
+  `#include "../ext/ngx/nvsdk_ngx.h"` from `src/`. The headers include each other
+  by quote form, so the rest of the chain resolves from `ext/ngx/` on its own.
+  Include `<d3d12.h>` before it. This is settled — do not re-derive it and do not
+  edit `CMakeLists.txt`.
+- **Section 09's claim that "`Reset` on a recording list is invalid" is suspect.**
+  It contradicts the standard D3D12 pattern of `CreateCommandList` followed
+  immediately by `Reset`. It is being re-examined and is **not** something to
+  reason around at length. Sidestep it: create a private allocator and command
+  list for the probe, pass the freshly created list to `CreateFeature` without
+  resetting it, and `Close` it afterwards — a transition P0's shipped code already
+  exercises. Note the concern in your report and move on.
+
+## 3.6 · Commit order for this task
+
+Two commits, and **the first one lands before you write any C++**:
+
+**Commit A — the header fetch.** `build.yml` (the `NGX_SHA` env entry, the fetch
+step, the verify step), `.gitignore`, and the `THIRD_PARTY.md` section. This is
+green on its own: the containment pattern still forbids the NGX symbols, and `src`
+does not yet contain them. Commit it, then start the code.
+
+**Commit B — the probe.** `src/gpu1_context.{hpp,cpp}`, the call site, the
+containment edit, and the P1 renames — together, because the code and the pattern
+change must land in the same commit or the build fails.
+
+If you are cut off after A, the next run inherits a working header fetch instead
+of nothing. Put every discrepancy you find into the commit messages.
 
 ## 4 · Log lines
 
@@ -239,6 +332,15 @@ The usual, plus specifically:
 - Step-by-step test instructions: what to deploy, what to launch, what to grep
   for, and what each of the two outcomes above looks like. Say explicitly that a
   `PROBE FAILED` line is a successful test run, so nobody reports it as a bug.
+- **State that the reference DLSS add-on must be present for this run**, and why:
+  it force-loads `_nvngx.dll`, without which the probe cannot find the module and
+  the run answers nothing. This is the one deployment difference from the README's
+  normal deploy set, and it is specific to P1.0.
+- **Warn about `Shutdown1`.** The game may have its own NGX session on GPU 0. The
+  entry point takes an `ID3D12Device *`, so it should be scoped to our device, but
+  that is not confirmed. If the game's own DLSS visibly breaks immediately after
+  the probe's `Shutdown1` line, that is the cause and it is not a mystery worth an
+  hour. Say so in the instructions.
 
 ---
 

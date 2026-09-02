@@ -517,9 +517,22 @@ signature you verified.
     `const ID3D12CommandList *lists[]` does not convert.
   - `DXGI_SWAP_CHAIN_DESC1::Scaling` is the enum `DXGI_SCALING`. Assigning `0`
     does not compile in C++; use `DXGI_SCALING_STRETCH`.
-- **`CreateCommandList` returns the list in the RECORDING state.** `Reset` on a
-  recording list is invalid, so a list used in a per-frame `Reset` loop must be
-  `Close()`d once immediately after creation.
+- **`CreateCommandList` returns the list in the RECORDING state.** A list used in
+  a per-frame `Reset` loop is `Close()`d once immediately after creation, and that
+  pattern is verified working on the rig — 18,600 frames at 210 fps.
+  **Correction, and a warning about this entry.** It previously read "`Reset` on a
+  recording list is invalid, so a list … must be `Close()`d once immediately after
+  creation." That reasoning is **not verified and is probably wrong**: the standard
+  D3D12 pattern is `CreateCommandList` followed immediately by `Reset`, with no
+  intervening `Close`. What P0 actually established is narrower — *fresh → `Close`*
+  works, and *closed → `Reset`* works. Whether *fresh → `Reset`* works was never
+  tested here. Do not build a design around the stronger claim, and do not spend
+  time reasoning about it: use the transitions P0 verified.
+  This entry is kept as a caution about section 09 itself. Every other entry here
+  was read from a primary source; this one asserted a mechanism from a working
+  workaround, and a later task lost time routing around it. If an entry states
+  *why* something is true rather than *what was observed*, treat the why as
+  weaker than the what.
 - **`ID3D12CommandAllocator::Reset()` must be called every frame.** Resetting the
   *command list* does not reclaim the allocator's memory. With a single allocator
   reused per frame, omitting it grows memory without bound for as long as the
