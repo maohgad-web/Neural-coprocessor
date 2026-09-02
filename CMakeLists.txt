@@ -14,7 +14,7 @@ project(mgpu_bridge CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Source list follows the closed manifest (Agent_Task.md, section 05):
+# Source list follows the closed manifest (P0_RECORD.md, section 01):
 # T2 adds diag/adapter, T3 adds worker/gpu1_context. runtime_probe lands
 # with its own task; assets/ is deployed by hand and never compiled.
 add_library(mgpu_bridge SHARED
