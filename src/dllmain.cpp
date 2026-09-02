@@ -9,6 +9,10 @@
 //     DllMain) creates the private device on the selected adapter;
 //     destroy_device events are logged, and the game's own device
 //     release triggers the bridge thread's orderly teardown.
+// T4: captures this module's own HMODULE at DLL_PROCESS_ATTACH and exposes
+//     it via mgpu::module_handle() - the window class's hInstance must be
+//     the add-on's handle, and GetModuleHandle(nullptr) returns the game's
+//     module, not ours (brief section 00, exception 1).
 //
 // Convention verified against crosire/reshade v6.8.0
 // (18deaa52de0c425a78b329e9cb3c497281cd00ec), include/reshade.hpp,
@@ -43,6 +47,22 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 
 #define MGPU_STR2(s) #s
 #define MGPU_STR(s) MGPU_STR2(s)
+
+// T4 (brief section 00, exception 1): the add-on's own module handle,
+// captured at DLL_PROCESS_ATTACH. GetModuleHandle(nullptr) returns the
+// *game's* module, not ours, so the T4 window class's hInstance must be
+// this handle. The accessor is declared in worker.cpp (the file manifest
+// is closed, so no new header is added); it is ordinary C++ linkage,
+// resolved within this DLL at link time.
+static HMODULE g_module = nullptr;
+
+namespace mgpu
+{
+    HMODULE module_handle()
+    {
+        return g_module;
+    }
+}
 
 // T2: both init_device and init_swapchain are the game's own separate API
 // calls - ReShade's CreateDXGIFactory1 hook is fully unwound when they
@@ -102,6 +122,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
     switch (fdwReason)
     {
     case DLL_PROCESS_ATTACH:
+        // T4 (exception 1): capture our own HMODULE before anything else.
+        // Set unconditionally (even if registration is refused below) so
+        // the accessor is never null in a loaded module.
+        g_module = hModule;
         if (!reshade::register_addon(hModule))
         {
             // ReShade absent (e.g. an add-on-disabled build) or add-on
@@ -140,9 +164,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         //   the OS reclaims its GPU objects. The signal is ceremonial.
         //   lpReserved == NULL: dynamic FreeLibrary (ReShade unloading
         //   us). The bridge thread is live; it tears down the GPU 1
-        //   objects itself once it wakes. API 20 has no reshade_unload
-        //   event to drive the teardown from earlier, so if the
-        //   FreeLibrary happens first the GPU 1 device is simply leaked
+        //   objects itself once it wakes (T4: window, class, device,
+        //   adapter - in that order, on its own thread). API 20 has no
+        //   reshade_unload event to drive the teardown from earlier, so if
+        //   the FreeLibrary happens first the GPU 1 device is simply leaked
         //   - explicitly in scope at P0. A hang is not.
         (void)lpReserved;
         mgpu::worker::stop();
