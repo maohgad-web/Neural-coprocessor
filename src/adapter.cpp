@@ -10,11 +10,17 @@
 //            the first init_device untrustworthy - one run captured a
 //            *software adapter* as the game LUID. init_device captures a
 //            provisional value that the swapchain value overrides.
-//   [rule 3] the software filter: DXGI_ADAPTER_FLAG_SOFTWARE adapters are
-//            still enumerated and logged (Flags in hex, VendorId - Microsoft
-//            is 0x1414 - and DedicatedVideoMemory), so the rig can see which
-//            discriminator actually separates them; they simply cannot be
-//            selected.
+//   [rule 3] the software filter: an adapter is software if it carries
+//            DXGI_ADAPTER_FLAG_SOFTWARE *or* reports Microsoft's vendor id
+//            0x1414. The flag alone is not sufficient - a rig run enumerated
+//            two "Microsoft Basic Render Driver" adapters with identical
+//            vendor, device id and memory reporting different Flags in the
+//            same session (0x0 and 0x2), so an unflagged WARP survived the
+//            filter and made the tiebreak ambiguous. Software adapters are
+//            still enumerated and logged (Flags in hex, VendorId and
+//            DedicatedVideoMemory); they simply cannot be selected.
+//            DedicatedVideoMemory is logged and never filtered on -
+//            integrated GPUs legitimately report zero.
 //   [rule 4] the output count: logged for every adapter; consulted only as a
 //            tiebreak when more than two hardware adapters exist. It is never
 //            the primary discriminator - this project's topology puts the
@@ -95,14 +101,20 @@ namespace
         return s;
     }
 
-    // Called on the game thread, before the bridge thread is spawned and
-    // before any on_device()/on_swapchain() state read - so the event is
-    // published without a race.
+    // The CAS alone published `initialised = true` before `ready` was
+    // assigned, so a thread that lost the race could read a null handle from
+    // ready_event() while the winner was still inside CreateEventW. Ordering
+    // by argument (game thread first) is not a guarantee once the bridge
+    // thread exists. std::call_once closes it: every caller blocks until the
+    // handle is written.
+    std::once_flag g_init_once;
+
     void ensure_init()
     {
-        bool expected = false;
-        if (st().initialised.compare_exchange_strong(expected, true))
+        std::call_once(g_init_once, [] {
             st().ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            st().initialised.store(true, std::memory_order_release);
+        });
     }
 
     bool luid_eq(const LUID &a, const LUID &b)
@@ -243,20 +255,36 @@ namespace
         // == the swapchain LUID, by the gate above.
         const LUID game = S.result.game_luid;
 
+        char line[512];
+
         // [rule 3] the software filter, plus exclusion of the game's own
         // adapter (a LUID match, never an index match).
-        std::vector<size_t> hw;     // hardware adapters (no SOFTWARE flag)
+        std::vector<size_t> hw;     // hardware adapters
         std::vector<size_t> cand;   // of those, luid != the game LUID
         for (size_t i = 0; i < S.table.size(); ++i)
         {
-            if (S.table[i].flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-                continue;   // enumerated + logged above; never selectable
+            // The flag is not reliable on its own - see the rule 3 note at
+            // the top of this file. Vendor 0x1414 is Microsoft, which ships
+            // no hardware GPU, so it is the backstop that catches an
+            // unflagged WARP / Basic Render Driver / virtual adapter.
+            // Never gate on dedicated_vram == 0: integrated GPUs report zero.
+            const bool is_software =
+                (S.table[i].flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+                S.table[i].vendor_id == 0x1414;
+            if (is_software)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] adapter[%zu] rejected as software (flags=0x%X vendor=0x%04X) "
+                         "- enumerated and logged, never selectable",
+                         i, (unsigned)S.table[i].flags, (unsigned)S.table[i].vendor_id);
+                mgpu::diag::info(line);
+                continue;
+            }
             hw.push_back(i);
             if (!luid_eq(S.table[i].luid, game))
                 cand.push_back(i);
         }
 
-        char line[512];
         const char *rule = "none";
         size_t sel = static_cast<size_t>(-1);
         bool degenerate = false;
@@ -499,7 +527,7 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
         char line[320];
         snprintf(line, sizeof line,
                  "[MGPU][T2] init_swapchain%s luid=0x%08X-0x%08X - swapchain-derived game luid "
-                 "already established; not re-selecting",
+                 "0x%08X-0x%08X already established; not re-selecting",
                  resize ? " (resize)" : "",
                  (unsigned)luid.HighPart, (unsigned)luid.LowPart,
                  (unsigned)S.result.game_luid.HighPart,
