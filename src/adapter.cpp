@@ -1,7 +1,38 @@
 // MGPU Bridge - adapter enumeration and selection (T2)
+//
+// Brief section 06, four rules. The gates are evaluated in an order that is
+// safe under partial application - every gate can only withhold a selection,
+// never cause a wrong one:
+//
+//   [rule 2] the game LUID gate, first: a selection may proceed only from
+//            the swapchain-derived game LUID (the device
+//            CreateSwapChainForHwnd was called on). UE5's probe devices make
+//            the first init_device untrustworthy - one run captured a
+//            *software adapter* as the game LUID. init_device captures a
+//            provisional value that the swapchain value overrides.
+//   [rule 3] the software filter: DXGI_ADAPTER_FLAG_SOFTWARE adapters are
+//            still enumerated and logged (Flags in hex, VendorId - Microsoft
+//            is 0x1414 - and DedicatedVideoMemory), so the rig can see which
+//            discriminator actually separates them; they simply cannot be
+//            selected.
+//   [rule 4] the output count: logged for every adapter; consulted only as a
+//            tiebreak when more than two hardware adapters exist. It is never
+//            the primary discriminator - this project's topology puts the
+//            display on the target card.
+//   [rule 1] refuse rather than guess, last: exactly one candidate or
+//            nothing. Listed first in the brief because it replaces the old
+//            last-in-enum-order fallback and governs every non-unanimous
+//            outcome; it is the final gate before a selection is committed.
+//
+// The binding keys on the LUID, never the enumeration index (index order is
+// not stable across driver restarts). The selected IDXGIAdapter1 is held
+// AddRef'd from the enumeration itself - T3's D3D12CreateDevice takes that
+// pointer directly, so no LUID re-resolution is needed.
 #include <windows.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
+#include <dxgi1_3.h>   // IDXGIAdapter3::QueryVideoMemoryInfo
+#include <dxgi1_4.h>   // IDXGIFactory4 (EnumAdapters1 is inherited from
+                      // IDXGIFactory1; the spec names factory 4)
 #include <reshade.hpp>
 #include <atomic>
 #include <cstdio>
@@ -14,21 +45,44 @@
 
 // get_native() returns uint64_t: unwrapping it to ID3D12Device * needs
 // reinterpret_cast, not static_cast (integer to pointer is only
-// reinterpret_cast). GetAdapterLuid() takes no parameters and returns
-// the LUID by value - there is no SUCCEEDED to check.
+// reinterpret_cast). GetAdapterLuid() takes no parameters and returns the
+// LUID by value - there is no SUCCEEDED to check.
 
 namespace mgpu::adapter
 {
 namespace
 {
+    struct entry
+    {
+        IDXGIAdapter1 *adapter = nullptr;   // AddRef'd by EnumAdapters1
+        LUID luid{};
+        UINT flags = 0;
+        UINT vendor_id = 0;
+        UINT device_id = 0;
+        UINT64 dedicated_vram = 0;          // bytes, DXGI_ADAPTER_DESC1
+        UINT outputs = 0;
+        bool has_vmem_info = false;
+        // Diagnostics only (QueryVideoMemoryInfo, LOCAL segment): this
+        // process's usage on this adapter. Multi-GB where the game renders,
+        // near-zero elsewhere. Nothing below reads these back into the
+        // candidate logic - they must not influence the selection.
+        UINT64 vram_budget = 0;
+        UINT64 vram_current_usage = 0;
+        UINT64 vram_avail_reservation = 0;
+        UINT64 vram_cur_reservation = 0;
+        char desc[128]{};
+    };
+
     struct state
     {
         std::atomic<bool> initialised{false};
-        std::atomic<bool> ran{false};     // one-shot guard: init_device fires for
-                                          // every D3D12CreateDevice in the process,
-                                          // with no thread guarantee
-        HANDLE ready = nullptr;           // manual-reset event
+        HANDLE ready = nullptr;             // manual-reset event
         std::mutex cs;
+        std::vector<entry> table;
+        bool table_enumerated = false;      // sticky: first successful pass
+        bool provisional_known = false;     // first init_device's LUID
+        LUID provisional_luid{};
+        bool decided = false;               // selected or terminally refused
         selection_result result;
     };
 
@@ -39,7 +93,8 @@ namespace
     }
 
     // Called on the game thread, before the bridge thread is spawned and
-    // before run_once() - so the event is published without a race.
+    // before any on_device()/on_swapchain() state read - so the event is
+    // published without a race.
     void ensure_init()
     {
         bool expected = false;
@@ -51,250 +106,435 @@ namespace
     {
         return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
     }
-}
 
-bool run_once(::reshade::api::device *game_device, const char *trigger)
-{
-    bool expected = false;
-    if (!st().ran.compare_exchange_strong(expected, true))
-        return false;   // a later device/swapchain event: the caller handles it
-
-    ensure_init();
-    auto &S = st();
-    std::lock_guard<std::mutex> lk(S.cs);
-
-    // 1. Capture the game's adapter LUID FIRST. The first D3D12CreateDevice
-    //    after add-on load is the game's; everything else in the process
-    //    (including T3's own device) arrives later and is logged, not trusted.
-    if (game_device != nullptr &&
-        game_device->get_api() == ::reshade::api::device_api::d3d12)
+    // Enumerate the full adapter table. Caller holds S.cs. The VRAM figures
+    // are diagnostics only (brief: "must not influence selection") - they
+    // are logged and stored, and the selection logic never reads them.
+    bool enumerate_table_locked(state &S)
     {
-        if (auto *dev12 = reinterpret_cast<ID3D12Device *>(game_device->get_native()))
+        IDXGIFactory4 *factory = nullptr;
+        const HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4),
+                                              reinterpret_cast<void **>(&factory));
+        if (FAILED(hr) || factory == nullptr)
         {
-            S.result.game_luid = dev12->GetAdapterLuid();
-            S.result.game_luid_known = true;
+            char line[192];
+            snprintf(line, sizeof line,
+                     "[MGPU][T2] CreateDXGIFactory2 hr=0x%08X - enumeration impossible this pass; "
+                     "selection deferred until a later device event retries",
+                     (unsigned)hr);
+            mgpu::diag::error(line);
+            if (factory != nullptr)
+                factory->Release();
+            return false;
         }
-    }
-    if (S.result.game_luid_known)
-    {
-        char line[240];
-        snprintf(line, sizeof line,
-                 "[MGPU][T2] enumeration triggered by %s; game luid=0x%08X-0x%08X "
-                 "(captured from the game's d3d12 device)",
-                 trigger, (unsigned)S.result.game_luid.HighPart, (unsigned)S.result.game_luid.LowPart);
-        mgpu::diag::info(line);
-    }
-    else
-    {
-        char line[240];
-        snprintf(line, sizeof line,
-                 "[MGPU][T2] enumeration triggered by %s; game LUID UNKNOWN (no d3d12 device on "
-                 "trigger) - exclusion rule disabled",
-                 trigger);
-        mgpu::diag::warn(line);
-    }
 
-    // 2. Enumerate.
-    IDXGIFactory4 *factory = nullptr;
-    HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4),
-                                    reinterpret_cast<void **>(&factory));
-    if (FAILED(hr))
-    {
-        char line[160];
-        snprintf(line, sizeof line,
-                 "[MGPU][T2] CreateDXGIFactory2 hr=0x%08X - enumeration impossible; no adapter selected",
-                 (unsigned)hr);
-        mgpu::diag::error(line);
-        S.result.degenerate = true;
-        S.result.rule = "none (factory creation failed)";
-        SetEvent(S.ready);
+        S.table.clear();
+        for (UINT i = 0;; ++i)
+        {
+            IDXGIAdapter1 *ad1 = nullptr;
+            if (FAILED(factory->EnumAdapters1(i, &ad1)))
+                break;   // DXGI_ERROR_NOT_FOUND: table exhausted
+            entry e;
+            e.adapter = ad1;
+            DXGI_ADAPTER_DESC1 d{};
+            ad1->GetDesc1(&d);
+            e.luid = d.AdapterLuid;
+            e.flags = d.Flags;
+            e.vendor_id = d.VendorId;
+            e.device_id = d.DeviceId;
+            e.dedicated_vram = static_cast<UINT64>(d.DedicatedVideoMemory);
+
+            // Output count: logged for every adapter; a rule 4 tiebreak
+            // input only when more than two hardware adapters are present.
+            // Never the primary discriminator.
+            IDXGIAdapter *ad0 = nullptr;
+            if (SUCCEEDED(ad1->QueryInterface(__uuidof(IDXGIAdapter),
+                                              reinterpret_cast<void **>(&ad0))))
+            {
+                IDXGIOutput *out = nullptr;
+                while (SUCCEEDED(ad0->EnumOutputs(e.outputs, &out)))
+                {
+                    out->Release();
+                    ++e.outputs;
+                }
+                ad0->Release();
+            }
+
+            // Diagnostics only: this process's VRAM usage on this adapter.
+            // Expected multi-GB on the adapter the game renders on and
+            // near-zero on every other one - it identifies the game's
+            // adapter independently of output counts.
+            IDXGIAdapter3 *ad3 = nullptr;
+            if (SUCCEEDED(ad1->QueryInterface(__uuidof(IDXGIAdapter3),
+                                              reinterpret_cast<void **>(&ad3))))
+            {
+                DXGI_QUERY_VIDEO_MEMORY_INFO vmem{};
+                if (SUCCEEDED(ad3->QueryVideoMemoryInfo(0,
+                                    DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmem)))
+                {
+                    e.has_vmem_info = true;
+                    e.vram_budget = vmem.Budget;
+                    e.vram_current_usage = vmem.CurrentUsage;
+                    e.vram_avail_reservation = vmem.AvailableForReservation;
+                    e.vram_cur_reservation = vmem.CurrentReservation;
+                }
+                ad3->Release();
+            }
+
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1,
+                                e.desc, 127, nullptr, nullptr);
+            e.desc[127] = '\0';
+            S.table.push_back(e);
+
+            char line[512];
+            snprintf(line, sizeof line,
+                     "[MGPU][T2] adapter[%u] luid=0x%08X-0x%08X flags=0x%X vendor=0x%04X "
+                     "device=0x%04X dedicated_vram=%lluMB outputs=%u desc=\"%s\"",
+                     i, (unsigned)e.luid.HighPart, (unsigned)e.luid.LowPart,
+                     (unsigned)e.flags, (unsigned)e.vendor_id, (unsigned)e.device_id,
+                     (unsigned long long)(e.dedicated_vram / (1024ull * 1024ull)),
+                     (unsigned)e.outputs, e.desc);
+            mgpu::diag::info(line);
+            if (e.has_vmem_info)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] adapter[%u] vmem(local) budget=%lluMB current_usage=%lluMB "
+                         "avail_reservation=%lluMB current_reservation=%lluMB "
+                         "(diagnostic only - this process's usage on this adapter)",
+                         i,
+                         (unsigned long long)(e.vram_budget / (1024ull * 1024ull)),
+                         (unsigned long long)(e.vram_current_usage / (1024ull * 1024ull)),
+                         (unsigned long long)(e.vram_avail_reservation / (1024ull * 1024ull)),
+                         (unsigned long long)(e.vram_cur_reservation / (1024ull * 1024ull)));
+                mgpu::diag::info(line);
+            }
+        }
+
+        factory->Release();
+        if (S.table.empty())
+        {
+            mgpu::diag::error("[MGPU][T2] zero adapters enumerated - no selection possible; "
+                              "a later device event will retry");
+            return false;
+        }
+        S.table_enumerated = true;
         return true;
     }
 
-    struct entry
+    // The selection pipeline. Caller holds S.cs. Runs at most once: it
+    // decides (selects or terminally refuses), sets S.decided, and signals
+    // the ready event. A deferral returns without a decision - the ready
+    // event stays unset and a later event may complete the selection.
+    void try_select_locked(state &S)
     {
-        LUID luid{};
-        UINT outputs = 0;
-        UINT64 vram_mb = 0;
-        char desc[128]{};
-    };
-    std::vector<entry> table;
-    std::vector<IDXGIAdapter1 *> adapters;   // held AddRef'd; non-selected ones released below
+        if (S.decided)
+            return;
+        // [rule 2] the gate: the swapchain-derived game LUID is the only
+        // value a selection may proceed from. No swapchain yet -> refuse to
+        // select (a deferral, not a terminal refusal).
+        if (!S.result.game_luid_from_swapchain)
+            return;
+        if (!S.table_enumerated)
+            return;   // the failure was logged at the enumeration site
 
-    for (UINT i = 0;; i++)
-    {
-        IDXGIAdapter1 *ad1 = nullptr;
-        if (FAILED(factory->EnumAdapters1(i, &ad1)))
-            break;
-        DXGI_ADAPTER_DESC1 d{};
-        ad1->GetDesc1(&d);
+        // == the swapchain LUID, by the gate above.
+        const LUID game = S.result.game_luid;
 
-        UINT outputs = 0;
-        IDXGIAdapter *ad0 = nullptr;
-        if (SUCCEEDED(ad1->QueryInterface(__uuidof(IDXGIAdapter),
-                                          reinterpret_cast<void **>(&ad0))))
+        // [rule 3] the software filter, plus exclusion of the game's own
+        // adapter (a LUID match, never an index match).
+        std::vector<size_t> hw;     // hardware adapters (no SOFTWARE flag)
+        std::vector<size_t> cand;   // of those, luid != the game LUID
+        for (size_t i = 0; i < S.table.size(); ++i)
         {
-            IDXGIOutput *out = nullptr;
-            while (SUCCEEDED(ad0->EnumOutputs(outputs, &out)))
-            {
-                out->Release();
-                ++outputs;
-            }
-            ad0->Release();
+            if (S.table[i].flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+                continue;   // enumerated + logged above; never selectable
+            hw.push_back(i);
+            if (!luid_eq(S.table[i].luid, game))
+                cand.push_back(i);
         }
 
-        entry e;
-        e.luid = d.AdapterLuid;
-        e.outputs = outputs;
-        e.vram_mb = static_cast<UINT64>(d.DedicatedVideoMemory) / (1024u * 1024u);
-        WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, e.desc, 127, nullptr, nullptr);
-        e.desc[127] = '\0';
-        table.push_back(e);
-        adapters.push_back(ad1);
+        char line[512];
+        const char *rule = "none";
+        size_t sel = static_cast<size_t>(-1);
+        bool degenerate = false;
 
-        char line[400];
-        snprintf(line, sizeof line,
-                 "[MGPU][T2] adapter[%u] luid=0x%08X-0x%08X desc=\"%s\" vram=%lluMB outputs=%u",
-                 i, (unsigned)e.luid.HighPart, (unsigned)e.luid.LowPart, e.desc,
-                 (unsigned long long)e.vram_mb, outputs);
-        mgpu::diag::info(line);
-    }
-
-    // 3. Select by exclusion from the game's LUID.
-    std::vector<UINT> cand;
-    for (UINT i = 0; i < table.size(); i++)
-    {
-        if (S.result.game_luid_known && luid_eq(table[i].luid, S.result.game_luid))
-            continue;                 // the game's own adapter - never
-        cand.push_back(i);
-    }
-    std::vector<UINT> headless;
-    for (UINT i : cand)
-        if (table[i].outputs == 0)
-            headless.push_back(i);
-
-    UINT sel = static_cast<UINT>(-1);
-    bool degenerate = false;
-    const char *rule = "none";
-
-    if (S.result.game_luid_known)
-    {
         if (cand.size() == 1)
         {
+            // [rule 1] satisfied: exactly one candidate.
             sel = cand[0];
-            rule = "exclusion (luid != game luid)";
+            rule = "exclusion (luid != swapchain game luid) + software filter";
         }
         else if (cand.empty())
         {
-            degenerate = true;
-            rule = "none (no non-game adapter)";
-            char line[320];
+            // [rule 1] refused: nothing besides the game's own card.
             snprintf(line, sizeof line,
-                     "[MGPU][T2] selection DEGENERATE: no adapter differs from game luid=0x%08X-0x%08X "
-                     "- single-adapter topology; P0 needs a second GPU. Refusing to select the game's adapter.",
-                     (unsigned)S.result.game_luid.HighPart, (unsigned)S.result.game_luid.LowPart);
+                     "[MGPU][T2] REFUSING: no hardware adapter differs from the swapchain-derived "
+                     "game luid=0x%08X-0x%08X (%zu hardware adapters total; the game's is the only "
+                     "one) - single-adapter topology, P0 needs a second GPU. Selecting nothing: a "
+                     "missing device is diagnosable, a device on the wrong adapter is not.",
+                     (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
             mgpu::diag::error(line);
-        }
-        else if (headless.size() == 1)
-        {
-            sel = headless[0];
-            rule = "exclusion + headless tie-break";
+            rule = "none (refused: no non-game hardware adapter)";
         }
         else
         {
-            sel = cand.back();
-            degenerate = true;
-            rule = "DEGENERATE last-in-enum-order";
-            char line[320];
-            snprintf(line, sizeof line,
-                     "[MGPU][T2] selection DEGENERATE: %zu non-game adapters, no unique headless "
-                     "(0 active outputs) tie-break - selecting last-in-enum-order; verify in the table above.",
-                     cand.size());
-            mgpu::diag::warn(line);
-        }
-    }
-    else
-    {
-        // Exclusion unavailable: fall back to the headless heuristic, loudly.
-        if (headless.size() == 1)
-        {
-            sel = headless[0];
-            degenerate = true;
-            rule = "headless only (game luid unknown)";
-            mgpu::diag::warn("[MGPU][T2] WARNING: game LUID unknown; selection is the single headless "
-                             "adapter - unverified against the game's card");
-        }
-        else if (!table.empty())
-        {
-            sel = static_cast<UINT>(table.size() - 1);
-            degenerate = true;
-            rule = "DEGENERATE last-in-enum-order (game luid unknown)";
-            char line[320];
-            snprintf(line, sizeof line,
-                     "[MGPU][T2] selection DEGENERATE: game LUID unknown and no unique headless adapter "
-                     "among %zu - selecting last-in-enum-order; verify in the table above.",
-                     table.size());
-            mgpu::diag::warn(line);
-        }
-        else
-        {
-            degenerate = true;
-            rule = "none (no adapters enumerated)";
-            mgpu::diag::error("[MGPU][T2] selection DEGENERATE: no adapters enumerated at all");
-        }
-    }
-
-    // 4. Publish.
-    if (sel != static_cast<UINT>(-1))
-    {
-        for (size_t i = 0; i < adapters.size(); i++)
-        {
-            if (static_cast<UINT>(i) != sel)
-                adapters[i]->Release();
+            // [rule 1] not yet satisfied: more than one candidate.
+            // [rule 4] the output count is consulted only when more than
+            // two hardware adapters exist - and it must never be the
+            // primary discriminator.
+            for (size_t c : cand)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] candidate adapter[%zu] luid=0x%08X-0x%08X outputs=%u "
+                         "(rule 4 input)",
+                         c, (unsigned)S.table[c].luid.HighPart,
+                         (unsigned)S.table[c].luid.LowPart,
+                         (unsigned)S.table[c].outputs);
+                mgpu::diag::info(line);
+            }
+            if (hw.size() > 2)
+            {
+                // This project's topology puts the display on the target
+                // card: prefer the single candidate that has outputs, when
+                // exactly one does. Any ambiguity refuses - a rig with
+                // displays on both cards breaks that rule silently.
+                size_t with_outputs = static_cast<size_t>(-1);
+                size_t n_with_outputs = 0;
+                for (size_t c : cand)
+                    if (S.table[c].outputs > 0)
+                    {
+                        with_outputs = c;
+                        ++n_with_outputs;
+                    }
+                if (n_with_outputs == 1)
+                {
+                    sel = with_outputs;
+                    degenerate = true;
+                    rule = "exclusion + software filter + output-count tiebreak "
+                           "(display on target card)";
+                }
+                else
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][T2] REFUSING: %zu non-game hardware adapters remain and the "
+                             "output-count tiebreak is ambiguous (%zu with outputs>0) - it applies "
+                             "only when it picks exactly one. Selecting nothing rather than guessing.",
+                             cand.size(), n_with_outputs);
+                    mgpu::diag::error(line);
+                    rule = "none (refused: ambiguous)";
+                }
+            }
             else
-                S.result.selected_adapter = adapters[i];   // AddRef'd, for T3
+            {
+                // Two hardware adapters total, both "candidates": the
+                // swapchain-derived game LUID matched no enumerated
+                // adapter. The game's own card is unidentified - refusing
+                // is the only safe outcome.
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] REFUSING: the swapchain-derived game luid=0x%08X-0x%08X matches "
+                         "no enumerated adapter (%zu hardware adapters, all candidates) - the "
+                         "game's own card is unidentified. Selecting nothing rather than guessing.",
+                         (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
+                mgpu::diag::error(line);
+                rule = "none (refused: game luid not in adapter table)";
+            }
         }
-        S.result.valid = true;
-        S.result.degenerate = degenerate;
-        S.result.selected_luid = table[sel].luid;
-        S.result.selected_index = sel;
-        S.result.selected_outputs = table[sel].outputs;
-        strncpy(S.result.selected_desc, table[sel].desc, sizeof S.result.selected_desc - 1);
-        S.result.selected_desc[sizeof S.result.selected_desc - 1] = '\0';
-        S.result.rule = rule;
 
-        char line[512];
-        if (S.result.game_luid_known)
+        S.decided = true;
+        if (sel != static_cast<size_t>(-1))
+        {
+            const entry &e = S.table[sel];
+            // Release every adapter except the selected one, which stays
+            // AddRef'd for T3's D3D12CreateDevice (it takes the pointer
+            // directly - no LUID re-resolution); adapter::shutdown()
+            // releases it. selected_index is for the log only.
+            for (size_t i = 0; i < S.table.size(); ++i)
+            {
+                if (i != sel)
+                {
+                    S.table[i].adapter->Release();
+                    S.table[i].adapter = nullptr;
+                }
+            }
+            S.result.valid = true;
+            S.result.degenerate = degenerate;
+            S.result.selected_luid = e.luid;
+            S.result.selected_index = static_cast<UINT>(sel);
+            S.result.selected_outputs = e.outputs;
+            strncpy(S.result.selected_desc, e.desc, sizeof S.result.selected_desc - 1);
+            S.result.selected_desc[sizeof S.result.selected_desc - 1] = '\0';
+            S.result.rule = rule;
+            S.result.selected_adapter = e.adapter;
+
             snprintf(line, sizeof line,
-                     "[MGPU][T2] selected adapter[%u] luid=0x%08X-0x%08X desc=\"%s\" rule=%s "
-                     "| game luid=0x%08X-0x%08X",
-                     sel, (unsigned)table[sel].luid.HighPart, (unsigned)table[sel].luid.LowPart,
-                     table[sel].desc, rule,
-                     (unsigned)S.result.game_luid.HighPart, (unsigned)S.result.game_luid.LowPart);
+                     "[MGPU][T2] SELECTED adapter[%u] luid=0x%08X-0x%08X desc=\"%s\" outputs=%u "
+                     "rule=\"%s\" | game luid=0x%08X-0x%08X (source: swapchain)",
+                     (unsigned)S.result.selected_index,
+                     (unsigned)e.luid.HighPart, (unsigned)e.luid.LowPart,
+                     e.desc, (unsigned)e.outputs, rule,
+                     (unsigned)game.HighPart, (unsigned)game.LowPart);
+            mgpu::diag::info(line);
+            if (degenerate)
+                mgpu::diag::warn("[MGPU][T2] WARNING: an output-count tie-break was used - confirm "
+                                 "the binding manually before trusting anything downstream");
+        }
         else
-            snprintf(line, sizeof line,
-                     "[MGPU][T2] selected adapter[%u] luid=0x%08X-0x%08X desc=\"%s\" rule=%s "
-                     "| game luid=unknown",
-                     sel, (unsigned)table[sel].luid.HighPart, (unsigned)table[sel].luid.LowPart,
-                     table[sel].desc, rule);
+        {
+            // Terminal refusal: release every adapter reference.
+            for (entry &e : S.table)
+            {
+                e.adapter->Release();
+                e.adapter = nullptr;
+            }
+            S.result.valid = false;
+            S.result.degenerate = false;
+            S.result.rule = rule;
+            mgpu::diag::error("[MGPU][T2] no adapter selected (see the REFUSING line above) - T3 "
+                              "will refuse to create a device");
+        }
+
+        // A decision was made - an adapter selected, or a terminal refusal
+        // logged. The worker may now read get_selection(); deferrals never
+        // reach this line.
+        SetEvent(S.ready);
+    }
+}
+
+void on_device(::reshade::api::device *device)
+{
+    ensure_init();
+    auto &S = st();
+
+    LUID luid{};
+    bool is_d3d12 = false;
+    if (device != nullptr &&
+        device->get_api() == ::reshade::api::device_api::d3d12 &&
+        reinterpret_cast<ID3D12Device *>(device->get_native()) != nullptr)
+    {
+        luid = reinterpret_cast<ID3D12Device *>(device->get_native())->GetAdapterLuid();
+        is_d3d12 = true;
+    }
+
+    std::lock_guard<std::mutex> lk(S.cs);
+
+    if (is_d3d12 && !S.provisional_known)
+    {
+        // [rule 2] provisional capture only. The first init_device in a UE5
+        // startup is frequently a throwaway probe device (one run captured a
+        // software adapter as the "game" LUID), so this value never
+        // authorises a selection - the swapchain-derived LUID overrides it.
+        // The first capture wins; later device events are logged, not
+        // captured.
+        S.provisional_known = true;
+        S.provisional_luid = luid;
+        S.result.game_luid = luid;
+        S.result.game_luid_known = true;
+        S.result.game_luid_from_swapchain = false;
+        char line[320];
+        snprintf(line, sizeof line,
+                 "[MGPU][T2] init_device luid=0x%08X-0x%08X captured as PROVISIONAL game luid "
+                 "(init_device is not trusted - a UE5 probe device is not the game's renderer; "
+                 "the swapchain-derived luid overrides it)",
+                 (unsigned)luid.HighPart, (unsigned)luid.LowPart);
         mgpu::diag::info(line);
-        if (degenerate)
-            mgpu::diag::warn("[MGPU][T2] WARNING: degenerate selection - confirm the binding manually "
-                             "before trusting anything downstream");
+    }
+    else if (is_d3d12)
+    {
+        // A later D3D12CreateDevice in the process - at P0 that is our own
+        // T3 device. A free, independent confirmation of the T3 binding;
+        // logged with the T3 id, never trusted for selection.
+        log_device_luid("init_device (subsequent)", device);
     }
     else
     {
-        for (IDXGIAdapter1 *a : adapters)
-            a->Release();
-        S.result.degenerate = degenerate;
-        S.result.rule = rule;
-        mgpu::diag::error("[MGPU][T2] no adapter selected - see the DEGENERATE lines above; "
-                          "T3 will refuse to create a device");
+        mgpu::diag::info("[MGPU][T2] init_device: not a d3d12 device - ignored for selection");
     }
 
-    factory->Release();
-    SetEvent(S.ready);
-    return true;
+    // The first successful pass builds the full table (with the VRAM
+    // diagnostics) so it exists in the log even if no swapchain ever
+    // arrives; a failed pass retries on the next device event.
+    if (!S.table_enumerated)
+        enumerate_table_locked(S);
+
+    // A device event never makes the selection on its own: [rule 2]
+    // requires the swapchain-derived game LUID. This call only completes a
+    // selection whose adapter table was still missing when the swapchain
+    // fired.
+    try_select_locked(S);
+}
+
+void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
+{
+    ensure_init();
+    if (swapchain == nullptr)
+        return;
+    ::reshade::api::device *dev = swapchain->get_device();
+    ID3D12Device *dev12 = nullptr;
+    if (dev != nullptr &&
+        dev->get_api() == ::reshade::api::device_api::d3d12 &&
+        reinterpret_cast<ID3D12Device *>(dev->get_native()) != nullptr)
+        dev12 = reinterpret_cast<ID3D12Device *>(dev->get_native());
+    if (dev12 == nullptr)
+    {
+        mgpu::diag::warn("[MGPU][T2] init_swapchain: the swapchain's device is not d3d12 - this "
+                         "event establishes no game luid");
+        return;
+    }
+    // The device that owns the swapchain is the device
+    // CreateSwapChainForHwnd was called on - the authoritative game render
+    // device.
+    const LUID luid = dev12->GetAdapterLuid();
+
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+
+    if (S.result.game_luid_from_swapchain)
+    {
+        // A subsequent swapchain event (a resize, a re-create, another
+        // window's swapchain): logged, never re-select. The selection is
+        // one-shot; whatever was decided stands.
+        char line[320];
+        snprintf(line, sizeof line,
+                 "[MGPU][T2] init_swapchain%s luid=0x%08X-0x%08X - swapchain-derived game luid "
+                 "already established; not re-selecting",
+                 resize ? " (resize)" : "",
+                 (unsigned)luid.HighPart, (unsigned)luid.LowPart,
+                 (unsigned)S.result.game_luid.HighPart,
+                 (unsigned)S.result.game_luid.LowPart);
+        mgpu::diag::info(line);
+        return;
+    }
+
+    // [rule 2] the authoritative value; it overrides whatever the
+    // provisional init_device capture held.
+    S.result.game_luid = luid;
+    S.result.game_luid_known = true;
+    S.result.game_luid_from_swapchain = true;
+    {
+        char line[320];
+        snprintf(line, sizeof line,
+                 "[MGPU][T2] init_swapchain%s: swapchain-derived game luid=0x%08X-0x%08X "
+                 "established (the device CreateSwapChainForHwnd was called on)%s",
+                 resize ? " [first event was a resize]" : "",
+                 (unsigned)luid.HighPart, (unsigned)luid.LowPart,
+                 S.provisional_known ? " - overrides the provisional init_device value"
+                                     : " - no provisional value had been captured");
+        mgpu::diag::info(line);
+        if (S.provisional_known && !luid_eq(S.provisional_luid, luid))
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][T2] WARNING: the provisional init_device luid=0x%08X-0x%08X DIFFERS "
+                     "from the swapchain-derived luid - the first init_device was a probe device; "
+                     "the swapchain value wins (the case rule 2 exists for)",
+                     (unsigned)S.provisional_luid.HighPart,
+                     (unsigned)S.provisional_luid.LowPart);
+            mgpu::diag::warn(line);
+        }
+    }
+
+    if (!S.table_enumerated)
+        enumerate_table_locked(S);
+    try_select_locked(S);
 }
 
 void shutdown()
@@ -306,6 +546,11 @@ void shutdown()
         static_cast<IDXGIAdapter1 *>(S.result.selected_adapter)->Release();
         S.result.selected_adapter = nullptr;
     }
+    // Drop the decision's wake-up so a re-armed bridge thread (see
+    // worker::ensure_started's re-arm) starts from an unset event and
+    // cannot act on this run's stale selection.
+    if (S.ready != nullptr)
+        ResetEvent(S.ready);
 }
 
 HANDLE ready_event()
