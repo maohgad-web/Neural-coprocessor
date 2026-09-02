@@ -427,193 +427,38 @@ What it guarantees:
 - At process exit the teardown does not run and does not need to: Windows has
   already terminated the thread and reclaims everything.
 
-### T4 — Window and message pump ⬅ ACTIVE TASK
+### T4 — Window and message pump ✅ PASSED
 
-The bridge thread creates a visible **1280×720** window, runs a message loop, and
-shuts down cleanly when the game exits or the add-on unloads. The window and the
-loop live in `worker.*`, on the thread T3 already spawned. **No new files** — the
-manifest in section 05 is closed.
+Implemented in `worker.cpp`, verified on the rig. **This is the thread and the
+loop T5 extends — read them, do not revise them.**
 
-Two of the four exceptions in section 00 fall outside `worker.*`: the `HMODULE`
-capture in `dllmain.cpp` and the removal-reason function in `gpu1_context.*`.
-Both are required by T4 and both are already specified below. Nothing else
-outside `worker.*` changes.
+What it guarantees:
 
-**The size is fixed at 1280×720 and is not a placeholder.** LumeniteFX builds an
-optical-flow pyramid whose coarsest level is `BUFFER_WIDTH/128 ×
-BUFFER_HEIGHT/128`, and `PS_ComputeFlow128` runs a 7×7 search on it. At 640×360
-that level is 5×2 pixels — degenerate, and it seeds every level below it.
-1280×720 gives 10×5, which the hierarchy can work with. Do not make it
-configurable, and do not shrink it to make a test cheaper.
+- A visible **1280×720 client area** window, created on the bridge thread only
+  after `create_device` returned true. The size is fixed, not a placeholder: it
+  keeps an optical-flow pyramid's coarsest level (`BUFFER_WIDTH/128`) at 10 px
+  rather than degenerate. `AdjustWindowRect` converts it to outer dimensions.
+- The window class name embeds the add-on's `HMODULE`, so a stale class from an
+  unmapped module can never be reused. `ERROR_CLASS_ALREADY_EXISTS` is treated as
+  success and logged at error level — it can only mean this same still-mapped
+  module registered it and a prior teardown missed `UnregisterClass`.
+- Class registration, window creation, message pumping, `DestroyWindow` and
+  `UnregisterClass` all happen on the bridge thread. Nothing touches the window
+  from a ReShade callback; `worker::stop()` stays signal-only.
+- `WM_CLOSE` and `WM_DESTROY` signal the stop event and return 0. **Closing the
+  bridge window does not close the game** — verified on the rig, the game ran a
+  further 23 seconds until a human quit it.
+- `WM_QUIT` is never the exit signal. It is drained and discarded; the stop event
+  is the only shutdown signal for this thread.
+- Teardown is ordered — `DestroyWindow`, `UnregisterClass`, `gpu1::shutdown()`,
+  `adapter::shutdown()`, final logs — and completes **before** `rearm()`, so a
+  replacement thread cannot race the cleanup. A permanently failed cycle closes
+  the thread handle inline and does not re-arm.
+- The device-removal poll T3 never built lives in this loop, via
+  `gpu1::device_removed_reason()`, logged once on the transition away from `S_OK`.
 
-**Thread ownership is the whole point of this task.** A window belongs to the
-thread that called `CreateWindowExW`, and only that thread may pump its messages.
-Everything here — register class, create window, `GetMessage`/`DispatchMessage`,
-and eventually `DestroyWindow` — happens on the bridge thread. Nothing touches
-the window from a ReShade callback, and nothing blocks the game thread waiting on
-it. The game must keep rendering exactly as it does today.
-
-Five requirements:
-
-**1. Register the window class on the bridge thread**, with the add-on's
-`HMODULE` as `hInstance`. `DllMain` has that handle but does not currently store
-it, and `GetModuleHandle(nullptr)` returns the *game's* module, not ours. **You
-may add exactly one thing to `dllmain.cpp`: a file-scope `HMODULE` captured at
-`DLL_PROCESS_ATTACH` and an accessor for it.** That is the only permitted edit
-to T1–T3 code.
-
-**Build the class name so it cannot collide across module reloads** — embed the
-`HMODULE` value in it, e.g. `MGPU_Bridge_Wnd_%p`. The reason is in section 09:
-the add-on is loaded and unloaded five times per launch, and ReShade sometimes
-re-attaches the module without a fresh `LoadLibrary`, so a class registered by a
-previous cycle can still exist. A per-module name means a stale class from an
-unmapped module can never be reused — which would mean creating a window whose
-`lpfnWndProc` points into unmapped memory.
-
-**`ERROR_CLASS_ALREADY_EXISTS` is safe to proceed on, and is also a defect
-report.** Those are not in conflict — they are the same fact seen from the code's
-side and from a human's side.
-
-The per-module class name is what makes them compatible. Windows unregisters a
-class automatically when the module that owns it unloads, and a reload at a
-different base produces a different name, so with that naming scheme the error
-has exactly one possible cause: this same still-mapped module registered the
-class on an earlier cycle and our teardown did not unregister it. The class is
-therefore ours, its `lpfnWndProc` is valid, and using it is correct.
-
-So: proceed with window creation, and log it at **error** level naming the prior
-cycle's missed `UnregisterClass` as the cause. It should never fire in a clean
-run. Do not add a retry, a delete-and-reregister, or a name fallback — the class
-is fine; the teardown is what needs fixing, and the log line is how a human
-learns that.
-
-Any other `RegisterClassExW` failure is a stop-and-report.
-
-**2. Create the window with `CreateWindowExW`**, `WS_OVERLAPPEDWINDOW |
-WS_VISIBLE`, client area exactly 1280×720. `CreateWindowExW`'s width and height
-are the *outer* dimensions, so compute them with `AdjustWindowRect` against the
-same style — otherwise the client area comes out smaller than 720 lines by the
-title bar and borders, and the pyramid argument above quietly stops holding. Log
-the resulting client rect so a human can confirm it.
-
-**3. Replace the post-device wait with a pumping loop, and add the removal poll
-T3 never built.** `bridge_main`'s wait after `create_device` is currently
-`WaitForSingleObject(st().stop_event, INFINITE)`. Replace it with a loop around
-
-```cpp
-MsgWaitForMultipleObjects(1, &st().stop_event, FALSE, 250, QS_ALLINPUT)
-```
-
-`WAIT_OBJECT_0` means shut down. `WAIT_OBJECT_0 + 1` means messages are waiting —
-drain them with `PeekMessage` / `TranslateMessage` / `DispatchMessage` until the
-queue is empty, then loop. `WAIT_TIMEOUT` is the poll tick. One loop, one thread. Do not spawn a second
-thread for the pump.
-
-**The poll needs a function that does not yet exist.** `gpu1_context` exposes
-`create_device`, `shutdown` and `has_device` — the `ID3D12Device *` itself never
-leaves that translation unit, and it must not start to. Handing the raw pointer
-out would put it outside the mutex that guards it, and `shutdown()` could release
-it between the caller's read and its use. Add instead:
-
-```cpp
-bool device_removed_reason(HRESULT &out);   // false when no device exists
-```
-
-implemented in `gpu1_context.cpp`, taking that file's existing lock and calling
-`GetDeviceRemovedReason()` inside it. The bridge thread calls it on each
-`WAIT_TIMEOUT` and logs **only on the transition away from `S_OK`**, since the
-value is sticky once removed. This is exception 4 in section 00; keep it to this
-one function.
-
-The 250 ms timeout is the poll interval, not a pump interval — messages wake the
-wait immediately regardless of it.
-
-**Pumping is not optional once the window exists.** A thread that owns a
-top-level window and blocks without pumping will hang any process that broadcasts
-a message to all top-level windows — that includes the shell and, in the wrong
-moment, the game. An unpumped window is a desktop-wide hazard, not a local one.
-For the same reason the window must be created **after** `create_device` returns
-true and never on a cycle with no device: a window whose thread is about to exit
-is worse than no window.
-
-**4. The window procedure stays minimal.** Handle `WM_CLOSE` and `WM_DESTROY` by
-signalling the same shutdown path the add-on unload uses, and pass everything
-else to `DefWindowProcW`. **The user closing this window must not close the
-game** — signal our shutdown, tear down our side, and leave the game running.
-Verify that specifically; it is the failure mode most likely to look like a
-crash. No rendering, no D3D calls, no logging inside the window procedure beyond
-those two messages.
-
-**5. Teardown is ordered, and it happens before `rearm()`.** On shutdown the
-bridge thread exits its loop and then, **on that same thread and in this order**:
-`DestroyWindow`, `UnregisterClass`, the existing `gpu1::shutdown()` /
-`adapter::shutdown()`, the final log lines, and only then `rearm()`.
-
-The ordering is not stylistic. `rearm()` sets `started = false`, which lets the
-game thread spawn a replacement bridge thread immediately — while the old thread
-is still running. If `UnregisterClass` has not happened yet, the new thread's
-`RegisterClassExW` races the old thread's cleanup. Everything the thread owns
-must be released before it re-arms.
-
-Nothing outside the bridge thread may destroy the window. `worker::stop()` is
-called from the game thread and from `DllMain`; it must stay signal-only. Do not
-add a `SendMessage` there — it would block the game thread on our pump, and from
-`DllMain` it would block under the loader lock.
-
-**The thread handle is already closed in `rearm()`** — `_beginthreadex` returns a
-handle the caller owns, and the five load cycles per launch turned that leak from
-theoretical into per-launch, so it was fixed ahead of T4. Rely on it; do not
-re-apply it. Any path that exits the thread *without* calling `rearm()` must
-close the handle itself.
-
-Section 06's T8 covers the full run report; here you only need this task's share
-of teardown to be clean.
-
-**Acceptance:** an empty 1280×720 window appears beside the game and can be moved
-and focused while the game keeps rendering; the log shows the class name, the
-window handle, the client rect and the owning thread id; closing the window
-leaves the game running; unloading the add-on tears down without a hang and
-without a `DestroyWindow` failure in the log.
-
-**What "stop-and-report" means for the code here.** The thread cannot abort — it
-owns the GPU 1 device and it must still tear down cleanly. So on a window or
-class failure other than `ERROR_CLASS_ALREADY_EXISTS`: log at error level with
-`GetLastError()` and the owning thread id, do not create a window, and fall
-through to the same wait loop with the pump branch omitted — **keeping the 250 ms
-timeout**, because the device-removal poll still has to run. On shutdown, tear
-down whatever was actually created and exit.
-
-Do not retry, and do not let a failed cycle re-arm into another attempt. Log one
-line stating plainly that P0 cannot proceed past T4 in this run, so the log
-cannot be mistaken for a pass: a run with a live device and no window would
-otherwise look healthy while proving nothing.
-
-**Track what you actually created.** `CreateWindowExW` can fail after
-`RegisterClassExW` succeeded, so teardown must not assume both happened —
-`DestroyWindow(nullptr)` and unregistering a class that was never registered are
-both errors that will show up in the log as noise on top of the real failure.
-
-**Do not use `PostQuitMessage`, and do not treat `WM_QUIT` as the exit signal.**
-The stop event is the single shutdown signal for this thread. A `WM_QUIT` sitting
-in the queue would be drained by `PeekMessage` and dispatched to nothing, and the
-loop would keep waiting — a hang with no error anywhere. `WM_CLOSE` and
-`WM_DESTROY` signal the stop event; the loop exits on the event, never on a
-message.
-
-**Two conditions specific to this rig, both from section 09 — read them before
-you start.** First, the add-on is loaded and unloaded five times per launch while
-UE5 probes adapters, and on those cycles the bridge thread starts and exits
-before any selection completes. Your window must not be created on a cycle that
-has no selected adapter, and the class must be unregistered on every one of those
-teardowns or the sixth `RegisterClassExW` fails with
-`ERROR_CLASS_ALREADY_EXISTS`. Treat `RegisterClassExW` failing that way as a
-teardown bug, not as a condition to tolerate. Second, T3's teardown has never been
-observed reaching its final log lines on the real cycle; log the class
-unregistration and the thread exit explicitly so that this run answers the
-question either way.
-
-Note the diagnostic pair in section 08: a window that appears and then freezes is
-a pump problem, not a rendering problem, and rendering does not arrive until T5.
+Two known gaps, both fixed in T5, both recorded in section 09: the window takes
+foreground activation when it appears, and it is resizable.
 
 ### T5 — Swapchain and a present loop ⬅ ACTIVE TASK
 
