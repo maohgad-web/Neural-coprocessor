@@ -1,4 +1,5 @@
-// MGPU Bridge - the private D3D12 device on the selected adapter (T3)
+// MGPU Bridge - the private D3D12 device on the selected adapter (T3;
+// the device-removal poll accessor arrives with T4)
 #include <windows.h>
 #include <combaseapi.h>
 #include <d3d12.h>
@@ -147,5 +148,22 @@ bool has_device()
     auto &S = st();
     std::lock_guard<std::mutex> lk(S.cs);
     return S.device != nullptr;
+}
+
+bool device_removed_reason(HRESULT &out)
+{
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    if (S.device == nullptr)
+    {
+        out = S_OK;
+        return false;   // no device exists; nothing to poll
+    }
+    // GetDeviceRemovedReason() takes no parameters and returns S_OK when
+    // healthy, otherwise the removal reason. It is sticky once removed
+    // (brief section 09) - the caller guards the log with a one-shot
+    // transition flag, so a healthy device is silent by construction.
+    out = S.device->GetDeviceRemovedReason();
+    return true;
 }
 }
