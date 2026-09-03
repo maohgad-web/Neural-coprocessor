@@ -424,3 +424,6 @@ so the *deltas* hold; the absolute frame rate does not represent a clean game.
 5. Focus the bridge window, press **Home** for the GPU 1 overlay.
 
 `ReShade.log` is overwritten on every launch. Copy it aside before relaunching.
+
+
+PASSED 2026-09-03 17:11. Payload crosses intact by both routes — path A (shared cross-adapter heap) and path A′ (host-pinned). Verified by byte comparison at 1280×720 and 2560×1440, differing=0, sentinel 0. The timings it produces are not yet performance figures.
