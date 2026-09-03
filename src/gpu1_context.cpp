@@ -2756,6 +2756,24 @@ namespace
 bool transit_probe(const char *tag)
 {
     if (tag == nullptr) tag = "unlabelled";
+
+    // P1.4b. ALTERNATE THE PATH BETWEEN INVOCATIONS. Until now A' only ran
+    // when A failed, so once A started working A' stopped being sampled at
+    // all and the two were never compared with n>1 on the same link. Odd
+    // invocations force A', even ones take A first. Press the hotkey an even
+    // number of times and the samples are paired.
+    //
+    // Why this is the question now rather than "is transit viable": this rig
+    // is PCIe 3.0 x2 on chipset lanes, ~1.6 GB/s usable. GPU 0 moves ~28 MiB
+    // over that link per 1440p run - about 17.5 ms of pure link time - so the
+    // ~35 ms observed is within 2x of the theoretical floor and is a property
+    // of THIS rig's interconnect, not of the architecture. Absolute numbers
+    // here do not decide whether the feature is worth building. What they can
+    // decide is which pipeline to build around, because A and A' are being
+    // measured over the identical link and the comparison between them
+    // survives the link being slow.
+    static unsigned s_invocation = 0;
+    const bool force_a_prime = ((++s_invocation) & 1u) != 0;
     // P1.3g. Every transit line from here on is preceded by this, so a log
     // holding several runs can never have two of them confused. The foreground
     // window is part of the record because it is a variable we do not control
@@ -2928,6 +2946,7 @@ bool transit_probe(const char *tag)
         // failed identically, so alignment cannot be the whole story. It is
         // corrected because it is cheap and correct, not because it is the
         // diagnosis.
+        if (!force_a_prime)
         {
             const UINT64 ALIGN = 65536;
             const UINT64 shared_bytes = ((bytes + ALIGN - 1) / ALIGN) * ALIGN;
@@ -3202,6 +3221,7 @@ bool transit_probe(const char *tag)
         }
 
         // ---- PATH A': one VirtualAlloc, opened as a heap on both devices ----
+        // Reached either because A failed, or because this invocation forced it.
         if (shared1 == nullptr && eh0.Supported && eh1.Supported)
         {
             // Five calls, five log lines, same reasoning as path A. The
@@ -3353,6 +3373,69 @@ bool transit_probe(const char *tag)
             upload0->Unmap(0, nullptr);
         }
 
+        // ---- P1.4b: the same-adapter control ----------------------------
+        // The discriminator for the 15x asymmetry between wait0 (~35 ms) and
+        // wait1 (~2.25 ms) at 1440p. GPU 0 does EXACTLY the two copies it does
+        // in the real measurement - upload -> tex0 -> buffer - except the
+        // destination buffer is GPU-0-LOCAL. Same adapter, same contention
+        // from the game, same bytes, no adapter crossing.
+        //
+        //   local fast, shared slow  -> the crossing is the cost
+        //   both slow                -> GPU 0 is busy and it is contention
+        //
+        // On a PCIe 3.0 x2 chipset link the crossing is expected to cost
+        // something; this says HOW MUCH of the 35 ms is the link rather than
+        // the adapter being busy, which is the number a bifurcated x8 rig
+        // would change and the contention number is not.
+        {
+            ID3D12Resource *local0 = nullptr;
+            LARGE_INTEGER lf{}, la{}, lb{};
+            QueryPerformanceFrequency(&lf);
+            double lsub = 0.0, lwait = 0.0;
+            if (SUCCEEDED(make_buf(g0.dev, bytes, D3D12_HEAP_TYPE_DEFAULT, &local0)) &&
+                local0 != nullptr)
+            {
+                g0.alloc->Reset(); g0.list->Reset(g0.alloc, nullptr);
+                D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
+                cs.pResource = upload0; cs.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                cs.PlacedFootprint = fp;
+                cd.pResource = tex0; cd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                g0.list->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+                barrier(g0.list, tex0, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION cs2{}, cd2{};
+                cs2.pResource = tex0; cs2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                cd2.pResource = local0; cd2.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                cd2.PlacedFootprint = fp; cd2.PlacedFootprint.Offset = 0;
+                g0.list->CopyTextureRegion(&cd2, 0, 0, 0, &cs2, nullptr);
+
+                QueryPerformanceCounter(&la);
+                const HRESULT lhr = transit_flush(g0, 20000, &lsub, &lwait);
+                QueryPerformanceCounter(&lb);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.4b] %ux%u SAME-ADAPTER CONTROL (GPU 0, identical two copies, "
+                         "destination LOCAL to GPU 0): hr=0x%08X sub=%.2f wait=%.2f total=%.2f ms "
+                         "for %.2f MiB. Compare against wait0 in the breakdown below: the "
+                         "DIFFERENCE is what crossing the adapter costs on this link; what is "
+                         "left is GPU 0 being busy with the game.",
+                         width, height, (unsigned)lhr, lsub, lwait, qpc_ms(la, lb, lf),
+                         (double)bytes / (1024.0 * 1024.0));
+                mgpu::diag::info(line);
+
+                // The texture goes back to COPY_DEST for the real run below.
+                g0.alloc->Reset(); g0.list->Reset(g0.alloc, nullptr);
+                barrier(g0.list, tex0, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+                (void)transit_flush(g0, 20000);
+                local0->Release();
+            }
+            else
+            {
+                mgpu::diag::warn("[MGPU][P1.4b] same-adapter control buffer allocation failed - "
+                                 "control skipped, the breakdown below stands alone");
+            }
+        }
+
         LARGE_INTEGER f{}, t0{}, t1{};
         QueryPerformanceFrequency(&f);
         // P1.4a stage boundaries. r0/r1 bracket GPU 0's command recording,
@@ -3487,10 +3570,16 @@ bool transit_probe(const char *tag)
             const double cpu_side = rec0 + rec1 + sub0 + sub1;
             const double waits = wait0 + wait1;
             snprintf(line, sizeof line,
-                     "[MGPU][P1.4a] %ux%u breakdown: rec0=%.2f sub0=%.2f wait0=%.2f | "
-                     "rec1=%.2f sub1=%.2f wait1=%.2f | cpu(rec+sub)=%.2f waits=%.2f "
-                     "(%.0f%% of the trip) round_trip=%.2f verify=%.2f ms",
-                     width, height, rec0, sub0, wait0, rec1, sub1, wait1,
+                     "[MGPU][P1.4a] %ux%u path=%s forced=%s breakdown: rec0=%.2f sub0=%.2f "
+                     "wait0=%.2f | rec1=%.2f sub1=%.2f wait1=%.2f | cpu(rec+sub)=%.2f "
+                     "waits=%.2f (%.0f%% of the trip) round_trip=%.2f verify=%.2f ms. "
+                     "LINK: this rig is PCIe 3.0 x2 on chipset lanes (~1.6 GB/s usable), so "
+                     "~28 MiB across it is ~17.5 ms of pure link time at 1440p. These absolute "
+                     "numbers are a property of THIS interconnect and do not decide whether the "
+                     "architecture is viable. What they do decide is A versus A', because both "
+                     "are measured over the same link.",
+                     width, height, path, force_a_prime ? "A-prime" : "A-first",
+                     rec0, sub0, wait0, rec1, sub1, wait1,
                      cpu_side, waits, ms > 0.0 ? (waits / ms * 100.0) : 0.0, ms, verify);
             mgpu::diag::info(line);
 
