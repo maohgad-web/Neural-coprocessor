@@ -325,19 +325,16 @@ namespace
                     pump = true;
 
                     // T5 (section 09): show the window without stealing
-                    // activation. On a valid hwnd ShowWindow is expected to
-                    // succeed; if it fails the window stays hidden - a
-                    // swapchain presents to a hidden window fine - so log
-                    // the input and continue.
-                    if (ShowWindow(hwnd, SW_SHOWNOACTIVATE) == FALSE)
-                    {
-                        const DWORD gle = GetLastError();
-                        snprintf(line, sizeof line,
-                                 "[MGPU][T5] ShowWindow(SW_SHOWNOACTIVATE) failed (GetLastError=%lu) "
-                                 "hwnd=0x%p - the window stays hidden; the present chain still runs",
-                                 (unsigned long)gle, (void *)hwnd);
-                        mgpu::diag::error(line);
-                    }
+                    // activation.
+                    //
+                    // ShowWindow's return value is NOT success or failure.
+                    // It is nonzero if the window was PREVIOUSLY VISIBLE and
+                    // zero if it was previously hidden. This window is
+                    // created without WS_VISIBLE, so it always returns FALSE
+                    // here, with GetLastError() == 0 - and an earlier version
+                    // of this code logged that as an error on every single
+                    // launch. There is nothing to check.
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
                     // T5: the present chain on the GPU 1 device, against
                     // this hwnd (bridge thread only). Failure is not fatal
@@ -358,6 +355,12 @@ namespace
                         // ignored: the probe logs its own verdict, and a
                         // failure must not change how the bridge behaves.
                         (void)mgpu::gpu1::ngx_probe(1280, 720);
+
+                        // P1.3: the first milestone that touches the bus.
+                        // Runs whatever the NGX probe reported - the two
+                        // are independent questions, and a run that
+                        // answers only one of them is still worth having.
+                        (void)mgpu::gpu1::transit_probe();
                     }
                     else
                         mgpu::diag::error("[MGPU][T5] no present chain on this cycle - the window "

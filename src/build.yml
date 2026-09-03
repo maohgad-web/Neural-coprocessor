@@ -1,0 +1,181 @@
+name: P1 build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Source of truth: VENDOR_LOCK.md. v6.8.0, RESHADE_API_VERSION 20.
+  RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
+  # NVIDIA/DLSS @ main, include/ only. Pinned for P1.0; copy into VENDOR_LOCK.md
+  # once the probe has run on the rig.
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The guard has been sequencing the remaining work all along, and
+      # P1.3 moves exactly the four symbols it needs, in the same commit
+      # that first uses them:
+      #
+      #   moved by P1.0  NVSDK_NGX  nvngx
+      #   moved by P1.3  SHARED_CROSS_ADAPTER  HEAP_FLAG_SHARED
+      #                  CreateSharedHandle    OpenSharedHandle
+      #   still guarded  reshade_finish_effects            -> P1.4
+      #                  FENCE_FLAG_SHARED                 -> P2
+      #                  COMMAND_LIST_TYPE_COPY            -> P2
+      #                  GetClockCalibration               -> P2
+      #
+      # P1.3 synchronises with a CPU wait between two submissions, on
+      # purpose: pipelining is P2's problem. Widening this pattern to make
+      # a build pass deletes the guard rather than moving it.
+      - name: P1 containment check
+        shell: bash
+        run: |
+          PATTERN='FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|GetClockCalibration'
+          FOUND=0
+          for DIR in src assets; do
+            [ -d "$DIR" ] || continue
+            if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
+          done
+          if [ "$FOUND" -ne 0 ]; then
+            echo "::error::Out-of-scope symbol for P1"
+            exit 1
+          fi
+
+      # Headers land FLATTENED at ext/reshade/reshade.hpp — that is the
+      # path CMakeLists.txt adds as an include directory. Downloads stay
+      # in the workspace; MSYS path translation makes /tmp unreliable here.
+      - name: Fetch ReShade headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/reshade.tar.gz \
+            "https://codeload.github.com/crosire/reshade/tar.gz/${RESHADE_SHA}"
+          tar -xzf _dl/reshade.tar.gz -C _dl "reshade-${RESHADE_SHA}/include"
+          rm -rf ext/reshade
+          mv "_dl/reshade-${RESHADE_SHA}/include" ext/reshade
+          test -f ext/reshade/reshade.hpp
+
+      - name: Verify pin (RESHADE_API_VERSION 20)
+        shell: bash
+        run: |
+          grep -q 'define RESHADE_API_VERSION 20' ext/reshade/reshade.hpp || {
+            echo "::error::Pin drift - fetched tree does not define RESHADE_API_VERSION 20"
+            exit 1
+          }
+
+      # NGX headers land FLATTENED at ext/ngx/nvsdk_ngx.h, mirroring the
+      # ReShade layout. CMakeLists.txt is closed and gains no include
+      # directory, so src/ reaches them with a quote include relative to
+      # itself: #include "../ext/ngx/nvsdk_ngx.h".
+      #
+      # --wildcards rather than a hardcoded "DLSS-${NGX_SHA}/include":
+      # codeload names the tarball root after the repository, and its
+      # capitalisation is the one thing this step must not assume. The
+      # glob extracts whatever the root is called.
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz \
+            "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          test -f ext/ngx/nvsdk_ngx_defs.h
+          test -f ext/ngx/nvsdk_ngx_params.h
+
+      # nvsdk_ngx_d3d12.h does NOT exist in this tree — the D3D12 entry
+      # points are declared in nvsdk_ngx.h itself. Do not add a test -f
+      # for it; it will fail the build.
+      #
+      # A silently-changed header is worse than a missing one: the feature
+      # id the probe creates must exist in the fetched tree, or the build
+      # fails here rather than the probe failing on the rig. Full enum
+      # constant as spelled in nvsdk_ngx_defs.h, not a bare substring.
+      - name: Verify NGX pin (NVSDK_NGX_Feature_Reserved18)
+        shell: bash
+        run: |
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx || {
+            echo "::error::Pin drift - fetched tree does not declare NVSDK_NGX_Feature_Reserved18"
+            exit 1
+          }
+
+      - name: Configure
+        run: cmake -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # Multi-config generators may append a per-config subdirectory, so
+      # locate by name rather than assuming a path. The extension must
+      # REPLACE .dll — a *.addon64.dll is CI-green and rig-dead.
+      - name: Verify artifact name
+        shell: bash
+        run: |
+          if find build -name 'mgpu_bridge.addon64.dll' -type f | grep -q .; then
+            echo "::error::Built mgpu_bridge.addon64.dll - SUFFIX appended to .dll instead of replacing it"
+            exit 1
+          fi
+          ADDON=$(find build -name 'mgpu_bridge.addon64' -type f | head -n1)
+          if [ -z "$ADDON" ]; then
+            echo "::error::mgpu_bridge.addon64 not produced"
+            find build -maxdepth 3 -type f || true
+            exit 1
+          fi
+          echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
+          echo "Output verified: $ADDON"
+
+      # The artifact is the complete deploy set: every file here goes into
+      # <game>\...\Binaries\Win64\ beside dxgi.dll, at the zip root.
+      # Staged into one directory on purpose — upload-artifact roots the zip
+      # at the least common ancestor of its inputs, so listing build/... and
+      # assets/... directly would preserve both paths instead of flattening.
+      #
+      # P1.0b RENAMES THE ADD-ON HERE, and only here. nvngx_dlssnr.dll
+      # resolves the module owning its caller's return address and requires
+      # that module's file path to contain the literal substring
+      # "nvngx.dll"; a caller that fails the test gets 0xBAD00002
+      # FAIL_PlatformError. The add-on is itself the module that calls the
+      # snippet, so its own name is what has to satisfy the check.
+      #
+      # The rename lives in this step rather than in CMakeLists.txt on
+      # purpose: CMakeLists.txt stays closed, and the "Verify artifact name"
+      # step above keeps checking the name CMake actually produces. The
+      # build tree is unchanged; only what ships is renamed.
+      #
+      # Do NOT shorten this to a bare "nvngx.dll". A directory or an
+      # executable with that name breaks process startup; only a calling
+      # DLL's name is safe to change, and it must keep the .addon64
+      # extension or ReShade will not load it.
+      - name: Stage deploy set
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
+          cp assets/gpu1.ini _deploy/
+          ls -l _deploy
+          test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          case "$(ls _deploy)" in
+            *nvngx.dll_*) ;;
+            *) echo "::error::Deploy set does not carry the nvngx.dll_ caller-gate prefix"; exit 1 ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_bridge
+          path: _deploy/
+          if-no-files-found: error

@@ -109,4 +109,11 @@ namespace mgpu::gpu1
     // loop and the teardown behave exactly as P0 shipped them. This is a
     // probe, not a dependency.
     bool ngx_probe(UINT width, UINT height);
+
+// P1.3: does a buffer cross between the two adapters intact? Creates its
+// OWN device on the game's adapter - the game's device is never touched -
+// tries a shared cross-adapter buffer first and a host-pinned heap second,
+// and verifies the payload byte for byte. Bridge thread only; safe to
+// ignore the return value, the probe logs its own verdict.
+bool transit_probe();
 }
