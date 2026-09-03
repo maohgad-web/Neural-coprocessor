@@ -2860,18 +2860,114 @@ bool transit_probe()
                      (unsigned)D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
             mgpu::diag::info(line);
 
-            const HRESULT a1 = g0.dev->CreateCommittedResource(
-                &hp,
-                D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER,
-                &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&shared0));
+            // P1.3d. The P1.3c run answered the question P1.3b could not: A.1
+            // itself fails with E_INVALIDARG, BEFORE any sharing is attempted.
+            // Nothing in that is a statement about the adapters - the runtime
+            // rejected our creation parameters, and every one of the five
+            // "cross-adapter validation requirements" was already satisfied
+            // (see the A.0 echo on the line above; it prints them as numbers).
+            //
+            // So stop reasoning about which flag is wrong and ask the runtime,
+            // one flag at a time. Five variants, each logged with its own
+            // hr; the first that succeeds carries on into A.2/A.3. The
+            // DIFFERENCE between two adjacent rows is the finding - if V1
+            // fails and V2 succeeds, ALLOW_CROSS_ADAPTER on a buffer is what
+            // the runtime dislikes, and we will know it rather than suspect it.
+            //
+            // V5 is the one I would bet on, and it is a structural difference
+            // rather than a flag tweak: Microsoft's own cross-adapter sample
+            // creates the heap explicitly with CreateHeap and then places the
+            // resource, and does NOT use CreateCommittedResource. If V1-V4 all
+            // fail and V5 succeeds, then SHARED_CROSS_ADAPTER is simply not
+            // supported on the committed path and the architecture uses an
+            // explicit heap. That is a real possibility, not a certainty, and
+            // it is exactly what this matrix is for.
+            struct a1_variant
+            {
+                const char *name;
+                D3D12_HEAP_FLAGS heap_flags;
+                D3D12_RESOURCE_FLAGS res_flags;
+                bool placed;   // true = CreateHeap + CreatePlacedResource
+            };
+            const a1_variant VARIANTS[] = {
+                {"V1 committed SHARED|SHARED_CROSS_ADAPTER + ALLOW_CROSS_ADAPTER",
+                 (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER),
+                 D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, false},
+                {"V2 committed SHARED|SHARED_CROSS_ADAPTER + no resource flag",
+                 (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER),
+                 D3D12_RESOURCE_FLAG_NONE, false},
+                {"V3 committed SHARED only + ALLOW_CROSS_ADAPTER",
+                 D3D12_HEAP_FLAG_SHARED,
+                 D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, false},
+                {"V4 committed SHARED only + no resource flag",
+                 D3D12_HEAP_FLAG_SHARED,
+                 D3D12_RESOURCE_FLAG_NONE, false},
+                {"V5 CreateHeap(SHARED|SHARED_CROSS_ADAPTER) + CreatePlacedResource",
+                 (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER),
+                 D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, true},
+            };
+
+            HRESULT a1 = E_FAIL;
+            const char *a1_won = "none";
+            for (int v = 0; v < 5 && shared0 == nullptr; ++v)
+            {
+                const a1_variant &V = VARIANTS[v];
+                bd.Flags = V.res_flags;
+                HRESULT hv = E_FAIL;
+
+                if (!V.placed)
+                {
+                    hv = g0.dev->CreateCommittedResource(&hp, V.heap_flags, &bd,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         IID_PPV_ARGS(&shared0));
+                }
+                else
+                {
+                    D3D12_HEAP_DESC hd{};
+                    hd.SizeInBytes = shared_bytes;
+                    hd.Properties = hp;
+                    hd.Alignment = 65536;
+                    hd.Flags = V.heap_flags;
+
+                    ID3D12Heap *ha = nullptr;
+                    hv = g0.dev->CreateHeap(&hd, IID_PPV_ARGS(&ha));
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.3] %ux%u   A.1 %s -> CreateHeap hr=0x%08X",
+                             width, height, V.name, (unsigned)hv);
+                    mgpu::diag::info(line);
+                    if (SUCCEEDED(hv) && ha != nullptr)
+                    {
+                        hv = g0.dev->CreatePlacedResource(ha, 0, &bd,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&shared0));
+                        // CreatePlacedResource takes its own reference; ours is
+                        // no longer needed whether or not it succeeded.
+                        ha->Release();
+                    }
+                }
+
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.3] %ux%u A.1 %s: hr=0x%08X%s",
+                         width, height, V.name, (unsigned)hv,
+                         SUCCEEDED(hv) ? "  <- ACCEPTED" : "");
+                mgpu::diag::info(line);
+
+                if (SUCCEEDED(hv) && shared0 != nullptr) { a1 = hv; a1_won = V.name; }
+                else if (shared0 != nullptr) { shared0->Release(); shared0 = nullptr; }
+            }
+
             snprintf(line, sizeof line,
-                     "[MGPU][P1.3] %ux%u A.1 CreateCommittedResource(DEFAULT|SHARED|"
-                     "SHARED_CROSS_ADAPTER, ALLOW_CROSS_ADAPTER, ROW_MAJOR): hr=0x%08X "
-                     "payload=%llu padded=%llu rowPitch=%u",
-                     width, height, (unsigned)a1, (unsigned long long)bytes,
+                     "[MGPU][P1.3] %ux%u A.1 verdict: %s (payload=%llu padded=%llu rowPitch=%u). "
+                     "If every variant failed, the runtime is refusing something none of these "
+                     "five rows varies, and the next move is to vary something else - not to "
+                     "conclude anything about the adapters.",
+                     width, height, a1_won, (unsigned long long)bytes,
                      (unsigned long long)shared_bytes, (unsigned)fp.Footprint.RowPitch);
             mgpu::diag::info(line);
             if (FAILED(a1)) transit_drain_info_queue(g0.dev, "gpu0 after A.1");
+
+            // Restore the descriptor the rest of path A expects.
+            bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
             HRESULT a2 = a1, a3 = a1;
             if (SUCCEEDED(a1))
@@ -2962,15 +3058,58 @@ bool transit_probe()
                          width, height, (unsigned)b);
                 mgpu::diag::info(line);
                 if (FAILED(b)) transit_drain_info_queue(g1.dev, "gpu1 after A'.3");
+
+                // P1.3d. We do not get to choose this heap's properties - the
+                // runtime derived them from the host allocation - so we were
+                // placing a resource into a heap whose type, CPU page property
+                // and memory pool we had never looked at. Ask it. This is free,
+                // needs no debug layer, and it is the difference between
+                // knowing what we are placing into and assuming.
+                if (SUCCEEDED(b) && heap0 != nullptr && heap1 != nullptr)
+                {
+                    const D3D12_HEAP_DESC h0 = heap0->GetDesc();
+                    const D3D12_HEAP_DESC h1 = heap1->GetDesc();
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.3] %ux%u A'.3b heap desc: gpu0 size=%llu align=%llu "
+                             "type=%d(DEFAULT=1,UPLOAD=2,READBACK=3,CUSTOM=4) cpuPage=%d "
+                             "pool=%d(L0=1,L1=2) flags=0x%X | gpu1 size=%llu align=%llu type=%d "
+                             "cpuPage=%d pool=%d flags=0x%X",
+                             width, height,
+                             (unsigned long long)h0.SizeInBytes, (unsigned long long)h0.Alignment,
+                             (int)h0.Properties.Type, (int)h0.Properties.CPUPageProperty,
+                             (int)h0.Properties.MemoryPoolPreference, (unsigned)h0.Flags,
+                             (unsigned long long)h1.SizeInBytes, (unsigned long long)h1.Alignment,
+                             (int)h1.Properties.Type, (int)h1.Properties.CPUPageProperty,
+                             (int)h1.Properties.MemoryPoolPreference, (unsigned)h1.Flags);
+                    mgpu::diag::info(line);
+                }
             }
             if (SUCCEEDED(b))
             {
+                // P1.3d. A'.4 was the ONLY failing call left on this path, and
+                // it failed with COMMON. A heap opened from host memory is
+                // CPU-accessible, and D3D12 constrains the initial state of a
+                // resource placed in a CPU-accessible heap. So try COMMON, then
+                // GENERIC_READ, and log both - if the second succeeds where the
+                // first failed, the rule is named by the log rather than by me.
                 b = g0.dev->CreatePlacedResource(heap0, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
                                                  nullptr, IID_PPV_ARGS(&shared0));
                 snprintf(line, sizeof line,
-                         "[MGPU][P1.3] %ux%u A'.4 CreatePlacedResource on GPU 0: hr=0x%08X",
-                         width, height, (unsigned)b);
+                         "[MGPU][P1.3] %ux%u A'.4 CreatePlacedResource on GPU 0 "
+                         "(state=COMMON): hr=0x%08X", width, height, (unsigned)b);
                 mgpu::diag::info(line);
+                if (FAILED(b))
+                {
+                    if (shared0 != nullptr) { shared0->Release(); shared0 = nullptr; }
+                    b = g0.dev->CreatePlacedResource(heap0, 0, &bd,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                     nullptr, IID_PPV_ARGS(&shared0));
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.3] %ux%u A'.4b CreatePlacedResource on GPU 0 "
+                             "(state=GENERIC_READ): hr=0x%08X%s", width, height, (unsigned)b,
+                             SUCCEEDED(b) ? "  <- the initial state was the whole problem" : "");
+                    mgpu::diag::info(line);
+                }
                 if (FAILED(b)) transit_drain_info_queue(g0.dev, "gpu0 after A'.4");
             }
             if (SUCCEEDED(b))
@@ -2978,9 +3117,20 @@ bool transit_probe()
                 b = g1.dev->CreatePlacedResource(heap1, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
                                                  nullptr, IID_PPV_ARGS(&shared1));
                 snprintf(line, sizeof line,
-                         "[MGPU][P1.3] %ux%u A'.5 CreatePlacedResource on GPU 1: hr=0x%08X",
-                         width, height, (unsigned)b);
+                         "[MGPU][P1.3] %ux%u A'.5 CreatePlacedResource on GPU 1 "
+                         "(state=COMMON): hr=0x%08X", width, height, (unsigned)b);
                 mgpu::diag::info(line);
+                if (FAILED(b))
+                {
+                    if (shared1 != nullptr) { shared1->Release(); shared1 = nullptr; }
+                    b = g1.dev->CreatePlacedResource(heap1, 0, &bd,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                     nullptr, IID_PPV_ARGS(&shared1));
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.3] %ux%u A'.5b CreatePlacedResource on GPU 1 "
+                             "(state=GENERIC_READ): hr=0x%08X", width, height, (unsigned)b);
+                    mgpu::diag::info(line);
+                }
                 if (FAILED(b)) transit_drain_info_queue(g1.dev, "gpu1 after A'.5");
             }
 
@@ -2995,9 +3145,12 @@ bool transit_probe()
                      "[MGPU][P1.3] %ux%u NEITHER PATH PRODUCED A SHARED RESOURCE. Read the "
                      "per-call hr lines above before drawing any conclusion: E_INVALIDARG "
                      "(0x80070057) is the runtime rejecting a parameter WE supplied, not the "
-                     "adapters refusing to share. Only a failure at A.3 OpenSharedHandle or A'.3 "
-                     "OpenExistingHeapFromAddress - with the debug layer's own message drained "
-                     "below it - is evidence about the bus. Anything earlier is our bug.",
+                     "adapters refusing to share. As of the 16:16 run, A'.2 and A'.3 both "
+                     "SUCCEEDED - both adapters opened the same host pages as a heap - so the "
+                     "only call on this path that could have been a hardware or driver refusal "
+                     "has already passed. Everything failing below that line is a parameter "
+                     "mistake of ours and is fixable. Path A has produced no evidence about the "
+                     "adapters at all: it dies at creation, before sharing is attempted.",
                      width, height);
             mgpu::diag::error(line);
             cleanup(); all_ok = false; continue;
