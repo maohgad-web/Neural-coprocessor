@@ -134,13 +134,35 @@ jobs:
       # Staged into one directory on purpose — upload-artifact roots the zip
       # at the least common ancestor of its inputs, so listing build/... and
       # assets/... directly would preserve both paths instead of flattening.
+      #
+      # P1.0b RENAMES THE ADD-ON HERE, and only here. nvngx_dlssnr.dll
+      # resolves the module owning its caller's return address and requires
+      # that module's file path to contain the literal substring
+      # "nvngx.dll"; a caller that fails the test gets 0xBAD00002
+      # FAIL_PlatformError. The add-on is itself the module that calls the
+      # snippet, so its own name is what has to satisfy the check.
+      #
+      # The rename lives in this step rather than in CMakeLists.txt on
+      # purpose: CMakeLists.txt stays closed, and the "Verify artifact name"
+      # step above keeps checking the name CMake actually produces. The
+      # build tree is unchanged; only what ships is renamed.
+      #
+      # Do NOT shorten this to a bare "nvngx.dll". A directory or an
+      # executable with that name breaks process startup; only a calling
+      # DLL's name is safe to change, and it must keep the .addon64
+      # extension or ReShade will not load it.
       - name: Stage deploy set
         shell: bash
         run: |
           mkdir -p _deploy
-          cp "$ADDON_PATH" _deploy/
+          cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
           cp assets/gpu1.ini _deploy/
           ls -l _deploy
+          test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          case "$(ls _deploy)" in
+            *nvngx.dll_*) ;;
+            *) echo "::error::Deploy set does not carry the nvngx.dll_ caller-gate prefix"; exit 1 ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         with:
