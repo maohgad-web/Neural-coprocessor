@@ -1912,10 +1912,13 @@ bool ngx_probe(UINT width, UINT height)
         HRESULT hr = make_tex(dev, width, height, fmt_color,
                               D3D12_RESOURCE_FLAG_NONE,
                               D3D12_RESOURCE_STATE_COPY_DEST, &tex_color);
+        // COPY_DEST, not UNORDERED_ACCESS: the output is pre-filled with a
+        // sentinel before evaluation (see below) and transitions to UAV
+        // afterwards.
         if (SUCCEEDED(hr))
             hr = make_tex(dev, width, height, fmt_color,
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &tex_output);
+                          D3D12_RESOURCE_STATE_COPY_DEST, &tex_output);
         if (SUCCEEDED(hr))
             hr = make_tex(dev, width, height, fmt_mvec,
                           D3D12_RESOURCE_FLAG_NONE,
@@ -1958,7 +1961,27 @@ bool ngx_probe(UINT width, UINT height)
         dev->GetCopyableFootprints(&d_mvec, 0, 1, off_mvec, &fp_mvec, &rows_mvec, &rb_mvec, &sz_mvec);
         const UINT64 off_depth = (off_mvec + sz_mvec + 511) & ~(UINT64)511;
         dev->GetCopyableFootprints(&d_depth, 0, 1, off_depth, &fp_depth, &rows_depth, &rb_depth, &sz_depth);
-        const UINT64 upload_bytes = off_depth + sz_depth;
+
+        // A fourth region: the SENTINEL that pre-fills the output.
+        //
+        // Without it "output differs from input" is not proof of anything.
+        // A texture NR never wrote is not black - it is UNINITIALISED, and
+        // uninitialised memory differs from the input too. The probe would
+        // then report PROBE PASSED on garbage, which is the precise class of
+        // false positive this project exists to avoid.
+        //
+        // With it the comparison is three-way and each outcome is
+        // unambiguous: still sentinel = NR wrote nothing; equal to input =
+        // NR copied; neither = NR processed.
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_out{};
+        UINT64 sz_out = 0, rb_out = 0; UINT rows_out = 0;
+        const UINT64 off_out = (off_depth + sz_depth + 511) & ~(UINT64)511;
+        dev->GetCopyableFootprints(&d_color, 0, 1, off_out, &fp_out, &rows_out, &rb_out, &sz_out);
+        const UINT64 upload_bytes = off_out + sz_out;
+
+        // Chosen so it cannot occur in the pattern: fill_pattern always
+        // writes B = 0.70*R, so any pixel with B far above R is ours.
+        const unsigned char SENT_R = 0x10, SENT_G = 0x20, SENT_B = 0xF0;
 
         hr = make_buf(dev, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, &buf_upload);
         if (SUCCEEDED(hr))
@@ -1992,6 +2015,15 @@ bool ngx_probe(UINT width, UINT height)
             // lower-resolution motion buffer requires.
             memset(mapped + off_mvec, 0, (size_t)(upload_bytes - off_mvec));
             fill_pattern(mapped + fp_color.Offset, width, height, fp_color.Footprint.RowPitch);
+            for (UINT y = 0; y < height; ++y)
+            {
+                unsigned char *row = mapped + fp_out.Offset + (size_t)y * fp_out.Footprint.RowPitch;
+                for (UINT x = 0; x < width; ++x)
+                {
+                    unsigned char *p = row + (size_t)x * 4;
+                    p[0] = SENT_R; p[1] = SENT_G; p[2] = SENT_B; p[3] = 255;
+                }
+            }
             buf_upload->Unmap(0, nullptr);
         }
 
@@ -2008,14 +2040,17 @@ bool ngx_probe(UINT width, UINT height)
             d.SubresourceIndex = 0;
             pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
         };
-        copy_in(tex_color, fp_color);
-        copy_in(tex_mvec,  fp_mvec);
-        copy_in(tex_depth, fp_depth);
+        copy_in(tex_color,  fp_color);
+        copy_in(tex_mvec,   fp_mvec);
+        copy_in(tex_depth,  fp_depth);
+        copy_in(tex_output, fp_out);     // the sentinel
 
         const D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barrier(pcmd, tex_color, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
         barrier(pcmd, tex_mvec,  D3D12_RESOURCE_STATE_COPY_DEST, read_state);
         barrier(pcmd, tex_depth, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
+        barrier(pcmd, tex_output, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         // ---- the parameters ----
         //
@@ -2138,6 +2173,8 @@ bool ngx_probe(UINT width, UINT height)
         // releases the buffers it would read. So the drain happens now;
         // list_open goes false and teardown skips its own.
         mgpu::diag::info("[MGPU][P1.1] flush: Close -> Execute -> fence wait ...");
+        LARGE_INTEGER g0{}, g1{};
+        QueryPerformanceCounter(&g0);
         hr = pcmd->Close();
         list_open = false;
         if (SUCCEEDED(hr))
@@ -2163,7 +2200,19 @@ bool ngx_probe(UINT width, UINT height)
             mgpu::diag::warn("[MGPU][P1.1] PROBE FAILED at flush. Bridge continues.");
             return false;
         }
-        mgpu::diag::info("[MGPU][P1.1] flush: GPU idle - the evaluate has executed");
+        QueryPerformanceCounter(&g1);
+        const double gms = (f.QuadPart > 0)
+            ? ((double)(g1.QuadPart - g0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
+        // WHOLE LIST, not the evaluate alone: four uploads, the evaluate and
+        // two readback copies, plus submission overhead. It is an upper
+        // bound and nothing more. A real per-pass GPU figure needs timestamp
+        // queries, which belong with the measurement work in
+        // P1_INSTRUMENT.md - do NOT compare this number against the
+        // reference tool's 14.2 ms evaluateGPU.
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.1] flush: GPU idle after %.2f ms (WHOLE LIST: uploads + evaluate + "
+                 "readback - an upper bound, not an evaluate timing)", gms);
+        mgpu::diag::info(line);
 
         // ---- the actual proof ----
         {
@@ -2182,6 +2231,7 @@ bool ngx_probe(UINT width, UINT height)
             else
             {
                 unsigned long long differing = 0, nonzero_out = 0, total = 0;
+                unsigned long long untouched = 0;   // still exactly the sentinel
                 unsigned long long sum_abs = 0;
                 unsigned int max_abs = 0;
                 const UINT pitch = fp_color.Footprint.RowPitch;
@@ -2203,6 +2253,7 @@ bool ngx_probe(UINT width, UINT height)
                             if (ad > max_abs) max_abs = ad;
                         }
                         if (b[0] || b[1] || b[2]) ++nonzero_out;
+                        if (b[0] == SENT_R && b[1] == SENT_G && b[2] == SENT_B) ++untouched;
                         if (diff) ++differing;
                         ++total;
                     }
@@ -2211,9 +2262,10 @@ bool ngx_probe(UINT width, UINT height)
                 const double mean = total ? ((double)sum_abs / (double)(total * 3)) : 0.0;
 
                 snprintf(line, sizeof line,
-                         "[MGPU][P1.1] readback: pixels=%llu differing=%llu (%.2f%%) "
-                         "mean_abs_delta=%.3f max_abs_delta=%u output_nonzero=%llu depth=%s",
-                         total, differing, pct, mean, max_abs, nonzero_out,
+                         "[MGPU][P1.1] readback: pixels=%llu differing_from_input=%llu (%.2f%%) "
+                         "still_sentinel=%llu mean_abs_delta=%.3f max_abs_delta=%u "
+                         "output_nonzero=%llu depth=%s",
+                         total, differing, pct, untouched, mean, max_abs, nonzero_out,
                          used_depth ? "bound" : "null");
                 mgpu::diag::info(line);
 
@@ -2223,12 +2275,19 @@ bool ngx_probe(UINT width, UINT height)
                                      "output NR did not write. Read them as a control, not a "
                                      "result.");
                 }
+                else if (untouched == total)
+                {
+                    mgpu::diag::error("[MGPU][P1.1] EVALUATE RETURNED SUCCESS BUT THE OUTPUT IS "
+                                      "STILL THE SENTINEL, every pixel - NR wrote nothing to the "
+                                      "resource we bound. Suspect the DLSSNR.Output key name, the "
+                                      "UAV state, or a subrect name. This is the case that would "
+                                      "have read as a pass without the sentinel.");
+                }
                 else if (nonzero_out == 0)
                 {
                     mgpu::diag::error("[MGPU][P1.1] EVALUATE RETURNED SUCCESS BUT THE OUTPUT IS "
-                                      "ENTIRELY BLACK - the model did not write to the resource we "
-                                      "bound. Suspect the DLSSNR.Output key, the UAV state, or a "
-                                      "subrect name.");
+                                      "ENTIRELY BLACK - written, but with nothing. Suspect the "
+                                      "input binding rather than the output binding.");
                 }
                 else if (differing == 0)
                 {
@@ -2239,8 +2298,13 @@ bool ngx_probe(UINT width, UINT height)
                 }
                 else
                 {
-                    mgpu::diag::info("[MGPU][P1.1] PROBE PASSED - DLSS-NR EXECUTED ON THE NON-GAME "
-                                     "ADAPTER AND MODIFIED THE IMAGE. Tensors ran on GPU 1.");
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.1] PROBE PASSED - DLSS-NR EXECUTED ON THE NON-GAME "
+                             "ADAPTER. The output is neither the sentinel nor a copy of the "
+                             "input: %llu of %llu pixels overwritten with processed data. "
+                             "Tensors ran on GPU 1.",
+                             total - untouched, total);
+                    mgpu::diag::info(line);
                 }
             }
             D3D12_RANGE nothing{0, 0};
