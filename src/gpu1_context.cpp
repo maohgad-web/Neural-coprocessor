@@ -2565,6 +2565,44 @@ namespace
     // ever genuinely needed, they must come from a process that enabled the
     // layer at startup - not from a hook that switches it on mid-flight.
 
+    // P1.3e. Four rows: resource flag NONE / ALLOW_CROSS_ADAPTER, crossed with
+    // initial state COMMON / GENERIC_READ. Every row is logged with its own hr,
+    // and the first success wins - here that IS safe, because unlike the A.1
+    // matrix none of these rows produces a resource that is unfit for purpose;
+    // they are four spellings of the same intent.
+    HRESULT transit_place_matrix(ID3D12Device *dev, ID3D12Heap *heap,
+                                 D3D12_RESOURCE_DESC desc, ID3D12Resource **out,
+                                 UINT width, UINT height, const char *step, const char *side)
+    {
+        struct row { const char *name; D3D12_RESOURCE_FLAGS rf; D3D12_RESOURCE_STATES st; };
+        const row ROWS[] = {
+            {"flags=NONE state=COMMON",
+             D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON},
+            {"flags=ALLOW_CROSS_ADAPTER state=COMMON",
+             D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, D3D12_RESOURCE_STATE_COMMON},
+            {"flags=NONE state=GENERIC_READ",
+             D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ},
+            {"flags=ALLOW_CROSS_ADAPTER state=GENERIC_READ",
+             D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, D3D12_RESOURCE_STATE_GENERIC_READ},
+        };
+        char line[1000];
+        HRESULT last = E_FAIL;
+        for (int i = 0; i < 4; ++i)
+        {
+            desc.Flags = ROWS[i].rf;
+            last = dev->CreatePlacedResource(heap, 0, &desc, ROWS[i].st, nullptr,
+                                             IID_PPV_ARGS(out));
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.3] %ux%u %s CreatePlacedResource on GPU %s, %s: hr=0x%08X%s",
+                     width, height, step, side, ROWS[i].name, (unsigned)last,
+                     SUCCEEDED(last) ? "  <- ACCEPTED" : "");
+            mgpu::diag::info(line);
+            if (SUCCEEDED(last) && *out != nullptr) return last;
+            if (*out != nullptr) { (*out)->Release(); *out = nullptr; }
+        }
+        return last;
+    }
+
     // Kept, but expected to do nothing. ID3D12InfoQueue only exists on a
     // device created while the debug layer was active, and P1.3c does not
     // activate it (see above), so the QueryInterface below normally fails and
@@ -2907,10 +2945,28 @@ bool transit_probe()
                  D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, true},
             };
 
+            // P1.3e. The P1.3d loop stopped at the FIRST variant that returned
+            // S_OK, and that was a design error of mine. V4 succeeded - and V4
+            // is the row with no cross-adapter tokens at all, so it handed the
+            // rest of path A a resource that was never eligible to cross an
+            // adapter in the first place. A.3 then failed, on a log line that
+            // calls itself "the call that answers whether the adapters can
+            // share". It answered nothing of the kind. A plain SHARED handle
+            // crosses DEVICES, not ADAPTERS; refusing it on the second adapter
+            // is the specified behaviour, not a capability verdict.
+            //
+            // So: run ALL five rows, log all five, and then prefer a success
+            // that is actually cross-adapter eligible over one that merely
+            // returned S_OK. A row that cannot cross is not a fallback, it is
+            // a different experiment.
             HRESULT a1 = E_FAIL;
             const char *a1_won = "none";
-            for (int v = 0; v < 5 && shared0 == nullptr; ++v)
+            bool a1_eligible = false;
+            ID3D12Resource *shared0_keep = nullptr;
+            for (int v = 0; v < 5; ++v)
             {
+                if (shared0 != nullptr && a1_eligible) break;   // best possible already held
+
                 const a1_variant &V = VARIANTS[v];
                 bd.Flags = V.res_flags;
                 HRESULT hv = E_FAIL;
@@ -2952,16 +3008,32 @@ bool transit_probe()
                          SUCCEEDED(hv) ? "  <- ACCEPTED" : "");
                 mgpu::diag::info(line);
 
-                if (SUCCEEDED(hv) && shared0 != nullptr) { a1 = hv; a1_won = V.name; }
+                const bool eligible =
+                    (V.heap_flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) != 0;
+
+                if (SUCCEEDED(hv) && shared0 != nullptr)
+                {
+                    if (!a1_eligible || eligible)
+                    {
+                        if (shared0_keep != nullptr) shared0_keep->Release();
+                        shared0_keep = shared0;
+                        a1 = hv; a1_won = V.name; a1_eligible = eligible;
+                    }
+                    else { shared0->Release(); }
+                    shared0 = nullptr;
+                }
                 else if (shared0 != nullptr) { shared0->Release(); shared0 = nullptr; }
             }
+            shared0 = shared0_keep; shared0_keep = nullptr;
 
             snprintf(line, sizeof line,
-                     "[MGPU][P1.3] %ux%u A.1 verdict: %s (payload=%llu padded=%llu rowPitch=%u). "
-                     "If every variant failed, the runtime is refusing something none of these "
-                     "five rows varies, and the next move is to vary something else - not to "
-                     "conclude anything about the adapters.",
-                     width, height, a1_won, (unsigned long long)bytes,
+                     "[MGPU][P1.3] %ux%u A.1 verdict: %s | cross-adapter eligible=%s "
+                     "(payload=%llu padded=%llu rowPitch=%u). READ THIS BEFORE READING A.3: if "
+                     "eligible=NO, then whatever A.3 returns says nothing about the adapters - "
+                     "the resource was never created able to cross one. Only an eligible=YES "
+                     "winner makes A.3 a capability answer.",
+                     width, height, a1_won, a1_eligible ? "YES" : "NO",
+                     (unsigned long long)bytes,
                      (unsigned long long)shared_bytes, (unsigned)fp.Footprint.RowPitch);
             mgpu::diag::info(line);
             if (FAILED(a1)) transit_drain_info_queue(g0.dev, "gpu0 after A.1");
@@ -2984,7 +3056,7 @@ bool transit_probe()
                 a3 = g1.dev->OpenSharedHandle(sh, IID_PPV_ARGS(&shared1));
                 snprintf(line, sizeof line,
                          "[MGPU][P1.3] %ux%u A.3 OpenSharedHandle on GPU 1: hr=0x%08X res=0x%p "
-                         "<- THIS is the call that answers whether the adapters can share",
+                         "<- a capability answer ONLY if the A.1 verdict above says eligible=YES",
                          width, height, (unsigned)a3, (void *)shared1);
                 mgpu::diag::info(line);
                 if (FAILED(a3)) transit_drain_info_queue(g1.dev, "gpu1 after A.3");
@@ -3092,45 +3164,27 @@ bool transit_probe()
                 // resource placed in a CPU-accessible heap. So try COMMON, then
                 // GENERIC_READ, and log both - if the second succeeds where the
                 // first failed, the rule is named by the log rather than by me.
-                b = g0.dev->CreatePlacedResource(heap0, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
-                                                 nullptr, IID_PPV_ARGS(&shared0));
-                snprintf(line, sizeof line,
-                         "[MGPU][P1.3] %ux%u A'.4 CreatePlacedResource on GPU 0 "
-                         "(state=COMMON): hr=0x%08X", width, height, (unsigned)b);
-                mgpu::diag::info(line);
-                if (FAILED(b))
-                {
-                    if (shared0 != nullptr) { shared0->Release(); shared0 = nullptr; }
-                    b = g0.dev->CreatePlacedResource(heap0, 0, &bd,
-                                                     D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                     nullptr, IID_PPV_ARGS(&shared0));
-                    snprintf(line, sizeof line,
-                             "[MGPU][P1.3] %ux%u A'.4b CreatePlacedResource on GPU 0 "
-                             "(state=GENERIC_READ): hr=0x%08X%s", width, height, (unsigned)b,
-                             SUCCEEDED(b) ? "  <- the initial state was the whole problem" : "");
-                    mgpu::diag::info(line);
-                }
+                // P1.3e. A'.3b earned its keep: the heap the RUNTIME built for us
+                // came back flags=0x421 - SHARED(0x1) | SHARED_CROSS_ADAPTER(0x20)
+                // | ALLOW_SHADER_ATOMICS(0x400). We never asked for
+                // SHARED_CROSS_ADAPTER; OpenExistingHeapFromAddress set it
+                // itself. And D3D12 pairs those: a resource placed in a heap
+                // carrying SHARED_CROSS_ADAPTER is expected to carry
+                // ALLOW_CROSS_ADAPTER. Our descriptor had Flags = NONE, which
+                // is very likely the whole of A'.4's E_INVALIDARG.
+                //
+                // Note what this means for the A.1 result. The runtime refuses
+                // SHARED_CROSS_ADAPTER when WE ask for it on a committed
+                // resource, and sets it itself on a heap it builds. That is not
+                // "cross-adapter is unsupported on this rig" - it is narrower
+                // and more interesting, and it is why the matrix below varies
+                // the flag rather than assuming either answer.
+                b = transit_place_matrix(g0.dev, heap0, bd, &shared0, width, height, "A'.4", "0");
                 if (FAILED(b)) transit_drain_info_queue(g0.dev, "gpu0 after A'.4");
             }
             if (SUCCEEDED(b))
             {
-                b = g1.dev->CreatePlacedResource(heap1, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
-                                                 nullptr, IID_PPV_ARGS(&shared1));
-                snprintf(line, sizeof line,
-                         "[MGPU][P1.3] %ux%u A'.5 CreatePlacedResource on GPU 1 "
-                         "(state=COMMON): hr=0x%08X", width, height, (unsigned)b);
-                mgpu::diag::info(line);
-                if (FAILED(b))
-                {
-                    if (shared1 != nullptr) { shared1->Release(); shared1 = nullptr; }
-                    b = g1.dev->CreatePlacedResource(heap1, 0, &bd,
-                                                     D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                     nullptr, IID_PPV_ARGS(&shared1));
-                    snprintf(line, sizeof line,
-                             "[MGPU][P1.3] %ux%u A'.5b CreatePlacedResource on GPU 1 "
-                             "(state=GENERIC_READ): hr=0x%08X", width, height, (unsigned)b);
-                    mgpu::diag::info(line);
-                }
+                b = transit_place_matrix(g1.dev, heap1, bd, &shared1, width, height, "A'.5", "1");
                 if (FAILED(b)) transit_drain_info_queue(g1.dev, "gpu1 after A'.5");
             }
 
