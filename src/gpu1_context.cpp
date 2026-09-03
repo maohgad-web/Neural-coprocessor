@@ -1566,14 +1566,44 @@ bool ngx_probe(UINT width, UINT height)
                          "That is a finding, not a fault; see the snippet-only exports line.");
     }
 
-    // Width and height last, so that a value the snippet's own population
-    // wrote is overwritten by the size this probe is actually asking for
-    // rather than the other way round. These two are the only parameters
-    // the header states are required for every feature; nothing
-    // feature-specific is invented here, because a result code is a better
-    // answer than a parameter we guessed.
+    // ---- 5d. the size, under BOTH key namespaces ----
+    //
+    // P1.0c's first run got all the way through: snippet init Success,
+    // PopulateParameters_Impl Success, CreateFeature 185 ms - long enough
+    // that the snippet's own log shows it building the network on GPU 1,
+    // 153 tensors, a 140.9 MB weight heap and a 296.9 MB working set,
+    // before unwinding with FAIL_InvalidParameter. The reason is in that
+    // log, in one line:
+    //
+    //     DLSSNR: CreateFeature begin requested resolution 0x0 (network 0x0)
+    //
+    // We had set NVSDK_NGX_Parameter_Width / _Height, which are the generic
+    // keys "Width" and "Height". The feature reads its OWN namespaced keys,
+    // DLSSNR.Width and DLSSNR.Height, saw nothing, and built a 0x0 network.
+    //
+    // Both namespaces are set, in this order, for a reason: the generic
+    // pair is what the header documents as required for every feature and
+    // may still be read by the core, and the namespaced pair is what this
+    // particular feature actually looks up. Setting both costs nothing and
+    // removes the question.
+    //
+    // The names are string literals rather than header constants because
+    // the DLSSNR.* keys appear in no public header - they belong to the
+    // snippet. A wrong name here fails SILENTLY: the parameter is set,
+    // nothing reads it, and the feature runs on defaults. That is why the
+    // resolution shows up in the snippet's log, and why that log is the
+    // thing to check first if this still comes back 0x0.
     params->Set(NVSDK_NGX_Parameter_Width, (unsigned int)width);
     params->Set(NVSDK_NGX_Parameter_Height, (unsigned int)height);
+    params->Set("DLSSNR.Width", (unsigned int)width);
+    params->Set("DLSSNR.Height", (unsigned int)height);
+
+    snprintf(line, sizeof line,
+             "[MGPU][P1.0c] size set: Width/Height and DLSSNR.Width/DLSSNR.Height = %ux%u "
+             "(check the snippet log's \"requested resolution\" line - it is the only place "
+             "that says whether the namespaced keys were read)",
+             (unsigned)width, (unsigned)height);
+    mgpu::diag::info(line);
 
     // ---- 6. a private command list, allocator and fence ----
     //
