@@ -2116,6 +2116,54 @@ bool ngx_probe(UINT width, UINT height)
         // retry path only.
         params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
 
+        // ---- what the machine was doing while this ran ----
+        //
+        // The probe fires within milliseconds of the present chain being
+        // created - which is during game STARTUP. The game is sitting in a
+        // menu with almost nothing on screen and is still compiling shaders,
+        // and which window owns the foreground at that instant varies from
+        // launch to launch: the game, our bridge window, or the desktop.
+        //
+        // None of that can move this milestone's VERDICT, and that is a
+        // property of the design rather than luck: the answer is a byte
+        // comparison between three images produced from one deterministic
+        // input, on a GPU the game is not using. Focus, occlusion and
+        // shader compilation cannot change whether two buffers are equal.
+        //
+        // It absolutely does contaminate every TIMING here. The flush
+        // number below, and the per-evaluate record_cpu values, are taken
+        // while another GPU and most of the CPU are busy with startup work.
+        // They are logged so a run can be described, NOT so they can be
+        // compared - against the reference tool's 14.2 ms, against each
+        // other, or against a later build. A real cost figure needs
+        // timestamp queries and a settled scene, which is P1_INSTRUMENT.md's
+        // job. This line exists so nobody reads these numbers as
+        // performance data later without seeing the caveat next to them.
+        {
+            const HWND fg = GetForegroundWindow();
+            DWORD fg_pid = 0;
+            if (fg != nullptr)
+                GetWindowThreadProcessId(fg, &fg_pid);
+            wchar_t cls_w[64] = {};
+            if (fg != nullptr)
+                GetClassNameW(fg, cls_w, 64);
+            char cls[128] = "";
+            WideCharToMultiByte(CP_UTF8, 0, cls_w, -1, cls, (int)sizeof cls, nullptr, nullptr);
+
+            const char *owner = "none";
+            if (fg != nullptr)
+                owner = (fg_pid == GetCurrentProcessId()) ? "this process"
+                                                          : "another process (desktop/shell/other)";
+
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.2] context: foreground hwnd=0x%p owner=%s class=\"%s\" - "
+                     "STARTUP PHASE (menu, shaders still compiling). Timings below are "
+                     "contaminated by construction and are NOT comparable; the verdict is a byte "
+                     "comparison and is unaffected.",
+                     (void *)fg, owner, cls);
+            mgpu::diag::info(line);
+        }
+
         LARGE_INTEGER f{}, e0{}, e1{};
         QueryPerformanceFrequency(&f);
         NVSDK_NGX_Result er[NOUT] = {};
@@ -2228,7 +2276,8 @@ bool ngx_probe(UINT width, UINT height)
         // against the reference tool's 14.2 ms evaluateGPU.
         snprintf(line, sizeof line,
                  "[MGPU][P1.2] flush: GPU idle after %.2f ms (WHOLE LIST: 4 uploads + 3 evaluates "
-                 "+ 4 readbacks - an upper bound, not an evaluate timing)", gms);
+                 "+ 4 readbacks, taken during game startup - an upper bound on a contaminated "
+                 "sample. NOT a performance figure. See the context line above.)", gms);
         mgpu::diag::info(line);
 
         // ---- the comparison ----
