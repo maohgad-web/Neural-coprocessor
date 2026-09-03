@@ -194,6 +194,87 @@ the adapter confirmation above. It is *not* reachable through an
 `NVSDK_NGX_FeatureCommonInfo` logging callback — that was installed at VERBOSE
 in the same run and produced nothing.
 
+## P1.0c — PASSED, 2026-09-03
+
+`nvngx.dll_mgpu_bridge.addon64` only. **No RenoDX, no Streamline shim, no
+third-party DLSS add-on, nothing patched.** Logs: `ReShade.log`, `nvngx.log`
+and `nvngx_dlssnr_310_8_0.log` of the `00:25:40` launch.
+
+| | |
+|---|---|
+| `CreateFeature(Reserved18)` | **`0x00000001 Success`**, `handle=0x000001CC85E9AAC0`, 1280×720, **213 ms** |
+| Adapter | LUID `00000000-0001382B`, `outputs=0` — the headless card |
+| Snippet's own record | `Created feature 1 (output 1280x720, network 1280x720, preset=0 -> CC_Control_History_Blend_Quantize_With_Teacher_honest_tench_2026_07_04_22_30_weights)` |
+| Teardown | `ReleaseFeature` Success, `DestroyParameters` Success, no crash |
+| Allocated on GPU 1 | 381.8 MB — weights 140.9 + upload 140.9 + pool 93.0 + history 7.0 |
+| Snippet build | v310.8.0 CL 38718415, `m_gpuArch = 0x1b0`, `Fast UAV clear: supported` |
+
+**The sequence that works.** Order is load-bearing; each omission has its own
+result code (`P0_RECORD.md` section 09 carries the ladder).
+
+1. `NVSDK_NGX_D3D12_Init` — **core** — application form, with
+   `NVSDK_NGX_FeatureCommonInfo`
+2. `GetCapabilityParameters` — **core**
+3. `NVSDK_NGX_D3D12_Init_Ext` — **snippet**, passing the core's block
+4. `NVSDK_NGX_D3D12_PopulateParameters_Impl` — **snippet**
+5. `Set("DLSSNR.Width")`, `Set("DLSSNR.Height")` — *not* the generic keys
+6. `CreateFeature(Reserved18)` — **snippet**
+7. Close → Execute → fence wait → `ReleaseFeature`
+
+`Init_Ext2` **does not exist** in the D3D12 snippet. `Shutdown1` is never
+called.
+
+**What this does and does not establish.** A DLSS-NR feature — the real
+network, the real weights, the real kernels — exists and tears down cleanly on
+a GPU that drives no display and renders no frame of the game. It has **not**
+been evaluated: no image has passed through it, and no performance claim of any
+kind is supported by this run.
+
+## Reference DLSS-NR evaluation numbers (single-GPU, third-party tool)
+
+Not ours. Measured by **NeuralOverlay** (`Merserk/dlss5-visual-enhancer`) on this
+same rig, driver 616.56, and recorded here because it is the target this project
+is trying to reproduce on the wrong GPU — and because it is the first evidence
+that DLSS-NR is expensive enough to be worth moving at all.
+
+| Quantity | Value |
+|---|---|
+| `evaluateGPU` | **avg 14.2 ms**, p95 15.0, p99 15.5 — n=120 per window, stable over 1500 frames |
+| `evaluateCPU` | 0.9 ms |
+| `submit` | 0.08 ms |
+| `slotWait` | 0.001 ms |
+| Resolution | 2248×1264 (88% of 1440p), `passes=2/2` |
+| Reliability | `success=3000 failures=0` |
+| Path | `signed-snippet` — it reaches NR through the snippet, as we do |
+| Motion source | **QuantMotion**, `source 2248x1264 motion 1976x1112 (88%) flow grid 247x139 searchRadius=3` |
+| Config | `guidanceMode=2 autoMask=true uiCorrection=false depthInterval=4 preset=0 style=0` |
+
+**Two things this settles.** `path=signed-snippet` independently corroborates
+that the snippet route P1.0c found is *the* route, not something we invented.
+And the QuantMotion→NR substitution — flow instead of engine motion vectors —
+is **already demonstrated working**, with zero failures over 3000 evaluates. It
+has simply never been done across two adapters. That makes P1.4 an engineering
+task, not a research question.
+
+**What it does not settle: whether depth may be omitted.** `guidanceMode=2` is
+real and logged — an earlier doubt of mine was wrong. But `depthInterval=4` sits
+in the same status line, which reads as depth being supplied on a *cadence*, not
+absent. That tool has the game's depth buffer and no reason to test the null
+case. P1.1 tests it directly: evaluate without depth first, and on refusal bind
+a cleared depth and retry, logging both codes.
+
+**Tuning values** used as P1.1's starting point, taken from that tool's working
+configuration rather than invented: `Intensity 0.842`, `LocalToneStrength 1.142`,
+`LocalStructureStrength 1.092`, `SkinStructureStrength 1.025`, `UseAutoMask 1`.
+
+**The arithmetic this creates.** Colour at 2248×1264 `R10G10B10A2` is 10.8 MiB
+one way, 21.7 MiB round trip; over chipset PCIe at ~6 GB/s effective that is
+roughly **3.8 ms**, against **14.2 ms** of work removed from the render GPU.
+Both transit figures are *theoretical* — `P1_INSTRUMENT.md` exists to replace
+them with measured ones, and no such number may be quoted as a result until it
+is measured on this rig. The ratio is what makes the architecture worth
+building, not a claim in itself.
+
 ### Reaching the NGX core without SetupAPI or a third-party add-on
 
 Two independent paths, both verified on this rig:

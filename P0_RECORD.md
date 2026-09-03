@@ -168,17 +168,35 @@ launch** while probing adapters.
 
 ## 04 · What P1 inherits
 
+**P1 was renumbered on 2026-09-03, after P1.0 closed.** The original order put
+both transit directions before evaluation:
+
+```
+old:  P1.0 NGX on GPU 1 -> P1.1 colour out -> P1.2 return -> P1.3 NR in loop
+new:  P1.0 NGX on GPU 1 -> P1.1 LOCAL EVALUATE -> P1.2 colour out
+                        -> P1.3 return -> P1.4 NR in loop
+```
+
+That ordering made sense while the pipe looked like the hard part. It stopped
+making sense the moment `CreateFeature` returned a handle on GPU 1: evaluating
+against GPU-1-local textures costs **no bus traffic at all**, and if the model
+will not execute on a display-less adapter then every line of transit code is
+dead. Same argument that put P1.0 first, applied again. **A reference to
+"P1.3 = NR in loop" in an older document means what is now P1.4.**
+
+---
+
 Read sections 09 and 10 before designing anything. The load-bearing items, most
 decisive first:
 
-- **Settled 2026-09-03 — NGX initialises on a headless, non-game adapter.**
-  This was the item that gated everything, and the P1.0 probe answered it:
-  `Init_Ext` → `Success` and `GetCapabilityParameters` → `Success` on the
-  `outputs=0` adapter. What remains open is narrower —
-  `CreateFeature(Reserved18)` returns `0xBAD0000B` when handed only
-  `Width`/`Height`, which is a parameter/resource gap, not an adapter
-  limit. Section 09 carries the full result, the export provenance, and
-  the two independent ways to reach `_nvngx.dll`.
+- **CLOSED 2026-09-03 — DLSS-NR creates a feature on a headless, non-game
+  adapter.** This was the item that gated everything.
+  `CreateFeature(Reserved18)` returned `Success` with a live handle in
+  213 ms on the `outputs=0` adapter, and NVIDIA's own snippet log records
+  the network built and 381.8 MB allocated there. Section 09 carries the
+  seven-step sequence, the result-code ladder, the parameter keys and the
+  allocation table. **Nothing has been evaluated yet** — no pixels have
+  passed through the feature. That is P1.3.
 - **The DLSS-NR path is public API and needs no effect runtime.**
   `Init_Ext` → private outputs → `CreateFeature(Reserved18)` → `EvaluateFeature`,
   with the driver's own `_nvngx.dll` as parameter provider. A working single-GPU
@@ -509,6 +527,61 @@ signature you verified.
   **An installed `NVSDK_NGX_FeatureCommonInfo` logging callback produced
   no lines at all** in that run; the driver wrote to its file sink
   instead. Do not read callback silence as NGX having nothing to say.
+- **P1.0 IS CLOSED — `CreateFeature(Reserved18)` returned `Success` on the
+  non-game adapter.** Run of `00:25:41`, 2026-09-03:
+  `handle=0x000001CC85E9AAC0`, `1280x720`, **213 ms**. The snippet's own log
+  for the same run: `Created feature 1 (output 1280x720, network 1280x720,
+  preset=0 -> CC_Control_History_Blend_Quantize_With_Teacher_honest_tench_
+  2026_07_04_22_30_weights)`. Teardown clean — `ReleaseFeature` Success,
+  `DestroyParameters` Success, no crash.
+  **The full working sequence, all seven steps:**
+
+  | # | Call | Module |
+  |---|---|---|
+  | 1 | `NVSDK_NGX_D3D12_Init` (app form, `FeatureCommonInfo`) | core |
+  | 2 | `GetCapabilityParameters` | core |
+  | 3 | `NVSDK_NGX_D3D12_Init_Ext` | **snippet** |
+  | 4 | `NVSDK_NGX_D3D12_PopulateParameters_Impl` | **snippet** |
+  | 5 | `Set("DLSSNR.Width"/"DLSSNR.Height")` | — |
+  | 6 | `CreateFeature(Reserved18)` | **snippet** |
+  | 7 | Close → Execute → fence wait → `ReleaseFeature` | — |
+
+  Steps 3, 4 and 5 are the ones that were missing. Removing any of them
+  reproduces a specific, different failure — see the code ladder below.
+- **The result-code ladder, in the order the project climbed it.** Each code
+  identifies exactly one missing thing; none of them is a defect report:
+
+  | Code | Means |
+  |---|---|
+  | `0xBAD0000B FAIL_UnableToInitializeFeature` | `CreateFeature` was called on the **core**, which has no snippet mapping for `Reserved18` |
+  | `0xBAD00007 FAIL_NotInitialized` | called on the snippet, but the **snippet's own session** was never opened |
+  | `0xBAD00005 FAIL_InvalidParameter` | snippet initialised, but it read `DLSSNR.Width`/`Height` and found nothing → built a 0×0 network |
+  | `0xBAD00002 FAIL_PlatformError` | the caller gate — the calling module's filename lacks `nvngx.dll` |
+  | `0xBAD0000C FAIL_OutOfDate` | a version gate at core init; **seen once and not reproduced** (see section 10) |
+
+- **`DLSSNR.Width` / `DLSSNR.Height` are the keys that matter, not
+  `NVSDK_NGX_Parameter_Width`/`_Height`.** The generic keys are `"Width"` and
+  `"Height"`; the feature reads its own namespace. Setting only the generic
+  pair produced `requested resolution 0x0 (network 0x0)` — and **it failed
+  silently on our side**: nothing in our log said the size had been ignored.
+  Only the snippet's log named it. `PopulateParameters_Impl` registers the
+  namespaced keys but does not fill them; it makes them exist, we supply the
+  values.
+- **What DLSS-NR allocates on GPU 1, measured at 1280×720:**
+
+  | Resource | Size | Scales with |
+  |---|---|---|
+  | `CG2RWeightHeap` | 140.9 MB | fixed — 153 tensors |
+  | `CG2RWeightUpload` | 140.9 MB | fixed |
+  | `CG2RPool` | 93.0 MB | **resolution** (15.1 MB at 0×0) |
+  | `dlssnr_prev_output` | 7.0 MB | resolution — the temporal history, a shared 2D texture |
+  | **total** | **381.8 MB** | |
+
+  Two kernels load: `PostProcess` (54824 bytes) and `Copy` (6936 bytes),
+  both block 16×16×1. **A 1440p working set will be substantially larger** —
+  the two pool-like resources scale with pixel count, so roughly 700 MB is a
+  reasonable planning figure. That is an extrapolation from one measurement,
+  not an observation; measure it before quoting it.
 - **A LumeniteFX technique has executed on GPU 1. P0's hypothesis is
   demonstrated.** With `gpu1.ini` as the GPU 1 runtime's own preset,
   `LUMENITE: QuantMotion` enabled, and `DEBUG_FLOW` set to `1` in the overlay,
@@ -787,6 +860,19 @@ is the first place to check for a pre-existing cause. Human-owned, like section
   installs third-party add-ons alongside ours, and if the same thing happens with
   them it is ReShade's input handling rather than anything this project
   introduced. Would be settled by: reproducing it with our add-on renamed away.
+- **One `0xBAD0000C FAIL_OutOfDate` at core init, seen once and not
+  reproduced.** Run of `00:06:58`; `nvngx.log` said `NGXInitValidateSnippets:
+  installed NGX API is older than the one used by client application`. The
+  configuration delta at the time was a set of `.ini` changes (`Generic Depth`
+  disabled among them), but the good runs on either side of it also show
+  `LaunchNGXUpdater` starting `nvngx_update.exe` with `OTAEnabled = 1`, and
+  the `cmsId` differs between runs (`1` vs `101654711`). **An over-the-air
+  snippet updater mutating `C:\ProgramData\NVIDIA\NGX\models` is a far more
+  natural partner for a version-validation error than a ReShade depth add-on
+  is.** Not settled, and it does not block anything: the known-good
+  configuration has `Generic Depth` enabled and is reproducible. Would be
+  settled by: three launches each way, with the OTA updater's activity noted
+  per run. **Do not build a theory on the one observation.**
 - **`Reference count for IDXGIFactory2 object ... is inconsistent (4)`.** New at
   T5, logged during our teardown right after ReShade destroys the GPU 1 runtime.
   It is ReShade's proxy around the factory our `create_present_chain` created and
