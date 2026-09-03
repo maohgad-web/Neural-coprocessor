@@ -1,10 +1,11 @@
-# VENDOR_LOCK — Milestone 0, Gate P0
+# VENDOR_LOCK — Milestone 0 (Gate P0) and the P1.0 probe
 
-The exact conditions under which P0 passed. Human-owned and human-observed:
-nothing here can be derived from the repository. If a later run disagrees with
-this file, this file describes the run that worked.
+The exact conditions under which P0 passed, and what the P1.0 rig runs observed.
+Human-owned and human-observed: nothing here can be derived from the repository.
+If a later run disagrees with this file, this file describes the run that
+happened.
 
-**P0 closed:** 2026-09-02.
+**P0 closed:** 2026-09-02. **P1.0 probe first run:** 2026-09-03.
 
 ---
 
@@ -83,6 +84,20 @@ DisabledAddons=Effect Runtime Sync
 at some point during DLSS-NR testing and is not part of what made P0 pass. It is
 recorded here so a future run that differs is not mistaken for a regression.
 
+`ReShade2.ini` (GPU 1 runtime — **written by ReShade**, not by us):
+
+```
+PresetPath=.\gpu1.ini
+```
+
+`gpu1.ini` (GPU 1 preset — root scope, no `[GENERAL]` header):
+
+```
+Techniques=Lumenite_QuantMotion@lumenite_QuantMotion.fx
+[lumenite_QuantMotion.fx]
+PreprocessorDefinitions=DEBUG_FLOW=1
+```
+
 ## Reference DLSS-NR configuration (single-GPU, GPU 0)
 
 Not part of P0. Recorded because it is the working NGX path on this exact rig and
@@ -105,41 +120,108 @@ Observed timings on this rig: `Init_Ext` → `CreateFeature(Reserved18)` took
 `flags=0x5` (RT|UAV), created lazily — one at init, three more about six seconds
 later, matching the game swapchain's `BufferCount=4`.
 
-**Two NGX facts established from the pinned header, not from that log.** Both
-were assumptions in P1.0's first draft and both turned out to be wrong or
-unconfirmed:
+**Two NGX facts read out of the pinned header, before any NGX code had run.**
+One held, one did not. Both are kept, with the outcome marked, because the
+value of this section is showing what header-reading can and cannot settle:
 
 - **`Shutdown1` is device-scoped.** The header states that passing a device
   shuts down only that device's instance and that passing `nullptr` shuts down
   all of them. The probe always passes the GPU 1 device, so the game's own NGX
   session on GPU 0 is not touched. This closes what was an open risk.
-- **`Init_Ext` is a Core↔Snippet entry point, not an application-facing one.**
-  The header declares it only under `NGX_SNIPPET_BUILD` — the interface the
-  driver core uses to call a feature DLL. The application-facing name in
-  `_nvngx.dll` is plain `NVSDK_NGX_D3D12_Init`, whose signature differs (it
-  takes `NVSDK_NGX_FeatureCommonInfo *` where `Init_Ext` takes
-  `NVSDK_NGX_Parameter *`, in a different argument position). Read that way,
-  the reference log's *"using force-loaded NVIDIA parameter provider
-  `_nvngx.dll`"* + *"attached snippet `nvngx_dlssnr.dll`"* + *"Init_Ext
-  succeeded"* describes the core supplying **parameters** while the **snippet**
-  receives the init and the feature — which is what "DLSS-NR **direct**" means.
-  P1.0 therefore resolves every entry point from `_nvngx.dll` first and
-  `nvngx_dlssnr.dll` second, and logs which module answered. **That is an
-  inference from a log, not an export table; the first rig run settles it.**
+- ~~**`Init_Ext` is a Core↔Snippet entry point, not an application-facing
+  one.**~~ **WRONG — disproved by the rig, 2026-09-03.** The reasoning was that
+  the header declares `Init_Ext` only under `NGX_SNIPPET_BUILD`, so the core
+  would not export it and the snippet would have to answer. The probe logged
+  `=core` for all seven entry points, `Init_Ext` among them: `_nvngx.dll`
+  exports it regardless of how the header gates the declaration. **A header's
+  preprocessor gating describes what a compiler sees, not what a DLL exports.**
+  The inference is kept struck through rather than deleted because the
+  dual-module resolver was designed around it, and the design survived being
+  wrong — that is the point of it.
 
-`ReShade2.ini` (GPU 1 runtime — **written by ReShade**, not by us):
+## P1.0 results — observed on the rig, 2026-09-03
 
-```
-PresetPath=.\gpu1.ini
-```
+The milestone's primary question, answered. Binary from commit B; log
+`ReShade.log` of the `20:24:22:051` run.
 
-`gpu1.ini` (GPU 1 preset — root scope, no `[GENERAL]` header):
+| Observation | Value |
+|---|---|
+| `NVSDK_NGX_D3D12_Init_Ext` | `result=0x00000001 (Success)` on the **headless** adapter, LUID `0x00000000-0x0001382B`, `outputs=0` |
+| `GetCapabilityParameters` | Success on GPU 1 |
+| Export provenance | all seven entry points `=core` (`_nvngx.dll`) |
+| `_nvngx.dll` | `0x00007FFE82D60000`, **already resident** — no DLSS add-on in the process, RenoDX absent from the log |
+| `nvngx_dlssnr.dll` | loads with plain `LoadLibraryW` from `Binaries\Win64\` |
+| `CreateFeature(Reserved18)` | `0xBAD0000B FAIL_UnableToInitializeFeature`, ~0 ms, with only `Width`/`Height` set |
+| Teardown | crashes; still being localised. Reproduces with RenoDX absent, so it is not our `Shutdown1` colliding with another NGX session. |
 
-```
-Techniques=Lumenite_QuantMotion@lumenite_QuantMotion.fx
-[lumenite_QuantMotion.fx]
-PreprocessorDefinitions=DEBUG_FLOW=1
-```
+**NGX runs on the non-render device.** That is the load-bearing result of the
+project so far, and it is now an observation rather than a hypothesis.
+
+## P1.0b results — observed on the rig, 2026-09-03
+
+Deployed as `nvngx.dll_mgpu_bridge.addon64`, **no RenoDX, no other DLSS add-on
+in the process.** Log `ReShade.log` of the `21:36:47:364` launch, plus NGX's own
+`nvngx.log` from the same run.
+
+| Observation | Value |
+|---|---|
+| Caller gate | **satisfied by the rename** — no `0xBAD00002 FAIL_PlatformError` |
+| `CreateFeature(Reserved18)` via snippet | `0xBAD00007 FAIL_NotInitialized`, 1 ms |
+| Meaning | the snippet has its **own** NGX session; initialising the core is not enough |
+| Snippet exports `Init` / `Init_Ext` | **yes** — both modules carry them |
+| Snippet exports `GetCapabilityParameters` / `DestroyParameters` | **no** — core only |
+| Core `Init` (application form, logging callback) | `Success` on LUID `0001382B` |
+| Teardown crash | **`NVSDK_NGX_D3D12_Shutdown1`**, localised by announce-before-call |
+| Logging callback | installed at VERBOSE, produced **zero** lines — driver used its file sink |
+| NGX driver log | `NGXCheckArchitectureSupport` matched NVAPI GPU handle `0x600`, LUID `{0x0, 0x1382b}` — GPU 1 |
+| NGX versions | core `1.4.0.0`, feature `310.1.0`, SDK `1.5`, driver `616.56` |
+
+**The core/snippet split is the contract.** The core owns the parameter block;
+the snippet owns the feature and its own session. Any future work that resolves
+NGX entry points must respect that division rather than searching one module
+first and stopping at the first hit.
+
+**`Shutdown1` is not called any more, on purpose.** P1.1 keeps NGX initialised
+for the process lifetime, so one session per launch reclaimed at process exit is
+the end state, not a workaround for the crash.
+
+### Enabling NGX's own log
+
+Set `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\LogLevel` to a non-zero
+`REG_DWORD`; the log lands under `%PROGRAMDATA%\NVIDIA\NGX\Logs`. It is a
+driver-side witness independent of anything this project writes, and it carried
+the adapter confirmation above. It is *not* reachable through an
+`NVSDK_NGX_FeatureCommonInfo` logging callback — that was installed at VERBOSE
+in the same run and produced nothing.
+
+### Reaching the NGX core without SetupAPI or a third-party add-on
+
+Two independent paths, both verified on this rig:
+
+1. **It is already there.** `GetModuleHandleW(L"_nvngx.dll")` succeeds in the
+   game process with only our add-on loaded. The locator is off the critical
+   path — it is a portability concern, not a dependency.
+2. **`HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore`** holds the path:
+
+   | Value | Type | Data |
+   |---|---|---|
+   | `FullPath` | `REG_SZ` | `C:\WINDOWS\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_a3944b54ff18b284` |
+   | `Installed` | `REG_DWORD` | `0x1` |
+   | `ShowDlssIndicator` | `REG_DWORD` | `0x400` |
+   | `LogLevel` | `REG_DWORD` | `0x0` |
+
+   Append `\_nvngx.dll`. No `setupapi.lib`, and **no new link library at all** —
+   `RegOpenKeyExW` / `RegQueryValueExW` / `RegCloseKey` come from
+   `LoadLibraryW(L"advapi32.dll")` + `GetProcAddress`, the same way the NGX
+   exports are resolved, so `CMakeLists.txt` stays closed at `dxgi`, `d3d12`.
+
+**The `nv_dispi.inf_amd64_…` hash changes on driver update.** It is recorded
+here as an observation of driver **616.56**, in the same spirit as the LUIDs
+above: read at runtime, never persisted as configuration, never hardcoded.
+Check `Installed == 1` before trusting `FullPath`.
+
+Fallback order, cheapest first: `GetModuleHandleW` → registry `FullPath` →
+`LoadLibraryW(L"_nvngx.dll")` on the default search path.
 
 ## What passed, and the evidence
 

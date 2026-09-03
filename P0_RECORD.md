@@ -171,12 +171,14 @@ launch** while probing adapters.
 Read sections 09 and 10 before designing anything. The load-bearing items, most
 decisive first:
 
-- **Untested and gating everything:** whether NGX will initialise and create a
-  feature on a **headless, non-game adapter**. That experiment costs almost
-  nothing — `Init_Ext` and `CreateFeature(Reserved18)` against the device T3
-  already creates, no transit, no game data — and it must precede any transit
-  work. If the answer is no, every transit task is work on a pipeline with no
-  consumer.
+- **Settled 2026-09-03 — NGX initialises on a headless, non-game adapter.**
+  This was the item that gated everything, and the P1.0 probe answered it:
+  `Init_Ext` → `Success` and `GetCapabilityParameters` → `Success` on the
+  `outputs=0` adapter. What remains open is narrower —
+  `CreateFeature(Reserved18)` returns `0xBAD0000B` when handed only
+  `Width`/`Height`, which is a parameter/resource gap, not an adapter
+  limit. Section 09 carries the full result, the export provenance, and
+  the two independent ways to reach `_nvngx.dll`.
 - **The DLSS-NR path is public API and needs no effect runtime.**
   `Init_Ext` → private outputs → `CreateFeature(Reserved18)` → `EvaluateFeature`,
   with the driver's own `_nvngx.dll` as parameter provider. A working single-GPU
@@ -403,6 +405,110 @@ signature you verified.
   `NVSDK_NGX_D3D12_Init_Ext` and `CreateFeature` succeed on a headless, non-game
   adapter. Untested. It should be tested before any transit work, because
   transit is pointless if the answer is no.
+- **ANSWERED — 2026-09-03, P1.0 probe, rig run.** `NVSDK_NGX_D3D12_Init_Ext`
+  returned `result=0x00000001 (Success)` against the **headless** adapter,
+  LUID `0x00000000-0x0001382B`, `outputs=0`, and
+  `GetCapabilityParameters` succeeded on it. NGX core initialises on a
+  non-game, display-less adapter. That is the fact the whole architecture
+  rested on and it is now observed, not assumed.
+  `CreateFeature(NVSDK_NGX_Feature_Reserved18)` returned
+  `0xBAD0000B FAIL_UnableToInitializeFeature` in ~0 ms with only `Width`
+  and `Height` set — an immediate parameter/resource rejection, not an
+  adapter refusal (an adapter refusal would not have let `Init_Ext` and
+  `GetCapabilityParameters` through). The reference path creates
+  `private output 1` **before** `CreateFeature` and sets more parameters;
+  that gap is P1.0b's subject.
+- **All seven NGX entry points resolve from `_nvngx.dll` — the core.**
+  Probe logged `=core` for every one, including
+  `NVSDK_NGX_D3D12_Init_Ext`. **This disproves the earlier header-derived
+  inference** that `Init_Ext` is a Core↔Snippet-only entry point absent
+  from the core's export table. The header declares it under
+  `NGX_SNIPPET_BUILD`, but the core exports it regardless. The dual-module
+  resolver (core first, snippet second, provenance logged) was written so
+  that this question would be answered by a log line instead of by a
+  crash; it did its job and stays.
+  `nvngx_dlssnr.dll` loads with a plain `LoadLibraryW` from the game's
+  `Binaries\Win64\` — no path manipulation needed.
+- **`_nvngx.dll` is already resident in the game process with no DLSS
+  add-on loaded.** Run of `20:24:22:051`: the only add-on registered was
+  `mgpu_bridge.addon64` — RenoDX absent from the whole log — and the probe
+  logged `_nvngx.dll=0x00007FFE82D60000 (already resident)`. Something in
+  the stock game/driver stack (UE5's own NVIDIA integration, or the
+  driver's D3D12 UMD) pulls the NGX core in unaided. **Consequence:**
+  `GetModuleHandleW(L"_nvngx.dll")` succeeds without any locator on this
+  rig and this game, so the DriverStore locator is **off the critical
+  path** and is a portability task, not a blocker. Do not build the
+  architecture around needing it.
+- **`HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` gives the
+  DriverStore path directly.** Read on the rig, 2026-09-03:
+
+  | Value | Type | Data |
+  |---|---|---|
+  | `FullPath` | `REG_SZ` | `C:\WINDOWS\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_a3944b54ff18b284` |
+  | `Installed` | `REG_DWORD` | `0x1` |
+  | `ShowDlssIndicator` | `REG_DWORD` | `0x400` |
+  | `LogLevel` | `REG_DWORD` | `0x0` |
+
+  Append `\_nvngx.dll` to `FullPath` and `LoadLibraryW` it. This
+  eliminates **SetupAPI enumeration** and **any third-party add-on
+  dependency** as ways to find the core. It also needs **no new link
+  library**: `CMakeLists.txt` stays closed (`dxgi`, `d3d12`) because
+  `advapi32.dll` can be reached with `LoadLibraryW(L"advapi32.dll")` +
+  `GetProcAddress` for `RegOpenKeyExW` / `RegQueryValueExW` /
+  `RegCloseKey`, exactly as the NGX exports are resolved.
+  **The hash in that path changes on driver update.** Treat it like a
+  LUID: read it at runtime, never persist it as configuration, never
+  hardcode it in a source file or an `.ini`. `Installed` must be `1`
+  before the path is trusted.
+  Fallback order for the core, cheapest first:
+  `GetModuleHandleW` → registry `FullPath` → `LoadLibraryW(L"_nvngx.dll")`
+  on the default search path. SetupAPI is not on the list.
+- **The snippet has its own NGX session, separate from the core's.** P1.0b
+  routed `CreateFeature` to `nvngx_dlssnr.dll` and the error changed:
+  `0xBAD0000B FAIL_UnableToInitializeFeature` (core) →
+  **`0xBAD00007 FAIL_NotInitialized`** (snippet), 1 ms, run of
+  `21:36:54:594`. The core was initialised; the snippet was not, and it
+  says so about itself. **Two inits are required, not one.**
+- **What each module exports, read off the rig rather than the header**
+  (P1.0b probes both modules for every name and logs both):
+
+  | Entry point | `_nvngx.dll` | `nvngx_dlssnr.dll` |
+  |---|---|---|
+  | `Init`, `Init_Ext` | yes | **yes** |
+  | `Shutdown1` | yes | yes |
+  | `CreateFeature`, `ReleaseFeature`, `EvaluateFeature` | yes | yes |
+  | `GetCapabilityParameters` | yes | **no** |
+  | `DestroyParameters` | yes | **no** |
+
+  The split is the contract: **the core owns the parameter block, the
+  snippet owns the feature**, and the snippet has an init of its own. A
+  design that resolves init from the core alone is incomplete — that was
+  P1.0b's error, and the table above is why.
+- **The caller gate is satisfied by the module rename.** Deployed as
+  `nvngx.dll_mgpu_bridge.addon64`, calls into the snippet returned a
+  feature-state error and **not** `0xBAD00002 FAIL_PlatformError`. ReShade
+  loads the renamed file normally and registers it as `"MGPU Bridge"`. No
+  shim DLL, no byte patching, nothing modified on disk but our own output
+  name. The rename happens in CI's deploy-staging step, so
+  `CMakeLists.txt` stays closed.
+- **The teardown crash is `NVSDK_NGX_D3D12_Shutdown1`.** Localised by
+  announcing each teardown step before making the call: every other step
+  logged its own completion, `Shutdown1` logged its announcement and
+  nothing after. Resolved by **not calling it** — P1.1 keeps NGX
+  initialised for the process lifetime anyway, so one session per launch,
+  reclaimed at process exit, is the correct end state rather than a
+  workaround. Do not spend a cycle making `Shutdown1` work.
+- **NGX's own log is at `%PROGRAMDATA%\NVIDIA\NGX\Logs` once
+  `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\LogLevel` is non-zero**,
+  and it is a second, driver-side witness. Its
+  `NGXCheckArchitectureSupport` line named
+  `NVAPI physical GPU handle 0x600, LUID { 0x0, 0x1382b }` — GPU 1 —
+  independently confirming the architecture check passes on the headless
+  adapter. It also reports `ngxCoreVersion 1.4.0.0`,
+  `ngxFeatureVersion 310.1.0`, `ngxSDKVersion 1.5`, driver `616.56`.
+  **An installed `NVSDK_NGX_FeatureCommonInfo` logging callback produced
+  no lines at all** in that run; the driver wrote to its file sink
+  instead. Do not read callback silence as NGX having nothing to say.
 - **A LumeniteFX technique has executed on GPU 1. P0's hypothesis is
   demonstrated.** With `gpu1.ini` as the GPU 1 runtime's own preset,
   `LUMENITE: QuantMotion` enabled, and `DEBUG_FLOW` set to `1` in the overlay,
