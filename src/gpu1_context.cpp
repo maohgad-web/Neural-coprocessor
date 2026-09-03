@@ -2703,10 +2703,37 @@ namespace
         return hr;
     }
 
+    static double qpc_ms(const LARGE_INTEGER &a, const LARGE_INTEGER &b,
+                         const LARGE_INTEGER &freq)
+    {
+        return (freq.QuadPart > 0)
+            ? ((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)freq.QuadPart) : 0.0;
+    }
+
     // Close, submit, wait. Bounded - a hang here would take the bridge
     // thread with it, and a timeout is a result we can print.
-    HRESULT transit_flush(transit_side &s, DWORD timeout_ms)
+    //
+    // P1.4a. `submit_ms` and `wait_ms` split this in two, and that split is
+    // the whole point of this build. 36 samples put the round trip at a
+    // ~6.6 ms fixed cost plus ~2.29 ms/MiB, and the fixed part decides the
+    // architecture: if it lives in the WAIT it is our synchronisation and
+    // pipelining deletes it; if it lives in the SUBMIT or the copies it is
+    // real work and it does not.
+    //
+    // What these two numbers are, precisely: `submit_ms` is Close +
+    // ExecuteCommandLists + Signal - CPU time spent handing work to the
+    // driver, not GPU time. `wait_ms` is wall-clock from the signal being
+    // queued to the fence event firing, so it contains the GPU's execution
+    // AND any queue latency in front of it. Neither is a GPU timestamp;
+    // separating execution from queueing needs timestamp queries, which stay
+    // in P2. State that when quoting either number.
+    HRESULT transit_flush(transit_side &s, DWORD timeout_ms,
+                          double *submit_ms = nullptr, double *wait_ms = nullptr)
     {
+        LARGE_INTEGER f{}, a{}, b{}, c{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+
         HRESULT hr = s.list->Close();
         if (FAILED(hr)) return hr;
         ID3D12CommandList *const lists[1] = { s.list };
@@ -2715,7 +2742,14 @@ namespace
         hr = s.queue->Signal(s.fence, s.fence_value);
         if (FAILED(hr)) return hr;
         s.fence->SetEventOnCompletion(s.fence_value, s.event);
-        return (WaitForSingleObject(s.event, timeout_ms) == WAIT_OBJECT_0) ? S_OK : E_FAIL;
+
+        QueryPerformanceCounter(&b);
+        const bool ok = (WaitForSingleObject(s.event, timeout_ms) == WAIT_OBJECT_0);
+        QueryPerformanceCounter(&c);
+
+        if (submit_ms != nullptr) *submit_ms = qpc_ms(a, b, f);
+        if (wait_ms   != nullptr) *wait_ms   = qpc_ms(b, c, f);
+        return ok ? S_OK : E_FAIL;
     }
 }
 
@@ -3321,8 +3355,13 @@ bool transit_probe(const char *tag)
 
         LARGE_INTEGER f{}, t0{}, t1{};
         QueryPerformanceFrequency(&f);
+        // P1.4a stage boundaries. r0/r1 bracket GPU 0's command recording,
+        // r2/r3 GPU 1's; the two flushes report their own submit/wait split.
+        LARGE_INTEGER r0{}, r1{}, r2{}, r3{}, c0{}, c1{};
+        double sub0 = 0.0, wait0 = 0.0, sub1 = 0.0, wait1 = 0.0;
 
         // GPU 0: upload -> tex0 -> shared buffer.
+        QueryPerformanceCounter(&r0);
         g0.alloc->Reset(); g0.list->Reset(g0.alloc, nullptr);
         {
             D3D12_TEXTURE_COPY_LOCATION s{}, d{};
@@ -3338,8 +3377,9 @@ bool transit_probe(const char *tag)
             d2.PlacedFootprint = fp; d2.PlacedFootprint.Offset = 0;
             g0.list->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
         }
-        QueryPerformanceCounter(&t0);
-        hr = transit_flush(g0, 20000);
+        QueryPerformanceCounter(&r1);
+        t0 = r1;
+        hr = transit_flush(g0, 20000, &sub0, &wait0);
         if (FAILED(hr))
         {
             snprintf(line, sizeof line, "[MGPU][P1.3] %ux%u GPU0 submit/wait failed hr=0x%08X",
@@ -3349,6 +3389,7 @@ bool transit_probe(const char *tag)
         }
 
         // GPU 1: shared buffer -> tex1 -> readback.
+        QueryPerformanceCounter(&r2);
         g1.alloc->Reset(); g1.list->Reset(g1.alloc, nullptr);
         {
             D3D12_TEXTURE_COPY_LOCATION s{}, d{};
@@ -3364,7 +3405,8 @@ bool transit_probe(const char *tag)
             d2.PlacedFootprint = fp; d2.PlacedFootprint.Offset = 0;
             g1.list->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
         }
-        hr = transit_flush(g1, 20000);
+        QueryPerformanceCounter(&r3);
+        hr = transit_flush(g1, 20000, &sub1, &wait1);
         QueryPerformanceCounter(&t1);
         if (FAILED(hr))
         {
@@ -3379,6 +3421,7 @@ bool transit_probe(const char *tag)
 
         // ---- did the bytes survive the crossing? ----
         {
+            QueryPerformanceCounter(&c0);
             const unsigned char *p = nullptr;
             D3D12_RANGE all{0, (SIZE_T)bytes};
             if (FAILED(read1->Map(0, &all, (void **)&p)) || p == nullptr)
@@ -3413,6 +3456,7 @@ bool transit_probe(const char *tag)
             }
             D3D12_RANGE nothing{0, 0};
             read1->Unmap(0, &nothing);
+            QueryPerformanceCounter(&c1);
 
             const double mib = (double)bytes / (1024.0 * 1024.0);
             snprintf(line, sizeof line,
@@ -3420,6 +3464,34 @@ bool transit_probe(const char *tag)
                      "(%.0f MiB/s apparent) differing=%llu of %llu sentinel=%llu",
                      width, height, path, mib, ms, ms > 0.0 ? (mib / (ms / 1000.0)) : 0.0,
                      differing, total, sentinel);
+            mgpu::diag::info(line);
+
+            // P1.4a. The same round trip, decomposed. rec0/rec1 are CPU
+            // command recording; sub0/sub1 are Close+Execute+Signal; wait0/
+            // wait1 are fence wall-clock (GPU execution plus queue latency).
+            // verify is CPU-only readback and comparison and is NOT part of
+            // the round trip above - it is printed so the run's total cost
+            // is accounted for rather than partly invisible.
+            //
+            // How to read it: rec+sub is CPU-side driver overhead that a
+            // pipelined design still pays but can overlap. wait0+wait1 is the
+            // part that pipelining and a shared fence are meant to remove,
+            // because in the real design GPU 1 does not block on a CPU event
+            // between the two halves. If wait0+wait1 dominates, the ~6.6 ms
+            // fixed cost is an artefact of this probe's structure and the
+            // architecture survives. If rec+sub dominates, it does not, and
+            // no amount of pipelining fixes it.
+            const double rec0 = qpc_ms(r0, r1, f);
+            const double rec1 = qpc_ms(r2, r3, f);
+            const double verify = qpc_ms(c0, c1, f);
+            const double cpu_side = rec0 + rec1 + sub0 + sub1;
+            const double waits = wait0 + wait1;
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.4a] %ux%u breakdown: rec0=%.2f sub0=%.2f wait0=%.2f | "
+                     "rec1=%.2f sub1=%.2f wait1=%.2f | cpu(rec+sub)=%.2f waits=%.2f "
+                     "(%.0f%% of the trip) round_trip=%.2f verify=%.2f ms",
+                     width, height, rec0, sub0, wait0, rec1, sub1, wait1,
+                     cpu_side, waits, ms > 0.0 ? (waits / ms * 100.0) : 0.0, ms, verify);
             mgpu::diag::info(line);
 
             if (differing == 0)
