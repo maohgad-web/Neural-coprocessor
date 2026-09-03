@@ -25,15 +25,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # P1.0 moved exactly two symbols out of this pattern - NVSDK_NGX and
-      # nvngx - in the same commit that first used them. The other eight
-      # stay: this milestone's probe transits nothing, so none of them are
-      # needed, and widening the pattern to make a build pass would delete
-      # the guard rather than move it.
+      # The guard has been sequencing the remaining work all along, and
+      # P1.3 moves exactly the four symbols it needs, in the same commit
+      # that first uses them:
+      #
+      #   moved by P1.0  NVSDK_NGX  nvngx
+      #   moved by P1.3  SHARED_CROSS_ADAPTER  HEAP_FLAG_SHARED
+      #                  CreateSharedHandle    OpenSharedHandle
+      #   still guarded  reshade_finish_effects            -> P1.4
+      #                  FENCE_FLAG_SHARED                 -> P2
+      #                  COMMAND_LIST_TYPE_COPY            -> P2
+      #                  GetClockCalibration               -> P2
+      #
+      # P1.3 synchronises with a CPU wait between two submissions, on
+      # purpose: pipelining is P2's problem. Widening this pattern to make
+      # a build pass deletes the guard rather than moving it.
       - name: P1 containment check
         shell: bash
         run: |
-          PATTERN='SHARED_CROSS_ADAPTER|HEAP_FLAG_SHARED|CreateSharedHandle|OpenSharedHandle|FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|GetClockCalibration'
+          PATTERN='FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|GetClockCalibration'
           FOUND=0
           for DIR in src assets; do
             [ -d "$DIR" ] || continue
