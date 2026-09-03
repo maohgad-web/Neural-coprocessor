@@ -1374,12 +1374,19 @@ bool ngx_probe(UINT width, UINT height)
     // nothing crossing the bus - the whole point of doing evaluation before
     // transit is that this milestone needs no bus at all.
     ID3D12Resource *tex_color = nullptr;    // NR input   (the uploaded pattern)
-    ID3D12Resource *tex_output = nullptr;   // NR output  (RT|UAV - never the input)
     ID3D12Resource *tex_depth = nullptr;    // cleared depth, only if NR demands one
     ID3D12Resource *tex_mvec = nullptr;     // zero motion
     ID3D12Resource *buf_upload = nullptr;
     ID3D12Resource *buf_read_in = nullptr;
-    ID3D12Resource *buf_read_out = nullptr;
+
+    // P1.2: THREE outputs, not one. A and C are evaluated at the same low
+    // intensity and B at a high one, in the order A -> B -> C. Two outputs
+    // would only show that something changed between evaluates; the third
+    // is what separates "intensity changed the image" from "the second
+    // evaluate differs because the first one ran". See the verdict block.
+    static const int NOUT = 3;
+    ID3D12Resource *tex_out[NOUT] = {};     // RT|UAV - never the input
+    ID3D12Resource *buf_read_out[NOUT] = {};
 
     // Unwinds in reverse order of construction and logs every NGX result it
     // produces - a teardown call is an NGX call too, and acceptance item 2
@@ -1509,12 +1516,15 @@ bool ngx_probe(UINT width, UINT height)
         // After ReleaseFeature and after the drain: NR held these while the
         // feature existed, and the drain above is what guarantees the GPU
         // is no longer reading them.
-        if (buf_read_out != nullptr) { buf_read_out->Release(); buf_read_out = nullptr; }
+        for (int i = NOUT - 1; i >= 0; --i)
+        {
+            if (buf_read_out[i] != nullptr) { buf_read_out[i]->Release(); buf_read_out[i] = nullptr; }
+            if (tex_out[i]      != nullptr) { tex_out[i]->Release();      tex_out[i]      = nullptr; }
+        }
         if (buf_read_in  != nullptr) { buf_read_in->Release();  buf_read_in  = nullptr; }
         if (buf_upload   != nullptr) { buf_upload->Release();   buf_upload   = nullptr; }
         if (tex_mvec     != nullptr) { tex_mvec->Release();     tex_mvec     = nullptr; }
         if (tex_depth    != nullptr) { tex_depth->Release();    tex_depth    = nullptr; }
-        if (tex_output   != nullptr) { tex_output->Release();   tex_output   = nullptr; }
         if (tex_color    != nullptr) { tex_color->Release();    tex_color    = nullptr; }
 
         // ---- 3. the D3D12 objects, reverse creation order ----
@@ -1873,52 +1883,66 @@ bool ngx_probe(UINT width, UINT height)
     }
 
     // =================================================================
-    // P1.1 - does the model EXECUTE on GPU 1, and does it consume what we
-    //        hand it?
+    // P1.2 - are the tuning parameters LIVE per evaluate, or baked at
+    //        CreateFeature?
     //
-    // P1.0c proved the feature can be built here. That is not the same as
-    // the network running: CreateFeature accepted a schema, it dispatched
-    // no tensors. Everything below is local to GPU 1 - our own textures,
-    // our own command list, no shared handles, nothing across the bus.
-    // Transit is deliberately not part of this milestone, for the same
-    // reason P1.0 came before transit: if the model will not execute on a
-    // display-less adapter, every byte moved would have been wasted.
+    // P1.1 closed the execution question: the model runs on GPU 1 and
+    // rewrites every pixel. It left one thing open, and the snippet named
+    // it itself:
     //
-    // The proof is NUMERIC, not visual. NR reconstructs organic sub-pixel
-    // detail; on the flat cycling colour this window presents, a working
-    // model and a no-op are indistinguishable by eye. So the probe uploads
-    // a structured pattern, evaluates, copies input and output back to the
-    // CPU and counts differing pixels. Non-zero means tensors ran.
+    //     DLSSNR: PollRuntimeParams - callback is NULL (core did not set it)
+    //
+    // NR expects a runtime-parameter callback that the core normally
+    // installs. On our path it is absent. So the echoed intensity=0.84
+    // proves the value was READ; it does not prove it was APPLIED. If
+    // tuning is frozen at CreateFeature, every quality change costs a
+    // ~220 ms feature rebuild, and that is an architectural constraint
+    // rather than a detail.
+    //
+    // THE CONTROL. Two evaluates would only show that something changed
+    // between them - NR keeps a temporal history (dlssnr_prev_output), so
+    // the second evaluate could differ from the first for reasons that have
+    // nothing to do with intensity. Three evaluates settle it:
+    //
+    //     A  intensity LOW    C  intensity LOW  (same as A, run last)
+    //     B  intensity HIGH
+    //
+    //     A == B            -> parameters are frozen at create
+    //     A != B, A == C    -> intensity is live per evaluate
+    //     A != B, A != C    -> history contamination; inconclusive
+    //
+    // Without C, that third case reads as a pass. DLSSNR.Reset is set on
+    // every evaluate to ask NR to discard history, so A == C is what we
+    // expect if Reset does what it says - and if it does not, the log says
+    // so instead of us believing a wrong answer.
+    //
+    // Still entirely local to GPU 1. No shared handles, nothing on the bus.
     // =================================================================
     {
-        // NR must never write to its own input (the guide is explicit, and
-        // the reference path creates a separate "private output"). Colour
-        // in and colour out are therefore two distinct textures.
-        //
-        // R8G8B8A8_UNORM matches this runtime's swapchain and is
-        // display-referred, which is what NR expects - it is a post-tone-map
-        // pass, and feeding it linear HDR blows out the image rather than
-        // merely looking different. The reference used R10G10B10A2 at 1440p;
-        // if the format is rejected the result code will say so and this is
-        // the one line to change.
         const DXGI_FORMAT fmt_color = DXGI_FORMAT_R8G8B8A8_UNORM;
         const DXGI_FORMAT fmt_mvec  = DXGI_FORMAT_R16G16_FLOAT;
-        // R32_FLOAT rather than a real depth format on purpose: NR reads
-        // depth as a plain texture, and a D32_FLOAT resource would need
-        // ALLOW_DEPTH_STENCIL, which conflicts with the simple copy path
-        // used to initialise it.
+        // R32_FLOAT rather than a real depth format: NR reads depth as a
+        // plain texture, and a D32_FLOAT resource would need
+        // ALLOW_DEPTH_STENCIL, which conflicts with the copy path used to
+        // initialise it. P1.1 established depth may be null anyway; this is
+        // kept only as the retry path.
         const DXGI_FORMAT fmt_depth = DXGI_FORMAT_R32_FLOAT;
+
+        // The two intensities. Far apart on purpose: if a wide separation
+        // produces no difference, a narrow one certainly would not, and a
+        // null result is only informative when the input range was generous.
+        const float INTENSITY_LO = 0.0f;
+        const float INTENSITY_HI = 1.6f;
+        const float intensities[NOUT] = { INTENSITY_LO, INTENSITY_HI, INTENSITY_LO };
+        const char *labels[NOUT]      = { "A(lo)",      "B(hi)",      "C(lo)" };
 
         HRESULT hr = make_tex(dev, width, height, fmt_color,
                               D3D12_RESOURCE_FLAG_NONE,
                               D3D12_RESOURCE_STATE_COPY_DEST, &tex_color);
-        // COPY_DEST, not UNORDERED_ACCESS: the output is pre-filled with a
-        // sentinel before evaluation (see below) and transitions to UAV
-        // afterwards.
-        if (SUCCEEDED(hr))
+        for (int i = 0; i < NOUT && SUCCEEDED(hr); ++i)
             hr = make_tex(dev, width, height, fmt_color,
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                          D3D12_RESOURCE_STATE_COPY_DEST, &tex_output);
+                          D3D12_RESOURCE_STATE_COPY_DEST, &tex_out[i]);
         if (SUCCEEDED(hr))
             hr = make_tex(dev, width, height, fmt_mvec,
                           D3D12_RESOURCE_FLAG_NONE,
@@ -1929,55 +1953,48 @@ bool ngx_probe(UINT width, UINT height)
                           D3D12_RESOURCE_STATE_COPY_DEST, &tex_depth);
 
         snprintf(line, sizeof line,
-                 "[MGPU][P1.1] resources hr=0x%08X color=0x%p output=0x%p(UAV) mvec=0x%p "
-                 "depth=0x%p %ux%u",
-                 (unsigned)hr, (void *)tex_color, (void *)tex_output,
-                 (void *)tex_mvec, (void *)tex_depth, width, height);
+                 "[MGPU][P1.2] resources hr=0x%08X color=0x%p outA=0x%p outB=0x%p outC=0x%p "
+                 "mvec=0x%p depth=0x%p %ux%u",
+                 (unsigned)hr, (void *)tex_color, (void *)tex_out[0], (void *)tex_out[1],
+                 (void *)tex_out[2], (void *)tex_mvec, (void *)tex_depth, width, height);
         mgpu::diag::info(line);
         if (FAILED(hr))
         {
-            teardown("P1.1 resource creation");
+            teardown("P1.2 resource creation");
             return false;
         }
 
-        // ---- footprints and one upload buffer for all three inputs ----
-        //
-        // Row pitches are padded to 256 bytes and each subresource's offset
-        // to 512, so the sizes come from GetCopyableFootprints rather than
-        // from width x height x bpp. At 1280 wide the colour pitch is
-        // already 5120 and needs no padding, but that is a property of this
-        // resolution and must not be assumed.
+        // ---- footprints: colour, mvec, depth, then one sentinel per output ----
         D3D12_RESOURCE_DESC d_color = tex_color->GetDesc();
         D3D12_RESOURCE_DESC d_mvec  = tex_mvec->GetDesc();
         D3D12_RESOURCE_DESC d_depth = tex_depth->GetDesc();
 
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_color{}, fp_mvec{}, fp_depth{};
-        UINT64 sz_color = 0, sz_mvec = 0, sz_depth = 0;
-        UINT rows_color = 0, rows_mvec = 0, rows_depth = 0;
-        UINT64 rb_color = 0, rb_mvec = 0, rb_depth = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_color{}, fp_mvec{}, fp_depth{}, fp_out[NOUT]{};
+        UINT64 sz_color = 0, sz_mvec = 0, sz_depth = 0, sz_out = 0;
+        UINT rows = 0; UINT64 rowb = 0;
 
-        dev->GetCopyableFootprints(&d_color, 0, 1, 0, &fp_color, &rows_color, &rb_color, &sz_color);
+        dev->GetCopyableFootprints(&d_color, 0, 1, 0, &fp_color, &rows, &rowb, &sz_color);
         const UINT64 off_mvec = (sz_color + 511) & ~(UINT64)511;
-        dev->GetCopyableFootprints(&d_mvec, 0, 1, off_mvec, &fp_mvec, &rows_mvec, &rb_mvec, &sz_mvec);
+        dev->GetCopyableFootprints(&d_mvec, 0, 1, off_mvec, &fp_mvec, &rows, &rowb, &sz_mvec);
         const UINT64 off_depth = (off_mvec + sz_mvec + 511) & ~(UINT64)511;
-        dev->GetCopyableFootprints(&d_depth, 0, 1, off_depth, &fp_depth, &rows_depth, &rb_depth, &sz_depth);
+        dev->GetCopyableFootprints(&d_depth, 0, 1, off_depth, &fp_depth, &rows, &rowb, &sz_depth);
 
-        // A fourth region: the SENTINEL that pre-fills the output.
+        // The SENTINEL, one region per output.
         //
-        // Without it "output differs from input" is not proof of anything.
-        // A texture NR never wrote is not black - it is UNINITIALISED, and
-        // uninitialised memory differs from the input too. The probe would
-        // then report PROBE PASSED on garbage, which is the precise class of
-        // false positive this project exists to avoid.
-        //
-        // With it the comparison is three-way and each outcome is
-        // unambiguous: still sentinel = NR wrote nothing; equal to input =
-        // NR copied; neither = NR processed.
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_out{};
-        UINT64 sz_out = 0, rb_out = 0; UINT rows_out = 0;
-        const UINT64 off_out = (off_depth + sz_depth + 511) & ~(UINT64)511;
-        dev->GetCopyableFootprints(&d_color, 0, 1, off_out, &fp_out, &rows_out, &rb_out, &sz_out);
-        const UINT64 upload_bytes = off_out + sz_out;
+        // Without it "the output differs from the input" is not proof of
+        // anything: a texture NR never wrote is not black, it is
+        // UNINITIALISED, and uninitialised memory differs from the input
+        // too. With it, each output is unambiguous - still sentinel means
+        // nothing was written there.
+        UINT64 off_out[NOUT] = {};
+        UINT64 cursor = off_depth + sz_depth;
+        for (int i = 0; i < NOUT; ++i)
+        {
+            off_out[i] = (cursor + 511) & ~(UINT64)511;
+            dev->GetCopyableFootprints(&d_color, 0, 1, off_out[i], &fp_out[i], &rows, &rowb, &sz_out);
+            cursor = off_out[i] + sz_out;
+        }
+        const UINT64 upload_bytes = cursor;
 
         // Chosen so it cannot occur in the pattern: fill_pattern always
         // writes B = 0.70*R, so any pixel with B far above R is ours.
@@ -1986,48 +2003,49 @@ bool ngx_probe(UINT width, UINT height)
         hr = make_buf(dev, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, &buf_upload);
         if (SUCCEEDED(hr))
             hr = make_buf(dev, sz_color, D3D12_HEAP_TYPE_READBACK, &buf_read_in);
-        if (SUCCEEDED(hr))
-            hr = make_buf(dev, sz_color, D3D12_HEAP_TYPE_READBACK, &buf_read_out);
+        for (int i = 0; i < NOUT && SUCCEEDED(hr); ++i)
+            hr = make_buf(dev, sz_color, D3D12_HEAP_TYPE_READBACK, &buf_read_out[i]);
         if (FAILED(hr))
         {
-            snprintf(line, sizeof line, "[MGPU][P1.1] staging buffers hr=0x%08X", (unsigned)hr);
+            snprintf(line, sizeof line, "[MGPU][P1.2] staging buffers hr=0x%08X", (unsigned)hr);
             mgpu::diag::error(line);
-            teardown("P1.1 staging buffers");
+            teardown("P1.2 staging buffers");
             return false;
         }
 
         {
             unsigned char *mapped = nullptr;
-            D3D12_RANGE none{0, 0};   // we only write; nothing to read back in
+            D3D12_RANGE none{0, 0};   // write-only mapping
             hr = buf_upload->Map(0, &none, reinterpret_cast<void **>(&mapped));
             if (FAILED(hr))
             {
-                snprintf(line, sizeof line, "[MGPU][P1.1] upload Map hr=0x%08X", (unsigned)hr);
+                snprintf(line, sizeof line, "[MGPU][P1.2] upload Map hr=0x%08X", (unsigned)hr);
                 mgpu::diag::error(line);
-                teardown("P1.1 upload Map");
+                teardown("P1.2 upload Map");
                 return false;
             }
-            // Motion and depth are ZERO for this milestone. Zero flow is the
-            // correct "nothing moved" input and it makes the result
-            // interpretable: any change in the output is the spatial model,
-            // not temporal reprojection. QuantMotion's real 320x180 flow
-            // arrives in P1.4 with the subrect and MVecScale keys that a
-            // lower-resolution motion buffer requires.
-            memset(mapped + off_mvec, 0, (size_t)(upload_bytes - off_mvec));
+            // Motion and depth are ZERO. Zero flow is the correct "nothing
+            // moved" input and it keeps this test about intensity alone.
+            // QuantMotion's real 320x180 flow arrives in P1.5, with the
+            // subrect and MVecScale values a lower-resolution motion buffer
+            // needs.
+            memset(mapped + off_mvec, 0, (size_t)(off_out[0] - off_mvec));
             fill_pattern(mapped + fp_color.Offset, width, height, fp_color.Footprint.RowPitch);
-            for (UINT y = 0; y < height; ++y)
-            {
-                unsigned char *row = mapped + fp_out.Offset + (size_t)y * fp_out.Footprint.RowPitch;
-                for (UINT x = 0; x < width; ++x)
+            for (int i = 0; i < NOUT; ++i)
+                for (UINT y = 0; y < height; ++y)
                 {
-                    unsigned char *p = row + (size_t)x * 4;
-                    p[0] = SENT_R; p[1] = SENT_G; p[2] = SENT_B; p[3] = 255;
+                    unsigned char *row = mapped + fp_out[i].Offset
+                                       + (size_t)y * fp_out[i].Footprint.RowPitch;
+                    for (UINT x = 0; x < width; ++x)
+                    {
+                        unsigned char *p = row + (size_t)x * 4;
+                        p[0] = SENT_R; p[1] = SENT_G; p[2] = SENT_B; p[3] = 255;
+                    }
                 }
-            }
             buf_upload->Unmap(0, nullptr);
         }
 
-        // ---- record: upload -> barriers -> evaluate -> readback ----
+        // ---- record: uploads -> barriers -> three evaluates -> readbacks ----
         auto copy_in = [&](ID3D12Resource *dst, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &fp)
         {
             D3D12_TEXTURE_COPY_LOCATION s{};
@@ -2040,32 +2058,30 @@ bool ngx_probe(UINT width, UINT height)
             d.SubresourceIndex = 0;
             pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
         };
-        copy_in(tex_color,  fp_color);
-        copy_in(tex_mvec,   fp_mvec);
-        copy_in(tex_depth,  fp_depth);
-        copy_in(tex_output, fp_out);     // the sentinel
+        copy_in(tex_color, fp_color);
+        copy_in(tex_mvec,  fp_mvec);
+        copy_in(tex_depth, fp_depth);
+        for (int i = 0; i < NOUT; ++i)
+            copy_in(tex_out[i], fp_out[i]);
 
         const D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barrier(pcmd, tex_color, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
         barrier(pcmd, tex_mvec,  D3D12_RESOURCE_STATE_COPY_DEST, read_state);
         barrier(pcmd, tex_depth, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
-        barrier(pcmd, tex_output, D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        for (int i = 0; i < NOUT; ++i)
+            barrier(pcmd, tex_out[i], D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-        // ---- the parameters ----
+        // ---- the parameters that do not change between evaluates ----
         //
-        // Namespaced keys, like DLSSNR.Width in P1.0c. PopulateParameters_Impl
-        // registered these; it did not fill them, and per the guide it does
-        // NOT register the subrect keys at all - those are set here by hand.
-        //
-        // The subrect naming has no separator: DLSSNR.ColorSubrectWidth, NOT
-        // DLSSNR.Color.SubrectWidth. Getting it wrong fails silently - the
-        // value is stored, nothing reads it, and the feature runs on the
-        // full resource extent. That is the same class of failure that cost
-        // P1.0c a rig cycle on DLSSNR.Width.
-        params->Set("DLSSNR.Color",  tex_color);
-        params->Set("DLSSNR.Output", tex_output);
-        params->Set("DLSSNR.MVec",   tex_mvec);
+        // Namespaced keys. PopulateParameters_Impl registers these but does
+        // not fill them, and per the guide it does NOT register the subrect
+        // keys at all - those are set here by hand. The subrect naming has
+        // no separator: DLSSNR.ColorSubrectWidth, NOT
+        // DLSSNR.Color.SubrectWidth. P1.1 confirmed every spelling below by
+        // seeing them echoed in the snippet's own log.
+        params->Set("DLSSNR.Color", tex_color);
+        params->Set("DLSSNR.MVec",  tex_mvec);
 
         params->Set("DLSSNR.ColorSubrectBaseX", 0u);
         params->Set("DLSSNR.ColorSubrectBaseY", 0u);
@@ -2080,75 +2096,78 @@ bool ngx_probe(UINT width, UINT height)
         params->Set("DLSSNR.MVecSubrectWidth", (unsigned int)width);
         params->Set("DLSSNR.MVecSubrectHeight", (unsigned int)height);
 
-        // Motion is at colour resolution this milestone, so the scale is
-        // 1.0 - NOT because 1.0 is a safe default but because the two
-        // extents genuinely match. When QuantMotion's 320x180 grid arrives
-        // this becomes the ratio between the two, and leaving it at 1.0
-        // would silently misread every vector.
+        // Motion is at colour resolution here, so the scale genuinely is
+        // 1.0 - not a safe default, a true one. When QuantMotion's 320x180
+        // grid arrives this becomes the ratio between the two extents, and
+        // leaving it at 1.0 would silently misread every vector.
         params->Set("DLSSNR.MVecScaleX", 1.0f);
         params->Set("DLSSNR.MVecScaleY", 1.0f);
         params->Set("DLSSNR.DepthInverted", 0u);
-        params->Set("DLSSNR.Reset", 1u);          // first frame of a new feature
 
-        // Tuning, taken from the reference tool's own working configuration
-        // rather than invented. Recorded in VENDOR_LOCK.md.
-        params->Set("DLSSNR.Intensity", 0.842f);
+        // Held CONSTANT across all three evaluates. Only Intensity varies,
+        // so that a difference has exactly one possible cause.
         params->Set("DLSSNR.LocalToneStrength", 1.142f);
         params->Set("DLSSNR.LocalStructureStrength", 1.092f);
         params->Set("DLSSNR.SkinStructureStrength", 1.025f);
         params->Set("DLSSNR.UseAutoMask", 1u);
 
-        // ---- evaluate, depth-free FIRST ----
-        //
-        // The reference tool runs guidanceMode=2 with depthInterval=4, which
-        // proves that mode exists but NOT that depth may be absent - it has
-        // the game's depth buffer and supplies it on a cadence. So this is a
-        // test, not an assumption: try without depth, and if NR refuses,
-        // bind the cleared depth and try again. Two result codes, one run,
-        // and the question is settled either way.
+        // P1.1 established depth may be null - it was accepted on the first
+        // attempt and the snippet logged Depth=0000000000000000. Kept as a
+        // retry path only.
+        params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
+
         LARGE_INTEGER f{}, e0{}, e1{};
         QueryPerformanceFrequency(&f);
-
-        params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
-        QueryPerformanceCounter(&e0);
-        NVSDK_NGX_Result er = p_evaluate(pcmd, handle, params, nullptr);
-        QueryPerformanceCounter(&e1);
-        double ems = (f.QuadPart > 0)
-            ? ((double)(e1.QuadPart - e0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
-        snprintf(line, sizeof line,
-                 "[MGPU][P1.1] EvaluateFeature (no depth): result=0x%08X (%s) record_cpu=%.2fms",
-                 (unsigned)er, ngx_result_name(er), ems);
-        mgpu::diag::info(line);
-
+        NVSDK_NGX_Result er[NOUT] = {};
         bool used_depth = false;
-        if (er != NVSDK_NGX_Result_Success)
+
+        for (int i = 0; i < NOUT; ++i)
         {
-            mgpu::diag::warn("[MGPU][P1.1] retrying WITH a cleared depth texture - the depth-free "
-                             "hypothesis did not hold on this build");
-            params->Set("DLSSNR.Depth", tex_depth);
-            params->Set("DLSSNR.DepthSubrectBaseX", 0u);
-            params->Set("DLSSNR.DepthSubrectBaseY", 0u);
-            params->Set("DLSSNR.DepthSubrectWidth", (unsigned int)width);
-            params->Set("DLSSNR.DepthSubrectHeight", (unsigned int)height);
+            params->Set("DLSSNR.Output", tex_out[i]);
+            params->Set("DLSSNR.Intensity", intensities[i]);
+            // Reset on EVERY evaluate: ask NR to discard dlssnr_prev_output
+            // so the three runs are independent. Whether it honours that is
+            // exactly what the A/C comparison measures.
+            params->Set("DLSSNR.Reset", 1u);
+
             QueryPerformanceCounter(&e0);
-            er = p_evaluate(pcmd, handle, params, nullptr);
+            er[i] = p_evaluate(pcmd, handle, params, nullptr);
             QueryPerformanceCounter(&e1);
-            ems = (f.QuadPart > 0)
+            const double ems = (f.QuadPart > 0)
                 ? ((double)(e1.QuadPart - e0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
-            used_depth = true;
             snprintf(line, sizeof line,
-                     "[MGPU][P1.1] EvaluateFeature (with depth): result=0x%08X (%s) "
+                     "[MGPU][P1.2] EvaluateFeature %s intensity=%.2f depth=%s: result=0x%08X (%s) "
                      "record_cpu=%.2fms",
-                     (unsigned)er, ngx_result_name(er), ems);
+                     labels[i], intensities[i], used_depth ? "bound" : "null",
+                     (unsigned)er[i], ngx_result_name(er[i]), ems);
             mgpu::diag::info(line);
+
+            // One retry, on the first failure only, with a cleared depth.
+            if (er[i] != NVSDK_NGX_Result_Success && !used_depth)
+            {
+                mgpu::diag::warn("[MGPU][P1.2] retrying WITH a cleared depth texture - the "
+                                 "depth-free path held in P1.1, so this is a regression worth "
+                                 "reporting whichever way it goes");
+                params->Set("DLSSNR.Depth", tex_depth);
+                params->Set("DLSSNR.DepthSubrectBaseX", 0u);
+                params->Set("DLSSNR.DepthSubrectBaseY", 0u);
+                params->Set("DLSSNR.DepthSubrectWidth", (unsigned int)width);
+                params->Set("DLSSNR.DepthSubrectHeight", (unsigned int)height);
+                used_depth = true;
+                er[i] = p_evaluate(pcmd, handle, params, nullptr);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.2] EvaluateFeature %s (with depth): result=0x%08X (%s)",
+                         labels[i], (unsigned)er[i], ngx_result_name(er[i]));
+                mgpu::diag::info(line);
+            }
         }
 
-        // The readback is recorded whatever the result codes said. An
-        // evaluate that returned Success and wrote nothing is a real and
-        // very quiet failure mode, and it is exactly what this comparison
-        // exists to catch.
-        barrier(pcmd, tex_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        // Readbacks are recorded whatever the result codes said. An evaluate
+        // that returned Success and wrote nothing is a real and very quiet
+        // failure mode, and it is what the sentinel exists to catch.
+        for (int i = 0; i < NOUT; ++i)
+            barrier(pcmd, tex_out[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
         barrier(pcmd, tex_color, read_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
         auto copy_out = [&](ID3D12Resource *src, ID3D12Resource *dst)
@@ -2164,15 +2183,16 @@ bool ngx_probe(UINT width, UINT height)
             d.PlacedFootprint.Offset = 0;
             pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
         };
-        copy_out(tex_color,  buf_read_in);
-        copy_out(tex_output, buf_read_out);
+        copy_out(tex_color, buf_read_in);
+        for (int i = 0; i < NOUT; ++i)
+            copy_out(tex_out[i], buf_read_out[i]);
 
         // ---- flush here rather than in teardown ----
         //
         // The comparison needs the GPU to have finished, and teardown
         // releases the buffers it would read. So the drain happens now;
         // list_open goes false and teardown skips its own.
-        mgpu::diag::info("[MGPU][P1.1] flush: Close -> Execute -> fence wait ...");
+        mgpu::diag::info("[MGPU][P1.2] flush: Close -> Execute -> fence wait ...");
         LARGE_INTEGER g0{}, g1{};
         QueryPerformanceCounter(&g0);
         hr = pcmd->Close();
@@ -2192,132 +2212,188 @@ bool ngx_probe(UINT width, UINT height)
         if (FAILED(hr) || wr != WAIT_OBJECT_0)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P1.1] flush FAILED hr=0x%08X wait=0x%08X - not reading back, and "
-                     "not releasing anything (the GPU may still hold these resources)",
+                     "[MGPU][P1.2] flush FAILED hr=0x%08X wait=0x%08X - not reading back, and not "
+                     "releasing anything (the GPU may still hold these resources)",
                      (unsigned)hr, (unsigned)wr);
             mgpu::diag::error(line);
-            // Deliberate leak, same rule as P1.0c's abandoned teardown.
-            mgpu::diag::warn("[MGPU][P1.1] PROBE FAILED at flush. Bridge continues.");
+            mgpu::diag::warn("[MGPU][P1.2] PROBE FAILED at flush. Bridge continues.");
             return false;
         }
         QueryPerformanceCounter(&g1);
         const double gms = (f.QuadPart > 0)
             ? ((double)(g1.QuadPart - g0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
-        // WHOLE LIST, not the evaluate alone: four uploads, the evaluate and
-        // two readback copies, plus submission overhead. It is an upper
-        // bound and nothing more. A real per-pass GPU figure needs timestamp
-        // queries, which belong with the measurement work in
-        // P1_INSTRUMENT.md - do NOT compare this number against the
-        // reference tool's 14.2 ms evaluateGPU.
+        // WHOLE LIST, and now THREE evaluates plus seven copies. An upper
+        // bound and nothing more. A per-pass GPU figure needs timestamp
+        // queries, which belong with P1_INSTRUMENT.md - do NOT compare this
+        // against the reference tool's 14.2 ms evaluateGPU.
         snprintf(line, sizeof line,
-                 "[MGPU][P1.1] flush: GPU idle after %.2f ms (WHOLE LIST: uploads + evaluate + "
-                 "readback - an upper bound, not an evaluate timing)", gms);
+                 "[MGPU][P1.2] flush: GPU idle after %.2f ms (WHOLE LIST: 4 uploads + 3 evaluates "
+                 "+ 4 readbacks - an upper bound, not an evaluate timing)", gms);
         mgpu::diag::info(line);
 
-        // ---- the actual proof ----
+        // ---- the comparison ----
         {
             const unsigned char *pin = nullptr;
-            const unsigned char *pout = nullptr;
+            const unsigned char *po[NOUT] = {};
             D3D12_RANGE all{0, (SIZE_T)sz_color};
-            const HRESULT h1 = buf_read_in->Map(0, &all, (void **)&pin);
-            const HRESULT h2 = buf_read_out->Map(0, &all, (void **)&pout);
-            if (FAILED(h1) || FAILED(h2) || pin == nullptr || pout == nullptr)
+            HRESULT hm = buf_read_in->Map(0, &all, (void **)&pin);
+            for (int i = 0; i < NOUT && SUCCEEDED(hm); ++i)
+                hm = buf_read_out[i]->Map(0, &all, (void **)&po[i]);
+
+            if (FAILED(hm) || pin == nullptr || po[0] == nullptr ||
+                po[1] == nullptr || po[2] == nullptr)
             {
                 snprintf(line, sizeof line,
-                         "[MGPU][P1.1] readback Map hr=0x%08X/0x%08X - cannot compare",
-                         (unsigned)h1, (unsigned)h2);
+                         "[MGPU][P1.2] readback Map hr=0x%08X - cannot compare", (unsigned)hm);
                 mgpu::diag::error(line);
             }
             else
             {
-                unsigned long long differing = 0, nonzero_out = 0, total = 0;
-                unsigned long long untouched = 0;   // still exactly the sentinel
-                unsigned long long sum_abs = 0;
-                unsigned int max_abs = 0;
                 const UINT pitch = fp_color.Footprint.RowPitch;
-                for (UINT y = 0; y < height; ++y)
+
+                // Counts one output against a reference image.
+                auto compare = [&](const unsigned char *a, const unsigned char *b,
+                                   unsigned long long &differing, double &mean_abs,
+                                   unsigned int &max_abs)
                 {
-                    const unsigned char *ri = pin + (size_t)y * pitch;
-                    const unsigned char *ro = pout + (size_t)y * pitch;
-                    for (UINT x = 0; x < width; ++x)
+                    unsigned long long sum = 0, n = 0;
+                    differing = 0; max_abs = 0;
+                    for (UINT y = 0; y < height; ++y)
                     {
-                        const unsigned char *a = ri + (size_t)x * 4;
-                        const unsigned char *b = ro + (size_t)x * 4;
-                        bool diff = false;
-                        for (int c = 0; c < 3; ++c)
+                        const unsigned char *ra = a + (size_t)y * pitch;
+                        const unsigned char *rb = b + (size_t)y * pitch;
+                        for (UINT x = 0; x < width; ++x)
                         {
-                            const int d = (int)b[c] - (int)a[c];
-                            const unsigned int ad = (unsigned int)(d < 0 ? -d : d);
-                            if (ad != 0) diff = true;
-                            sum_abs += ad;
-                            if (ad > max_abs) max_abs = ad;
+                            const unsigned char *pa = ra + (size_t)x * 4;
+                            const unsigned char *pb = rb + (size_t)x * 4;
+                            bool diff = false;
+                            for (int c = 0; c < 3; ++c)
+                            {
+                                const int d = (int)pb[c] - (int)pa[c];
+                                const unsigned int ad = (unsigned int)(d < 0 ? -d : d);
+                                if (ad != 0) diff = true;
+                                sum += ad;
+                                if (ad > max_abs) max_abs = ad;
+                            }
+                            if (diff) ++differing;
+                            ++n;
                         }
-                        if (b[0] || b[1] || b[2]) ++nonzero_out;
-                        if (b[0] == SENT_R && b[1] == SENT_G && b[2] == SENT_B) ++untouched;
-                        if (diff) ++differing;
-                        ++total;
                     }
-                }
-                const double pct = total ? (100.0 * (double)differing / (double)total) : 0.0;
-                const double mean = total ? ((double)sum_abs / (double)(total * 3)) : 0.0;
+                    mean_abs = n ? ((double)sum / (double)(n * 3)) : 0.0;
+                };
+
+                // Sentinel survivors per output: the "NR wrote nothing here"
+                // detector.
+                unsigned long long sentinel[NOUT] = {};
+                const unsigned long long total = (unsigned long long)width * height;
+                for (int i = 0; i < NOUT; ++i)
+                    for (UINT y = 0; y < height; ++y)
+                    {
+                        const unsigned char *r = po[i] + (size_t)y * pitch;
+                        for (UINT x = 0; x < width; ++x)
+                        {
+                            const unsigned char *p = r + (size_t)x * 4;
+                            if (p[0] == SENT_R && p[1] == SENT_G && p[2] == SENT_B)
+                                ++sentinel[i];
+                        }
+                    }
+
+                unsigned long long d_in = 0, d_ab = 0, d_ac = 0;
+                double m_in = 0, m_ab = 0, m_ac = 0;
+                unsigned int x_in = 0, x_ab = 0, x_ac = 0;
+                compare(pin,   po[0], d_in, m_in, x_in);   // A vs input  - did it process?
+                compare(po[0], po[1], d_ab, m_ab, x_ab);   // A vs B      - did intensity matter?
+                compare(po[0], po[2], d_ac, m_ac, x_ac);   // A vs C      - THE CONTROL
 
                 snprintf(line, sizeof line,
-                         "[MGPU][P1.1] readback: pixels=%llu differing_from_input=%llu (%.2f%%) "
-                         "still_sentinel=%llu mean_abs_delta=%.3f max_abs_delta=%u "
-                         "output_nonzero=%llu depth=%s",
-                         total, differing, pct, untouched, mean, max_abs, nonzero_out,
-                         used_depth ? "bound" : "null");
+                         "[MGPU][P1.2] sentinel survivors: A=%llu B=%llu C=%llu of %llu pixels",
+                         sentinel[0], sentinel[1], sentinel[2], total);
+                mgpu::diag::info(line);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.2] A vs input: differing=%llu (%.2f%%) mean=%.3f max=%u",
+                         d_in, total ? 100.0 * (double)d_in / (double)total : 0.0, m_in, x_in);
+                mgpu::diag::info(line);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.2] A(%.2f) vs B(%.2f): differing=%llu (%.2f%%) mean=%.3f max=%u",
+                         INTENSITY_LO, INTENSITY_HI, d_ab,
+                         total ? 100.0 * (double)d_ab / (double)total : 0.0, m_ab, x_ab);
+                mgpu::diag::info(line);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.2] A(%.2f) vs C(%.2f) [CONTROL]: differing=%llu (%.2f%%) "
+                         "mean=%.3f max=%u",
+                         INTENSITY_LO, INTENSITY_LO, d_ac,
+                         total ? 100.0 * (double)d_ac / (double)total : 0.0, m_ac, x_ac);
                 mgpu::diag::info(line);
 
-                if (er != NVSDK_NGX_Result_Success)
+                const bool all_ok = (er[0] == NVSDK_NGX_Result_Success &&
+                                     er[1] == NVSDK_NGX_Result_Success &&
+                                     er[2] == NVSDK_NGX_Result_Success);
+                const bool wrote  = (sentinel[0] == 0 && sentinel[1] == 0 && sentinel[2] == 0);
+
+                if (!all_ok)
                 {
-                    mgpu::diag::warn("[MGPU][P1.1] EVALUATE FAILED - the numbers above describe an "
-                                     "output NR did not write. Read them as a control, not a "
-                                     "result.");
+                    mgpu::diag::warn("[MGPU][P1.2] ONE OR MORE EVALUATES FAILED - the numbers "
+                                     "above describe outputs NR may not have written. Read them "
+                                     "as a control, not a result.");
                 }
-                else if (untouched == total)
+                else if (!wrote)
                 {
-                    mgpu::diag::error("[MGPU][P1.1] EVALUATE RETURNED SUCCESS BUT THE OUTPUT IS "
-                                      "STILL THE SENTINEL, every pixel - NR wrote nothing to the "
-                                      "resource we bound. Suspect the DLSSNR.Output key name, the "
-                                      "UAV state, or a subrect name. This is the case that would "
-                                      "have read as a pass without the sentinel.");
+                    mgpu::diag::error("[MGPU][P1.2] AN OUTPUT STILL HOLDS SENTINEL PIXELS after a "
+                                      "Success - NR did not write everything it claimed. Suspect "
+                                      "the DLSSNR.Output rebind between evaluates, or a UAV "
+                                      "barrier this path is missing.");
                 }
-                else if (nonzero_out == 0)
+                else if (d_in == 0)
                 {
-                    mgpu::diag::error("[MGPU][P1.1] EVALUATE RETURNED SUCCESS BUT THE OUTPUT IS "
-                                      "ENTIRELY BLACK - written, but with nothing. Suspect the "
-                                      "input binding rather than the output binding.");
+                    mgpu::diag::error("[MGPU][P1.2] OUTPUT A == INPUT byte for byte - NR copied "
+                                      "rather than processed. The intensity comparison below is "
+                                      "meaningless until that is fixed.");
                 }
-                else if (differing == 0)
+                else if (d_ac != 0)
                 {
-                    mgpu::diag::error("[MGPU][P1.1] EVALUATE RETURNED SUCCESS BUT OUTPUT == INPUT "
-                                      "byte for byte - NR copied rather than processed. Suspect a "
-                                      "silently-ignored parameter; the snippet log is the place to "
-                                      "look.");
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.2] INCONCLUSIVE - the control failed. A and C ran at the "
+                             "SAME intensity (%.2f) and still differ in %llu pixels (mean %.3f). "
+                             "DLSSNR.Reset did not fully discard dlssnr_prev_output, so evaluate "
+                             "order contaminates the comparison and A-vs-B cannot be attributed "
+                             "to intensity. Next: one feature per setting, rebuilt between runs.",
+                             INTENSITY_LO, d_ac, m_ac);
+                    mgpu::diag::error(line);
+                }
+                else if (d_ab == 0)
+                {
+                    mgpu::diag::warn("[MGPU][P1.2] PARAMETERS ARE FROZEN AT CREATE. Intensity 0.00 "
+                                     "and 1.60 produced byte-identical output, with the control "
+                                     "clean. PollRuntimeParams reporting a NULL callback is the "
+                                     "explanation. CONSEQUENCE: every tuning change costs a "
+                                     "~220 ms CreateFeature rebuild, and runtime quality control "
+                                     "is not available on this path.");
                 }
                 else
                 {
                     snprintf(line, sizeof line,
-                             "[MGPU][P1.1] PROBE PASSED - DLSS-NR EXECUTED ON THE NON-GAME "
-                             "ADAPTER. The output is neither the sentinel nor a copy of the "
-                             "input: %llu of %llu pixels overwritten with processed data. "
-                             "Tensors ran on GPU 1.",
-                             total - untouched, total);
+                             "[MGPU][P1.2] PROBE PASSED - PARAMETERS ARE LIVE PER EVALUATE. "
+                             "Intensity %.2f vs %.2f changed %llu pixels (%.2f%%, mean %.3f, "
+                             "max %u) while the same-intensity control A vs C was byte-identical. "
+                             "DLSS-NR on GPU 1 is tunable at runtime without a rebuild.",
+                             INTENSITY_LO, INTENSITY_HI, d_ab,
+                             total ? 100.0 * (double)d_ab / (double)total : 0.0, m_ab, x_ab);
                     mgpu::diag::info(line);
                 }
             }
+
             D3D12_RANGE nothing{0, 0};
-            if (pin != nullptr)  buf_read_in->Unmap(0, &nothing);
-            if (pout != nullptr) buf_read_out->Unmap(0, &nothing);
+            if (pin != nullptr) buf_read_in->Unmap(0, &nothing);
+            for (int i = 0; i < NOUT; ++i)
+                if (po[i] != nullptr) buf_read_out[i]->Unmap(0, &nothing);
         }
     }
 
     // ---- 8. leave nothing behind ----
     teardown(nullptr);
 
-    mgpu::diag::info("[MGPU][P1.0c] create/teardown cycle complete - see the [MGPU][P1.1] lines "
-                     "above for whether the model actually executed");
+    mgpu::diag::info("[MGPU][P1.0c] create/teardown cycle complete - see the [MGPU][P1.2] lines "
+                     "above for the parameter-liveness verdict");
     return true;
 }
 }
