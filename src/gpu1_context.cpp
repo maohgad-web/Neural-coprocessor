@@ -2793,9 +2793,27 @@ bool transit_probe()
             bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
             bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
+            // OpenExistingHeapFromAddress is on ID3D12Device3, NOT
+            // ID3D12Device - the base interface has no such method and the
+            // compiler says so. Both devices are queried for it here rather
+            // than being created as Device3 up front, because everything
+            // else in this file only needs the base interface and P1.3
+            // should not change what create_device produces.
+            ID3D12Device3 *dev0_3 = nullptr, *dev1_3 = nullptr;
             HRESULT b = (pinned != nullptr) ? S_OK : E_OUTOFMEMORY;
-            if (SUCCEEDED(b)) b = g0.dev->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap0));
-            if (SUCCEEDED(b)) b = g1.dev->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap1));
+            if (SUCCEEDED(b))
+                b = g0.dev->QueryInterface(__uuidof(ID3D12Device3),
+                                           reinterpret_cast<void **>(&dev0_3));
+            if (SUCCEEDED(b))
+                b = g1.dev->QueryInterface(__uuidof(ID3D12Device3),
+                                           reinterpret_cast<void **>(&dev1_3));
+            if (FAILED(b))
+                mgpu::diag::warn("[MGPU][P1.3] ID3D12Device3 unavailable on one or both devices - "
+                                 "path A' cannot run on this runtime");
+            if (SUCCEEDED(b)) b = dev0_3->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap0));
+            if (SUCCEEDED(b)) b = dev1_3->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap1));
+            if (dev1_3 != nullptr) dev1_3->Release();
+            if (dev0_3 != nullptr) dev0_3->Release();
             if (SUCCEEDED(b))
                 b = g0.dev->CreatePlacedResource(heap0, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
                                                  nullptr, IID_PPV_ARGS(&shared0));
