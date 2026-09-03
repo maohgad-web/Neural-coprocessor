@@ -918,6 +918,27 @@ is the first place to check for a pre-existing cause. Human-owned, like section
   for `UpscaleFlow` and `BilateralMedian9` on compile. Pre-existing in the shader,
   identical on both runtimes, not introduced by this project. Noted so it is not
   read as a GPU 1 anomaly.
+- **NO TIMING FROM THE PROBE IS A PERFORMANCE FIGURE, and the reason is
+  structural.** `ngx_probe` fires within milliseconds of the present chain
+  being created — during **game startup**. The game is in a menu with almost
+  nothing on screen, still compiling shaders (a dozen `Successfully compiled`
+  lines land in the same second), and **which window owns the foreground at
+  that instant varies from launch to launch** — the game, the bridge window,
+  or the desktop. `CreateFeature` has already been seen at 213, 236 and
+  1506 ms across otherwise identical runs.
+  The probe now logs the foreground window and its owner so a run can be
+  described rather than guessed at, but **that line is context, not a
+  correction**: nothing recovers a clean measurement from a contaminated
+  sample.
+  **What is unaffected: every verdict this project has produced.** They are
+  byte comparisons between deterministic images on a GPU the game is not
+  using, and focus, occlusion and shader compilation cannot change whether
+  two buffers are equal. That is a property of the design, not luck — and
+  it is the reason the probe was built to answer questions numerically
+  rather than by timing or by eye.
+  A real per-pass cost needs timestamp queries and a settled scene in
+  gameplay. Until then, do not compare a probe timing against the reference
+  tool's 14.2 ms `evaluateGPU`, against another build, or against itself.
 - **No no-bridge baseline exists yet.** Every frame-rate figure so far was taken
   with the bridge window present and presenting. We know that *toggling the GPU 1
   effect* costs the game nothing; we do not know what the bridge itself costs
