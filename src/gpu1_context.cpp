@@ -2522,11 +2522,16 @@ bool ngx_probe(UINT width, UINT height)
 // just a fallback that happened to work.
 //
 // NO SHARED FENCE. Synchronisation here is a CPU wait between the two
-// submissions - serialised on purpose. Pipelining is P2, and
-// FENCE_FLAG_SHARED stays inside build.yml's containment pattern until
-// then. This probe moves exactly four symbols out of it:
-// SHARED_CROSS_ADAPTER, HEAP_FLAG_SHARED, CreateSharedHandle,
+// submissions - serialised on purpose. Pipelining is P2, and the
+// cross-adapter shared-fence flag stays inside build.yml's containment
+// pattern until then. This probe moves exactly four symbols out of that
+// pattern: SHARED_CROSS_ADAPTER, HEAP_FLAG_SHARED, CreateSharedHandle,
 // OpenSharedHandle.
+//
+// Do not name the still-guarded symbols in this file, even in a comment
+// saying they are unused - the containment grep matches text, not code,
+// and it is right to. It caught exactly that mistake on build #1 of this
+// milestone.
 // =====================================================================
 namespace
 {
@@ -2952,8 +2957,8 @@ bool transit_probe()
     mgpu::diag::info("[MGPU][P1.3] NOTE: the timings above are a CPU-serialised round trip "
                      "measured during game startup, with no shared fence and no pipelining. "
                      "Treat the RATIO between the two sizes as the signal and the absolute "
-                     "numbers as an upper bound; a real figure needs GetClockCalibration and a "
-                     "settled scene (P2).");
+                     "numbers as an upper bound; a real figure needs cross-adapter GPU clock "
+                     "calibration and a settled scene (P2).");
 
     transit_side_release(g1, false);   // the GPU 1 device belongs to create_device
     transit_side_release(g0, true);    // our GPU 0 device is ours to destroy
