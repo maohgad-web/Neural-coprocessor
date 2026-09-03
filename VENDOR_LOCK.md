@@ -230,6 +230,38 @@ a GPU that drives no display and renders no frame of the game. It has **not**
 been evaluated: no image has passed through it, and no performance claim of any
 kind is supported by this run.
 
+## P1.1 — PASSED, 2026-09-03
+
+**DLSS-NR executed on the headless adapter.** `nvngx.dll_mgpu_bridge.addon64`
+only; no RenoDX, no shim DLL, nothing patched. Logs of the `14:17:33` launch.
+
+| | |
+|---|---|
+| `EvaluateFeature` | `0x00000001 Success`, depth **null**, first attempt |
+| Readback | `differing_from_input=914752/921600 (99.26%)`, **`still_sentinel=0`**, `mean_abs_delta=5.324`, `max_abs_delta=252` |
+| Reproducibility | **bit-identical across two builds** — all four statistics |
+| `CreateFeature` warm | ~220 ms (213 / 236); 1506 ms once on cold model load |
+| GPU 1 working set | **388.8 MB** at 1280×720 |
+| Snippet's own record | `EvaluateFeature Color=… MVec=… Depth=0000000000000000 Output=… intensity=0.84 reset=1` / `color (0,0 1280x720) mvec (0,0 1280x720) scale (1.00,1.00)` |
+
+**The sentinel is why this counts.** The output texture is pre-filled with a
+constant that cannot occur in the test pattern. `still_sentinel=0` means NR
+overwrote every pixel — without it, an uninitialised texture would also have
+"differed from the input" and read as a pass.
+
+**Depth may be null.** Not a fallback: the depth-free path was tried first and
+accepted, and NVIDIA's log records `Depth=0000000000000000` alongside
+`result=0x1`.
+
+**Open: `PollRuntimeParams - callback is NULL (core did not set it)`.** The
+echoed `intensity=0.84` proves the parameter was read, not that it was applied.
+Whether tuning is per-evaluate or baked at create is unsettled, and it decides
+whether a quality change costs a ~220 ms rebuild.
+
+**Record the telemetry versions with any quoted result.** `StreamlineVersion`
+moved from `2,12,129,0` to `2,14,0,0` between runs on this same rig and driver,
+with the game untouched — `OTAEnabled = 1` and `nvngx_update.exe` runs at init.
+
 ## Reference DLSS-NR evaluation numbers (single-GPU, third-party tool)
 
 Not ours. Measured by **NeuralOverlay** (`Merserk/dlss5-visual-enhancer`) on this

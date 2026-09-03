@@ -582,6 +582,81 @@ signature you verified.
   the two pool-like resources scale with pixel count, so roughly 700 MB is a
   reasonable planning figure. That is an extrapolation from one measurement,
   not an observation; measure it before quoting it.
+- **P1.1 IS CLOSED — DLSS-NR EXECUTED on the non-game adapter.** Run of
+  `14:17:40`, 2026-09-03. `EvaluateFeature` → `Success`, and the readback
+  proves the model wrote processed data rather than copying or no-oping:
+
+  ```
+  pixels=921600 differing_from_input=914752 (99.26%) still_sentinel=0
+  mean_abs_delta=5.324 max_abs_delta=252 output_nonzero=911931 depth=null
+  ```
+
+  `still_sentinel=0` is the load-bearing number: the output was pre-filled
+  with a constant that cannot occur in the test pattern, and **not one
+  pixel of 921600 survived**. Without that control, "differs from input"
+  would also have been satisfied by an uninitialised texture NR never
+  touched — a false positive the earlier build could have produced.
+  `mean_abs_delta` of ~2% is the expected magnitude: NR does local contrast
+  shaping on low-structure content, not transformation.
+  **Reproduced bit-for-bit across two different builds** — all four
+  statistics identical. Deterministic pattern, deterministic model.
+- **NVIDIA's own snippet log corroborates it, pointer for pointer:**
+
+  ```
+  DLSSNR: EvaluateFeature Color=...4774D0 MVec=...477E60 Depth=0000000000000000
+          Output=...4761B0 intensity=0.84 reset=1
+  DLSSNR:   color (0,0 1280x720) mvec (0,0 1280x720) scale (1.00,1.00)
+  ```
+
+  Every address matches the `[MGPU][P1.1] resources` line. Independent
+  confirmation from the vendor's component that the evaluate happened
+  against our resources on our device.
+- **DEPTH MAY BE NULL.** `Depth=0000000000000000` with `result=0x1`, first
+  attempt, no retry. The depth-free path is not a fallback — it is the
+  working configuration. This was doubted and the doubt was wrong.
+- **Every namespaced key we set was read back with the spelling we used**:
+  `DLSSNR.Intensity` (echoed `0.84`), `DLSSNR.Reset`, the four
+  `*SubrectBaseX/BaseY/Width/Height` sets, `MVecScaleX/Y`. The
+  no-separator naming (`DLSSNR.ColorSubrectWidth`, not
+  `DLSSNR.Color.SubrectWidth`) is confirmed correct.
+- **`PollRuntimeParams - callback is NULL (core did not set it)` — OPEN.**
+  NR expects a runtime-parameter callback the core normally installs; on
+  this path it is absent. So it is **not yet known whether tuning
+  parameters are read per-evaluate or baked at `CreateFeature`**. The
+  echoed `intensity=0.84` proves the value was *read*, not that it was
+  *applied*. Settled by evaluating twice at extreme `DLSSNR.Intensity` into
+  two outputs and diffing them. It matters: if tuning is create-time only,
+  every quality change costs a feature rebuild.
+- **What NR allocates on GPU 1 at 1280×720, complete:**
+
+  | Resource | Size | Notes |
+  |---|---|---|
+  | `CG2RWeightHeap` | 140.9 MB | fixed, 153 tensors |
+  | `CG2RWeightUpload` | 140.9 MB | fixed |
+  | `CG2RPool` | 93.0 MB | scales with resolution |
+  | `dlssnr_prev_output` | 7.0 MB | temporal history, created at `CreateFeature` |
+  | `dlssnr_network_output_scratch` | 7.0 MB | created at the **first evaluate**, not at create |
+  | `FontTexture`, `DynamicText`, `DynamicTextUpload` | ~0 MB | the DLSS indicator overlay |
+  | **total** | **388.8 MB** | |
+
+  `CreateFeature` warm cost is **~220 ms** (213 / 236 ms); one run showed
+  1506 ms on a cold model load. Budget for the cold case.
+- **A node-mask warning appears, and it is not what it looks like.** The
+  three overlay resources are created with `CreationMask=0x1,
+  VisibilityMask=0x0` and NR's own validator says: *"visible on GPU nodes
+  where it was not created ... may degrade multi-GPU performance"*.
+  It comes from `NGXCubinGeneric` **inside `nvngx_dlssnr.dll`** — NR's own
+  code, not Streamline, not the core. But "multi-GPU" there means D3D12
+  **linked-node** (LDA), which is a different mechanism from our two
+  separate adapters and two separate devices. The same log says
+  `GPU nodes 1 - visible node mask 1`, so NGX asked our device and got one
+  node. It affects only the debug-overlay resources, nothing on the
+  inference path, and setting `ShowDlssIndicator` to 0 would likely stop
+  them being created at all.
+  **Do not read this as evidence about how NVIDIA runs DLSS across two
+  cards.** It shows the allocator carries node masks, which is unsurprising
+  in code that ships to LDA-capable systems. Whatever multi-GPU path may or
+  may not exist inside that DLL, this line is not it.
 - **A LumeniteFX technique has executed on GPU 1. P0's hypothesis is
   demonstrated.** With `gpu1.ini` as the GPU 1 runtime's own preset,
   `LUMENITE: QuantMotion` enabled, and `DEBUG_FLOW` set to `1` in the overlay,
@@ -873,6 +948,14 @@ is the first place to check for a pre-existing cause. Human-owned, like section
   configuration has `Generic Depth` enabled and is reproducible. Would be
   settled by: three launches each way, with the OTA updater's activity noted
   per run. **Do not build a theory on the one observation.**
+- **The NGX environment drifts under us via OTA, with the game untouched.**
+  `StreamlineVersion` read `2,12,129,0 (v2.12.129-rc0)` in the morning runs
+  and `2,14,0,0 (SHA 614ea534a v2.14.0-rc2)` by `14:17`. `OTAEnabled = 1`
+  and `nvngx_update.exe` is launched at init. `cmsId` has also varied
+  between `1` and `101654711` across runs. **Record the telemetry block's
+  versions with any result that will be quoted**, because "same rig, same
+  driver" does not mean same NGX stack. This is also the leading
+  explanation for the one unreproduced `FAIL_OutOfDate` above.
 - **`Reference count for IDXGIFactory2 object ... is inconsistent (4)`.** New at
   T5, logged during our teardown right after ReShade destroys the GPU 1 runtime.
   It is ReShade's proxy around the factory our `create_present_chain` created and
