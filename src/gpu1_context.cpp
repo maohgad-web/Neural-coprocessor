@@ -865,6 +865,144 @@ namespace
     typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_populate_params)(
         NVSDK_NGX_Parameter *InParameters);
 
+    // P1.1. The fourth argument is a progress callback. It is declared as
+    // void * rather than PFN_NVSDK_NGX_ProgressCallback on purpose: we
+    // always pass nullptr, the header's spelling of that typedef is one
+    // more thing to get wrong, and on x64 Windows a pointer parameter is a
+    // pointer parameter - same register, same ABI. If a real callback is
+    // ever wanted, the type comes from the header at that point.
+    typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_evaluate_feature)(
+        ID3D12GraphicsCommandList *InCmdList,
+        const NVSDK_NGX_Handle *InFeatureHandle,
+        const NVSDK_NGX_Parameter *InParameters,
+        void *InCallback);
+
+    // ---- P1.1 helpers: local resources for the evaluate probe ----
+
+    // One committed texture on the GPU 1 device. Every field is spelled out
+    // rather than using a d3dx12 helper - CMakeLists.txt is closed and
+    // d3dx12.h is not in the include path.
+    HRESULT make_tex(ID3D12Device *dev, UINT w, UINT h, DXGI_FORMAT fmt,
+                     D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+                     ID3D12Resource **out)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        hp.CreationNodeMask = 0;
+        hp.VisibleNodeMask = 0;
+
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Alignment = 0;
+        rd.Width = w;
+        rd.Height = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = fmt;
+        rd.SampleDesc.Count = 1;
+        rd.SampleDesc.Quality = 0;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rd.Flags = flags;
+
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                            state, nullptr, IID_PPV_ARGS(out));
+    }
+
+    // A buffer on an UPLOAD or READBACK heap. Buffers must be created in
+    // GENERIC_READ (upload) or COPY_DEST (readback); anything else is a
+    // debug-layer error.
+    HRESULT make_buf(ID3D12Device *dev, UINT64 bytes, D3D12_HEAP_TYPE type,
+                     ID3D12Resource **out)
+    {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = type;
+        hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        const D3D12_RESOURCE_STATES state = (type == D3D12_HEAP_TYPE_UPLOAD)
+            ? D3D12_RESOURCE_STATE_GENERIC_READ
+            : D3D12_RESOURCE_STATE_COPY_DEST;
+
+        return dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                            state, nullptr, IID_PPV_ARGS(out));
+    }
+
+    void barrier(ID3D12GraphicsCommandList *cl, ID3D12Resource *res,
+                 D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+    {
+        if (from == to)
+            return;
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        cl->ResourceBarrier(1, &b);
+    }
+
+    // The test image. This is not decoration.
+    //
+    // DLSS-NR reconstructs organic sub-pixel detail; on a flat or
+    // low-frequency field the honest output is nearly identical to the
+    // input, so a uniform clear colour would make "the model ran" and "the
+    // model did nothing" indistinguishable. The bridge window currently
+    // presents exactly such a flat field, which is why the probe uploads
+    // its own image instead of sampling the backbuffer.
+    //
+    // Four ingredients, each of which NR has a documented reason to touch:
+    // a smooth luminance ramp (local tone), hard edges (local structure),
+    // a fine checker near the Nyquist limit (detail synthesis), and
+    // deterministic pseudo-noise (texture). Deterministic on purpose - the
+    // same bytes every run, so two runs are comparable.
+    void fill_pattern(unsigned char *px, UINT w, UINT h, UINT row_pitch)
+    {
+        for (UINT y = 0; y < h; ++y)
+        {
+            unsigned char *row = px + (size_t)y * row_pitch;
+            for (UINT x = 0; x < w; ++x)
+            {
+                const float fx = (float)x / (float)(w ? w : 1);
+                const float fy = (float)y / (float)(h ? h : 1);
+
+                float v = 0.25f + 0.5f * (fx * 0.5f + fy * 0.5f);          // ramp
+                if (((x / 64) + (y / 64)) % 2 == 0) v += 0.12f;            // blocks
+                if (((x / 2) + (y / 2)) % 2 == 0)   v += 0.06f;            // fine checker
+                if (x % 128 < 3 || y % 128 < 3)     v = 0.95f;             // hard edges
+
+                // xorshift-ish hash on the pixel index: deterministic,
+                // no <random>, no state.
+                unsigned int hsh = (unsigned int)(x * 1973u + y * 9277u + 26699u);
+                hsh ^= hsh << 13; hsh ^= hsh >> 17; hsh ^= hsh << 5;
+                v += ((float)(hsh & 0xFF) / 255.0f - 0.5f) * 0.08f;        // noise
+
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                const unsigned char c = (unsigned char)(v * 255.0f + 0.5f);
+
+                unsigned char *p = row + (size_t)x * 4;
+                p[0] = c;                                   // R
+                p[1] = (unsigned char)(c * 0.85f);          // G
+                p[2] = (unsigned char)(c * 0.70f);          // B  (warm, skin-ish)
+                p[3] = 255;
+            }
+        }
+    }
+
     struct ngx_modules
     {
         HMODULE core = nullptr;      // _nvngx.dll       - the driver's NGX core
@@ -1126,12 +1264,11 @@ bool ngx_probe(UINT width, UINT height)
     ngx_pf_create_feature  p_create   = (ngx_pf_create_feature) ngx_resolve(mods, "NVSDK_NGX_D3D12_CreateFeature",           ngx_prefer::snippet, w_create,   sizeof w_create);
     ngx_pf_release_feature p_release  = (ngx_pf_release_feature)ngx_resolve(mods, "NVSDK_NGX_D3D12_ReleaseFeature",          ngx_prefer::snippet, w_release,  sizeof w_release);
 
-    // Resolved to be reported, never called - P1.0b evaluates nothing. The
-    // pointer is deliberately left as FARPROC: writing an EvaluateFeature
-    // typedef would mean guessing the progress-callback type from memory,
-    // and this line only has to answer "does the snippet export it".
-    FARPROC p_evaluate = ngx_resolve(mods, "NVSDK_NGX_D3D12_EvaluateFeature", ngx_prefer::snippet,
-                                     w_evaluate, sizeof w_evaluate);
+    // P1.1 calls this one. Snippet-preferred like create and release - the
+    // three feature entry points must come from the same module.
+    ngx_pf_evaluate_feature p_evaluate = (ngx_pf_evaluate_feature)
+        ngx_resolve(mods, "NVSDK_NGX_D3D12_EvaluateFeature", ngx_prefer::snippet,
+                    w_evaluate, sizeof w_evaluate);
 
     snprintf(line, sizeof line,
              "[MGPU][P1.0c] ngx exports: Init=%s Init_Ext=%s GetCapabilityParameters=%s "
@@ -1139,7 +1276,6 @@ bool ngx_probe(UINT width, UINT height)
              "EvaluateFeature=%s",
              w_init, w_init_ext, w_caps, w_destroy, w_shutdown, w_create, w_release, w_evaluate);
     mgpu::diag::info(line);
-    (void)p_evaluate;
     (void)p_shutdown;   // P1.0c no longer calls it - see the teardown comment
 
     // ---- 2b. the SNIPPET's own entry points ----
@@ -1182,7 +1318,7 @@ bool ngx_probe(UINT width, UINT height)
     }
 
     if ((p_init == nullptr && p_init_ext == nullptr) ||
-        p_caps == nullptr || p_create == nullptr ||
+        p_caps == nullptr || p_create == nullptr || p_evaluate == nullptr ||
         p_release == nullptr || p_destroy == nullptr)
     {
         mgpu::diag::warn("[MGPU][P1.0c] PROBE FAILED at exports - see the line above for which "
@@ -1233,6 +1369,17 @@ bool ngx_probe(UINT width, UINT height)
     HANDLE pevent = nullptr;
     NVSDK_NGX_Handle *handle = nullptr;
     bool list_open = false;   // pcmd exists and has not been Closed yet
+
+    // P1.1: the local evaluate set. All on the GPU 1 device, nothing shared,
+    // nothing crossing the bus - the whole point of doing evaluation before
+    // transit is that this milestone needs no bus at all.
+    ID3D12Resource *tex_color = nullptr;    // NR input   (the uploaded pattern)
+    ID3D12Resource *tex_output = nullptr;   // NR output  (RT|UAV - never the input)
+    ID3D12Resource *tex_depth = nullptr;    // cleared depth, only if NR demands one
+    ID3D12Resource *tex_mvec = nullptr;     // zero motion
+    ID3D12Resource *buf_upload = nullptr;
+    ID3D12Resource *buf_read_in = nullptr;
+    ID3D12Resource *buf_read_out = nullptr;
 
     // Unwinds in reverse order of construction and logs every NGX result it
     // produces - a teardown call is an NGX call too, and acceptance item 2
@@ -1356,6 +1503,19 @@ bool ngx_probe(UINT width, UINT height)
             mgpu::diag::info(line);
             params = nullptr;
         }
+
+        // ---- 2b. the P1.1 local resources ----
+        //
+        // After ReleaseFeature and after the drain: NR held these while the
+        // feature existed, and the drain above is what guarantees the GPU
+        // is no longer reading them.
+        if (buf_read_out != nullptr) { buf_read_out->Release(); buf_read_out = nullptr; }
+        if (buf_read_in  != nullptr) { buf_read_in->Release();  buf_read_in  = nullptr; }
+        if (buf_upload   != nullptr) { buf_upload->Release();   buf_upload   = nullptr; }
+        if (tex_mvec     != nullptr) { tex_mvec->Release();     tex_mvec     = nullptr; }
+        if (tex_depth    != nullptr) { tex_depth->Release();    tex_depth    = nullptr; }
+        if (tex_output   != nullptr) { tex_output->Release();   tex_output   = nullptr; }
+        if (tex_color    != nullptr) { tex_color->Release();    tex_color    = nullptr; }
 
         // ---- 3. the D3D12 objects, reverse creation order ----
         if (pevent != nullptr)
@@ -1712,11 +1872,388 @@ bool ngx_probe(UINT width, UINT height)
         }
     }
 
+    // =================================================================
+    // P1.1 - does the model EXECUTE on GPU 1, and does it consume what we
+    //        hand it?
+    //
+    // P1.0c proved the feature can be built here. That is not the same as
+    // the network running: CreateFeature accepted a schema, it dispatched
+    // no tensors. Everything below is local to GPU 1 - our own textures,
+    // our own command list, no shared handles, nothing across the bus.
+    // Transit is deliberately not part of this milestone, for the same
+    // reason P1.0 came before transit: if the model will not execute on a
+    // display-less adapter, every byte moved would have been wasted.
+    //
+    // The proof is NUMERIC, not visual. NR reconstructs organic sub-pixel
+    // detail; on the flat cycling colour this window presents, a working
+    // model and a no-op are indistinguishable by eye. So the probe uploads
+    // a structured pattern, evaluates, copies input and output back to the
+    // CPU and counts differing pixels. Non-zero means tensors ran.
+    // =================================================================
+    {
+        // NR must never write to its own input (the guide is explicit, and
+        // the reference path creates a separate "private output"). Colour
+        // in and colour out are therefore two distinct textures.
+        //
+        // R8G8B8A8_UNORM matches this runtime's swapchain and is
+        // display-referred, which is what NR expects - it is a post-tone-map
+        // pass, and feeding it linear HDR blows out the image rather than
+        // merely looking different. The reference used R10G10B10A2 at 1440p;
+        // if the format is rejected the result code will say so and this is
+        // the one line to change.
+        const DXGI_FORMAT fmt_color = DXGI_FORMAT_R8G8B8A8_UNORM;
+        const DXGI_FORMAT fmt_mvec  = DXGI_FORMAT_R16G16_FLOAT;
+        // R32_FLOAT rather than a real depth format on purpose: NR reads
+        // depth as a plain texture, and a D32_FLOAT resource would need
+        // ALLOW_DEPTH_STENCIL, which conflicts with the simple copy path
+        // used to initialise it.
+        const DXGI_FORMAT fmt_depth = DXGI_FORMAT_R32_FLOAT;
+
+        HRESULT hr = make_tex(dev, width, height, fmt_color,
+                              D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_COPY_DEST, &tex_color);
+        if (SUCCEEDED(hr))
+            hr = make_tex(dev, width, height, fmt_color,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &tex_output);
+        if (SUCCEEDED(hr))
+            hr = make_tex(dev, width, height, fmt_mvec,
+                          D3D12_RESOURCE_FLAG_NONE,
+                          D3D12_RESOURCE_STATE_COPY_DEST, &tex_mvec);
+        if (SUCCEEDED(hr))
+            hr = make_tex(dev, width, height, fmt_depth,
+                          D3D12_RESOURCE_FLAG_NONE,
+                          D3D12_RESOURCE_STATE_COPY_DEST, &tex_depth);
+
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.1] resources hr=0x%08X color=0x%p output=0x%p(UAV) mvec=0x%p "
+                 "depth=0x%p %ux%u",
+                 (unsigned)hr, (void *)tex_color, (void *)tex_output,
+                 (void *)tex_mvec, (void *)tex_depth, width, height);
+        mgpu::diag::info(line);
+        if (FAILED(hr))
+        {
+            teardown("P1.1 resource creation");
+            return false;
+        }
+
+        // ---- footprints and one upload buffer for all three inputs ----
+        //
+        // Row pitches are padded to 256 bytes and each subresource's offset
+        // to 512, so the sizes come from GetCopyableFootprints rather than
+        // from width x height x bpp. At 1280 wide the colour pitch is
+        // already 5120 and needs no padding, but that is a property of this
+        // resolution and must not be assumed.
+        D3D12_RESOURCE_DESC d_color = tex_color->GetDesc();
+        D3D12_RESOURCE_DESC d_mvec  = tex_mvec->GetDesc();
+        D3D12_RESOURCE_DESC d_depth = tex_depth->GetDesc();
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_color{}, fp_mvec{}, fp_depth{};
+        UINT64 sz_color = 0, sz_mvec = 0, sz_depth = 0;
+        UINT rows_color = 0, rows_mvec = 0, rows_depth = 0;
+        UINT64 rb_color = 0, rb_mvec = 0, rb_depth = 0;
+
+        dev->GetCopyableFootprints(&d_color, 0, 1, 0, &fp_color, &rows_color, &rb_color, &sz_color);
+        const UINT64 off_mvec = (sz_color + 511) & ~(UINT64)511;
+        dev->GetCopyableFootprints(&d_mvec, 0, 1, off_mvec, &fp_mvec, &rows_mvec, &rb_mvec, &sz_mvec);
+        const UINT64 off_depth = (off_mvec + sz_mvec + 511) & ~(UINT64)511;
+        dev->GetCopyableFootprints(&d_depth, 0, 1, off_depth, &fp_depth, &rows_depth, &rb_depth, &sz_depth);
+        const UINT64 upload_bytes = off_depth + sz_depth;
+
+        hr = make_buf(dev, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, &buf_upload);
+        if (SUCCEEDED(hr))
+            hr = make_buf(dev, sz_color, D3D12_HEAP_TYPE_READBACK, &buf_read_in);
+        if (SUCCEEDED(hr))
+            hr = make_buf(dev, sz_color, D3D12_HEAP_TYPE_READBACK, &buf_read_out);
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line, "[MGPU][P1.1] staging buffers hr=0x%08X", (unsigned)hr);
+            mgpu::diag::error(line);
+            teardown("P1.1 staging buffers");
+            return false;
+        }
+
+        {
+            unsigned char *mapped = nullptr;
+            D3D12_RANGE none{0, 0};   // we only write; nothing to read back in
+            hr = buf_upload->Map(0, &none, reinterpret_cast<void **>(&mapped));
+            if (FAILED(hr))
+            {
+                snprintf(line, sizeof line, "[MGPU][P1.1] upload Map hr=0x%08X", (unsigned)hr);
+                mgpu::diag::error(line);
+                teardown("P1.1 upload Map");
+                return false;
+            }
+            // Motion and depth are ZERO for this milestone. Zero flow is the
+            // correct "nothing moved" input and it makes the result
+            // interpretable: any change in the output is the spatial model,
+            // not temporal reprojection. QuantMotion's real 320x180 flow
+            // arrives in P1.4 with the subrect and MVecScale keys that a
+            // lower-resolution motion buffer requires.
+            memset(mapped + off_mvec, 0, (size_t)(upload_bytes - off_mvec));
+            fill_pattern(mapped + fp_color.Offset, width, height, fp_color.Footprint.RowPitch);
+            buf_upload->Unmap(0, nullptr);
+        }
+
+        // ---- record: upload -> barriers -> evaluate -> readback ----
+        auto copy_in = [&](ID3D12Resource *dst, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &fp)
+        {
+            D3D12_TEXTURE_COPY_LOCATION s{};
+            s.pResource = buf_upload;
+            s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            s.PlacedFootprint = fp;
+            D3D12_TEXTURE_COPY_LOCATION d{};
+            d.pResource = dst;
+            d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            d.SubresourceIndex = 0;
+            pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        };
+        copy_in(tex_color, fp_color);
+        copy_in(tex_mvec,  fp_mvec);
+        copy_in(tex_depth, fp_depth);
+
+        const D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier(pcmd, tex_color, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
+        barrier(pcmd, tex_mvec,  D3D12_RESOURCE_STATE_COPY_DEST, read_state);
+        barrier(pcmd, tex_depth, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
+
+        // ---- the parameters ----
+        //
+        // Namespaced keys, like DLSSNR.Width in P1.0c. PopulateParameters_Impl
+        // registered these; it did not fill them, and per the guide it does
+        // NOT register the subrect keys at all - those are set here by hand.
+        //
+        // The subrect naming has no separator: DLSSNR.ColorSubrectWidth, NOT
+        // DLSSNR.Color.SubrectWidth. Getting it wrong fails silently - the
+        // value is stored, nothing reads it, and the feature runs on the
+        // full resource extent. That is the same class of failure that cost
+        // P1.0c a rig cycle on DLSSNR.Width.
+        params->Set("DLSSNR.Color",  tex_color);
+        params->Set("DLSSNR.Output", tex_output);
+        params->Set("DLSSNR.MVec",   tex_mvec);
+
+        params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+        params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+        params->Set("DLSSNR.ColorSubrectWidth", (unsigned int)width);
+        params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)height);
+        params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+        params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+        params->Set("DLSSNR.OutputSubrectWidth", (unsigned int)width);
+        params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)height);
+        params->Set("DLSSNR.MVecSubrectBaseX", 0u);
+        params->Set("DLSSNR.MVecSubrectBaseY", 0u);
+        params->Set("DLSSNR.MVecSubrectWidth", (unsigned int)width);
+        params->Set("DLSSNR.MVecSubrectHeight", (unsigned int)height);
+
+        // Motion is at colour resolution this milestone, so the scale is
+        // 1.0 - NOT because 1.0 is a safe default but because the two
+        // extents genuinely match. When QuantMotion's 320x180 grid arrives
+        // this becomes the ratio between the two, and leaving it at 1.0
+        // would silently misread every vector.
+        params->Set("DLSSNR.MVecScaleX", 1.0f);
+        params->Set("DLSSNR.MVecScaleY", 1.0f);
+        params->Set("DLSSNR.DepthInverted", 0u);
+        params->Set("DLSSNR.Reset", 1u);          // first frame of a new feature
+
+        // Tuning, taken from the reference tool's own working configuration
+        // rather than invented. Recorded in VENDOR_LOCK.md.
+        params->Set("DLSSNR.Intensity", 0.842f);
+        params->Set("DLSSNR.LocalToneStrength", 1.142f);
+        params->Set("DLSSNR.LocalStructureStrength", 1.092f);
+        params->Set("DLSSNR.SkinStructureStrength", 1.025f);
+        params->Set("DLSSNR.UseAutoMask", 1u);
+
+        // ---- evaluate, depth-free FIRST ----
+        //
+        // The reference tool runs guidanceMode=2 with depthInterval=4, which
+        // proves that mode exists but NOT that depth may be absent - it has
+        // the game's depth buffer and supplies it on a cadence. So this is a
+        // test, not an assumption: try without depth, and if NR refuses,
+        // bind the cleared depth and try again. Two result codes, one run,
+        // and the question is settled either way.
+        LARGE_INTEGER f{}, e0{}, e1{};
+        QueryPerformanceFrequency(&f);
+
+        params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
+        QueryPerformanceCounter(&e0);
+        NVSDK_NGX_Result er = p_evaluate(pcmd, handle, params, nullptr);
+        QueryPerformanceCounter(&e1);
+        double ems = (f.QuadPart > 0)
+            ? ((double)(e1.QuadPart - e0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.1] EvaluateFeature (no depth): result=0x%08X (%s) record_cpu=%.2fms",
+                 (unsigned)er, ngx_result_name(er), ems);
+        mgpu::diag::info(line);
+
+        bool used_depth = false;
+        if (er != NVSDK_NGX_Result_Success)
+        {
+            mgpu::diag::warn("[MGPU][P1.1] retrying WITH a cleared depth texture - the depth-free "
+                             "hypothesis did not hold on this build");
+            params->Set("DLSSNR.Depth", tex_depth);
+            params->Set("DLSSNR.DepthSubrectBaseX", 0u);
+            params->Set("DLSSNR.DepthSubrectBaseY", 0u);
+            params->Set("DLSSNR.DepthSubrectWidth", (unsigned int)width);
+            params->Set("DLSSNR.DepthSubrectHeight", (unsigned int)height);
+            QueryPerformanceCounter(&e0);
+            er = p_evaluate(pcmd, handle, params, nullptr);
+            QueryPerformanceCounter(&e1);
+            ems = (f.QuadPart > 0)
+                ? ((double)(e1.QuadPart - e0.QuadPart) * 1000.0 / (double)f.QuadPart) : 0.0;
+            used_depth = true;
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.1] EvaluateFeature (with depth): result=0x%08X (%s) "
+                     "record_cpu=%.2fms",
+                     (unsigned)er, ngx_result_name(er), ems);
+            mgpu::diag::info(line);
+        }
+
+        // The readback is recorded whatever the result codes said. An
+        // evaluate that returned Success and wrote nothing is a real and
+        // very quiet failure mode, and it is exactly what this comparison
+        // exists to catch.
+        barrier(pcmd, tex_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(pcmd, tex_color, read_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        auto copy_out = [&](ID3D12Resource *src, ID3D12Resource *dst)
+        {
+            D3D12_TEXTURE_COPY_LOCATION s{};
+            s.pResource = src;
+            s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            s.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION d{};
+            d.pResource = dst;
+            d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            d.PlacedFootprint = fp_color;
+            d.PlacedFootprint.Offset = 0;
+            pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        };
+        copy_out(tex_color,  buf_read_in);
+        copy_out(tex_output, buf_read_out);
+
+        // ---- flush here rather than in teardown ----
+        //
+        // The comparison needs the GPU to have finished, and teardown
+        // releases the buffers it would read. So the drain happens now;
+        // list_open goes false and teardown skips its own.
+        mgpu::diag::info("[MGPU][P1.1] flush: Close -> Execute -> fence wait ...");
+        hr = pcmd->Close();
+        list_open = false;
+        if (SUCCEEDED(hr))
+        {
+            ID3D12CommandList *const lists[1] = { pcmd };
+            queue->ExecuteCommandLists(1, lists);
+            hr = queue->Signal(pfence, 1);
+        }
+        DWORD wr = WAIT_FAILED;
+        if (SUCCEEDED(hr))
+        {
+            pfence->SetEventOnCompletion(1, pevent);
+            wr = WaitForSingleObject(pevent, 20000);
+        }
+        if (FAILED(hr) || wr != WAIT_OBJECT_0)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.1] flush FAILED hr=0x%08X wait=0x%08X - not reading back, and "
+                     "not releasing anything (the GPU may still hold these resources)",
+                     (unsigned)hr, (unsigned)wr);
+            mgpu::diag::error(line);
+            // Deliberate leak, same rule as P1.0c's abandoned teardown.
+            mgpu::diag::warn("[MGPU][P1.1] PROBE FAILED at flush. Bridge continues.");
+            return false;
+        }
+        mgpu::diag::info("[MGPU][P1.1] flush: GPU idle - the evaluate has executed");
+
+        // ---- the actual proof ----
+        {
+            const unsigned char *pin = nullptr;
+            const unsigned char *pout = nullptr;
+            D3D12_RANGE all{0, (SIZE_T)sz_color};
+            const HRESULT h1 = buf_read_in->Map(0, &all, (void **)&pin);
+            const HRESULT h2 = buf_read_out->Map(0, &all, (void **)&pout);
+            if (FAILED(h1) || FAILED(h2) || pin == nullptr || pout == nullptr)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.1] readback Map hr=0x%08X/0x%08X - cannot compare",
+                         (unsigned)h1, (unsigned)h2);
+                mgpu::diag::error(line);
+            }
+            else
+            {
+                unsigned long long differing = 0, nonzero_out = 0, total = 0;
+                unsigned long long sum_abs = 0;
+                unsigned int max_abs = 0;
+                const UINT pitch = fp_color.Footprint.RowPitch;
+                for (UINT y = 0; y < height; ++y)
+                {
+                    const unsigned char *ri = pin + (size_t)y * pitch;
+                    const unsigned char *ro = pout + (size_t)y * pitch;
+                    for (UINT x = 0; x < width; ++x)
+                    {
+                        const unsigned char *a = ri + (size_t)x * 4;
+                        const unsigned char *b = ro + (size_t)x * 4;
+                        bool diff = false;
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            const int d = (int)b[c] - (int)a[c];
+                            const unsigned int ad = (unsigned int)(d < 0 ? -d : d);
+                            if (ad != 0) diff = true;
+                            sum_abs += ad;
+                            if (ad > max_abs) max_abs = ad;
+                        }
+                        if (b[0] || b[1] || b[2]) ++nonzero_out;
+                        if (diff) ++differing;
+                        ++total;
+                    }
+                }
+                const double pct = total ? (100.0 * (double)differing / (double)total) : 0.0;
+                const double mean = total ? ((double)sum_abs / (double)(total * 3)) : 0.0;
+
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.1] readback: pixels=%llu differing=%llu (%.2f%%) "
+                         "mean_abs_delta=%.3f max_abs_delta=%u output_nonzero=%llu depth=%s",
+                         total, differing, pct, mean, max_abs, nonzero_out,
+                         used_depth ? "bound" : "null");
+                mgpu::diag::info(line);
+
+                if (er != NVSDK_NGX_Result_Success)
+                {
+                    mgpu::diag::warn("[MGPU][P1.1] EVALUATE FAILED - the numbers above describe an "
+                                     "output NR did not write. Read them as a control, not a "
+                                     "result.");
+                }
+                else if (nonzero_out == 0)
+                {
+                    mgpu::diag::error("[MGPU][P1.1] EVALUATE RETURNED SUCCESS BUT THE OUTPUT IS "
+                                      "ENTIRELY BLACK - the model did not write to the resource we "
+                                      "bound. Suspect the DLSSNR.Output key, the UAV state, or a "
+                                      "subrect name.");
+                }
+                else if (differing == 0)
+                {
+                    mgpu::diag::error("[MGPU][P1.1] EVALUATE RETURNED SUCCESS BUT OUTPUT == INPUT "
+                                      "byte for byte - NR copied rather than processed. Suspect a "
+                                      "silently-ignored parameter; the snippet log is the place to "
+                                      "look.");
+                }
+                else
+                {
+                    mgpu::diag::info("[MGPU][P1.1] PROBE PASSED - DLSS-NR EXECUTED ON THE NON-GAME "
+                                     "ADAPTER AND MODIFIED THE IMAGE. Tensors ran on GPU 1.");
+                }
+            }
+            D3D12_RANGE nothing{0, 0};
+            if (pin != nullptr)  buf_read_in->Unmap(0, &nothing);
+            if (pout != nullptr) buf_read_out->Unmap(0, &nothing);
+        }
+    }
+
     // ---- 8. leave nothing behind ----
     teardown(nullptr);
 
-    mgpu::diag::info("[MGPU][P1.0c] PROBE PASSED - NGX created a DLSS-NR feature on the non-game "
-                     "adapter");
+    mgpu::diag::info("[MGPU][P1.0c] create/teardown cycle complete - see the [MGPU][P1.1] lines "
+                     "above for whether the model actually executed");
     return true;
 }
 }
