@@ -2963,6 +2963,12 @@ bool transit_probe()
             const char *a1_won = "none";
             bool a1_eligible = false;
             ID3D12Resource *shared0_keep = nullptr;
+            // P1.3f. V5's heap must OUTLIVE the loop now. A placed resource is
+            // not itself shareable: for a resource in a shared heap, D3D12
+            // shares the HEAP and the other adapter places its own resource
+            // into it. P1.3e released the heap immediately after placing, so
+            // A.2 had nothing correct to share and was handed the resource.
+            ID3D12Heap *heapA = nullptr, *heapA_keep = nullptr;
             for (int v = 0; v < 5; ++v)
             {
                 if (shared0 != nullptr && a1_eligible) break;   // best possible already held
@@ -2987,6 +2993,7 @@ bool transit_probe()
 
                     ID3D12Heap *ha = nullptr;
                     hv = g0.dev->CreateHeap(&hd, IID_PPV_ARGS(&ha));
+                    heapA = ha;
                     snprintf(line, sizeof line,
                              "[MGPU][P1.3] %ux%u   A.1 %s -> CreateHeap hr=0x%08X",
                              width, height, V.name, (unsigned)hv);
@@ -2996,9 +3003,8 @@ bool transit_probe()
                         hv = g0.dev->CreatePlacedResource(ha, 0, &bd,
                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                           IID_PPV_ARGS(&shared0));
-                        // CreatePlacedResource takes its own reference; ours is
-                        // no longer needed whether or not it succeeded.
-                        ha->Release();
+                        // Our reference is handed to heapA_keep below if this
+                        // row wins; otherwise it is dropped with the row.
                     }
                 }
 
@@ -3016,13 +3022,17 @@ bool transit_probe()
                     if (!a1_eligible || eligible)
                     {
                         if (shared0_keep != nullptr) shared0_keep->Release();
+                        if (heapA_keep != nullptr) heapA_keep->Release();
                         shared0_keep = shared0;
+                        heapA_keep = heapA; heapA = nullptr;
                         a1 = hv; a1_won = V.name; a1_eligible = eligible;
                     }
                     else { shared0->Release(); }
                     shared0 = nullptr;
                 }
                 else if (shared0 != nullptr) { shared0->Release(); shared0 = nullptr; }
+
+                if (heapA != nullptr) { heapA->Release(); heapA = nullptr; }
             }
             shared0 = shared0_keep; shared0_keep = nullptr;
 
@@ -3041,26 +3051,74 @@ bool transit_probe()
             // Restore the descriptor the rest of path A expects.
             bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
+            // P1.3f. SHARE THE HEAP, NOT THE RESOURCE. The 17:01 run reached
+            // A.2 with an eligible=YES winner for the first time and got
+            // E_INVALIDARG - and that is our mistake once more, not a verdict.
+            // A committed resource carries its own implicit heap and can be
+            // shared directly; a PLACED resource cannot, because the thing that
+            // owns the memory is the heap. The documented cross-adapter shape is
+            // share the heap, open it on the second adapter, and place a
+            // matching resource into it there.
+            //
+            // So A.2/A.3 now operate on heapA_keep when V5 won, and fall back to
+            // the resource only when a committed row won. The log says which,
+            // because "which object did we hand it" is exactly the kind of
+            // detail that turns into a wrong conclusion three days later.
             HRESULT a2 = a1, a3 = a1;
+            ID3D12Heap *heap1_opened = nullptr;
+            const bool share_heap = (heapA_keep != nullptr);
             if (SUCCEEDED(a1))
             {
-                a2 = g0.dev->CreateSharedHandle(shared0, nullptr, GENERIC_ALL, nullptr, &sh);
+                ID3D12DeviceChild *to_share = share_heap
+                    ? static_cast<ID3D12DeviceChild *>(heapA_keep)
+                    : static_cast<ID3D12DeviceChild *>(shared0);
+                a2 = g0.dev->CreateSharedHandle(to_share, nullptr, GENERIC_ALL, nullptr, &sh);
                 snprintf(line, sizeof line,
-                         "[MGPU][P1.3] %ux%u A.2 CreateSharedHandle: hr=0x%08X handle=0x%p",
-                         width, height, (unsigned)a2, (void *)sh);
+                         "[MGPU][P1.3] %ux%u A.2 CreateSharedHandle(%s): hr=0x%08X handle=0x%p",
+                         width, height, share_heap ? "HEAP" : "resource",
+                         (unsigned)a2, (void *)sh);
                 mgpu::diag::info(line);
                 if (FAILED(a2)) transit_drain_info_queue(g0.dev, "gpu0 after A.2");
             }
             if (SUCCEEDED(a2))
             {
-                a3 = g1.dev->OpenSharedHandle(sh, IID_PPV_ARGS(&shared1));
-                snprintf(line, sizeof line,
-                         "[MGPU][P1.3] %ux%u A.3 OpenSharedHandle on GPU 1: hr=0x%08X res=0x%p "
-                         "<- a capability answer ONLY if the A.1 verdict above says eligible=YES",
-                         width, height, (unsigned)a3, (void *)shared1);
-                mgpu::diag::info(line);
+                if (share_heap)
+                {
+                    a3 = g1.dev->OpenSharedHandle(sh, IID_PPV_ARGS(&heap1_opened));
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.3] %ux%u A.3 OpenSharedHandle as HEAP on GPU 1: "
+                             "hr=0x%08X heap=0x%p <- THE capability answer: an eligible "
+                             "cross-adapter heap presented to the second adapter",
+                             width, height, (unsigned)a3, (void *)heap1_opened);
+                    mgpu::diag::info(line);
+                    if (SUCCEEDED(a3) && heap1_opened != nullptr)
+                    {
+                        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+                        a3 = g1.dev->CreatePlacedResource(heap1_opened, 0, &bd,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&shared1));
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P1.3] %ux%u A.3b CreatePlacedResource in the opened "
+                                 "heap on GPU 1: hr=0x%08X res=0x%p",
+                                 width, height, (unsigned)a3, (void *)shared1);
+                        mgpu::diag::info(line);
+                    }
+                }
+                else
+                {
+                    a3 = g1.dev->OpenSharedHandle(sh, IID_PPV_ARGS(&shared1));
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.3] %ux%u A.3 OpenSharedHandle as resource on GPU 1: "
+                             "hr=0x%08X res=0x%p <- a capability answer ONLY if the A.1 verdict "
+                             "above says eligible=YES", width, height, (unsigned)a3,
+                             (void *)shared1);
+                    mgpu::diag::info(line);
+                }
                 if (FAILED(a3)) transit_drain_info_queue(g1.dev, "gpu1 after A.3");
             }
+
+            if (heap1_opened != nullptr) heap1_opened->Release();
+            if (heapA_keep != nullptr) heapA_keep->Release();
 
             if (SUCCEEDED(a3) && shared1 != nullptr) { path = "A(shared cross-adapter)"; }
             else
