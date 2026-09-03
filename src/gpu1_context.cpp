@@ -3,7 +3,8 @@
 #include <windows.h>
 #include <combaseapi.h>
 #include <d3d12.h>
-#include <d3d12sdklayers.h>   // P1.3: ID3D12Debug, ID3D12InfoQueue
+#include <d3d12sdklayers.h>   // P1.3: ID3D12InfoQueue only. NOT ID3D12Debug -
+                              // see the comment above transit_drain_info_queue.
 #include <dxgi1_4.h>   // T5: IDXGISwapChain3 (GetCurrentBackBufferIndex),
                       // IDXGIFactory2 (CreateSwapChainForHwnd,
                       // MakeWindowAssociation) and DXGI_SWAP_CHAIN_DESC1.
@@ -2547,27 +2548,30 @@ namespace
         UINT64 fence_value = 0;
     };
 
-    // P1.3b. The runtime knows exactly why it returned E_INVALIDARG; the
-    // only reason we did not know is that nobody asked it. Enabling the
-    // debug layer here affects ONLY devices created after this call, so
-    // the game's device and P0's GPU 1 device are untouched. If the
-    // Graphics Tools feature is not installed this fails harmlessly and
-    // the probe carries on without commentary.
-    bool transit_enable_debug_layer()
-    {
-        ID3D12Debug *d = nullptr;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&d))) && d != nullptr)
-        {
-            d->EnableDebugLayer();
-            d->Release();
-            return true;
-        }
-        return false;
-    }
+    // P1.3c. THERE IS DELIBERATELY NO EnableDebugLayer HERE. The P1.3b build
+    // called ID3D12Debug::EnableDebugLayer() from inside the bridge thread,
+    // long after the process had live D3D12 devices, and the run at 16:06:56
+    // went: debug layer ENABLED at :750 -> both D3D12CreateDevice calls fail
+    // with DXGI_ERROR_DEVICE_RESET at :751 and :752 -> the ALREADY-RUNNING
+    // GPU 1 present-chain device is reported removed at :759, reason
+    // DXGI_ERROR_DEVICE_RESET. Nine milliseconds, one reason code, every
+    // device in the process.
+    //
+    // That is out of contract and it was my mistake: the debug layer is
+    // documented as something you enable BEFORE any device exists in the
+    // process. The comment I wrote claiming it "affects ONLY devices created
+    // after this call" was an assumption stated as a fact, and the rig
+    // disproved it. Do not reintroduce this call. If validation messages are
+    // ever genuinely needed, they must come from a process that enabled the
+    // layer at startup - not from a hook that switches it on mid-flight.
 
-    // Drain whatever the validation layer has to say and put it in our log
-    // verbatim. Same move as raising NGX's LogLevel: let the component that
-    // rejected the call explain itself instead of inferring from a code.
+    // Kept, but expected to do nothing. ID3D12InfoQueue only exists on a
+    // device created while the debug layer was active, and P1.3c does not
+    // activate it (see above), so the QueryInterface below normally fails and
+    // this returns silently. It stays in the source because it costs one
+    // failed QI per failure path and it is the correct reader if this probe
+    // is ever run under an externally-enabled layer - PIX, or a launcher that
+    // sets the layer before the process starts a device.
     void transit_drain_info_queue(ID3D12Device *dev, const char *tag)
     {
         if (dev == nullptr) return;
@@ -2699,19 +2703,11 @@ bool transit_probe()
     //
     // BOTH are created here, including the one on our own adapter. P1.3's
     // first version borrowed the present chain's GPU 1 device; this one does
-    // not, for two reasons. It isolates the probe completely - a transit
-    // failure cannot disturb P0's device - and it means both sides are
-    // created AFTER the debug layer is enabled, so both can be interrogated
-    // when something is rejected. A capability answer from two fresh devices
-    // holds for the real ones.
-    const bool dbg = transit_enable_debug_layer();
-    snprintf(line, sizeof line,
-             "[MGPU][P1.3] D3D12 debug layer: %s. It applies only to devices created after this "
-             "point, so the game's device and P0's GPU 1 device are unaffected.%s",
-             dbg ? "ENABLED" : "unavailable (Graphics Tools not installed)",
-             dbg ? "" : " Validation messages will not be available - install the optional "
-                        "\"Graphics Tools\" Windows feature to get them.");
-    mgpu::diag::info(line);
+    // not. It isolates the probe completely: a transit failure cannot disturb
+    // P0's device, and a capability answer from two fresh devices holds for
+    // the real ones.
+    mgpu::diag::info("[MGPU][P1.3] no debug layer (see comment above transit_drain_info_queue) - "
+                     "the split per-call HRESULTs below are the instrument.");
 
     {
         HRESULT hr0 = transit_make_device(luid0, &g0.dev);
