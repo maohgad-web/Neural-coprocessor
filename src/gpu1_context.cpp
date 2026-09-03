@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <combaseapi.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>   // P1.3: ID3D12Debug, ID3D12InfoQueue
 #include <dxgi1_4.h>   // T5: IDXGISwapChain3 (GetCurrentBackBufferIndex),
                       // IDXGIFactory2 (CreateSwapChainForHwnd,
                       // MakeWindowAssociation) and DXGI_SWAP_CHAIN_DESC1.
@@ -2546,6 +2547,81 @@ namespace
         UINT64 fence_value = 0;
     };
 
+    // P1.3b. The runtime knows exactly why it returned E_INVALIDARG; the
+    // only reason we did not know is that nobody asked it. Enabling the
+    // debug layer here affects ONLY devices created after this call, so
+    // the game's device and P0's GPU 1 device are untouched. If the
+    // Graphics Tools feature is not installed this fails harmlessly and
+    // the probe carries on without commentary.
+    bool transit_enable_debug_layer()
+    {
+        ID3D12Debug *d = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&d))) && d != nullptr)
+        {
+            d->EnableDebugLayer();
+            d->Release();
+            return true;
+        }
+        return false;
+    }
+
+    // Drain whatever the validation layer has to say and put it in our log
+    // verbatim. Same move as raising NGX's LogLevel: let the component that
+    // rejected the call explain itself instead of inferring from a code.
+    void transit_drain_info_queue(ID3D12Device *dev, const char *tag)
+    {
+        if (dev == nullptr) return;
+        ID3D12InfoQueue *iq = nullptr;
+        if (FAILED(dev->QueryInterface(__uuidof(ID3D12InfoQueue),
+                                       reinterpret_cast<void **>(&iq))) || iq == nullptr)
+            return;
+        const UINT64 n = iq->GetNumStoredMessages();
+        char line[1000];
+        for (UINT64 i = 0; i < n; ++i)
+        {
+            SIZE_T len = 0;
+            if (FAILED(iq->GetMessage(i, nullptr, &len)) || len == 0) continue;
+            D3D12_MESSAGE *m = static_cast<D3D12_MESSAGE *>(malloc(len));
+            if (m == nullptr) continue;
+            if (SUCCEEDED(iq->GetMessage(i, m, &len)) && m->pDescription != nullptr)
+            {
+                snprintf(line, sizeof line, "[MGPU][P1.3][D3D12:%s] sev=%d id=%d %s",
+                         tag, (int)m->Severity, (int)m->ID, m->pDescription);
+                mgpu::diag::info(line);
+            }
+            free(m);
+        }
+        iq->ClearStoredMessages();
+        iq->Release();
+    }
+
+    // A device of our own on the adapter with this LUID.
+    HRESULT transit_make_device(LUID want, ID3D12Device **out)
+    {
+        IDXGIFactory2 *factory = nullptr;
+        HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2),
+                                        reinterpret_cast<void **>(&factory));
+        if (FAILED(hr)) return hr;
+        IDXGIAdapter1 *found = nullptr;
+        for (UINT i = 0; ; ++i)
+        {
+            IDXGIAdapter1 *a = nullptr;
+            if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 d{};
+            if (SUCCEEDED(a->GetDesc1(&d)) &&
+                d.AdapterLuid.LowPart == want.LowPart &&
+                d.AdapterLuid.HighPart == want.HighPart)
+            { found = a; break; }
+            a->Release();
+        }
+        if (found == nullptr) { factory->Release(); return DXGI_ERROR_NOT_FOUND; }
+        hr = D3D12CreateDevice(static_cast<IUnknown *>(found), D3D_FEATURE_LEVEL_11_0,
+                               IID_PPV_ARGS(out));
+        found->Release();
+        factory->Release();
+        return hr;
+    }
+
     void transit_side_release(transit_side &s, bool release_device)
     {
         if (s.event != nullptr) { CloseHandle(s.event); s.event = nullptr; }
@@ -2601,17 +2677,15 @@ bool transit_probe()
     auto &S = st();
     char line[700];
 
-    ID3D12Device *dev1 = nullptr;
     LUID luid1{}, luid0{};
     bool have_game_luid = false;
     {
         std::lock_guard<std::mutex> lk(S.cs);
-        dev1 = S.device;
         luid1 = S.device_luid;
         luid0 = S.game_luid;
-        have_game_luid = S.game_luid_known;
+        have_game_luid = S.game_luid_known && S.device != nullptr;
     }
-    if (dev1 == nullptr || !have_game_luid)
+    if (!have_game_luid)
     {
         mgpu::diag::warn("[MGPU][P1.3] no GPU 1 device or no known game luid - transit probe "
                          "skipped");
@@ -2619,56 +2693,49 @@ bool transit_probe()
     }
 
     transit_side g0;   // our own device on the GAME's adapter
-    transit_side g1;   // the existing GPU 1 device
-    g1.dev = dev1;
+    transit_side g1;   // our own device on OUR adapter
 
-    // ---- 1. a device of our own on the game's adapter ----
+    // ---- 1. two devices of our own, one per adapter ----
+    //
+    // BOTH are created here, including the one on our own adapter. P1.3's
+    // first version borrowed the present chain's GPU 1 device; this one does
+    // not, for two reasons. It isolates the probe completely - a transit
+    // failure cannot disturb P0's device - and it means both sides are
+    // created AFTER the debug layer is enabled, so both can be interrogated
+    // when something is rejected. A capability answer from two fresh devices
+    // holds for the real ones.
+    const bool dbg = transit_enable_debug_layer();
+    snprintf(line, sizeof line,
+             "[MGPU][P1.3] D3D12 debug layer: %s. It applies only to devices created after this "
+             "point, so the game's device and P0's GPU 1 device are unaffected.%s",
+             dbg ? "ENABLED" : "unavailable (Graphics Tools not installed)",
+             dbg ? "" : " Validation messages will not be available - install the optional "
+                        "\"Graphics Tools\" Windows feature to get them.");
+    mgpu::diag::info(line);
+
     {
-        IDXGIFactory2 *factory = nullptr;
-        HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2),
-                                        reinterpret_cast<void **>(&factory));
-        if (FAILED(hr))
-        {
-            snprintf(line, sizeof line, "[MGPU][P1.3] CreateDXGIFactory2 hr=0x%08X", (unsigned)hr);
-            mgpu::diag::error(line);
-            return false;
-        }
-        IDXGIAdapter1 *found = nullptr;
-        for (UINT i = 0; ; ++i)
-        {
-            IDXGIAdapter1 *a = nullptr;
-            if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
-            DXGI_ADAPTER_DESC1 d{};
-            if (SUCCEEDED(a->GetDesc1(&d)) &&
-                d.AdapterLuid.LowPart == luid0.LowPart &&
-                d.AdapterLuid.HighPart == luid0.HighPart)
-            { found = a; break; }
-            a->Release();
-        }
-        if (found == nullptr)
-        {
-            factory->Release();
-            mgpu::diag::error("[MGPU][P1.3] game adapter not found by luid - transit probe skipped");
-            return false;
-        }
-        hr = D3D12CreateDevice(static_cast<IUnknown *>(found), D3D_FEATURE_LEVEL_11_0,
-                               IID_PPV_ARGS(&g0.dev));
-        found->Release();
-        factory->Release();
+        HRESULT hr0 = transit_make_device(luid0, &g0.dev);
+        HRESULT hr1 = transit_make_device(luid1, &g1.dev);
         snprintf(line, sizeof line,
-                 "[MGPU][P1.3] our own device on the GAME'S ADAPTER hr=0x%08X luid=%08lX-%08lX "
-                 "(the game's own device is NOT touched)",
-                 (unsigned)hr, (unsigned long)luid0.HighPart, (unsigned long)luid0.LowPart);
+                 "[MGPU][P1.3] own devices: gpu0(game adapter) hr=0x%08X luid=%08lX-%08lX | "
+                 "gpu1 hr=0x%08X luid=%08lX-%08lX (the game's own device is NOT touched)",
+                 (unsigned)hr0, (unsigned long)luid0.HighPart, (unsigned long)luid0.LowPart,
+                 (unsigned)hr1, (unsigned long)luid1.HighPart, (unsigned long)luid1.LowPart);
         mgpu::diag::info(line);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr0) || FAILED(hr1))
+        {
+            transit_side_release(g1, true);
+            transit_side_release(g0, true);
+            return false;
+        }
 
-        hr = transit_side_init(g0);
+        HRESULT hr = transit_side_init(g0);
         if (SUCCEEDED(hr)) hr = transit_side_init(g1);
         if (FAILED(hr))
         {
             snprintf(line, sizeof line, "[MGPU][P1.3] command objects hr=0x%08X", (unsigned)hr);
             mgpu::diag::error(line);
-            transit_side_release(g1, false);
+            transit_side_release(g1, true);
             transit_side_release(g0, true);
             return false;
         }
@@ -2742,63 +2809,133 @@ bool transit_probe()
         // no barriers are recorded against them anywhere below - a
         // transition on a cross-adapter resource is a debug-layer error,
         // not an optimisation.
+        //
+        // EVERY CALL IS LOGGED SEPARATELY. P1.3's first version chained
+        // three calls into one HRESULT and reported 0x80070057 without
+        // saying which produced it - and the distinction is the whole
+        // question. A rejection at CreateCommittedResource is a parameter
+        // mistake we can fix; a rejection at OpenSharedHandle is the
+        // RECEIVING adapter refusing the handle, which is a capability
+        // answer. Collapsing them made those indistinguishable.
+        //
+        // Sizes are rounded up to 64 KB. Cross-adapter placement alignment
+        // is 64 KB, and 1280x720x4 = 3,686,400 is 56.25 of those - not an
+        // integer multiple. 2560x1440x4 = 14,745,600 IS exactly 225, and it
+        // failed identically, so alignment cannot be the whole story. It is
+        // corrected because it is cheap and correct, not because it is the
+        // diagnosis.
         {
+            const UINT64 ALIGN = 65536;
+            const UINT64 shared_bytes = ((bytes + ALIGN - 1) / ALIGN) * ALIGN;
+
             D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            // Documented as equivalent to 1 when left at 0. Set explicitly so
+            // the echo below reports a value we chose rather than a default we
+            // are assuming the meaning of.
+            hp.CreationNodeMask = 1; hp.VisibleNodeMask = 1;
+
             D3D12_RESOURCE_DESC bd{};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
-            bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+            bd.Alignment = 0;
+            bd.Width = shared_bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1; bd.SampleDesc.Quality = 0;
             bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
-            HRESULT a = g0.dev->CreateCommittedResource(
+            // Echo the descriptor we are about to submit, field by field, as
+            // NUMBERS rather than as a claim in a comment. Every cross-adapter
+            // buffer requirement is visible in this one line, so a future
+            // reading of the log can settle "did we set that" without reading
+            // this source, and without anyone having to be believed.
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.3] %ux%u A.0 desc echo: dim=%d(BUFFER=1) w=%llu (%llu x 64KB, "
+                     "exact=%s) h=%u depth=%u mips=%u fmt=%d(UNKNOWN=0) samples=%u layout=%d"
+                     "(ROW_MAJOR=1) resFlags=0x%X(ALLOW_CROSS_ADAPTER=0x%X) heapType=%d(DEFAULT=1) "
+                     "nodeMask=%u/%u heapFlags=0x%X(SHARED=0x%X|SHARED_CROSS_ADAPTER=0x%X)",
+                     width, height, (int)bd.Dimension, (unsigned long long)bd.Width,
+                     (unsigned long long)(shared_bytes / 65536),
+                     (shared_bytes % 65536) == 0 ? "yes" : "NO",
+                     (unsigned)bd.Height, (unsigned)bd.DepthOrArraySize, (unsigned)bd.MipLevels,
+                     (int)bd.Format, (unsigned)bd.SampleDesc.Count, (int)bd.Layout,
+                     (unsigned)bd.Flags, (unsigned)D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                     (int)hp.Type, (unsigned)hp.CreationNodeMask, (unsigned)hp.VisibleNodeMask,
+                     (unsigned)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER),
+                     (unsigned)D3D12_HEAP_FLAG_SHARED,
+                     (unsigned)D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+            mgpu::diag::info(line);
+
+            const HRESULT a1 = g0.dev->CreateCommittedResource(
                 &hp,
                 D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER,
                 &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&shared0));
-            if (SUCCEEDED(a))
-                a = g0.dev->CreateSharedHandle(shared0, nullptr, GENERIC_ALL, nullptr, &sh);
-            if (SUCCEEDED(a))
-                a = g1.dev->OpenSharedHandle(sh, IID_PPV_ARGS(&shared1));
-
             snprintf(line, sizeof line,
-                     "[MGPU][P1.3] %ux%u path A (shared cross-adapter buffer): hr=0x%08X "
-                     "bytes=%llu rowPitch=%u",
-                     width, height, (unsigned)a, (unsigned long long)bytes,
-                     (unsigned)fp.Footprint.RowPitch);
+                     "[MGPU][P1.3] %ux%u A.1 CreateCommittedResource(DEFAULT|SHARED|"
+                     "SHARED_CROSS_ADAPTER, ALLOW_CROSS_ADAPTER, ROW_MAJOR): hr=0x%08X "
+                     "payload=%llu padded=%llu rowPitch=%u",
+                     width, height, (unsigned)a1, (unsigned long long)bytes,
+                     (unsigned long long)shared_bytes, (unsigned)fp.Footprint.RowPitch);
             mgpu::diag::info(line);
+            if (FAILED(a1)) transit_drain_info_queue(g0.dev, "gpu0 after A.1");
 
-            if (SUCCEEDED(a)) { path = "A(shared cross-adapter)"; }
+            HRESULT a2 = a1, a3 = a1;
+            if (SUCCEEDED(a1))
+            {
+                a2 = g0.dev->CreateSharedHandle(shared0, nullptr, GENERIC_ALL, nullptr, &sh);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.3] %ux%u A.2 CreateSharedHandle: hr=0x%08X handle=0x%p",
+                         width, height, (unsigned)a2, (void *)sh);
+                mgpu::diag::info(line);
+                if (FAILED(a2)) transit_drain_info_queue(g0.dev, "gpu0 after A.2");
+            }
+            if (SUCCEEDED(a2))
+            {
+                a3 = g1.dev->OpenSharedHandle(sh, IID_PPV_ARGS(&shared1));
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.3] %ux%u A.3 OpenSharedHandle on GPU 1: hr=0x%08X res=0x%p "
+                         "<- THIS is the call that answers whether the adapters can share",
+                         width, height, (unsigned)a3, (void *)shared1);
+                mgpu::diag::info(line);
+                if (FAILED(a3)) transit_drain_info_queue(g1.dev, "gpu1 after A.3");
+            }
+
+            if (SUCCEEDED(a3) && shared1 != nullptr) { path = "A(shared cross-adapter)"; }
             else
             {
                 if (shared1 != nullptr) { shared1->Release(); shared1 = nullptr; }
                 if (sh != nullptr) { CloseHandle(sh); sh = nullptr; }
                 if (shared0 != nullptr) { shared0->Release(); shared0 = nullptr; }
-                mgpu::diag::warn("[MGPU][P1.3] path A unavailable - trying A' (host-pinned heap "
-                                 "opened on both devices)");
+                mgpu::diag::warn("[MGPU][P1.3] path A did not complete - trying A' (host-pinned "
+                                 "heap opened on both devices)");
             }
         }
 
         // ---- PATH A': one VirtualAlloc, opened as a heap on both devices ----
         if (shared1 == nullptr && eh0.Supported && eh1.Supported)
         {
-            SYSTEM_INFO si_{};
-            GetSystemInfo(&si_);
-            const SIZE_T page = si_.dwPageSize ? si_.dwPageSize : 4096;
-            const SIZE_T alloc_bytes = (SIZE_T)((bytes + page - 1) / page) * page;
+            // Five calls, five log lines, same reasoning as path A. The
+            // VirtualAlloc region is rounded to 64 KB rather than to the
+            // page size: a D3D12 heap's size must be a multiple of 64 KB,
+            // and Windows reserves at 64 KB granularity anyway, so the
+            // earlier page rounding could hand OpenExistingHeapFromAddress
+            // a region it was never allowed to accept.
+            const UINT64 ALIGN = 65536;
+            const SIZE_T alloc_bytes = (SIZE_T)(((bytes + ALIGN - 1) / ALIGN) * ALIGN);
             pinned = VirtualAlloc(nullptr, alloc_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
             D3D12_RESOURCE_DESC bd{};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
-            bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+            bd.Alignment = 0;
+            bd.Width = alloc_bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1; bd.SampleDesc.Quality = 0;
             bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-            // OpenExistingHeapFromAddress is on ID3D12Device3, NOT
-            // ID3D12Device - the base interface has no such method and the
-            // compiler says so. Both devices are queried for it here rather
-            // than being created as Device3 up front, because everything
-            // else in this file only needs the base interface and P1.3
-            // should not change what create_device produces.
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.3] %ux%u A'.0 VirtualAlloc: addr=0x%p bytes=%llu (payload %llu, "
+                     "rounded to 64 KB)",
+                     width, height, pinned, (unsigned long long)alloc_bytes,
+                     (unsigned long long)bytes);
+            mgpu::diag::info(line);
+
             ID3D12Device3 *dev0_3 = nullptr, *dev1_3 = nullptr;
             HRESULT b = (pinned != nullptr) ? S_OK : E_OUTOFMEMORY;
             if (SUCCEEDED(b))
@@ -2807,35 +2944,65 @@ bool transit_probe()
             if (SUCCEEDED(b))
                 b = g1.dev->QueryInterface(__uuidof(ID3D12Device3),
                                            reinterpret_cast<void **>(&dev1_3));
-            if (FAILED(b))
-                mgpu::diag::warn("[MGPU][P1.3] ID3D12Device3 unavailable on one or both devices - "
-                                 "path A' cannot run on this runtime");
-            if (SUCCEEDED(b)) b = dev0_3->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap0));
-            if (SUCCEEDED(b)) b = dev1_3->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap1));
-            if (dev1_3 != nullptr) dev1_3->Release();
-            if (dev0_3 != nullptr) dev0_3->Release();
+            snprintf(line, sizeof line, "[MGPU][P1.3] %ux%u A'.1 QueryInterface(ID3D12Device3): "
+                     "hr=0x%08X", width, height, (unsigned)b);
+            mgpu::diag::info(line);
+
             if (SUCCEEDED(b))
+            {
+                b = dev0_3->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap0));
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.3] %ux%u A'.2 OpenExistingHeapFromAddress on GPU 0: hr=0x%08X",
+                         width, height, (unsigned)b);
+                mgpu::diag::info(line);
+                if (FAILED(b)) transit_drain_info_queue(g0.dev, "gpu0 after A'.2");
+            }
+            if (SUCCEEDED(b))
+            {
+                b = dev1_3->OpenExistingHeapFromAddress(pinned, IID_PPV_ARGS(&heap1));
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.3] %ux%u A'.3 OpenExistingHeapFromAddress on GPU 1: hr=0x%08X "
+                         "<- same host pages, second adapter",
+                         width, height, (unsigned)b);
+                mgpu::diag::info(line);
+                if (FAILED(b)) transit_drain_info_queue(g1.dev, "gpu1 after A'.3");
+            }
+            if (SUCCEEDED(b))
+            {
                 b = g0.dev->CreatePlacedResource(heap0, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
                                                  nullptr, IID_PPV_ARGS(&shared0));
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.3] %ux%u A'.4 CreatePlacedResource on GPU 0: hr=0x%08X",
+                         width, height, (unsigned)b);
+                mgpu::diag::info(line);
+                if (FAILED(b)) transit_drain_info_queue(g0.dev, "gpu0 after A'.4");
+            }
             if (SUCCEEDED(b))
+            {
                 b = g1.dev->CreatePlacedResource(heap1, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
                                                  nullptr, IID_PPV_ARGS(&shared1));
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.3] %ux%u A'.5 CreatePlacedResource on GPU 1: hr=0x%08X",
+                         width, height, (unsigned)b);
+                mgpu::diag::info(line);
+                if (FAILED(b)) transit_drain_info_queue(g1.dev, "gpu1 after A'.5");
+            }
 
-            snprintf(line, sizeof line,
-                     "[MGPU][P1.3] %ux%u path A' (host-pinned, OpenExistingHeapFromAddress): "
-                     "hr=0x%08X addr=0x%p alloc=%llu",
-                     width, height, (unsigned)b, pinned, (unsigned long long)alloc_bytes);
-            mgpu::diag::info(line);
+            if (dev1_3 != nullptr) dev1_3->Release();
+            if (dev0_3 != nullptr) dev0_3->Release();
             if (SUCCEEDED(b)) path = "A'(host-pinned)";
         }
 
         if (shared0 == nullptr || shared1 == nullptr)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P1.3] %ux%u BOTH PATHS FAILED - no buffer crosses between these two "
-                     "adapters by either route. This is the finding, and it changes the "
-                     "architecture: the last resort is a CPU-staged copy, which stalls the game's "
-                     "queue by construction.", width, height);
+                     "[MGPU][P1.3] %ux%u NEITHER PATH PRODUCED A SHARED RESOURCE. Read the "
+                     "per-call hr lines above before drawing any conclusion: E_INVALIDARG "
+                     "(0x80070057) is the runtime rejecting a parameter WE supplied, not the "
+                     "adapters refusing to share. Only a failure at A.3 OpenSharedHandle or A'.3 "
+                     "OpenExistingHeapFromAddress - with the debug layer's own message drained "
+                     "below it - is evidence about the bus. Anything earlier is our bug.",
+                     width, height);
             mgpu::diag::error(line);
             cleanup(); all_ok = false; continue;
         }
@@ -2978,9 +3145,12 @@ bool transit_probe()
                      "numbers as an upper bound; a real figure needs cross-adapter GPU clock "
                      "calibration and a settled scene (P2).");
 
-    transit_side_release(g1, false);   // the GPU 1 device belongs to create_device
-    transit_side_release(g0, true);    // our GPU 0 device is ours to destroy
-    mgpu::diag::info("[MGPU][P1.3] transit probe torn down - our GPU 0 device released");
+    // P1.3b: the probe now creates BOTH devices itself (one per adapter), so
+    // both are ours to destroy. The NGX session on create_device's GPU 1
+    // device is untouched by this - we never borrowed it.
+    transit_side_release(g1, true);
+    transit_side_release(g0, true);
+    mgpu::diag::info("[MGPU][P1.3] transit probe torn down - both probe-owned devices released");
     return all_ok;
 }
 
