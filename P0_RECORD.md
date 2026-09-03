@@ -657,6 +657,31 @@ signature you verified.
   cards.** It shows the allocator carries node masks, which is unsurprising
   in code that ships to LDA-capable systems. Whatever multi-GPU path may or
   may not exist inside that DLL, this line is not it.
+- **P1.2 IS CLOSED — DLSS-NR's tuning parameters are LIVE per evaluate on
+  GPU 1.** Run of `14:44:14`, three evaluates on one command list against
+  one deterministic input, into three sentinel-filled outputs:
+
+  ```
+  sentinel survivors:            A=0  B=0  C=0  of 921600
+  A(0.00) vs B(1.60):  differing=903460 (98.03%) mean=3.968 max=31
+  A(0.00) vs C(0.00):  differing=0      (0.00%)  mean=0.000 max=0   [CONTROL]
+  ```
+
+  **The control is byte-identical.** A and C ran at the same intensity with
+  B between them, and produced exactly the same 921,600 pixels. That
+  establishes three things at once: `DLSSNR.Reset` really does discard
+  `dlssnr_prev_output`, evaluate order contaminates nothing, and the 98%
+  A-vs-B difference has exactly one available cause.
+  **Consequence: quality is tunable at runtime without a ~220 ms feature
+  rebuild.** `PollRuntimeParams` reporting a NULL callback does *not* mean
+  parameters are frozen — it is about a core-installed callback we do not
+  need.
+- **Intensity shows a dose-response, not just liveness.** Pixels changed
+  against the same input pattern: **0.00 → 13,728 (1.49%)**, mean 1.985 —
+  near-passthrough; **0.84 → 914,752 (99.26%)**, mean 5.324 (the P1.1 run).
+  The model's behaviour tracks the value rather than merely reacting to it.
+  Unplanned, and it falls out of having three settings against one fixed
+  input.
 - **A LumeniteFX technique has executed on GPU 1. P0's hypothesis is
   demonstrated.** With `gpu1.ini` as the GPU 1 runtime's own preset,
   `LUMENITE: QuantMotion` enabled, and `DEBUG_FLOW` set to `1` in the overlay,
@@ -956,19 +981,60 @@ is the first place to check for a pre-existing cause. Human-owned, like section
   installs third-party add-ons alongside ours, and if the same thing happens with
   them it is ReShade's input handling rather than anything this project
   introduced. Would be settled by: reproducing it with our add-on renamed away.
-- **One `0xBAD0000C FAIL_OutOfDate` at core init, seen once and not
-  reproduced.** Run of `00:06:58`; `nvngx.log` said `NGXInitValidateSnippets:
-  installed NGX API is older than the one used by client application`. The
-  configuration delta at the time was a set of `.ini` changes (`Generic Depth`
-  disabled among them), but the good runs on either side of it also show
-  `LaunchNGXUpdater` starting `nvngx_update.exe` with `OTAEnabled = 1`, and
-  the `cmsId` differs between runs (`1` vs `101654711`). **An over-the-air
-  snippet updater mutating `C:\ProgramData\NVIDIA\NGX\models` is a far more
-  natural partner for a version-validation error than a ReShade depth add-on
-  is.** Not settled, and it does not block anything: the known-good
-  configuration has `Generic Depth` enabled and is reproducible. Would be
-  settled by: three launches each way, with the OTA updater's activity noted
-  per run. **Do not build a theory on the one observation.**
+- **`0xBAD0000C FAIL_OutOfDate` at core init — INTERMITTENT, reproduced
+  twice, and NOT caused by the `.ini` settings.** Seen at `00:06:58` and
+  again at `14:36:53`.
+  **The `Generic Depth` theory is dead.** The first failure had it
+  **disabled**; the second had it **enabled**. Same failure, opposite
+  settings. (It was recorded as a correlation rather than a conclusion at
+  the time, which is the only reason the second run was interpretable.)
+  **The signature, in `nvngx.log`:** `NGXInitValidateSnippets: installed NGX
+  API is older than the one used by client application` as the **first and
+  only** line, with **no telemetry blocks after it**. Good runs open with
+  four telemetry blocks (SuperSampling, FrameGeneration, DeepDVC,
+  SuperSamplingDenoising). So snippet validation runs before telemetry init
+  and gates everything downstream.
+  **Leading hypothesis: OTA.** `nvngx_update.exe` launches at the end of
+  every *successful* run and rewrites `C:\ProgramData\NVIDIA\NGX\models`;
+  `StreamlineVersion` was observed moving `2,12,129,0` → `2,14,0,0` between
+  two runs on an untouched game. A launch that catches that store
+  mid-update, or holding a snippet newer than the installed core, fails
+  exactly this way. Hypothesis, not finding.
+  **It became PERSISTENT on 2026-09-03.** `14:07` pass, `14:17` pass,
+  `14:36` fail, `14:40` fail — two consecutive failures with no changes
+  between them. An earlier note here said "relaunch, it recovered unaided
+  at `00:15`"; **that guidance was wrong and is retracted.** One recovery
+  is not a recovery rule.
+  **Eliminated:** the Streamline version. `2,14,0,0` was already live in
+  the **passing** `14:17` run.
+  **Last event before the first failure:** `LaunchNGXUpdater` at `14:17:43`,
+  writing `C:\ProgramData\NVIDIA\NGX\models`. It fires on failed runs too,
+  so it is not gated on success. Revised hypothesis: an OTA update landed a
+  snippet set the installed core (1.4.0.0, driver 616.56) rejects, and the
+  rejection sticks.
+  **Check `nvngx.log`'s first line before trusting any run** — if it is that
+  error, the run is void whatever `ReShade.log` says, and must not be
+  recorded as a result.
+  **CLEARED at `14:44` by relaunching the NVIDIA app, which had a pending
+  update.** Three consecutive failures, then one app relaunch and it passed
+  immediately, with no change to the game, the add-on, the `.ini` files or
+  the deploy set.
+  **The versions are what make this interesting: none of them moved.**
+  `ngxCoreVersion 1.4.0.0`, `ngxFeatureVersion 310.1.0`, driver `616.56`,
+  `StreamlineVersion 2,14,0,0` — identical across the passing `14:17` run,
+  all three failures, and the passing `14:44` run. So this was **never a
+  file version mismatch**. It was the state of the NVIDIA app / its service,
+  which `NGXInitValidateSnippets` evidently consults, and which reports a
+  version complaint when it is stale or mid-update.
+  **n=1 on the fix.** Recorded as the leading cause, not as settled.
+  **Operational rule:** if `nvngx.log` opens with that error, relaunch the
+  NVIDIA app before touching anything else. Do not go looking in
+  `C:\ProgramData\NVIDIA\NGX\models`, do not bisect `.ini` files, and do not
+  suspect the add-on — the same binary passed on either side of the outage.
+  **Still true, and still a prerequisite for measurement:** an environment
+  that can change state under a running experiment cannot support P1.4/P1.5
+  numbers unless the telemetry block is captured with every result. A null
+  result and a broken run must remain distinguishable after the fact.
 - **The NGX environment drifts under us via OTA, with the game untouched.**
   `StreamlineVersion` read `2,12,129,0 (v2.12.129-rc0)` in the morning runs
   and `2,14,0,0 (SHA 614ea534a v2.14.0-rc2)` by `14:17`. `OTAEnabled = 1`

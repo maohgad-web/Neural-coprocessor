@@ -262,6 +262,40 @@ whether a quality change costs a ~220 ms rebuild.
 moved from `2,12,129,0` to `2,14,0,0` between runs on this same rig and driver,
 with the game untouched — `OTAEnabled = 1` and `nvngx_update.exe` runs at init.
 
+## P1.2 — PASSED, 2026-09-03
+
+**DLSS-NR's tuning parameters are live per evaluate on GPU 1.** Three evaluates
+on one command list, one deterministic input, three sentinel-filled outputs.
+Log of the `14:44:05` launch.
+
+| Comparison | Result |
+|---|---|
+| Sentinel survivors | **A=0 B=0 C=0** of 921,600 — all three outputs fully written |
+| `A(0.00)` vs `B(1.60)` | differing **903,460 (98.03%)**, mean 3.968, max 31 |
+| `A(0.00)` vs `C(0.00)` **[CONTROL]** | **0 (0.00%)** — byte-identical |
+| `CreateFeature` | Success, 1350 ms (cold, after an NVIDIA app update) |
+
+**Why the control matters.** A and C ran at the same intensity with B between
+them. Byte-identical output proves `DLSSNR.Reset` discards
+`dlssnr_prev_output`, that evaluate order does not contaminate results, and
+therefore that the A-vs-B difference is attributable to intensity alone. Two
+evaluates could not have established any of that.
+
+**Dose-response, against the same input pattern:**
+
+| `DLSSNR.Intensity` | pixels changed vs input | mean abs delta |
+|---|---|---|
+| 0.00 | 13,728 (1.49%) | 1.985 |
+| 0.84 | 914,752 (99.26%) | 5.324 |
+
+Intensity 0 is near-passthrough. The model tracks the value; it does not merely
+respond to it.
+
+**`PollRuntimeParams - callback is NULL` does not mean parameters are frozen.**
+That callback is something the core normally installs and we do not need.
+Quality is adjustable at runtime with **no feature rebuild**, so the ~220 ms
+`CreateFeature` cost is not on the tuning path.
+
 ## Reference DLSS-NR evaluation numbers (single-GPU, third-party tool)
 
 Not ours. Measured by **NeuralOverlay** (`Merserk/dlss5-visual-enhancer`) on this
