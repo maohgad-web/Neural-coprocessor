@@ -115,5 +115,10 @@ namespace mgpu::gpu1
 // tries a shared cross-adapter buffer first and a host-pinned heap second,
 // and verifies the payload byte for byte. Bridge thread only; safe to
 // ignore the return value, the probe logs its own verdict.
-bool transit_probe();
+// P1.3g: `tag` names the run in every log line it produces. "startup" is the
+// automatic run that fires while shaders are still compiling; a manual run
+// triggered by the hotkey passes its own label. The same launch can therefore
+// contain a contaminated sample and a settled one, and the DIFFERENCE between
+// them is the measurement of the contamination itself.
+bool transit_probe(const char *tag = "startup");
 }

@@ -43,6 +43,10 @@
 // defined in dllmain.cpp and captured at DLL_PROCESS_ATTACH.
 // GetModuleHandle(nullptr) returns the game's module, not ours, so the
 // window class's hInstance must be this handle.
+// P1.3g. Hotkey id, process-unique. RegisterHotKey(nullptr, id, ...) scopes the
+// id to the calling THREAD, so a collision is only possible with ourselves.
+#define MGPU_HOTKEY_ID 0x4D47   // 'MG'
+
 namespace mgpu { HMODULE module_handle(); }
 
 namespace mgpu::worker
@@ -206,6 +210,8 @@ namespace
         bool pump = false;
         bool failed_permanently = false;
         bool have_chain = false;   // T5: the present chain was created
+        bool hotkey_ok = false;            // P1.3g: CTRL+ALT+F10 registered
+        unsigned manual_runs = 0;          // P1.3g: how many on-demand runs so far
 
         if (have_device)
         {
@@ -336,6 +342,44 @@ namespace
                     // launch. There is nothing to check.
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
+                    // P1.3g. A GLOBAL hotkey, deliberately - not a key handled by
+                    // the bridge window. A window-scoped key would force the
+                    // bridge window to be focused before it could be pressed,
+                    // which is one of the three focus conditions we want to be
+                    // able to VARY. RegisterHotKey delivers WM_HOTKEY to this
+                    // thread's queue whatever holds the foreground, so the game
+                    // can stay focused, or the desktop, and the probe still fires.
+                    //
+                    // Must be registered on the thread that pumps, which is this
+                    // one. Ctrl+Alt+F10 rather than a bare function key: ReShade
+                    // owns Home, and games claim unmodified F-keys freely.
+                    // Failure is logged and non-fatal - the startup run still
+                    // happens, we just lose manual triggering.
+                    if (hwnd != nullptr)
+                    {
+                        if (RegisterHotKey(nullptr, MGPU_HOTKEY_ID,
+                                           MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10) != FALSE)
+                        {
+                            hotkey_ok = true;
+                            mgpu::diag::info("[MGPU][P1.3g] hotkey registered: CTRL+ALT+F10 runs the "
+                                             "transit probe on demand, from any foreground window. "
+                                             "Press it once the game has settled - in gameplay, not "
+                                             "the menu - and again with a different window focused; "
+                                             "each run labels itself and records which window held "
+                                             "the foreground.");
+                        }
+                        else
+                        {
+                            char hk[256];
+                            snprintf(hk, sizeof hk,
+                                     "[MGPU][P1.3g] RegisterHotKey failed (GetLastError=%lu) - "
+                                     "CTRL+ALT+F10 is probably owned by another process. Manual runs "
+                                     "unavailable this launch; the startup run is unaffected.",
+                                     (unsigned long)GetLastError());
+                            mgpu::diag::warn(hk);
+                        }
+                    }
+
                     // T5: the present chain on the GPU 1 device, against
                     // this hwnd (bridge thread only). Failure is not fatal
                     // to the window: the pump must stay (a window whose
@@ -424,12 +468,38 @@ namespace
                 // discard it without dispatching, so a stray WM_QUIT cannot
                 // be mistaken for a shutdown.
                 MSG m;
+                bool run_transit = false;
                 while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
                 {
                     if (m.message == WM_QUIT)
                         continue;
+                    // P1.3g. WM_HOTKEY is thread-posted, not window-posted, so
+                    // it arrives here with hwnd == nullptr and never reaches a
+                    // window procedure. Flag it and run the probe AFTER the
+                    // queue is drained rather than inside the drain: the probe
+                    // takes ~100 ms, and pumping is what keeps this thread from
+                    // stalling anything that broadcasts to top-level windows.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_ID)
+                    {
+                        run_transit = true;
+                        continue;
+                    }
                     TranslateMessage(&m);
                     DispatchMessageW(&m);
+                }
+
+                if (run_transit)
+                {
+                    ++manual_runs;
+                    char tag[64];
+                    snprintf(tag, sizeof tag, "manual %u @frame %llu",
+                             manual_runs, (unsigned long long)frame);
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.3g] hotkey - running transit probe (%s). The present loop "
+                             "stalls for the duration; a gap in the frame counter here is this, "
+                             "not a fault.", tag);
+                    mgpu::diag::info(line);
+                    (void)mgpu::gpu1::transit_probe(tag);
                 }
 
                 // The colour must animate: a static clear cannot
@@ -553,6 +623,12 @@ namespace
         // created against and would outlive it. gpu1::shutdown() drains
         // the GPU before releasing the chain, and is a no-op for the chain
         // when none was created (the no-window path is unaffected).
+        if (hotkey_ok)
+        {
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_ID);
+            mgpu::diag::info("[MGPU][P1.3g] hotkey unregistered");
+        }
+
         mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (gpu1::shutdown [present chain -> "
                          "device] -> DestroyWindow -> UnregisterClass -> adapter::shutdown)");
 

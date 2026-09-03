@@ -1683,12 +1683,17 @@ bool ngx_probe(UINT width, UINT height)
                     "in this add-on - the same call succeeded repeatedly on this rig with this "
                     "binary. Confirm in nvngx.log: its first line will be "
                     "\"NGXInitValidateSnippets: installed NGX API is older than the one used by "
-                    "client application\" with NO telemetry blocks after it. Relaunching does NOT "
-                    "reliably clear it. Discriminator: move nvngx_dlssnr.dll out of the deploy "
-                    "directory and launch - init succeeding without it blames the app-directory "
-                    "snippet, still failing blames the driver/OTA store under "
-                    "C:\\ProgramData\\NVIDIA\\NGX\\models. THIS RUN ANSWERS NOTHING and must not "
-                    "be recorded as a result.");
+                    "client application\" with NO telemetry blocks after it. "
+                    "FIX, reproduced on the rig 2026-09-03: OPEN THE NVIDIA APP, then relaunch "
+                    "the game. Every earlier clearing event was an instance of this - an app "
+                    "update, a reboot, a settings change - each of which restarted or refreshed "
+                    "that app. Relaunching the game ALONE does not reliably clear it. "
+                    "The OTA model store is NOT the cause and is exonerated: failing runs still "
+                    "parse C:\\ProgramData\\NVIDIA\\NGX\\models and MapProjectId succeeds in them. "
+                    "THIS RUN ANSWERS NOTHING ABOUT NGX and no NGX result from it may be "
+                    "recorded - but it does NOT void probes that never touch NGX. P1.3 builds "
+                    "its own devices and produced a valid cross-adapter transit result on a "
+                    "launch that failed here. Void the NGX portion, not the launch.");
             teardown(which);
             return false;
         }
@@ -2714,8 +2719,39 @@ namespace
     }
 }
 
-bool transit_probe()
+bool transit_probe(const char *tag)
 {
+    if (tag == nullptr) tag = "unlabelled";
+    // P1.3g. Every transit line from here on is preceded by this, so a log
+    // holding several runs can never have two of them confused. The foreground
+    // window is part of the record because it is a variable we do not control
+    // and cannot recover after the fact: a run taken with the game focused, the
+    // bridge window focused, or the desktop focused are three different
+    // measurements, and only this line says which one happened.
+    {
+        char ctx[900];
+        const HWND fg_w = GetForegroundWindow();
+        DWORD fg_pid = 0;
+        if (fg_w != nullptr) GetWindowThreadProcessId(fg_w, &fg_pid);
+        wchar_t cls_w[64] = {};
+        if (fg_w != nullptr) GetClassNameW(fg_w, cls_w, 64);
+        char cls[128] = "";
+        WideCharToMultiByte(CP_UTF8, 0, cls_w, -1, cls, (int)sizeof cls, nullptr, nullptr);
+        const char *owner = "none";
+        if (fg_w != nullptr)
+            owner = (fg_pid == GetCurrentProcessId()) ? "this process"
+                                                      : "another process (game/desktop/shell)";
+        snprintf(ctx, sizeof ctx,
+                 "[MGPU][P1.3] ===== RUN \"%s\" ===== foreground hwnd=0x%p owner=%s class=\"%s\" "
+                 "uptime=%lu ms. A \"startup\" run is contaminated by construction (menu, shaders "
+                 "compiling) and its timings are an upper bound only. A manual run is quieter but "
+                 "is STILL not a performance figure: no shared fence, no pipelining, CPU-serialised "
+                 "round trip. What manual runs buy is repetition and a controlled foreground - n>1 "
+                 "in one launch, and a named focus condition per sample.",
+                 tag, (void *)fg_w, owner, cls, (unsigned long)GetTickCount());
+        mgpu::diag::info(ctx);
+    }
+
     auto &S = st();
     char line[700];
 
