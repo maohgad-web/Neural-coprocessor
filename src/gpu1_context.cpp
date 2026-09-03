@@ -774,7 +774,7 @@ bool device_removed_reason(HRESULT &out)
 //      nvngx.dll_mgpu_bridge.addon64).
 //   2. We were blind to NGX's own diagnostics. An application-form Init
 //      with a log callback fixes that; the driver's lines arrive prefixed
-//      [MGPU][P1.0b][NGX].
+//      [MGPU][P1.0c][NGX].
 //   3. The teardown crashed. The probe released a command list
 //      CreateFeature had recorded into and that had never executed. It is
 //      now closed, executed and fence-waited before anything is released,
@@ -847,6 +847,24 @@ namespace
     typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_shutdown1)(
         ID3D12Device *InDevice);
 
+    // P1.0c. NOT IN ANY PUBLIC HEADER. The snippet exports a routine the
+    // core normally calls to have the feature register its own private
+    // parameter keys - the DLSSNR.* set - into a parameter block. Reaching
+    // it by hand is what lets the block arrive at CreateFeature configured
+    // by the feature itself rather than by us transcribing key names from
+    // a document.
+    //
+    // The signature is INFERRED, not read: the entry point appears in no
+    // header we have. Two things make that acceptable here rather than
+    // reckless. It plausibly takes exactly the block it populates, and on
+    // x64 Windows there is one calling convention with arguments in
+    // registers and the caller cleaning up - so a wrong ARITY does not
+    // corrupt the stack the way the guide's x86-era warning implies. If it
+    // returns something absurd, the result code says so and nothing has
+    // been handed a bad pointer.
+    typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_populate_params)(
+        NVSDK_NGX_Parameter *InParameters);
+
     struct ngx_modules
     {
         HMODULE core = nullptr;      // _nvngx.dll       - the driver's NGX core
@@ -892,6 +910,17 @@ namespace
         return pick;
     }
 
+    // P1.0c: resolve strictly from one module, with no fallback. The
+    // snippet's own session is what FAIL_NotInitialized was complaining
+    // about, so "initialise the snippet" must not be silently satisfiable
+    // by the core's export of the same name - which both modules carry.
+    FARPROC ngx_resolve_strict(HMODULE m, const char *name, char *where, size_t where_n)
+    {
+        FARPROC p = (m != nullptr) ? GetProcAddress(m, name) : nullptr;
+        snprintf(where, where_n, "%s", p != nullptr ? "yes" : "no");
+        return p;
+    }
+
     // P1.0b: NGX's own diagnostics. The registry's
     // HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\LogLevel opens the
     // tap; this callback is the only thing that catches what comes out.
@@ -925,7 +954,7 @@ namespace
             return;
 
         char line[1000];
-        snprintf(line, sizeof line, "[MGPU][P1.0b][NGX] level=%d feature=%d %s",
+        snprintf(line, sizeof line, "[MGPU][P1.0c][NGX] level=%d feature=%d %s",
                  (int)level, (int)source, buf);
         mgpu::diag::info(line);
     }
@@ -991,7 +1020,7 @@ bool ngx_probe(UINT width, UINT height)
     }
     if (dev == nullptr)
     {
-        mgpu::diag::warn("[MGPU][P1.0b] no GPU 1 device - probe skipped");
+        mgpu::diag::warn("[MGPU][P1.0c] no GPU 1 device - probe skipped");
         return false;
     }
     if (queue == nullptr)
@@ -1000,7 +1029,7 @@ bool ngx_probe(UINT width, UINT height)
         // the command list cannot be drained, and releasing an undrained
         // list is the fault this task exists to remove. Refusing is the
         // correct outcome, and it is loud.
-        mgpu::diag::warn("[MGPU][P1.0b] no GPU 1 command queue - probe skipped (the probe must be "
+        mgpu::diag::warn("[MGPU][P1.0c] no GPU 1 command queue - probe skipped (the probe must be "
                          "able to execute the list CreateFeature records into; without that it "
                          "would have to release an undrained list, which is the exact fault P1.0b "
                          "removes)");
@@ -1055,13 +1084,13 @@ bool ngx_probe(UINT width, UINT height)
     }
 
     snprintf(line, sizeof line,
-             "[MGPU][P1.0b] ngx modules: _nvngx.dll=0x%p (%s) nvngx_dlssnr.dll=0x%p (%s)",
+             "[MGPU][P1.0c] ngx modules: _nvngx.dll=0x%p (%s) nvngx_dlssnr.dll=0x%p (%s)",
              (void *)mods.core, core_how, (void *)mods.snippet, snip_how);
     mgpu::diag::info(line);
 
     if (mods.core == nullptr && mods.snippet == nullptr)
     {
-        mgpu::diag::warn("[MGPU][P1.0b] PROBE FAILED at module - neither _nvngx.dll nor "
+        mgpu::diag::warn("[MGPU][P1.0c] PROBE FAILED at module - neither _nvngx.dll nor "
                          "nvngx_dlssnr.dll is reachable. On this rig _nvngx.dll has always been "
                          "resident already, so this line means something changed in the driver or "
                          "the process, not that a DLSS add-on is missing. Bridge continues.");
@@ -1073,7 +1102,7 @@ bool ngx_probe(UINT width, UINT height)
     // P1.0's 0xBAD0000B - a run that costs a rig cycle and answers nothing.
     if (mods.snippet == nullptr)
     {
-        mgpu::diag::warn("[MGPU][P1.0b] PROBE FAILED at module - nvngx_dlssnr.dll is not present "
+        mgpu::diag::warn("[MGPU][P1.0c] PROBE FAILED at module - nvngx_dlssnr.dll is not present "
                          "beside dxgi.dll. P1.0b exists to call the snippet; without it this probe "
                          "would repeat P1.0 exactly. Copy nvngx_dlssnr.dll into the deploy "
                          "directory and rerun. Bridge continues.");
@@ -1105,18 +1134,58 @@ bool ngx_probe(UINT width, UINT height)
                                      w_evaluate, sizeof w_evaluate);
 
     snprintf(line, sizeof line,
-             "[MGPU][P1.0b] ngx exports: Init=%s Init_Ext=%s GetCapabilityParameters=%s "
+             "[MGPU][P1.0c] ngx exports: Init=%s Init_Ext=%s GetCapabilityParameters=%s "
              "DestroyParameters=%s Shutdown1=%s CreateFeature=%s ReleaseFeature=%s "
              "EvaluateFeature=%s",
              w_init, w_init_ext, w_caps, w_destroy, w_shutdown, w_create, w_release, w_evaluate);
     mgpu::diag::info(line);
     (void)p_evaluate;
+    (void)p_shutdown;   // P1.0c no longer calls it - see the teardown comment
+
+    // ---- 2b. the SNIPPET's own entry points ----
+    //
+    // P1.0b initialised the core and then asked the snippet to create a
+    // feature. The snippet answered FAIL_NotInitialized, about itself. So
+    // the snippet has a session of its own and nobody had opened it.
+    //
+    // Resolved strictly from nvngx_dlssnr.dll: both modules export these
+    // names, and a fallback to the core here would re-run P1.0b while
+    // looking like progress. Three init spellings are probed because the
+    // guide names Init_Ext2 among the Vulkan snippet exports and we do not
+    // know which of them the D3D12 snippet carries - the log answers that
+    // rather than a guess doing so.
+    char s_init[8]{}, s_init_ext[8]{}, s_init_ext2[8]{}, s_populate[8]{};
+
+    ngx_pf_init     ps_init      = (ngx_pf_init)     ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init",      s_init,      sizeof s_init);
+    ngx_pf_init_ext ps_init_ext  = (ngx_pf_init_ext) ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext",  s_init_ext,  sizeof s_init_ext);
+    FARPROC         ps_init_ext2 =                   ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext2", s_init_ext2, sizeof s_init_ext2);
+
+    ngx_pf_populate_params ps_populate = (ngx_pf_populate_params)
+        ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl",
+                           s_populate, sizeof s_populate);
+
+    snprintf(line, sizeof line,
+             "[MGPU][P1.0c] snippet-only exports: Init=%s Init_Ext=%s Init_Ext2=%s "
+             "PopulateParameters_Impl=%s",
+             s_init, s_init_ext, s_init_ext2, s_populate);
+    mgpu::diag::info(line);
+    (void)ps_init_ext2;   // presence is the finding; not called this task
+
+    if (ps_init == nullptr && ps_init_ext == nullptr)
+    {
+        mgpu::diag::warn("[MGPU][P1.0c] PROBE FAILED at snippet exports - nvngx_dlssnr.dll offers "
+                         "no Init or Init_Ext to open its own session with. The Init_Ext2 line "
+                         "above says whether a third spelling exists; if it does, that is the next "
+                         "thing to call and its signature has to come from the header, not from "
+                         "this one. Bridge continues.");
+        return false;
+    }
 
     if ((p_init == nullptr && p_init_ext == nullptr) ||
         p_caps == nullptr || p_create == nullptr ||
-        p_release == nullptr || p_destroy == nullptr || p_shutdown == nullptr)
+        p_release == nullptr || p_destroy == nullptr)
     {
-        mgpu::diag::warn("[MGPU][P1.0b] PROBE FAILED at exports - see the line above for which "
+        mgpu::diag::warn("[MGPU][P1.0c] PROBE FAILED at exports - see the line above for which "
                          "names were missing. Bridge continues.");
         return false;
     }
@@ -1135,7 +1204,7 @@ bool ngx_probe(UINT width, UINT height)
         if (n == 0 || n >= MAX_PATH)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P1.0b] GetModuleFileNameW failed (n=%lu GetLastError=%lu) - "
+                     "[MGPU][P1.0c] GetModuleFileNameW failed (n=%lu GetLastError=%lu) - "
                      "InApplicationDataPath will be empty; the init result code says what the "
                      "driver makes of that",
                      (unsigned long)n, (unsigned long)GetLastError());
@@ -1190,10 +1259,10 @@ bool ngx_probe(UINT width, UINT height)
         bool drained = true;
         if (list_open)
         {
-            mgpu::diag::info("[MGPU][P1.0b] teardown: Close(probe command list) ...");
+            mgpu::diag::info("[MGPU][P1.0c] teardown: Close(probe command list) ...");
             const HRESULT hr = pcmd->Close();
             list_open = false;
-            snprintf(line, sizeof line, "[MGPU][P1.0b] teardown: Close hr=0x%08X", (unsigned)hr);
+            snprintf(line, sizeof line, "[MGPU][P1.0c] teardown: Close hr=0x%08X", (unsigned)hr);
             mgpu::diag::info(line);
             if (FAILED(hr))
             {
@@ -1201,16 +1270,16 @@ bool ngx_probe(UINT width, UINT height)
             }
             else
             {
-                mgpu::diag::info("[MGPU][P1.0b] teardown: ExecuteCommandLists(probe list) ...");
+                mgpu::diag::info("[MGPU][P1.0c] teardown: ExecuteCommandLists(probe list) ...");
                 ID3D12CommandList *const lists[1] = { pcmd };
                 queue->ExecuteCommandLists(1, lists);
 
-                mgpu::diag::info("[MGPU][P1.0b] teardown: Signal + wait for the probe list ...");
+                mgpu::diag::info("[MGPU][P1.0c] teardown: Signal + wait for the probe list ...");
                 const HRESULT shr = queue->Signal(pfence, 1);
                 if (FAILED(shr))
                 {
                     snprintf(line, sizeof line,
-                             "[MGPU][P1.0b] teardown: Signal hr=0x%08X - cannot confirm the list "
+                             "[MGPU][P1.0c] teardown: Signal hr=0x%08X - cannot confirm the list "
                              "executed", (unsigned)shr);
                     mgpu::diag::error(line);
                     drained = false;
@@ -1226,12 +1295,12 @@ bool ngx_probe(UINT width, UINT height)
                     const DWORD wr = WaitForSingleObject(pevent, 10000);
                     if (wr == WAIT_OBJECT_0)
                     {
-                        mgpu::diag::info("[MGPU][P1.0b] teardown: probe list executed and drained");
+                        mgpu::diag::info("[MGPU][P1.0c] teardown: probe list executed and drained");
                     }
                     else
                     {
                         snprintf(line, sizeof line,
-                                 "[MGPU][P1.0b] teardown: fence wait returned 0x%08X "
+                                 "[MGPU][P1.0c] teardown: fence wait returned 0x%08X "
                                  "(GetLastError=%lu) - the probe list may still be in flight",
                                  (unsigned)wr, (unsigned long)GetLastError());
                         mgpu::diag::error(line);
@@ -1250,7 +1319,7 @@ bool ngx_probe(UINT width, UINT height)
             // launch is bounded and harmless by comparison. Say so plainly,
             // because a silent leak here would be indistinguishable from a
             // clean teardown in the log.
-            mgpu::diag::error("[MGPU][P1.0b] teardown: ABANDONED - the probe's GPU work could not "
+            mgpu::diag::error("[MGPU][P1.0c] teardown: ABANDONED - the probe's GPU work could not "
                               "be confirmed complete, so nothing is released. The command list, "
                               "allocator, fence, NGX parameters and NGX session are leaked on "
                               "purpose; releasing them now is the exact device-lost fault this "
@@ -1258,7 +1327,7 @@ bool ngx_probe(UINT width, UINT height)
             if (failed_step != nullptr)
             {
                 snprintf(line, sizeof line,
-                         "[MGPU][P1.0b] PROBE FAILED at %s - see the result code above. "
+                         "[MGPU][P1.0c] PROBE FAILED at %s - see the result code above. "
                          "Bridge continues.", failed_step);
                 mgpu::diag::warn(line);
             }
@@ -1268,9 +1337,9 @@ bool ngx_probe(UINT width, UINT height)
         // ---- 2. the NGX objects, now that the GPU is idle ----
         if (handle != nullptr)
         {
-            mgpu::diag::info("[MGPU][P1.0b] teardown: ReleaseFeature ...");
+            mgpu::diag::info("[MGPU][P1.0c] teardown: ReleaseFeature ...");
             const NVSDK_NGX_Result r = p_release(handle);
-            snprintf(line, sizeof line, "[MGPU][P1.0b] teardown: ReleaseFeature result=0x%08X (%s)",
+            snprintf(line, sizeof line, "[MGPU][P1.0c] teardown: ReleaseFeature result=0x%08X (%s)",
                      (unsigned)r, ngx_result_name(r));
             mgpu::diag::info(line);
             handle = nullptr;
@@ -1279,10 +1348,10 @@ bool ngx_probe(UINT width, UINT height)
         {
             // The capability map is driver-allocated and the header states
             // it must be freed this way - never with delete or free.
-            mgpu::diag::info("[MGPU][P1.0b] teardown: DestroyParameters ...");
+            mgpu::diag::info("[MGPU][P1.0c] teardown: DestroyParameters ...");
             const NVSDK_NGX_Result r = p_destroy(params);
             snprintf(line, sizeof line,
-                     "[MGPU][P1.0b] teardown: DestroyParameters result=0x%08X (%s)",
+                     "[MGPU][P1.0c] teardown: DestroyParameters result=0x%08X (%s)",
                      (unsigned)r, ngx_result_name(r));
             mgpu::diag::info(line);
             params = nullptr;
@@ -1291,50 +1360,62 @@ bool ngx_probe(UINT width, UINT height)
         // ---- 3. the D3D12 objects, reverse creation order ----
         if (pevent != nullptr)
         {
-            mgpu::diag::info("[MGPU][P1.0b] teardown: CloseHandle(probe fence event) ...");
+            mgpu::diag::info("[MGPU][P1.0c] teardown: CloseHandle(probe fence event) ...");
             CloseHandle(pevent);
             pevent = nullptr;
         }
         if (pfence != nullptr)
         {
-            mgpu::diag::info("[MGPU][P1.0b] teardown: Release(probe fence) ...");
+            mgpu::diag::info("[MGPU][P1.0c] teardown: Release(probe fence) ...");
             pfence->Release();
             pfence = nullptr;
         }
         if (pcmd != nullptr)
         {
-            mgpu::diag::info("[MGPU][P1.0b] teardown: Release(probe command list) ...");
+            mgpu::diag::info("[MGPU][P1.0c] teardown: Release(probe command list) ...");
             pcmd->Release();
             pcmd = nullptr;
         }
         if (palloc != nullptr)
         {
-            mgpu::diag::info("[MGPU][P1.0b] teardown: Release(probe allocator) ...");
+            mgpu::diag::info("[MGPU][P1.0c] teardown: Release(probe allocator) ...");
             palloc->Release();
             palloc = nullptr;
         }
 
-        // ---- 4. the NGX session ----
+        // ---- 4. the NGX session is KEPT ----
+        //
+        // P1.0b's teardown crashed inside NVSDK_NGX_D3D12_Shutdown1. It was
+        // localised by announcing each step before making the call: every
+        // other step logged its own completion, and Shutdown1 logged its
+        // announcement and nothing after.
+        //
+        // The fix is not to make that call work. P1.1 keeps NGX
+        // initialised for the process lifetime anyway, so a probe that
+        // opens a session and closes it is satisfying a P1.0-shaped
+        // requirement that the next milestone deletes. One NGX session per
+        // launch, reclaimed by the OS at process exit, is the intended end
+        // state - and every crash observed in this project so far has been
+        // in teardown, none in use.
+        //
+        // The device is still ours and is still released by shutdown()
+        // below in the ordinary way; only NGX's session outlives the probe.
         if (init_ok)
         {
-            // The header states that passing a device shuts down only that
-            // device's instance, and that nullptr shuts down all of them.
-            // We always pass ours, so the game's own NGX session (if it has
-            // one on GPU 0) is not touched.
-            mgpu::diag::info("[MGPU][P1.0b] teardown: Shutdown1 ...");
-            const NVSDK_NGX_Result r = p_shutdown(dev);
-            snprintf(line, sizeof line, "[MGPU][P1.0b] teardown: Shutdown1 result=0x%08X (%s)",
-                     (unsigned)r, ngx_result_name(r));
-            mgpu::diag::info(line);
+            mgpu::diag::info("[MGPU][P1.0c] teardown: NGX session KEPT OPEN on purpose - "
+                             "Shutdown1 is not called (it is where P1.0b faulted, and P1.1 needs "
+                             "the session anyway). One session per launch, reclaimed at process "
+                             "exit.");
             init_ok = false;
         }
 
-        mgpu::diag::info("[MGPU][P1.0b] teardown: complete - nothing left initialised");
+        mgpu::diag::info("[MGPU][P1.0c] teardown: complete - D3D12 objects released, NGX session "
+                         "intentionally retained");
 
         if (failed_step != nullptr)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P1.0b] PROBE FAILED at %s - see the result code above. "
+                     "[MGPU][P1.0c] PROBE FAILED at %s - see the result code above. "
                      "Bridge continues.",
                      failed_step);
             mgpu::diag::warn(line);
@@ -1351,7 +1432,7 @@ bool ngx_probe(UINT width, UINT height)
     //
     // The fallback to Init_Ext is kept because P1.0 proved it works, but a
     // run that takes it has NO callback installed - so the absence of
-    // [MGPU][P1.0b][NGX] lines would mean "we never asked" rather than "NGX
+    // [MGPU][P1.0c][NGX] lines would mean "we never asked" rather than "NGX
     // had nothing to say". The log says which form ran, so the two are
     // never confused.
     {
@@ -1383,7 +1464,7 @@ bool ngx_probe(UINT width, UINT height)
         // two values most likely to be what the driver objects to, and they
         // were chosen rather than derived.
         snprintf(line, sizeof line,
-                 "[MGPU][P1.0b] %s: result=0x%08X (%s) device=0x%p luid=%08lX-%08lX "
+                 "[MGPU][P1.0c] %s: result=0x%08X (%s) device=0x%p luid=%08lX-%08lX "
                  "app_id=0 sdk_version=0x%08X log_callback=%s data_path=\"%s\"",
                  which, (unsigned)r, ngx_result_name(r), (void *)dev,
                  (unsigned long)luid.HighPart, (unsigned long)luid.LowPart,
@@ -1404,7 +1485,7 @@ bool ngx_probe(UINT width, UINT height)
     {
         const NVSDK_NGX_Result r = p_caps(&params);
         snprintf(line, sizeof line,
-                 "[MGPU][P1.0b] GetCapabilityParameters: result=0x%08X (%s) params=0x%p",
+                 "[MGPU][P1.0c] GetCapabilityParameters: result=0x%08X (%s) params=0x%p",
                  (unsigned)r, ngx_result_name(r), (void *)params);
         mgpu::diag::info(line);
         if (r != NVSDK_NGX_Result_Success || params == nullptr)
@@ -1415,10 +1496,82 @@ bool ngx_probe(UINT width, UINT height)
         }
     }
 
-    // Width and height are the only parameters the header states are
-    // required for every feature. Nothing feature-specific is guessed: if
-    // DLSS-NR wants more, it says so in a result code, and that code is a
-    // better answer than a parameter we invented.
+    // ---- 5b. open the SNIPPET's session ----
+    //
+    // This is P1.0c's whole point. The block from the core is passed in
+    // because the snippet-build init takes a parameter block where the
+    // application form takes an NVSDK_NGX_FeatureCommonInfo * - a
+    // difference in TYPE at the same argument position, which is why
+    // Init_Ext's typedef is written out by hand in this file and not
+    // borrowed from the application-facing declaration.
+    //
+    // Init_Ext is preferred over Init for exactly that reason: it is the
+    // form that carries the parameter block. A snippet that only exports
+    // Init gets Init with a null common-info, and the log says which ran.
+    {
+        NVSDK_NGX_Result r;
+        const char *which;
+        if (ps_init_ext != nullptr)
+        {
+            which = "snippet Init_Ext";
+            r = ps_init_ext(0ULL, data_path, dev, NVSDK_NGX_Version_API, params);
+        }
+        else
+        {
+            which = "snippet Init";
+            r = ps_init(0ULL, data_path, dev, nullptr, NVSDK_NGX_Version_API);
+        }
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.0c] %s: result=0x%08X (%s) device=0x%p params=0x%p",
+                 which, (unsigned)r, ngx_result_name(r), (void *)dev, (void *)params);
+        mgpu::diag::info(line);
+
+        // A failure here is NOT fatal to the probe, deliberately. The point
+        // of this run is to learn what the snippet says at each step, and
+        // stopping now would throw away the two results below - which are
+        // the ones nobody has ever seen. CreateFeature will repeat
+        // FAIL_NotInitialized if this did not take, and that is a clean
+        // answer rather than a lost run.
+        if (r != NVSDK_NGX_Result_Success)
+            mgpu::diag::warn("[MGPU][P1.0c] snippet init did not succeed - continuing anyway so "
+                             "PopulateParameters_Impl and CreateFeature still report. Expect "
+                             "FAIL_NotInitialized below if the session really is closed.");
+    }
+
+    // ---- 5c. let the snippet register its own parameter keys ----
+    //
+    // The alternative is transcribing DLSSNR.* key names by hand, which
+    // fails SILENTLY when a name is wrong: the parameter is set, nothing
+    // reads it, and the feature runs on defaults. Asking the feature to
+    // name its own keys removes that entire class of error.
+    //
+    // Called AFTER the snippet init above, on the theory that a routine
+    // belonging to an uninitialised session will refuse like CreateFeature
+    // did. If this returns FAIL_NotInitialized while the init above
+    // returned Success, that ordering assumption is wrong and the two
+    // blocks swap - which is a one-line change and a settled question
+    // rather than a guess either way.
+    if (ps_populate != nullptr)
+    {
+        const NVSDK_NGX_Result r = ps_populate(params);
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.0c] PopulateParameters_Impl: result=0x%08X (%s) params=0x%p",
+                 (unsigned)r, ngx_result_name(r), (void *)params);
+        mgpu::diag::info(line);
+    }
+    else
+    {
+        mgpu::diag::warn("[MGPU][P1.0c] PopulateParameters_Impl not exported under that D3D12 name "
+                         "- the parameter block reaches CreateFeature carrying only what we set. "
+                         "That is a finding, not a fault; see the snippet-only exports line.");
+    }
+
+    // Width and height last, so that a value the snippet's own population
+    // wrote is overwritten by the size this probe is actually asking for
+    // rather than the other way round. These two are the only parameters
+    // the header states are required for every feature; nothing
+    // feature-specific is invented here, because a result code is a better
+    // answer than a parameter we guessed.
     params->Set(NVSDK_NGX_Parameter_Width, (unsigned int)width);
     params->Set(NVSDK_NGX_Parameter_Height, (unsigned int)height);
 
@@ -1438,7 +1591,7 @@ bool ngx_probe(UINT width, UINT height)
         HRESULT hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                  IID_PPV_ARGS(&palloc));
         snprintf(line, sizeof line,
-                 "[MGPU][P1.0b] probe CreateCommandAllocator hr=0x%08X", (unsigned)hr);
+                 "[MGPU][P1.0c] probe CreateCommandAllocator hr=0x%08X", (unsigned)hr);
         mgpu::diag::info(line);
         if (FAILED(hr))
         {
@@ -1450,7 +1603,7 @@ bool ngx_probe(UINT width, UINT height)
         hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, palloc,
                                     nullptr, IID_PPV_ARGS(&pcmd));
         snprintf(line, sizeof line,
-                 "[MGPU][P1.0b] probe CreateCommandList hr=0x%08X (open and recording, not reset)",
+                 "[MGPU][P1.0c] probe CreateCommandList hr=0x%08X (open and recording, not reset)",
                  (unsigned)hr);
         mgpu::diag::info(line);
         if (FAILED(hr))
@@ -1465,7 +1618,7 @@ bool ngx_probe(UINT width, UINT height)
 
         hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pfence));
         snprintf(line, sizeof line,
-                 "[MGPU][P1.0b] probe CreateFence hr=0x%08X", (unsigned)hr);
+                 "[MGPU][P1.0c] probe CreateFence hr=0x%08X", (unsigned)hr);
         mgpu::diag::info(line);
         if (FAILED(hr))
         {
@@ -1478,7 +1631,7 @@ bool ngx_probe(UINT width, UINT height)
         if (pevent == nullptr)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P1.0b] probe CreateEventW failed (GetLastError=%lu)",
+                     "[MGPU][P1.0c] probe CreateEventW failed (GetLastError=%lu)",
                      (unsigned long)GetLastError());
             mgpu::diag::error(line);
             teardown("CreateEventW");
@@ -1515,7 +1668,7 @@ bool ngx_probe(UINT width, UINT height)
             : 0.0;
 
         snprintf(line, sizeof line,
-                 "[MGPU][P1.0b] CreateFeature(Reserved18) via %s: result=0x%08X (%s) handle=0x%p "
+                 "[MGPU][P1.0c] CreateFeature(Reserved18) via %s: result=0x%08X (%s) handle=0x%p "
                  "%ux%u elapsed=%.0fms",
                  w_create, (unsigned)r, ngx_result_name(r), (void *)handle,
                  (unsigned)width, (unsigned)height, ms);
@@ -1532,8 +1685,8 @@ bool ngx_probe(UINT width, UINT height)
     // ---- 8. leave nothing behind ----
     teardown(nullptr);
 
-    mgpu::diag::info("[MGPU][P1.0b] PROBE PASSED - NGX created a DLSS-NR feature on the non-game "
-                     "adapter and tore it down cleanly");
+    mgpu::diag::info("[MGPU][P1.0c] PROBE PASSED - NGX created a DLSS-NR feature on the non-game "
+                     "adapter");
     return true;
 }
 }
