@@ -108,7 +108,26 @@ namespace mgpu::gpu1
     // false. A false return never stops the bridge: the window, the present
     // loop and the teardown behave exactly as P0 shipped them. This is a
     // probe, not a dependency.
-    bool ngx_probe(UINT width, UINT height);
+    // P3.0: an externally supplied colour frame for ngx_probe.
+    //
+    // The pixels are CPU-side, tightly packed at `row_pitch` bytes per row, and
+    // must already be in the format ngx_probe builds its colour texture with
+    // (R8G8B8A8_UNORM today). `dxgi_format` is the ORIGINAL format the frame was
+    // captured in and is carried for the log only - it is what says whether a
+    // conversion happened on the way here, which is a real per-frame cost in any
+    // production version of this path and must not become invisible.
+    struct ngx_input_frame
+    {
+    const unsigned char *pixels = nullptr;
+    UINT row_pitch = 0;
+    unsigned dxgi_format = 0;
+    };
+
+    // ext == nullptr is the P1 behaviour, unchanged: NR runs on a generated
+    // pattern. ext != nullptr is P3.0: NR runs on the frame supplied, which is
+    // the game's own, and the P1.4 transit block is skipped because its control
+    // belongs to the synthetic path.
+    bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext = nullptr);
 
 // P1.3: does a buffer cross between the two adapters intact? Creates its
 // OWN device on the game's adapter - the game's device is never touched -

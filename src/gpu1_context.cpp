@@ -1152,10 +1152,41 @@ namespace
     HRESULT transit_make_device(LUID want, ID3D12Device **out);
 }
 
-bool ngx_probe(UINT width, UINT height)
+bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
 {
     auto &S = st();
     char line[600];
+
+    // P3.0. `ext` is the entire difference between this being a probe and
+    // this being a pipeline stage. When it is null every path below is
+    // byte-identical to the P1 build that has been passing since P1.0 -
+    // that is deliberate, and it is why this milestone is a parameter
+    // rather than a fork: the four probes that already work must not be
+    // able to regress because P3 was added.
+    //
+    // When it is non-null, the colour input is the GAME'S OWN FRAME, already
+    // carried across the adapter boundary by the P1.5 capture path and
+    // waited on by P2.0's shared fence, and this call is the last stage of
+    // the chain the whole project exists to build:
+    //
+    //   game frame -> cross the boundary -> DLSS-NR on GPU 1
+    //
+    // Two things change with it and nothing else does. The upload writes the
+    // supplied pixels instead of fill_pattern, and P1.4's transit block is
+    // skipped - P1.4 compares against a control that only exists for the
+    // synthetic path, and running it here would compare a real frame against
+    // a pattern's control and call the difference a finding.
+    const bool P3 = (ext != nullptr);
+    if (P3)
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][P3.0] ngx_probe entered with an EXTERNAL frame: %ux%u src_pitch=%u "
+                 "src_dxgi_fmt=%u. This is the game's own transited frame, not a pattern of "
+                 "ours. The P1.2 intensity comparison below now runs against real rendered "
+                 "content; the P1.4 transit block is skipped by design.",
+                 width, height, ext->row_pitch, ext->dxgi_format);
+        mgpu::diag::info(line);
+    }
 
     // The device and its LUID are copied out under the lock and every NGX
     // call happens outside it. CreateFeature took 1.16 s on the reference
@@ -1671,7 +1702,27 @@ bool ngx_probe(UINT width, UINT height)
                  data_path_n);
         mgpu::diag::info(line);
 
-        if (r != NVSDK_NGX_Result_Success)
+        // P3.0. THE SECOND INIT IS EXPECTED NOT TO BE A FIRST INIT. The
+        // session opened by the startup call is deliberately never shut down
+        // (see the teardown note - Shutdown1 is where P1.0b faulted), so by
+        // the time a captured frame arrives NGX has been initialised in this
+        // process for minutes. What a re-Init returns in that state is not
+        // documented anywhere we trust, so this does not guess: it logs the
+        // result and CONTINUES, because the session it would be establishing
+        // is known to be open already. If the code turns out to matter, it is
+        // in the line above and the failure will surface at CreateFeature
+        // with its own result - which is a better place to read it than an
+        // abort here on an assumption.
+        if (P3 && r != NVSDK_NGX_Result_Success)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P3.0] re-Init returned 0x%08X (%s) and is being IGNORED: this is "
+                     "the second Init of a session that was never shut down. Continuing to "
+                     "CreateFeature, which is where a genuinely broken session will say so.",
+                     (unsigned)r, ngx_result_name(r));
+            mgpu::diag::warn(line);
+        }
+        else if (r != NVSDK_NGX_Result_Success)
         {
             // FAIL_OutOfDate here is a KNOWN INTERMITTENT and almost
             // certainly not a defect in this add-on. Seen twice: once with
@@ -2097,7 +2148,23 @@ bool ngx_probe(UINT width, UINT height)
             // subrect and MVecScale values a lower-resolution motion buffer
             // needs.
             memset(mapped + off_mvec, 0, (size_t)(off_out[0] - off_mvec));
-            fill_pattern(mapped + fp_color.Offset, width, height, fp_color.Footprint.RowPitch);
+            if (P3)
+            {
+                // The game's frame, row by row. Two pitches are in play and
+                // they are not the same number: the source is whatever the
+                // capture produced on the game's device, the destination is
+                // whatever GetCopyableFootprints chose for GPU 1's texture.
+                // Copying by bytes rather than by rows is the classic way to
+                // get a sheared image that still "transfers correctly".
+                const UINT copy = (ext->row_pitch < fp_color.Footprint.RowPitch)
+                                    ? ext->row_pitch : fp_color.Footprint.RowPitch;
+                for (UINT y = 0; y < height; ++y)
+                    memcpy(mapped + fp_color.Offset + (size_t)y * fp_color.Footprint.RowPitch,
+                           ext->pixels + (size_t)y * ext->row_pitch, copy);
+            }
+            else
+                fill_pattern(mapped + fp_color.Offset, width, height,
+                             fp_color.Footprint.RowPitch);
             for (int i = 0; i < NOUT; ++i)
                 for (UINT y = 0; y < height; ++y)
                 {
@@ -2496,6 +2563,42 @@ bool ngx_probe(UINT width, UINT height)
                              total ? 100.0 * (double)d_ab / (double)total : 0.0, m_ab, x_ab);
                     mgpu::diag::info(line);
                 }
+
+                // ---- the P3.0 verdict ----
+                // Same evidence, different question. P1.2 asked whether the
+                // parameters were live. P3.0 asks whether the thing NR just
+                // processed was the application's frame - and the answer is
+                // carried by d_ab being non-zero on content we did not
+                // generate, with the A/C control still clean. A pattern and a
+                // real frame are not distinguishable from the numbers alone,
+                // which is why this line states the provenance rather than
+                // inferring it: the pixels came from the capture path, which
+                // had already proved them byte-identical to what the game
+                // rendered.
+                if (P3)
+                {
+                    if (d_ab == 0)
+                        mgpu::diag::error("[MGPU][P3.0] PROBE FAILED - DLSS-NR produced "
+                                          "byte-identical output at both intensities on the "
+                                          "game's own frame. Either the model did not run or it "
+                                          "did nothing to this content. Read the CreateFeature "
+                                          "and Evaluate results above before assuming the "
+                                          "former.");
+                    else
+                    {
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P3.0] PROBE PASSED - DLSS-NR RAN ON THE GAME'S OWN "
+                                 "FRAME, ON THE SECOND ADAPTER. %ux%u of real rendered content "
+                                 "crossed the adapter boundary and was processed by the neural "
+                                 "stage: intensity %.2f vs %.2f changed %llu pixels (%.2f%%) "
+                                 "with the same-intensity control byte-identical. The chain is "
+                                 "closed end to end - game frame, boundary, model - and no "
+                                 "stage of it is synthetic any more.",
+                                 width, height, INTENSITY_LO, INTENSITY_HI, d_ab,
+                                 total ? 100.0 * (double)d_ab / (double)total : 0.0);
+                        mgpu::diag::info(line);
+                    }
+                }
             }
 
             // P1.4 needs the LOCAL NR output as its control, and the mapping
@@ -2543,7 +2646,10 @@ bool ngx_probe(UINT width, UINT height)
         // pattern
         // is what makes the byte comparison possible at all; real content would
         // trade the verdict for a screenshot.
-        if (ref_local != nullptr && st().game_luid_known)
+        // !P3: P1.4's control is the LOCAL NR output for the SYNTHETIC
+        // pattern. Running it against a real frame would compare two
+        // different inputs and report the difference as a transit fault.
+        if (!P3 && ref_local != nullptr && st().game_luid_known)
         {
             ID3D12Device *dev0 = nullptr;
             ID3D12CommandQueue *q0 = nullptr;
@@ -5099,6 +5205,14 @@ void capture_poll()
         return;
     }
 
+    // P3.0: the converted copy of the arrived frame, built while the readback
+    // is still mapped and consumed after it is not. Declared out here because
+    // ngx_probe must NOT be called with a D3D12 resource mapped - it creates
+    // its own resources, submits its own work and blocks for over a second on
+    // CreateFeature, all on this thread.
+    unsigned char *nr_in = nullptr;
+    UINT nr_pitch = 0;
+
     const unsigned char *pn = nullptr, *pg = nullptr;
     D3D12_RANGE all{0, (SIZE_T)c.bytes};
     const bool mn = SUCCEEDED(c.nread->Map(0, &all, (void **)&pn)) && pn != nullptr;
@@ -5158,6 +5272,74 @@ void capture_poll()
                      "BOTH buffers - content, not survival.)",
                      total, nonzero, c.width, c.height, (int)c.format, sent_ref);
             mgpu::diag::info(line);
+
+            // ---- P3.0: hand the arrived frame to the neural stage ----
+            //
+            // THE CONVERSION IS A KNOWN COST AND IT IS NOT A PRODUCTION PATH.
+            // The game renders R10G10B10A2 and ngx_probe builds its colour
+            // texture as R8G8B8A8, so this drops two bits per channel on the
+            // CPU, at 3.7 million pixels, once. That is acceptable for a
+            // one-shot probe and unacceptable per frame. Whether DLSS-NR will
+            // accept R10G10B10A2 directly - which would delete this stage
+            // entirely - is NOT answered here and is the first thing to test
+            // once the pipeline runs at all. It is called out rather than
+            // buried because a silent conversion is exactly the kind of cost
+            // that ends up in a performance number later with no name on it.
+            nr_pitch = c.width * 4;
+            nr_in = (unsigned char *)malloc((size_t)nr_pitch * c.height);
+            if (nr_in == nullptr)
+                mgpu::diag::warn("[MGPU][P3.0] out of memory converting the frame - the neural "
+                                 "stage is skipped, the P1.5 verdict above still stands");
+            else
+            {
+                const int f = (int)c.format;
+                bool ok_fmt = true;
+                for (UINT y = 0; y < c.height && ok_fmt; ++y)
+                {
+                    const unsigned char *srow = pn + (size_t)y * c.fp.Footprint.RowPitch;
+                    unsigned char *drow = nr_in + (size_t)y * nr_pitch;
+                    for (UINT x = 0; x < c.width; ++x)
+                    {
+                        const unsigned char *sp = srow + (size_t)x * 4;
+                        unsigned char *dp = drow + (size_t)x * 4;
+                        if (f == 24)   // R10G10B10A2_UNORM - the game's format on this rig
+                        {
+                            unsigned v = (unsigned)sp[0] | ((unsigned)sp[1] << 8) |
+                                         ((unsigned)sp[2] << 16) | ((unsigned)sp[3] << 24);
+                            dp[0] = (unsigned char)(( v        & 0x3FF) >> 2);
+                            dp[1] = (unsigned char)(((v >> 10) & 0x3FF) >> 2);
+                            dp[2] = (unsigned char)(((v >> 20) & 0x3FF) >> 2);
+                            dp[3] = 0xFF;
+                        }
+                        else if (f == 28 || f == 29)        // R8G8B8A8_UNORM / _SRGB
+                        { dp[0]=sp[0]; dp[1]=sp[1]; dp[2]=sp[2]; dp[3]=0xFF; }
+                        else if (f == 87 || f == 91)        // B8G8R8A8_UNORM / _SRGB
+                        { dp[0]=sp[2]; dp[1]=sp[1]; dp[2]=sp[0]; dp[3]=0xFF; }
+                        else { ok_fmt = false; break; }
+                    }
+                }
+                if (!ok_fmt)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.0] the captured frame is DXGI format %d, which this "
+                             "converter does not handle. The neural stage is skipped rather "
+                             "than fed bytes it would misread - a wrong conversion here would "
+                             "produce a plausible NR result on a corrupted image, which is the "
+                             "worst outcome available. Add the case and rerun.", f);
+                    mgpu::diag::error(line);
+                    free(nr_in); nr_in = nullptr;
+                }
+                else
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.0] frame converted for the neural stage: DXGI %d -> "
+                             "R8G8B8A8_UNORM, %ux%u, %u bytes/row. Two bits per channel were "
+                             "discarded; see the note in the source before quoting any quality "
+                             "result from this run.",
+                             f, c.width, c.height, nr_pitch);
+                    mgpu::diag::info(line);
+                }
+            }
         }
         else if (nonzero == 0)
         {
@@ -5206,7 +5388,41 @@ void capture_poll()
     D3D12_RANGE nothing{0, 0};
     if (mn) c.nread->Unmap(0, &nothing);
     if (mg) c.gread->Unmap(0, &nothing);
+
+    // ---- P3.0: the last stage ----
+    //
+    // Released FIRST, then evaluated. capture_release frees the cross-adapter
+    // heap, the shared fence and both readbacks; ngx_probe is about to create
+    // several full-resolution textures plus its own upload and readback
+    // buffers on the same adapter, and holding the capture's ~28 MiB of
+    // mappable allocations across that is free memory pressure for no reason.
+    // The frame is already a CPU copy by this point and does not depend on any
+    // of it.
+    //
+    // This runs on the BRIDGE THREAD, the same thread the startup ngx_probe
+    // ran on, which is what makes reusing the retained NGX session legitimate.
+    // It will block for roughly a second in CreateFeature at native
+    // resolution; the bridge's present loop pauses for that long and the game
+    // is unaffected, because nothing here touches the game's device.
+    // Snapshotted before the release, not read through `c` after it.
+    // capture_release does not currently clear these three, but depending on
+    // that is depending on the internals of another function to stay the way
+    // they are - and a stale width here would be a wrongly-shaped NR run with
+    // no obvious symptom.
+    const UINT nr_w = c.width, nr_h = c.height;
+    const unsigned nr_srcfmt = (unsigned)c.format;
+
     capture_release();
+
+    if (nr_in != nullptr)
+    {
+        ngx_input_frame ext{};
+        ext.pixels = nr_in;
+        ext.row_pitch = nr_pitch;
+        ext.dxgi_format = nr_srcfmt;
+        (void)ngx_probe(nr_w, nr_h, &ext);
+        free(nr_in);
+    }
 }
 
 }
