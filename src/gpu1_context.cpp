@@ -1138,6 +1138,20 @@ namespace
     }
 }
 
+namespace
+{
+    // P1.4. One forward declaration. It is defined with the P1.3 transit
+    // helpers further down, and ngx_probe needs it because P1.4 lives INSIDE
+    // ngx_probe rather than beside it. That placement is deliberate: the NGX
+    // session, the parameter block and the feature handle are locals of this
+    // function, and opening a SECOND NGX session on the same device to reach
+    // them from outside is exactly the thing P1.0b showed is delicate. P1.4
+    // reaches the session where it already is. The GPU 0 side builds its own
+    // command objects inline rather than borrowing transit_side, so nothing
+    // else has to move.
+    HRESULT transit_make_device(LUID want, ID3D12Device **out);
+}
+
 bool ngx_probe(UINT width, UINT height)
 {
     auto &S = st();
@@ -1394,6 +1408,10 @@ bool ngx_probe(UINT width, UINT height)
     // would only show that something changed between evaluates; the third
     // is what separates "intensity changed the image" from "the second
     // evaluate differs because the first one ran". See the verdict block.
+    // P1.4: a CPU copy of the local NR result for output A, taken before the
+    // readback buffers are unmapped. Freed at the end of this function.
+    unsigned char *ref_local = nullptr;
+
     static const int NOUT = 3;
     ID3D12Resource *tex_out[NOUT] = {};     // RT|UAV - never the input
     ID3D12Resource *buf_read_out[NOUT] = {};
@@ -2480,12 +2498,394 @@ bool ngx_probe(UINT width, UINT height)
                 }
             }
 
+            // P1.4 needs the LOCAL NR output as its control, and the mapping
+            // it lives in is about to go away. One memcpy now is cheaper than
+            // a second evaluate later, and - more to the point - it is the
+            // SAME evaluate rather than a repeat of it, so a difference later
+            // cannot be blamed on the model having been run twice.
+            if (po[0] != nullptr)
+            {
+                ref_local = (unsigned char *)malloc((size_t)sz_color);
+                if (ref_local != nullptr) memcpy(ref_local, po[0], (size_t)sz_color);
+            }
+
             D3D12_RANGE nothing{0, 0};
             if (pin != nullptr) buf_read_in->Unmap(0, &nothing);
             for (int i = 0; i < NOUT; ++i)
                 if (po[i] != nullptr) buf_read_out[i]->Unmap(0, &nothing);
         }
     }
+
+    // =================================================================
+    // P1.4 - DLSS-NR INSIDE THE LOOP, ACROSS THE BUS
+    // =================================================================
+    //
+    // Everything before this ran NR against textures that were already on
+    // GPU 1. P1.3 crossed a payload but never fed it to anything. P1.4 joins
+    // them and asks the milestone's actual question:
+    //
+    //   pattern on GPU 0 -> cross -> NR on GPU 1 -> cross back -> GPU 0
+    //
+    // THE VERDICT IS A COMPARISON AGAINST A CONTROL, NOT AN OBSERVATION.
+    // `ref_local` holds output A from the P1.2 evaluate above - the same
+    // model, the same deterministic input, the same intensity, run entirely
+    // on GPU 1 with no bus involved. P1.4 passes only if the bytes that come
+    // back across the bus are BYTE-IDENTICAL to it. Anything less and the
+    // difference is either transit corrupting the payload or NR behaving
+    // differently on transited input, and both are failures.
+    //
+    // "It looks processed" is not the test, and neither is "it differs from
+    // the input" - an uninitialised buffer satisfies both. The sentinel fill
+    // separates "came back wrong" from "never came back".
+    //
+    // Deliberately NOT here: the game's own frame. That needs the ReShade
+    // effect-runtime finish hook, which stays in the containment guard until
+    // the milestone that legitimately uses it. A synthetic deterministic
+    // pattern
+    // is what makes the byte comparison possible at all; real content would
+    // trade the verdict for a screenshot.
+    if (ref_local != nullptr && st().game_luid_known)
+    {
+        ID3D12Device *dev0 = nullptr;
+        ID3D12CommandQueue *q0 = nullptr;
+        ID3D12CommandAllocator *a0 = nullptr;
+        ID3D12GraphicsCommandList *l0 = nullptr;
+        ID3D12Fence *fen0 = nullptr;
+        HANDLE ev0 = nullptr;
+        UINT64 fv0 = 0;
+
+        ID3D12Heap *hp0 = nullptr, *hp1 = nullptr;
+        HANDLE shh = nullptr;
+        ID3D12Resource *xfer0 = nullptr, *xfer1 = nullptr;
+        ID3D12Resource *up0 = nullptr, *rb0 = nullptr;
+        ID3D12Resource *t_in = nullptr, *t_out = nullptr;
+
+        auto p14_cleanup = [&]()
+        {
+            if (t_out != nullptr) t_out->Release();
+            if (t_in  != nullptr) t_in->Release();
+            if (rb0   != nullptr) rb0->Release();
+            if (up0   != nullptr) up0->Release();
+            if (xfer1 != nullptr) xfer1->Release();
+            if (xfer0 != nullptr) xfer0->Release();
+            if (hp1   != nullptr) hp1->Release();
+            if (hp0   != nullptr) hp0->Release();
+            if (shh   != nullptr) CloseHandle(shh);
+            if (ev0   != nullptr) CloseHandle(ev0);
+            if (fen0  != nullptr) fen0->Release();
+            if (l0    != nullptr) l0->Release();
+            if (a0    != nullptr) a0->Release();
+            if (q0    != nullptr) q0->Release();
+            if (dev0  != nullptr) dev0->Release();
+        };
+
+        auto flush0 = [&](DWORD timeout_ms) -> HRESULT
+        {
+            HRESULT h = l0->Close();
+            if (FAILED(h)) return h;
+            ID3D12CommandList *const ls[1] = { l0 };
+            q0->ExecuteCommandLists(1, ls);
+            h = q0->Signal(fen0, ++fv0);
+            if (FAILED(h)) return h;
+            fen0->SetEventOnCompletion(fv0, ev0);
+            return (WaitForSingleObject(ev0, timeout_ms) == WAIT_OBJECT_0) ? S_OK : E_FAIL;
+        };
+
+        HRESULT h = transit_make_device(st().game_luid, &dev0);
+        if (SUCCEEDED(h))
+        {
+            D3D12_COMMAND_QUEUE_DESC qd{};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            h = dev0->CreateCommandQueue(&qd, IID_PPV_ARGS(&q0));
+        }
+        if (SUCCEEDED(h))
+            h = dev0->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a0));
+        if (SUCCEEDED(h))
+            h = dev0->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a0, nullptr,
+                                        IID_PPV_ARGS(&l0));
+        if (SUCCEEDED(h))
+            h = dev0->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fen0));
+        if (SUCCEEDED(h))
+        {
+            ev0 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (ev0 == nullptr) h = E_FAIL;
+        }
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.4] GPU 0 side: own device + command objects hr=0x%08X "
+                 "(the game's device is not touched; the GPU 1 side is the NGX device, "
+                 "because that is where the session and the feature handle live)",
+                 (unsigned)h);
+        mgpu::diag::info(line);
+
+        // ---- the shared cross-adapter heap, path A as P1.3 settled it ----
+        // CreateHeap + CreatePlacedResource, share the HEAP not the resource.
+        const UINT64 ALIGN = 65536;
+        const UINT64 xbytes = ((sz_color + ALIGN - 1) / ALIGN) * ALIGN;
+        if (SUCCEEDED(h))
+        {
+            D3D12_HEAP_PROPERTIES xhp{};
+            xhp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            xhp.CreationNodeMask = 1; xhp.VisibleNodeMask = 1;
+            D3D12_HEAP_DESC hd{};
+            hd.SizeInBytes = xbytes;
+            hd.Properties = xhp;
+            hd.Alignment = ALIGN;
+            hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED |
+                                          D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+            h = dev0->CreateHeap(&hd, IID_PPV_ARGS(&hp0));
+            if (SUCCEEDED(h))
+                h = dev0->CreateSharedHandle(hp0, nullptr, GENERIC_ALL, nullptr, &shh);
+            if (SUCCEEDED(h))
+                h = dev->OpenSharedHandle(shh, IID_PPV_ARGS(&hp1));
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.4] shared cross-adapter heap: %llu bytes, CreateHeap ->"
+                     " CreateSharedHandle(HEAP) -> OpenSharedHandle on the NGX device: "
+                     "hr=0x%08X", (unsigned long long)xbytes, (unsigned)h);
+            mgpu::diag::info(line);
+        }
+
+        D3D12_RESOURCE_DESC xd{};
+        xd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        xd.Alignment = 0;
+        xd.Width = xbytes; xd.Height = 1; xd.DepthOrArraySize = 1; xd.MipLevels = 1;
+        xd.Format = DXGI_FORMAT_UNKNOWN; xd.SampleDesc.Count = 1;
+        xd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        xd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        if (SUCCEEDED(h))
+            h = dev0->CreatePlacedResource(hp0, 0, &xd, D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, IID_PPV_ARGS(&xfer0));
+        if (SUCCEEDED(h))
+            h = dev->CreatePlacedResource(hp1, 0, &xd, D3D12_RESOURCE_STATE_COMMON,
+                                          nullptr, IID_PPV_ARGS(&xfer1));
+
+        // GPU 0 staging, and the two GPU 1 textures NR will work on.
+        if (SUCCEEDED(h)) h = make_buf(dev0, sz_color, D3D12_HEAP_TYPE_UPLOAD, &up0);
+        if (SUCCEEDED(h)) h = make_buf(dev0, sz_color, D3D12_HEAP_TYPE_READBACK, &rb0);
+        if (SUCCEEDED(h))
+            h = make_tex(dev, width, height, DXGI_FORMAT_R8G8B8A8_UNORM,
+                         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &t_in);
+        if (SUCCEEDED(h))
+            h = make_tex(dev, width, height, DXGI_FORMAT_R8G8B8A8_UNORM,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_COPY_DEST, &t_out);
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.4] resources hr=0x%08X xfer0=0x%p xfer1=0x%p in=0x%p out=0x%p",
+                 (unsigned)h, (void *)xfer0, (void *)xfer1, (void *)t_in, (void *)t_out);
+        mgpu::diag::info(line);
+
+        // ---- fill the GPU 0 upload with the SAME deterministic pattern ----
+        if (SUCCEEDED(h))
+        {
+            unsigned char *mp = nullptr;
+            D3D12_RANGE none{0, 0};
+            h = up0->Map(0, &none, (void **)&mp);
+            if (SUCCEEDED(h) && mp != nullptr)
+            {
+                memset(mp, 0, (size_t)sz_color);
+                fill_pattern(mp, width, height, fp_color.Footprint.RowPitch);
+                up0->Unmap(0, nullptr);
+            }
+            else h = E_FAIL;
+        }
+
+        LARGE_INTEGER pf{}, p0{}, p1{};
+        QueryPerformanceFrequency(&pf);
+        QueryPerformanceCounter(&p0);
+
+        // ---- leg 1: GPU 0 -> shared ----
+        if (SUCCEEDED(h))
+        {
+            // Buffer to buffer, so CopyBufferRegion - no footprint needed on
+            // this leg. The footprint matters only where a texture is one end
+            // of the copy.
+            l0->CopyBufferRegion(xfer0, 0, up0, 0, sz_color);
+            h = flush0(20000);
+            snprintf(line, sizeof line, "[MGPU][P1.4] leg 1 GPU0 -> shared: hr=0x%08X",
+                     (unsigned)h);
+            mgpu::diag::info(line);
+        }
+
+        // ---- leg 2: shared -> GPU 1 -> NR -> shared ----
+        NVSDK_NGX_Result p14r = NVSDK_NGX_Result_Fail;
+        if (SUCCEEDED(h))
+        {
+            h = palloc->Reset();
+            if (SUCCEEDED(h)) h = pcmd->Reset(palloc, nullptr);
+        }
+        if (SUCCEEDED(h))
+        {
+            // shared buffer -> the NR input texture
+            D3D12_TEXTURE_COPY_LOCATION s{}, d{};
+            s.pResource = xfer1; s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            s.PlacedFootprint = fp_color; s.PlacedFootprint.Offset = 0;
+            d.pResource = t_in; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+            barrier(pcmd, t_in, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
+            barrier(pcmd, t_out, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            // Same parameters as the P1.2 A evaluate, restated rather than
+            // assumed: the control is only a control if the two runs differ
+            // in exactly one thing, which is whether the input crossed a bus.
+            params->Set("DLSSNR.Color", t_in);
+            params->Set("DLSSNR.Output", t_out);
+            params->Set("DLSSNR.MVec", tex_mvec);
+            params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+            params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+            params->Set("DLSSNR.ColorSubrectWidth", (unsigned int)width);
+            params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)height);
+            params->Set("DLSSNR.Intensity", INTENSITY_LO);
+            params->Set("DLSSNR.Reset", 1u);
+
+            p14r = p_evaluate(pcmd, handle, params, nullptr);
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.4] EvaluateFeature on TRANSITED input: result=0x%08X (%s) "
+                     "intensity=%.2f", (unsigned)p14r, ngx_result_name(p14r), INTENSITY_LO);
+            mgpu::diag::info(line);
+
+            barrier(pcmd, t_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION s2{}, d2{};
+            s2.pResource = t_out; s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            d2.pResource = xfer1; d2.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            d2.PlacedFootprint = fp_color; d2.PlacedFootprint.Offset = 0;
+            pcmd->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
+
+            h = pcmd->Close();
+            if (SUCCEEDED(h))
+            {
+                ID3D12CommandList *const ls[1] = { pcmd };
+                queue->ExecuteCommandLists(1, ls);
+                h = queue->Signal(pfence, 1000);
+                if (SUCCEEDED(h))
+                {
+                    pfence->SetEventOnCompletion(1000, pevent);
+                    if (WaitForSingleObject(pevent, 20000) != WAIT_OBJECT_0) h = E_FAIL;
+                }
+            }
+            snprintf(line, sizeof line, "[MGPU][P1.4] leg 2 shared -> GPU1 -> NR -> shared: "
+                     "hr=0x%08X", (unsigned)h);
+            mgpu::diag::info(line);
+        }
+
+        // ---- leg 3: shared -> GPU 0 readback ----
+        if (SUCCEEDED(h))
+        {
+            h = a0->Reset();
+            if (SUCCEEDED(h)) h = l0->Reset(a0, nullptr);
+            if (SUCCEEDED(h))
+            {
+                l0->CopyBufferRegion(rb0, 0, xfer0, 0, sz_color);
+                h = flush0(20000);
+            }
+            snprintf(line, sizeof line, "[MGPU][P1.4] leg 3 shared -> GPU0: hr=0x%08X",
+                     (unsigned)h);
+            mgpu::diag::info(line);
+        }
+        QueryPerformanceCounter(&p1);
+        const double p14ms = (pf.QuadPart > 0)
+            ? ((double)(p1.QuadPart - p0.QuadPart) * 1000.0 / (double)pf.QuadPart) : 0.0;
+
+        // ---- the verdict ----
+        if (SUCCEEDED(h))
+        {
+            const unsigned char *pb = nullptr;
+            D3D12_RANGE all{0, (SIZE_T)sz_color};
+            if (SUCCEEDED(rb0->Map(0, &all, (void **)&pb)) && pb != nullptr)
+            {
+                unsigned long long diff_ctrl = 0, sent = 0, diff_in = 0;
+                const unsigned long long total = (unsigned long long)width * height;
+                unsigned char *inref = (unsigned char *)malloc((size_t)sz_color);
+                if (inref != nullptr)
+                {
+                    memset(inref, 0, (size_t)sz_color);
+                    fill_pattern(inref, width, height, fp_color.Footprint.RowPitch);
+                }
+                for (UINT y = 0; y < height; ++y)
+                {
+                    const size_t ro = (size_t)y * fp_color.Footprint.RowPitch;
+                    for (UINT x = 0; x < width; ++x)
+                    {
+                        const unsigned char *a = pb + ro + (size_t)x * 4;
+                        const unsigned char *c = ref_local + ro + (size_t)x * 4;
+                        if (a[0] != c[0] || a[1] != c[1] || a[2] != c[2]) ++diff_ctrl;
+                        if (a[0] == SENT_R && a[1] == SENT_G && a[2] == SENT_B) ++sent;
+                        if (inref != nullptr)
+                        {
+                            const unsigned char *i0 = inref + ro + (size_t)x * 4;
+                            if (a[0] != i0[0] || a[1] != i0[1] || a[2] != i0[2]) ++diff_in;
+                        }
+                    }
+                }
+                if (inref != nullptr) free(inref);
+                D3D12_RANGE nothing{0, 0};
+                rb0->Unmap(0, &nothing);
+
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.4] round trip %.2f ms | vs LOCAL NR control: differing=%llu "
+                         "of %llu | vs raw input: differing=%llu | sentinel survivors=%llu",
+                         p14ms, diff_ctrl, total, diff_in, sent);
+                mgpu::diag::info(line);
+
+                if (p14r != NVSDK_NGX_Result_Success)
+                {
+                    mgpu::diag::error("[MGPU][P1.4] PROBE FAILED - EvaluateFeature refused the "
+                                      "transited input. The result code above names the reason; "
+                                      "the bytes below it describe a buffer NR never wrote.");
+                }
+                else if (diff_ctrl == 0 && sent == 0 && diff_in > 0)
+                {
+                    mgpu::diag::info(
+                        "[MGPU][P1.4] PROBE PASSED - DLSS-NR RAN ON A PAYLOAD THAT CROSSED THE "
+                        "BUS AND THE RESULT CAME BACK. Byte-identical to the local NR control "
+                        "at the same intensity on the same input, no sentinel survivors, and "
+                        "different from the raw input - so the model processed transited data "
+                        "and produced exactly what it produces without a bus. The neural stage "
+                        "is decoupled from the render device end to end.");
+                }
+                else if (sent > 0)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.4] PROBE FAILED - %llu sentinel pixels survived. Part of "
+                             "the output never arrived; this is a transit or synchronisation "
+                             "fault, not a model one.", sent);
+                    mgpu::diag::error(line);
+                }
+                else if (diff_in == 0)
+                {
+                    mgpu::diag::error("[MGPU][P1.4] PROBE FAILED - the result is identical to the "
+                                      "raw input. NR returned Success and changed nothing, or a "
+                                      "copy overwrote its output.");
+                }
+                else
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P1.4] PROBE INCONCLUSIVE - %llu of %llu pixels differ from "
+                             "the local control. NR ran on both, so this is not a transit "
+                             "corruption question alone: either the payload changed crossing the "
+                             "bus, or the model is not deterministic across these two runs. "
+                             "Re-run before interpreting; do NOT record either reading yet.",
+                             diff_ctrl, total);
+                    mgpu::diag::error(line);
+                }
+            }
+            else mgpu::diag::error("[MGPU][P1.4] readback Map failed - no verdict possible");
+        }
+        else
+        {
+            mgpu::diag::error("[MGPU][P1.4] PROBE DID NOT COMPLETE - see the failing leg above. "
+                              "No conclusion about the architecture follows from a setup failure.");
+        }
+
+        p14_cleanup();
+    }
+    else
+    {
+        mgpu::diag::warn("[MGPU][P1.4] skipped - no local NR control was captured, or the game "
+                         "adapter LUID is unknown. P1.4 without its control is not worth running.");
+    }
+
+    if (ref_local != nullptr) { free(ref_local); ref_local = nullptr; }
 
     // ---- 8. leave nothing behind ----
     teardown(nullptr);
