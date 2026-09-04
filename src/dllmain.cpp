@@ -133,9 +133,21 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     const reshade::api::resource res = dev->get_resource_from_view(rtv);
     if (res.handle == 0) return;
 
+    // P2.0: the game's immediate queue. effect_runtime declares
+    // `virtual command_queue *get_command_queue() = 0;` - it is the queue
+    // ReShade itself submits the list above on, which is exactly the queue our
+    // copies will be executed on, and therefore the only queue a signal placed
+    // behind them can be ordered against. A null queue is not fatal: the
+    // capture path falls back to the P1.5 frame counter and says so.
+    reshade::api::command_queue *q = runtime->get_command_queue();
+    void *q_native = (q != nullptr)
+                       ? reinterpret_cast<void *>(static_cast<uintptr_t>(q->get_native()))
+                       : nullptr;
+
     mgpu::gpu1::capture_on_finish_effects(
         reinterpret_cast<void *>(runtime),
         reinterpret_cast<void *>(static_cast<uintptr_t>(cmd_list->get_native())),
+        q_native,
         static_cast<unsigned long long>(res.handle));
 }
 

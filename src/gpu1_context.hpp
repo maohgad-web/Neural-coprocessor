@@ -138,21 +138,32 @@ bool transit_probe(const char *tag = "startup");
 //                              own window. First call allocates and arms;
 //                              the second records the copies. One shot.
 //   capture_poll               bridge thread, once per present. Does nothing
-//                              until the capture has been recorded and enough
-//                              frames have passed for the game's queue to have
-//                              retired it, then reads, compares and reports.
+//                              until the capture has been recorded and the
+//                              handoff is known to have completed, then reads,
+//                              compares and reports.
 //
-// SYNCHRONISATION IS DELIBERATELY WEAK HERE AND THE PROBE SAYS SO. We do not
-// own the game's queue and cannot signal a fence on it, so "the copy has
-// completed" is inferred from frames elapsed rather than known. That is why the
-// destination is sentinel-filled: reading too early produces surviving sentinel
-// bytes and a named diagnosis, instead of a plausible wrong answer. A shared
-// fence removes the guess and belongs to P2.
+// P2.0 CLOSES THE SYNCHRONISATION GAP. P1.5 inferred "the copy has completed"
+// from frames elapsed, because we do not own the game's queue. P2.0 creates a
+// fence with SHARED | SHARED_CROSS_ADAPTER on the game's device, opens the same
+// fence on the bridge's device, and signals it on the game's own queue on the
+// frame AFTER the copies were recorded - queue order then guarantees the signal
+// lands behind them. capture_poll waits on that fence instead of counting.
+// The frame counter is kept as a labelled fallback for the case where the
+// shared fence cannot be created, and the sentinel fill stays in either mode:
+// it is what turns "read too early" into a named diagnosis rather than a
+// plausible wrong answer.
 // Bridge thread. Until this is called the capture path is inert: the event
 // handler returns immediately and the game's command list is never touched.
 // Without it P1.5 would fire on the first two frames of the process and
 // capture a loading screen, spending its one shot on a black frame.
 void capture_request();
-void capture_on_finish_effects(void *runtime, void *cmd_list, unsigned long long rtv_handle);
+// P2.0 adds cmd_queue: the game's immediate command queue, as a native
+// ID3D12CommandQueue*. It is the one object we need that the P1.5 signature
+// did not carry - without it the shared fence can be created and opened but
+// never signalled, and the wait would hang instead of measuring. It is passed
+// as void* for the same reason as the others: this header names no ReShade and
+// no D3D12 types.
+void capture_on_finish_effects(void *runtime, void *cmd_list, void *cmd_queue,
+                               unsigned long long rtv_handle);
 void capture_poll();
 }

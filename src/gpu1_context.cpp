@@ -4060,6 +4060,17 @@ namespace
         bool said_wrongq = false;   // armed, but the list belonged elsewhere
         unsigned ev_game = 0;       // post-arm events whose list is on the game adapter
         unsigned ev_other = 0;      // post-arm events from anywhere else
+
+        // P2.0: the shared fence. Created on the GAME's device, signalled on the
+        // GAME's queue after the copies have been submitted, waited on from the
+        // NGX device. This replaces counting bridge presents and hoping - the
+        // one deliberately weak thing left in P1.5.
+        ID3D12Fence *gfence = nullptr;      // game side
+        HANDLE gfence_share = nullptr;
+        ID3D12Fence *nfence = nullptr;      // the same fence, opened on GPU 1
+        bool fence_ok = false;              // the cross-adapter pair exists
+        bool signalled = false;             // Signal has been issued on the game queue
+        const UINT64 SIG = 1;
         bool tried = false;         // allocation attempted (success or not)
         bool armed = false;         // resources exist, waiting to record
         bool recorded = false;      // the copies are in a submitted list
@@ -4110,6 +4121,9 @@ namespace
         if (c.nread != nullptr) { c.nread->Release(); c.nread = nullptr; }
         if (c.nxfer != nullptr) { c.nxfer->Release(); c.nxfer = nullptr; }
         if (c.nheap != nullptr) { c.nheap->Release(); c.nheap = nullptr; }
+        if (c.nfence != nullptr) { c.nfence->Release(); c.nfence = nullptr; }
+        if (c.gfence_share != nullptr) { CloseHandle(c.gfence_share); c.gfence_share = nullptr; }
+        if (c.gfence != nullptr) { c.gfence->Release(); c.gfence = nullptr; }
         if (c.gshare!= nullptr) { CloseHandle(c.gshare); c.gshare = nullptr; }
         if (c.gread != nullptr) { c.gread->Release(); c.gread = nullptr; }
         if (c.gxfer != nullptr) { c.gxfer->Release(); c.gxfer = nullptr; }
@@ -4147,7 +4161,7 @@ void capture_request()
                      "makes the verdict inconclusive and the shot is not repeatable.");
 }
 
-void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
+void capture_on_finish_effects(void *runtime_v, void *cmd_list_v, void *cmd_queue_v,
                                unsigned long long rtv_handle)
 {
     (void)runtime_v;
@@ -4155,6 +4169,44 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
     std::lock_guard<std::mutex> lk(c.cs);
     // Inert until requested. The operator picks the frame, because the probe
     // cannot tell a loading screen from gameplay and only gets one.
+    // P2.0. SIGNAL ON THE FRAME AFTER RECORDING, NOT THE SAME ONE. Queue
+    // operations happen in submission order, and ReShade executes the list we
+    // recorded into AFTER this event returns. Signalling here would place the
+    // signal ahead of our own copies and the wait would clear before the data
+    // existed - a race that produces a plausible frame most of the time and a
+    // torn one occasionally, which is the worst possible failure shape.
+    //
+    // By the next event on this adapter, the previous frame's list has been
+    // submitted (it had to be, to present), so a Signal now lands behind it.
+    if (c.recorded && !c.signalled && c.fence_ok && !c.done)
+    {
+        ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
+        if (gq != nullptr)
+        {
+            ID3D12Device *qd = nullptr;
+            LUID ql{};
+            const bool got = SUCCEEDED(gq->GetDevice(IID_PPV_ARGS(&qd))) && qd != nullptr;
+            if (got) { ql = qd->GetAdapterLuid(); qd->Release(); }
+            LUID want{};
+            {
+                std::lock_guard<std::mutex> g(st().cs);
+                want = st().game_luid;
+            }
+            if (got && ql.LowPart == want.LowPart && ql.HighPart == want.HighPart)
+            {
+                const HRESULT sh2 = gq->Signal(c.gfence, c.SIG);
+                c.signalled = SUCCEEDED(sh2);
+                char sl[400];
+                snprintf(sl, sizeof sl,
+                         "[MGPU][P2.0] Signal(%llu) issued on the GAME's queue, one frame after "
+                         "the copies were recorded so queue order puts it behind them: hr=0x%08X",
+                         (unsigned long long)c.SIG, (unsigned)sh2);
+                mgpu::diag::info(sl);
+            }
+        }
+        return;   // nothing else to do on this event
+    }
+
     if (!c.requested || c.done || c.recorded) return;
 
     char line[900];
@@ -4323,6 +4375,39 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
                  (unsigned)c.fp.Footprint.RowPitch, (unsigned long long)c.bytes);
         mgpu::diag::info(line);
 
+        // ---- P2.0: the cross-adapter shared fence ----
+        //
+        // A fence created SHARED | SHARED_CROSS_ADAPTER on the game's device and
+        // opened on the NGX device is the only way to know the game's queue has
+        // retired our copies. We cannot ask that queue anything - but we can be
+        // told by it. Capability is logged rather than assumed: cross-adapter
+        // fences are a separate support question from cross-adapter heaps, and
+        // this rig has answered only the second.
+        if (SUCCEEDED(h) && ndev != nullptr)
+        {
+            HRESULT fh = gdev->CreateFence(0, (D3D12_FENCE_FLAGS)(D3D12_FENCE_FLAG_SHARED |
+                                                                  D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER),
+                                           IID_PPV_ARGS(&c.gfence));
+            if (SUCCEEDED(fh))
+                fh = gdev->CreateSharedHandle(c.gfence, nullptr, GENERIC_ALL, nullptr,
+                                              &c.gfence_share);
+            if (SUCCEEDED(fh))
+                fh = ndev->OpenSharedHandle(c.gfence_share, IID_PPV_ARGS(&c.nfence));
+            c.fence_ok = SUCCEEDED(fh) && c.nfence != nullptr;
+            snprintf(line, sizeof line,
+                     "[MGPU][P2.0] cross-adapter shared fence: CreateFence(SHARED|"
+                     "SHARED_CROSS_ADAPTER) on the game's device -> CreateSharedHandle -> "
+                     "OpenSharedHandle on the NGX device: hr=0x%08X. %s",
+                     (unsigned)fh,
+                     c.fence_ok
+                       ? "The read below waits on this instead of counting frames - the guess is gone."
+                       : "UNAVAILABLE on this rig; falling back to the frame-count wait, which is "
+                         "a guess and is labelled as one in the verdict.");
+            mgpu::diag::info(line);
+            // A missing fence is not fatal: the frame-count path still works and
+            // the sentinel still catches a premature read.
+        }
+
         // ---- WRITE THE SENTINEL, or the control cannot fire ----
         //
         // A DEFAULT heap comes back zeroed, not poisoned, so a "sentinel
@@ -4481,14 +4566,70 @@ void capture_poll()
     std::lock_guard<std::mutex> lk(c.cs);
     if (c.done || !c.recorded) return;
 
-    // WE DO NOT OWN THE GAME'S QUEUE, so we cannot signal a fence on it and
-    // cannot know the copy has retired. We wait a generous number of bridge
-    // presents instead, and the sentinel below is what turns "waited too
-    // little" into a named diagnosis rather than a wrong answer. A shared fence
-    // makes this exact and belongs to P2.
+    // ---- P2.0: wait on the shared fence, not on a frame count ----
+    //
+    // P1.5 counted bridge presents because we could not signal on a queue we
+    // do not own. We can: ReShade hands us the game's immediate queue, and a
+    // fence created SHARED | SHARED_CROSS_ADAPTER on the game's device and
+    // opened on ours is visible to both. The signal was issued on the frame
+    // AFTER the copies were recorded, so queue order puts it behind them; when
+    // it lands, the crossing is complete by definition rather than by guess.
+    //
+    // POLLED, NOT BLOCKED. GetCompletedValue is a read, and capture_poll runs
+    // under the same mutex the game-thread event handler takes. Blocking here
+    // on SetEventOnCompletion would hold that lock across a wait on work owned
+    // by another process's queue - the one place in this add-on where a stall
+    // could reach into the game's render thread. Once per present is frequent
+    // enough; the fence is either past SIG or it is not.
+    //
+    // WAIT_POLLS survives as the bound and as the fallback. When the shared
+    // fence could not be created (fence_ok false) or could not be signalled
+    // (signalled false), this is exactly P1.5's frames-elapsed guess and the
+    // verdict below says which mode produced it. When the fence exists but
+    // never reaches SIG within the bound, that is itself the finding - the
+    // handoff did not complete - and it is reported as such rather than read
+    // early and blamed on transit.
     const unsigned WAIT_POLLS = 240;
-    if (++c.polls < WAIT_POLLS) return;
+    ++c.polls;
+
+    const bool fence_mode = c.fence_ok && c.signalled && c.nfence != nullptr;
+    bool fence_landed = false;
+
+    if (fence_mode)
+    {
+        fence_landed = (c.nfence->GetCompletedValue() >= c.SIG);
+        if (!fence_landed && c.polls < WAIT_POLLS) return;
+    }
+    else
+    {
+        if (c.polls < WAIT_POLLS) return;
+    }
+
     c.done = true;
+
+    {
+        char mline[400];
+        if (fence_mode && fence_landed)
+            snprintf(mline, sizeof mline,
+                     "[MGPU][P2.0] handoff CONFIRMED by shared fence: the game's queue passed "
+                     "value %llu after %u bridge presents. The read below is ordered behind the "
+                     "copies, not merely later than them.",
+                     (unsigned long long)c.SIG, c.polls);
+        else if (fence_mode)
+            snprintf(mline, sizeof mline,
+                     "[MGPU][P2.0] shared fence NEVER REACHED %llu in %u bridge presents "
+                     "(completed=%llu). Reading anyway so the buffers can be described, but any "
+                     "sentinel survivors below are the unfinished handoff, not transit.",
+                     (unsigned long long)c.SIG, c.polls,
+                     (unsigned long long)c.nfence->GetCompletedValue());
+        else
+            snprintf(mline, sizeof mline,
+                     "[MGPU][P2.0] FALLBACK MODE - no shared fence (created=%s signalled=%s). "
+                     "Completion is inferred from %u elapsed bridge presents, exactly as P1.5 "
+                     "did. Treat the verdict as timing-dependent.",
+                     c.fence_ok ? "yes" : "no", c.signalled ? "yes" : "no", c.polls);
+        mgpu::diag::info(mline);
+    }
 
     char line[1000];
     HRESULT h = c.na->Reset();
@@ -4527,7 +4668,7 @@ void capture_poll()
     const bool mg = SUCCEEDED(c.gread->Map(0, &all, (void **)&pg)) && pg != nullptr;
     if (mn && mg)
     {
-        unsigned long long diff = 0, sent = 0, nonzero = 0;
+        unsigned long long diff = 0, sent = 0, nonzero = 0, sent_ref = 0;
         const unsigned long long total = (unsigned long long)c.width * c.height;
         for (UINT y = 0; y < c.height; ++y)
         {
@@ -4538,33 +4679,48 @@ void capture_poll()
                 const unsigned char *b2 = pg + ro + (size_t)x * 4;
                 if (a[0] != b2[0] || a[1] != b2[1] || a[2] != b2[2] || a[3] != b2[3]) ++diff;
                 if (a[0] == CAP_SENT && a[1] == CAP_SENT && a[2] == CAP_SENT) ++sent;
+                // P1.5e: count the sentinel colour in the REFERENCE too. A real
+                // frame contains mid-greys and 0xA5A5A5 is one, so counting it
+                // only on the received side turns ordinary content into a
+                // "survivor" - which reported failure at 21:50:44 on a run
+                // where differing was 0.
+                if (b2[0] == CAP_SENT && b2[1] == CAP_SENT && b2[2] == CAP_SENT) ++sent_ref;
                 if (b2[0] || b2[1] || b2[2]) ++nonzero;
             }
         }
+        // A survivor is only a survivor if the REFERENCE does not also hold it.
+        // Subtracting is what turns an absolute test into a comparison against
+        // the control, which is the rule everywhere else in this project.
+        const unsigned long long survivors = (sent > sent_ref) ? (sent - sent_ref) : 0;
         snprintf(line, sizeof line,
                  "[MGPU][P1.5] %ux%u fmt=%d %.2f MiB | received vs sent: differing=%llu of %llu "
-                 "| sentinel survivors=%llu | source non-black pixels=%llu",
+                 "| sentinel-coloured: received=%llu reference=%llu -> true survivors=%llu "
+                 "| source non-black pixels=%llu",
                  c.width, c.height, (int)c.format,
-                 (double)c.bytes / (1024.0 * 1024.0), diff, total, sent, nonzero);
+                 (double)c.bytes / (1024.0 * 1024.0), diff, total, sent, sent_ref, survivors,
+                 nonzero);
         mgpu::diag::info(line);
 
-        if (sent > 0)
+        // ORDER MATTERS, AND IT WAS WRONG. `differing == 0` means every byte
+        // received equals the reference taken from the same command list at the
+        // same instant. A buffer that was never written would differ from that
+        // reference in essentially every pixel, so a byte-exact match cannot be
+        // stale sentinel data whatever colours it happens to contain. The
+        // comparison against the control outranks every absolute test - putting
+        // an absolute first is what made a passing run report failure over one
+        // grey pixel out of 3.69 million.
+        if (diff == 0 && nonzero > 0)
         {
-            // TWO causes produce surviving sentinel and they are told apart by
-            // the reference buffer, not by this count. Say which.
-            if (nonzero == 0)
-                mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - sentinel survived AND the "
-                                  "game-side reference readback is empty. The reference needs "
-                                  "no bus, so this is NOT a transit or timing fault: the "
-                                  "recorded copies never executed at all. Suspect the command "
-                                  "list we recorded into, not the link.");
-            else
-                mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - sentinel survived while the "
-                                  "game-side reference HAS content, so the copies did run and "
-                                  "the crossing did not complete before we read. This is the "
-                                  "synchronisation gap: we cannot signal a fence on a queue we "
-                                  "do not own. Raise WAIT_POLLS, or wait for P2's shared "
-                                  "fence.");
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.5] PROBE PASSED - THE GAME'S OWN FRAME CROSSED THE ADAPTER "
+                     "BOUNDARY INTACT. All %llu pixels received on the second adapter match the "
+                     "reference taken from the same command list at the same instant, and the "
+                     "source carried %llu non-black pixels of real rendered content at the "
+                     "game's native %ux%u fmt=%d. This is the application's finished colour "
+                     "buffer, not a pattern of ours. (%llu pixels were the sentinel colour in "
+                     "BOTH buffers - content, not survival.)",
+                     total, nonzero, c.width, c.height, (int)c.format, sent_ref);
+            mgpu::diag::info(line);
         }
         else if (nonzero == 0)
         {
@@ -4572,21 +4728,38 @@ void capture_poll()
                               "black, so an all-black arrival proves nothing. Capture during "
                               "gameplay, not on a loading screen or a faded menu.");
         }
-        else if (diff == 0)
+        else if (survivors > 0)
         {
-            mgpu::diag::info("[MGPU][P1.5] PROBE PASSED - THE GAME'S OWN FRAME CROSSED THE "
-                             "ADAPTER BOUNDARY INTACT. Every byte received on the second adapter "
-                             "matches the reference copy taken from the same command list at the "
-                             "same instant. The payload is real rendered content at the game's "
-                             "native resolution and format, not a pattern of ours.");
+            // Two causes, told apart by the reference buffer rather than by the
+            // survivor count alone.
+            if (diff >= total / 2)
+                mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - most of the buffer is still "
+                                  "sentinel and the reference has content, so the copies ran but "
+                                  "the crossing had not completed when we read. In fallback mode "
+                                  "this is the frames-elapsed guess being wrong and the bound "
+                                  "should rise; in fence mode it is a real finding - the fence "
+                                  "reports the copies retired and the bytes did not arrive, "
+                                  "which means the ordering assumption itself is wrong. The "
+                                  "[MGPU][P2.0] line above says which mode this was.");
+            else
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.5] PROBE FAILED - %llu true sentinel survivors (received "
+                         "%llu, reference %llu) with %llu of %llu pixels differing. A PARTIAL "
+                         "arrival, which is neither a clean timing miss nor a clean corruption "
+                         "- record the counts before theorising.",
+                         survivors, sent, sent_ref, diff, total);
+                mgpu::diag::error(line);
+            }
         }
         else
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P1.5] PROBE FAILED - %llu of %llu pixels differ from the reference. "
-                     "Both copies came from one source in one list, so the two cannot have "
-                     "diverged before transit: this is the payload changing on the way across. "
-                     "Check the footprint arithmetic first - row pitch is %u for a %u-pixel row.",
+                     "[MGPU][P1.5] PROBE FAILED - %llu of %llu pixels differ from the reference "
+                     "with no sentinel left. Both copies came from one source in one list, so "
+                     "they cannot have diverged before transit: the payload changed on the way "
+                     "across. Check the footprint arithmetic first - row pitch is %u for a "
+                     "%u-pixel row.",
                      diff, total, (unsigned)c.fp.Footprint.RowPitch, c.width);
             mgpu::diag::error(line);
         }
