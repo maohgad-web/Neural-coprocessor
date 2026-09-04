@@ -32,18 +32,21 @@ jobs:
       #   moved by P1.0  NVSDK_NGX  nvngx
       #   moved by P1.3  SHARED_CROSS_ADAPTER  HEAP_FLAG_SHARED
       #                  CreateSharedHandle    OpenSharedHandle
-      #   still guarded  reshade_finish_effects            -> P1.4
-      #                  FENCE_FLAG_SHARED                 -> P2
+      #   moved by P1.5  reshade_finish_effects
+      #   still guarded  FENCE_FLAG_SHARED                 -> P2
       #                  COMMAND_LIST_TYPE_COPY            -> P2
       #                  GetClockCalibration               -> P2
       #
-      # P1.3 synchronises with a CPU wait between two submissions, on
-      # purpose: pipelining is P2's problem. Widening this pattern to make
-      # a build pass deletes the guard rather than moving it.
+      # P1.3/P1.4/P1.5 all synchronise with a CPU wait between submissions,
+      # on purpose: pipelining is P2's problem. P1.5 goes further and infers
+      # completion from frames elapsed, because it cannot signal a fence on the
+      # game's queue - that is what FENCE_FLAG_SHARED is being held for, and it
+      # is the next symbol to move. Widening this pattern to make a build pass
+      # deletes the guard rather than moving it.
       - name: P1 containment check
         shell: bash
         run: |
-          PATTERN='FENCE_FLAG_SHARED|reshade_finish_effects|COMMAND_LIST_TYPE_COPY|GetClockCalibration'
+          PATTERN='FENCE_FLAG_SHARED|COMMAND_LIST_TYPE_COPY|GetClockCalibration'
           FOUND=0
           for DIR in src assets; do
             [ -d "$DIR" ] || continue
