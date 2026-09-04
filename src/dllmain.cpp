@@ -149,6 +149,13 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
         reinterpret_cast<void *>(static_cast<uintptr_t>(cmd_list->get_native())),
         q_native,
         static_cast<unsigned long long>(res.handle));
+
+    // P4.0 rides the same event. Both paths are inert until requested and are
+    // independent by construction, so neither can leave the other half-armed.
+    mgpu::gpu1::stream_on_finish_effects(
+        reinterpret_cast<void *>(static_cast<uintptr_t>(cmd_list->get_native())),
+        q_native,
+        static_cast<unsigned long long>(res.handle));
 }
 
 // T3 instrumentation: in a clean run, no destroy_device with the game's

@@ -198,4 +198,41 @@ void capture_request();
 void capture_on_finish_effects(void *runtime, void *cmd_list, void *cmd_queue,
                                unsigned long long rtv_handle);
 void capture_poll();
+
+// ---- P4.0: the stream ----
+//
+// The first stage that RUNS rather than probes: every game frame, sealed and
+// transited into a ring of slots, until a self-imposed bound.
+//
+// A stream is where the QUIET failures in P1_INSTRUMENT section 00 live - torn,
+// stale, dropped, duplicated, reordered, slot-aliased. None of them is
+// reachable by a one-shot probe and none is visible to a person watching the
+// window; a stream that consistently delivers frame N-4 looks perfect on static
+// content. The 64-byte seal carried in each slot is what makes them nameable,
+// and section 06 committed to shipping it with the first task that transits a
+// stream.
+//
+// Scope, so the log is not over-read: the seal proves IDENTITY, ORDER and AGE.
+// It does NOT verify pixels per frame (P1.5 established the payload crosses
+// byte-exact, and re-proving it per frame would measure the instrument), and
+// the barcode field is written as 0 and left UNCHECKED because the shader that
+// would make it an independent check does not exist yet. The neural stage is
+// deliberately not attached: if both landed in one commit, a failure would not
+// say which half.
+
+// Bridge thread. Arms the stream; inert until called, one stream per process.
+// Reads Fault= from mgpu.ini beside the add-on - absent means no fault, so the
+// shipped default is a clean run and a missing file is never an error.
+void stream_request();
+
+// GAME thread, every frame, with the game's command list open. Filters by
+// adapter LUID; signals the previous frame's fence value before recording the
+// current one, because ReShade executes our list after this returns.
+void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
+                              unsigned long long rtv_handle);
+
+// Bridge thread, once per present. Consumes whatever the fence says has
+// arrived, checks each seal, and prints the summary once the producer has
+// stopped and drained.
+void stream_poll();
 }

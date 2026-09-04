@@ -5743,4 +5743,677 @@ void capture_poll()
     if (nr_in != nullptr) free(nr_in);
 }
 
+// =====================================================================
+// P4.0 - THE STREAM: continuous per-frame capture into a ring, with the seal
+// =====================================================================
+//
+// Everything before this was a probe: one frame, one question, one answer, one
+// shot per process. This is the first stage that RUNS - every game frame, into
+// a ring of slots, for as long as it is armed.
+//
+// That changes what can go wrong, completely. P1_INSTRUMENT.md section 00
+// lists thirteen transit failures and calls the second half of them QUIET:
+// torn, stale, dropped, duplicated, reordered, slot-aliased. Not one of them
+// is reachable by a one-shot probe, and not one of them is visible to a person
+// watching the bridge window - a stream that consistently delivers frame N-4
+// looks perfect on static content. The seal is the instrument that makes them
+// nameable, and section 06 committed to shipping it with the first task that
+// transits a stream. This is that task.
+//
+// WHAT THIS DOES NOT DO, stated up front so the log is not over-read:
+//
+//   - It does NOT verify pixels per frame. The seal proves IDENTITY, ORDER and
+//     AGE. P1.5 already proved the payload crosses byte-exact, and re-proving
+//     that every frame would cost a full-resolution readback per frame and
+//     measure the instrument instead of the transit.
+//   - The `barcode` field is written as 0 and NOT CHECKED. It needs a shader
+//     that renders the frame index into the pixels (P1_INSTRUMENT section 03),
+//     which does not exist yet. Writing frame_index into it here would produce
+//     a check that compares a value against itself and always passes - the
+//     exact shape of the failures section 00a records. Zero and unchecked is
+//     honest; self-comparison would not be.
+//   - It does NOT run the neural stage. Feeding this stream to a persistent
+//     DLSS-NR feature is the next step and is deliberately separate: if both
+//     landed in one commit, a failure would not say which half.
+//
+// SELF-LIMITING BY DESIGN. This is the first code in the project that adds
+// per-frame work to the GAME'S command list, so it stops on its own after
+// STREAM_MAX_FRAMES and prints a summary. A build that misbehaves costs a
+// bounded number of frames rather than the rest of the session.
+namespace
+{
+    // The seal. Layout is fixed and shared by both ends; the static_assert is
+    // the requirement and the comment is a courtesy (P1_INSTRUMENT section 01
+    // records an earlier draft that asserted 64 while listing 56 bytes).
+    struct MgpuSeal
+    {
+        unsigned int  magic;          // 'MGPU'
+        unsigned int  seal_version;
+        unsigned long long frame_index;
+        unsigned long long qpc_submit;
+        unsigned long long payload_bytes;
+        unsigned int  width;
+        unsigned int  height;
+        unsigned int  dxgi_format;
+        unsigned int  row_pitch;      // the FOOTPRINT pitch, not width * bpp
+        unsigned int  slot_index;
+        unsigned int  barcode;        // 0 = not implemented; see the note above
+        unsigned int  reserved[2];
+    };
+    static_assert(sizeof(MgpuSeal) == 64, "seal layout changed");
+
+    const unsigned int SEAL_MAGIC   = 0x5550474Du;   // 'MGPU' little-endian
+    const unsigned int SEAL_VERSION = 1u;
+
+    // 512, not 64: D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT. The payload in each
+    // slot must start on that boundary, so the seal lives in space that would
+    // have been padding anyway and costs nothing.
+    const UINT64 SEAL_STRIDE = 512;
+
+    struct stream_state
+    {
+        std::mutex cs;
+
+        // RING DEPTH IS A NAMED CONSTANT, NEVER A HARDCODED 2. P0_RECORD's
+        // multi-pass note requires this: depth is entangled with the fence and
+        // ownership logic, and changing it later means reopening the
+        // synchronisation design. Three is a starting value, not a result.
+        static const unsigned RING = 3;
+
+        // The bound. See the header comment.
+        static const unsigned long long STREAM_MAX_FRAMES = 600;
+
+        bool requested = false, tried = false, armed = false;
+        bool finished = false, summarised = false;
+        bool said_other = false, said_overrun = false;
+
+        ID3D12Device *gdev = nullptr;          // borrowed
+        ID3D12Heap *gheap = nullptr, *nheap = nullptr;
+        ID3D12Resource *gxfer = nullptr, *nxfer = nullptr;
+        ID3D12Resource *gup = nullptr;         // UPLOAD, RING seals, game side
+        unsigned char *gup_cpu = nullptr;      // persistently mapped
+        HANDLE gshare = nullptr;
+
+        ID3D12Fence *gfence = nullptr;         // produced-count, game side
+        HANDLE gfence_share = nullptr;
+        ID3D12Fence *nfence = nullptr;         // the same fence on GPU 1
+
+        ID3D12Resource *nseal = nullptr;       // READBACK, RING * SEAL_STRIDE
+        ID3D12CommandQueue *nq = nullptr;
+        ID3D12CommandAllocator *na = nullptr;
+        ID3D12GraphicsCommandList *nl = nullptr;
+        ID3D12Fence *nf = nullptr;
+        HANDLE nev = nullptr;
+        UINT64 nf_value = 0;
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 payload_bytes = 0, slot_bytes = 0;
+        UINT width = 0, height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+        unsigned long long produced = 0;   // frames recorded into the game's list
+        unsigned long long consumed = 0;   // frames whose seal has been checked
+        unsigned long long last_seen = 0;
+
+        // Counters. A quiet failure is a RATE, not an event, which is why the
+        // summary matters more than any single line.
+        unsigned long long reuse = 0, dropped = 0, reordered = 0;
+        unsigned long long bad_magic = 0, contract = 0, alias = 0, overrun = 0;
+
+        LARGE_INTEGER freq{};
+        double lat_min = 1e30, lat_max = 0.0, lat_sum = 0.0;
+        unsigned long long lat_n = 0;
+
+        // Fault injection (P1_INSTRUMENT section 04). Absent file = no fault,
+        // so the shipped default is a clean run and a missing file is never an
+        // error.
+        char fault[32] = "none";
+    };
+
+    stream_state &str()
+    {
+        static stream_state s;
+        return s;
+    }
+
+    // Read Fault= out of mgpu.ini beside the add-on. Deliberately tiny and
+    // deliberately failure-tolerant: this must never be a reason a run does not
+    // happen.
+    void stream_read_fault(char *out, size_t n)
+    {
+        snprintf(out, n, "none");
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return;
+        const char *k = strstr(buf, "Fault=");
+        if (k == nullptr) return;
+        k += 6;
+        size_t i = 0;
+        while (i + 1 < n && k[i] != '\0' && k[i] != '\r' && k[i] != '\n' && k[i] != ' ')
+        { out[i] = k[i]; ++i; }
+        out[i] = '\0';
+        if (i == 0) snprintf(out, n, "none");
+    }
+
+    void stream_release()
+    {
+        stream_state &s = str();
+        if (s.gup != nullptr && s.gup_cpu != nullptr) { s.gup->Unmap(0, nullptr); }
+        s.gup_cpu = nullptr;
+        if (s.nev != nullptr) { CloseHandle(s.nev); s.nev = nullptr; }
+        if (s.nf  != nullptr) { s.nf->Release();  s.nf = nullptr; }
+        if (s.nl  != nullptr) { s.nl->Release();  s.nl = nullptr; }
+        if (s.na  != nullptr) { s.na->Release();  s.na = nullptr; }
+        if (s.nq  != nullptr) { s.nq->Release();  s.nq = nullptr; }
+        if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
+        if (s.nfence != nullptr) { s.nfence->Release(); s.nfence = nullptr; }
+        if (s.gfence_share != nullptr) { CloseHandle(s.gfence_share); s.gfence_share = nullptr; }
+        if (s.gfence != nullptr) { s.gfence->Release(); s.gfence = nullptr; }
+        if (s.nxfer != nullptr) { s.nxfer->Release(); s.nxfer = nullptr; }
+        if (s.nheap != nullptr) { s.nheap->Release(); s.nheap = nullptr; }
+        if (s.gup   != nullptr) { s.gup->Release();   s.gup = nullptr; }
+        if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
+        if (s.gheap != nullptr) { s.gheap->Release(); s.gheap = nullptr; }
+        if (s.gshare!= nullptr) { CloseHandle(s.gshare); s.gshare = nullptr; }
+        s.gdev = nullptr;
+        s.armed = false;
+    }
+}
+
+void stream_request()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (s.finished)
+    {
+        mgpu::diag::info("[MGPU][P4.0] stream already ran to its bound this launch. One stream "
+                         "per process, by design - restart to run another.");
+        return;
+    }
+    if (s.requested) return;
+    s.requested = true;
+    stream_read_fault(s.fault, sizeof s.fault);
+    char l[500];
+    snprintf(l, sizeof l,
+             "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\". "
+             "Every game frame from the next one is sealed and transited until the bound is "
+             "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
+             "measures identity and ordering correctly and tells you nothing about anything "
+             "else.",
+             stream_state::RING, stream_state::STREAM_MAX_FRAMES, s.fault);
+    mgpu::diag::info(l);
+}
+
+// Game thread, every frame, with the game's command list open.
+void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
+                              unsigned long long rtv_handle)
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (!s.requested || s.finished) return;
+
+    ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
+    ID3D12Resource *src = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)rtv_handle);
+    ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
+    if (gl == nullptr || src == nullptr || gq == nullptr) return;
+
+    // FILTER FIRST, ALWAYS. The bridge's own effect runtime raises this event
+    // too, and by LUID rather than by pointer: ReShade wraps D3D12 objects, so
+    // a pointer comparison rejects every event including the right ones.
+    ID3D12Device *ld = nullptr;
+    if (FAILED(gl->GetDevice(IID_PPV_ARGS(&ld))) || ld == nullptr) return;
+    const LUID ll = ld->GetAdapterLuid();
+    ld->Release();
+    {
+        LUID want{}; bool known = false;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            want = st().game_luid; known = st().game_luid_known;
+        }
+        if (!known || ll.LowPart != want.LowPart || ll.HighPart != want.HighPart)
+        {
+            if (!s.said_other)
+            {
+                s.said_other = true;
+                mgpu::diag::info("[MGPU][P4.0] ignoring events from the bridge's own runtime "
+                                 "(correct - said once)");
+            }
+            return;
+        }
+    }
+
+    char line[900];
+
+    // ---- arm on the first game-adapter event, record nothing ----
+    if (!s.armed)
+    {
+        if (s.tried) return;
+        s.tried = true;
+
+        ID3D12Device *gdev = nullptr;
+        if (FAILED(src->GetDevice(IID_PPV_ARGS(&gdev))) || gdev == nullptr) return;
+        s.gdev = gdev;
+
+        QueryPerformanceFrequency(&s.freq);
+
+        const D3D12_RESOURCE_DESC rd = src->GetDesc();
+        s.width = (UINT)rd.Width; s.height = rd.Height; s.format = rd.Format;
+        UINT rows = 0; UINT64 rowb = 0;
+        gdev->GetCopyableFootprints(&rd, 0, 1, 0, &s.fp, &rows, &rowb, &s.payload_bytes);
+
+        // One slot = seal (padded to the placement alignment) + payload,
+        // rounded up so that every slot offset is itself 512-aligned. Whole
+        // slots only: sub-slot arithmetic is how a ring aliases.
+        s.slot_bytes = ((SEAL_STRIDE + s.payload_bytes + SEAL_STRIDE - 1) / SEAL_STRIDE)
+                       * SEAL_STRIDE;
+
+        const UINT64 ALIGN = 65536;
+        const UINT64 heap_bytes =
+            ((s.slot_bytes * stream_state::RING + ALIGN - 1) / ALIGN) * ALIGN;
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hp.CreationNodeMask = 1; hp.VisibleNodeMask = 1;
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = heap_bytes; hd.Properties = hp; hd.Alignment = ALIGN;
+        hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED |
+                                      D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = heap_bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+        HRESULT h = gdev->CreateHeap(&hd, IID_PPV_ARGS(&s.gheap));
+        if (SUCCEEDED(h))
+            h = gdev->CreatePlacedResource(s.gheap, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, IID_PPV_ARGS(&s.gxfer));
+        if (SUCCEEDED(h))
+            h = gdev->CreateSharedHandle(s.gheap, nullptr, GENERIC_ALL, nullptr, &s.gshare);
+
+        // The seal staging buffer, persistently mapped. One UPLOAD buffer with
+        // RING seal slots: the CPU writes slot k while the GPU may still be
+        // reading slot k-1, which is what the ring is for.
+        if (SUCCEEDED(h))
+            h = make_buf(gdev, SEAL_STRIDE * stream_state::RING,
+                         D3D12_HEAP_TYPE_UPLOAD, &s.gup);
+        if (SUCCEEDED(h))
+        {
+            D3D12_RANGE none{0, 0};
+            h = s.gup->Map(0, &none, reinterpret_cast<void **>(&s.gup_cpu));
+            if (SUCCEEDED(h) && s.gup_cpu != nullptr)
+                memset(s.gup_cpu, 0, (size_t)(SEAL_STRIDE * stream_state::RING));
+            else h = E_FAIL;
+        }
+
+        // The produced-count fence. Its value IS the frame index, which is why
+        // there is only one of them for the whole ring.
+        if (SUCCEEDED(h))
+            h = gdev->CreateFence(0, (D3D12_FENCE_FLAGS)(D3D12_FENCE_FLAG_SHARED |
+                                                         D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER),
+                                  IID_PPV_ARGS(&s.gfence));
+        if (SUCCEEDED(h))
+            h = gdev->CreateSharedHandle(s.gfence, nullptr, GENERIC_ALL, nullptr,
+                                         &s.gfence_share);
+
+        ID3D12Device *ndev = nullptr;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            ndev = st().device;
+        }
+        if (SUCCEEDED(h) && ndev != nullptr)
+        {
+            h = ndev->OpenSharedHandle(s.gshare, IID_PPV_ARGS(&s.nheap));
+            if (SUCCEEDED(h))
+                h = ndev->CreatePlacedResource(s.nheap, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                               nullptr, IID_PPV_ARGS(&s.nxfer));
+            if (SUCCEEDED(h)) h = ndev->OpenSharedHandle(s.gfence_share,
+                                                         IID_PPV_ARGS(&s.nfence));
+            if (SUCCEEDED(h))
+                h = make_buf(ndev, SEAL_STRIDE * stream_state::RING,
+                             D3D12_HEAP_TYPE_READBACK, &s.nseal);
+            if (SUCCEEDED(h))
+            {
+                D3D12_COMMAND_QUEUE_DESC qd{};
+                qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                h = ndev->CreateCommandQueue(&qd, IID_PPV_ARGS(&s.nq));
+            }
+            if (SUCCEEDED(h))
+                h = ndev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 IID_PPV_ARGS(&s.na));
+            if (SUCCEEDED(h))
+                h = ndev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.na, nullptr,
+                                            IID_PPV_ARGS(&s.nl));
+            if (SUCCEEDED(h)) h = s.nl->Close();
+            if (SUCCEEDED(h))
+                h = ndev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.nf));
+            if (SUCCEEDED(h))
+            {
+                s.nev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (s.nev == nullptr) h = E_FAIL;
+            }
+        }
+        else if (ndev == nullptr) h = E_FAIL;
+
+        snprintf(line, sizeof line,
+                 "[MGPU][P4.0] stream arm hr=0x%08X source=%ux%u fmt=%d rowPitch=%u "
+                 "payload=%llu slot=%llu ring=%u heap=%llu bytes. The heap is created on the "
+                 "GAME's device: its command list can only reference resources from the device "
+                 "that made it.",
+                 (unsigned)h, s.width, s.height, (int)s.format,
+                 (unsigned)s.fp.Footprint.RowPitch, (unsigned long long)s.payload_bytes,
+                 (unsigned long long)s.slot_bytes, stream_state::RING,
+                 (unsigned long long)heap_bytes);
+        mgpu::diag::info(line);
+
+        if (FAILED(h))
+        {
+            mgpu::diag::error("[MGPU][P4.0] arm failed - the stream is inert for this launch and "
+                              "the game's command list is never touched");
+            s.finished = true;
+            stream_release();
+            return;
+        }
+        s.armed = true;
+        return;    // record nothing on the arming frame
+    }
+
+    // ---- SIGNAL THE PREVIOUS FRAME, THEN RECORD THIS ONE ----
+    //
+    // The same ordering rule P2.0 established, now generalised to a stream.
+    // ReShade executes the list we recorded into AFTER this handler returns, so
+    // a signal issued in the same event sits AHEAD of our own copies and would
+    // clear before the data existed. By the time the next event arrives, the
+    // previous frame's list has necessarily been submitted - it had to be, to
+    // present - so a Signal here lands behind it. One fence, whose value is the
+    // count of frames whose copies are known to have been submitted.
+    if (s.produced > 0)
+        (void)gq->Signal(s.gfence, s.produced);
+
+    if (s.produced >= stream_state::STREAM_MAX_FRAMES)
+    {
+        // Bound reached. Stop touching the game's list; the bridge thread
+        // prints the summary once the last frames have been consumed.
+        s.finished = true;
+        return;
+    }
+
+    const unsigned long long fi = s.produced + 1;
+    const unsigned slot = (unsigned)((fi - 1) % stream_state::RING);
+    const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+
+    MgpuSeal seal{};
+    seal.magic = SEAL_MAGIC;
+    seal.seal_version = SEAL_VERSION;
+    seal.frame_index = fi;
+    seal.qpc_submit = (unsigned long long)now.QuadPart;
+    seal.payload_bytes = s.payload_bytes;
+    seal.width = s.width;
+    seal.height = s.height;
+    seal.dxgi_format = (unsigned)s.format;
+    seal.row_pitch = s.fp.Footprint.RowPitch;
+    seal.slot_index = slot;
+    seal.barcode = 0;      // NOT IMPLEMENTED - see the note at the top
+
+    // Fault injection. Each of these corrupts exactly one field, so the
+    // checker's diagnosis names the field it was given. Absent = none.
+    if (strcmp(s.fault, "pitch") == 0 && fi == 30) seal.row_pitch += 20;
+    if (strcmp(s.fault, "alias") == 0 && fi == 30) seal.slot_index =
+        (slot + 1) % stream_state::RING;
+    if (strcmp(s.fault, "magic") == 0 && fi == 30) seal.magic = 0xDEADBEEFu;
+
+    memcpy(s.gup_cpu + (size_t)(slot * SEAL_STRIDE), &seal, sizeof seal);
+
+    // Seal first, payload second, in one list. Command-list order guarantees
+    // the seal is written before the pixels within the same submission, and the
+    // single fence signal covers both.
+    gl->CopyBufferRegion(s.gxfer, slot_off, s.gup, (UINT64)slot * SEAL_STRIDE, sizeof(MgpuSeal));
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = src;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    gl->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
+    cs.pResource = src; cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    cs.SubresourceIndex = 0;
+    cd.pResource = s.gxfer; cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    cd.PlacedFootprint = s.fp; cd.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+    gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+
+    // Restore EXACTLY. The game did not ask us to change its resource state and
+    // must not be able to tell that we did.
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    gl->ResourceBarrier(1, &b);
+
+    s.produced = fi;
+}
+
+// Bridge thread, once per present. Cheap and does nothing until frames exist.
+void stream_poll()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (!s.armed || s.summarised) return;
+
+    const unsigned long long completed =
+        (s.nfence != nullptr) ? (unsigned long long)s.nfence->GetCompletedValue() : 0;
+
+    char line[1000];
+
+    while (s.consumed < completed)
+    {
+        const unsigned long long f = s.consumed + 1;
+
+        // The slot for frame f has been recycled if the producer is more than
+        // RING frames ahead. That is a real, nameable condition - THE CONSUMER
+        // FELL BEHIND - and it is emphatically NOT a producer drop. Conflating
+        // the two would report our own slowness as the game's fault.
+        if (completed >= f + stream_state::RING)
+        {
+            ++s.overrun;
+            s.consumed = f;
+            if (!s.said_overrun)
+            {
+                s.said_overrun = true;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] CONSUMER OVERRUN at f=%llu: the producer is %llu frames "
+                         "ahead of us and ring depth is %u, so this slot was rewritten before it "
+                         "was read. This is OUR slowness, not a dropped frame - counted "
+                         "separately for exactly that reason. Said once; the summary carries the "
+                         "total.",
+                         f, completed - f, stream_state::RING);
+                mgpu::diag::warn(line);
+            }
+            continue;
+        }
+
+        const unsigned slot = (unsigned)((f - 1) % stream_state::RING);
+        const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
+
+        HRESULT h = s.na->Reset();
+        if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
+        if (SUCCEEDED(h))
+        {
+            s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
+                                   s.nxfer, slot_off, sizeof(MgpuSeal));
+            h = s.nl->Close();
+        }
+        if (SUCCEEDED(h))
+        {
+            ID3D12CommandList *const ls[1] = { s.nl };
+            s.nq->ExecuteCommandLists(1, ls);
+            ++s.nf_value;
+            h = s.nq->Signal(s.nf, s.nf_value);
+            if (SUCCEEDED(h))
+            {
+                s.nf->SetEventOnCompletion(s.nf_value, s.nev);
+                if (WaitForSingleObject(s.nev, 5000) != WAIT_OBJECT_0) h = E_FAIL;
+            }
+        }
+        if (FAILED(h)) { s.consumed = f; continue; }
+
+        MgpuSeal got{};
+        const unsigned char *m = nullptr;
+        D3D12_RANGE rr{ (SIZE_T)(slot * SEAL_STRIDE),
+                        (SIZE_T)(slot * SEAL_STRIDE + sizeof(MgpuSeal)) };
+        if (SUCCEEDED(s.nseal->Map(0, &rr, (void **)&m)) && m != nullptr)
+        {
+            memcpy(&got, m + (size_t)(slot * SEAL_STRIDE), sizeof got);
+            D3D12_RANGE none{0, 0};
+            s.nseal->Unmap(0, &none);
+        }
+        else { s.consumed = f; continue; }
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+
+        if (got.magic != SEAL_MAGIC || got.seal_version != SEAL_VERSION)
+        {
+            ++s.bad_magic;
+            snprintf(line, sizeof line,
+                     "[MGPU][SEAL] BAD MAGIC f=%llu slot=%u: magic=0x%08X version=%u. Nothing "
+                     "arrived at this offset, or the two ends disagree about the layout.",
+                     f, slot, got.magic, got.seal_version);
+            mgpu::diag::error(line);
+        }
+        else
+        {
+            if (got.slot_index != slot)
+            {
+                ++s.alias;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] RING ALIAS f=%llu: seal claims slot %u, read from slot %u",
+                         f, got.slot_index, slot);
+                mgpu::diag::error(line);
+            }
+            if (got.width != s.width || got.height != s.height ||
+                got.dxgi_format != (unsigned)s.format ||
+                got.row_pitch != s.fp.Footprint.RowPitch ||
+                got.payload_bytes != s.payload_bytes)
+            {
+                ++s.contract;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] CONTRACT MISMATCH f=%llu: seal %ux%u fmt=%u pitch=%u "
+                         "bytes=%llu | expected %ux%u fmt=%u pitch=%u bytes=%llu",
+                         f, got.width, got.height, got.dxgi_format, got.row_pitch,
+                         (unsigned long long)got.payload_bytes,
+                         s.width, s.height, (unsigned)s.format,
+                         (unsigned)s.fp.Footprint.RowPitch,
+                         (unsigned long long)s.payload_bytes);
+                mgpu::diag::error(line);
+            }
+
+            if (got.frame_index == s.last_seen) ++s.reuse;
+            else if (got.frame_index < s.last_seen)
+            {
+                ++s.reordered;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] REORDERED f=%llu: seal says %llu, last seen %llu",
+                         f, (unsigned long long)got.frame_index, s.last_seen);
+                mgpu::diag::error(line);
+            }
+            else
+            {
+                const unsigned long long gap = got.frame_index - s.last_seen;
+                if (s.last_seen != 0 && gap != 1)
+                {
+                    ++s.dropped;
+                    snprintf(line, sizeof line,
+                             "[MGPU][SEAL] DROPPED f=%llu gap=%llu (last_new=%llu)",
+                             f, gap, s.last_seen);
+                    mgpu::diag::error(line);
+                }
+                const double lat = (s.freq.QuadPart > 0)
+                    ? ((double)(now.QuadPart - (long long)got.qpc_submit) * 1000.0
+                       / (double)s.freq.QuadPart) : 0.0;
+                if (lat < s.lat_min) s.lat_min = lat;
+                if (lat > s.lat_max) s.lat_max = lat;
+                s.lat_sum += lat; ++s.lat_n;
+                s.last_seen = got.frame_index;
+
+                if ((got.frame_index % 60) == 0)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][SEAL] new f=%llu slot=%u gap=%llu lat=%.2fms pitch=%u "
+                             "fmt=%u bytes=%llu bc=%u(unimplemented) OK",
+                             (unsigned long long)got.frame_index, slot, gap, lat,
+                             got.row_pitch, got.dxgi_format,
+                             (unsigned long long)got.payload_bytes, got.barcode);
+                    mgpu::diag::info(line);
+                }
+            }
+        }
+        s.consumed = f;
+    }
+
+    // ---- summary, once, after the producer has stopped and drained ----
+    if (s.finished && s.consumed >= s.produced && !s.summarised)
+    {
+        s.summarised = true;
+        const double mean = (s.lat_n > 0) ? (s.lat_sum / (double)s.lat_n) : 0.0;
+        snprintf(line, sizeof line,
+                 "[MGPU][SEAL] summary: produced=%llu consumed=%llu new=%llu reuse=%llu "
+                 "dropped=%llu reordered=%llu overrun=%llu bad_magic=%llu contract=%llu "
+                 "alias=%llu fault=\"%s\" seal_version=%u",
+                 s.produced, s.consumed, s.lat_n, s.reuse, s.dropped, s.reordered,
+                 s.overrun, s.bad_magic, s.contract, s.alias, s.fault, SEAL_VERSION);
+        mgpu::diag::info(line);
+        snprintf(line, sizeof line,
+                 "[MGPU][SEAL] latency ms: min=%.2f mean=%.2f max=%.2f n=%llu. SUBMIT-TO-CONSUME "
+                 "only - it excludes the game's render before it and GPU 1's present after it, "
+                 "and it is wall-clock around a CPU-visible completion rather than a GPU "
+                 "timestamp. Perishable: this is one cabling at one link width.",
+                 (s.lat_n > 0) ? s.lat_min : 0.0, mean, s.lat_max, s.lat_n);
+        mgpu::diag::info(line);
+
+        const bool clean = (s.dropped == 0 && s.reordered == 0 && s.bad_magic == 0 &&
+                            s.contract == 0 && s.alias == 0);
+        if (strcmp(s.fault, "none") != 0)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.0] FAULT-INJECTED RUN (\"%s\") - this is a NEGATIVE CONTROL and "
+                     "must NOT be recorded as a clean stream. Acceptance is that the counter "
+                     "matching the injected fault is non-zero above; a clean summary here means "
+                     "the checker did not trip and the instrument is not yet trustworthy.",
+                     s.fault);
+            mgpu::diag::warn(line);
+        }
+        else if (clean && s.lat_n > 0)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.0] STREAM PASSED - %llu game frames sealed, transited and "
+                     "checked with no drop, no reorder, no alias and no contract mismatch. "
+                     "Identity, ordering and age hold across a continuous stream, which is the "
+                     "first thing in this project that a one-shot probe could not have shown. "
+                     "NOTE THE SCOPE: pixels are NOT verified per frame (P1.5 established the "
+                     "payload crosses byte-exact) and the barcode is unimplemented, so "
+                     "seal-to-pixel identity is UNCHECKED. A green run here is not evidence "
+                     "until the fault-injection runs in P1_INSTRUMENT section 04 have been seen "
+                     "to trip this same checker.",
+                     s.produced);
+            mgpu::diag::info(line);
+        }
+        else
+        {
+            mgpu::diag::error("[MGPU][P4.0] STREAM FAILED - see the counters above; each "
+                              "non-zero one names its own failure and they have different "
+                              "causes. Do not average them into a verdict.");
+        }
+        stream_release();
+    }
+}
+
 }

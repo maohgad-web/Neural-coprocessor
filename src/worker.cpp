@@ -503,6 +503,9 @@ namespace
                     // P1.5 rides the same key. It is inert until requested and
                     // one-shot after that, so repeated presses cost nothing.
                     mgpu::gpu1::capture_request();
+                    // P4.0 rides the same key: one stream per process, armed on
+                    // demand so the operator picks gameplay rather than a menu.
+                    mgpu::gpu1::stream_request();
                 }
 
                 // The colour must animate: a static clear cannot
@@ -531,6 +534,9 @@ namespace
                 // frame has actually been captured. Placed after the present so
                 // its one expensive poll cannot delay a frame that was ready.
                 mgpu::gpu1::capture_poll();
+                // P4.0: same placement, same reason - after the present, so a
+                // seal readback cannot delay a frame that was ready.
+                mgpu::gpu1::stream_poll();
 
                 ++frame;
                 if (frame == 1)
