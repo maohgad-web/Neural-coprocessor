@@ -10,6 +10,28 @@ this document, the header wins and this document is wrong.
 This exists because P0's verification methods do not transfer to P1, and that is
 not obvious until it has already cost a milestone.
 
+**First contact with the rig, 2026-09-03/04, and the design survived it.**
+P1.3 and P1.4 both closed: a payload crosses between the adapters intact by two
+routes, and DLSS-NR runs on transited data producing output byte-identical to
+the same model run with no bus involved. `VENDOR_LOCK.md` carries the results.
+
+Three things this document should absorb from those milestones, none of which
+change the design:
+
+- A new failure row in section 00 — an instrument that answers the wrong
+  question convincingly — and it is now the most expensive failure mode this
+  project has actually hit.
+- A partial resolution of the CPU-visibility question in section 01.
+- **Section 02's premise is confirmed, and its scope is narrowed.** Latency does
+  come free from the clock arithmetic, and the sub-step decomposition it implies
+  is what settled P1.3: CPU recording and submission total 0.25 ms of a ~37 ms
+  round trip, so the cost is execution rather than synchronisation. But
+  `QueryPerformanceCounter` boundaries can only see *submit* and *wait*. They
+  cannot separate GPU execution from queue latency inside a wait. That needs
+  timestamp queries, and `GetClockCalibration` correctly stays in the
+  containment grep — section 02 is right that the seal does not need it, and
+  P2 will.
+
 **It does not set P1's task order.** The first task is P1.0 — NGX on the GPU 1
 device — which moves no bytes and to which nothing here applies. See section 06.
 
@@ -38,6 +60,7 @@ Transit failures are quiet. The full set, sorted by how easily they are noticed:
 | Slot aliasing in the ring | intermittent corruption | **quiet** |
 | sRGB double-conversion | slightly washed | **very quiet** |
 | Correct content, N frames late | **indistinguishable in a screenshot** | **silent** |
+| Probe falls back to a variant that cannot answer the question | **a clean, specific, wrong result** | **silent** |
 
 The loud half needs no instrument; it is caught by looking. The quiet half is
 where P1 will actually fail, and **a human watching the bridge window will report
@@ -47,6 +70,25 @@ Note the shape of the quiet set: with one exception (sRGB) they are not failures
 of *content*. They are failures of **identity, ordering and time**. The pixels are
 usually fine — they are just the wrong frame's pixels, or the right frame's pixels
 too late.
+
+**A thirteenth row was added on 2026-09-03, it is not a transit failure at all
+— it is the instrument failing — and it has since cost more than any other entry
+in this table.** A P1.3 probe tried several parameter
+variants at one call, took the first that returned `S_OK`, and carried that
+resource into a downstream call the variant could never have satisfied. The
+result was a precise hexadecimal answer to a question nobody had asked. It is
+the quietest failure in the table, because nothing about the log looks wrong:
+the calls are in order, the codes are real, and every number is correctly
+reported.
+
+**A fallback is not a fallback if it changes what is being measured.** When a
+probe substitutes one configuration for another, the substitution has to be
+carried into the verdict — which is why the P1.3 `A.1` verdict line now prints
+`eligible=YES/NO`, and why the downstream result is defined as meaningless
+unless it reads YES. Section 04's negative control is the general answer to this
+class of fault; this row is the reminder that an instrument can also fail by
+*producing output* rather than by going silent, and that the output will look
+exactly like a finding.
 
 That is the whole design constraint. The instrument does not need to judge whether
 an image is correct. It needs to answer, for every frame that arrives on GPU 1:
@@ -116,6 +158,19 @@ relative to it. Do not assume the arithmetic — read it.
 
 A cross-adapter shared heap is not guaranteed to be CPU-writable, and whether it
 is on this hardware is unknown. **Do not build the design on that question.**
+
+**Partially settled on the rig, 2026-09-03 — for one heap kind, not for the one
+this section is about.** A heap obtained via `OpenExistingHeapFromAddress` over a
+`VirtualAlloc` region reports `CUSTOM / WRITE_BACK / L0` (`VENDOR_LOCK.md`, P1.3
+Finding 2) and is therefore CPU-writable by construction: it *is* host memory.
+**That says nothing about a heap created with `SHARED_CROSS_ADAPTER` on the
+committed path**, which on this rig currently cannot be created at all. The two
+are different transports and only one has been observed.
+
+**The design does not change.** Writing the seal with the GPU, in the same
+command list as the pixel copy, requires no CPU visibility of any heap and works
+under either transport. That is the point of the four-step sequence below, and a
+favourable observation about one path is not a reason to grow a dependency on it.
 
 Write the seal with the GPU, in the same command list as the pixel copy:
 

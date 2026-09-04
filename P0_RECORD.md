@@ -2,24 +2,25 @@
 
 Multi-GPU DLSS-NR R&D. Private, local, non-redistributed.
 
-> **If you are a coding agent: this is not your task list.**
-> This document is a finished record of completed work. Every task in it passed
-> and every file it describes is already committed. **Do not implement anything
-> from it, do not edit it, and do not treat an item here as work to do.** Your
-> assignment is in `Agent_Task.md` — and if that file says no task is assigned,
-> then none is, and you should stop and say so rather than inferring one from
-> here. Read sections 09 and 10 when you need a verified fact — that is what
-> this document is for.
+> **This is not a task list.** Sections 00–04 are a finished record of completed
+> work: every task in them passed and every file they describe is committed. Do
+> not infer work from them. **Sections 09 and 10 are different** — they are the
+> project's standing technical reference, they stay open, and verified facts are
+> added to them as later milestones produce them.
 
-**This document is the P0 record. It is finished and frozen.** P0 passed on
-2026-09-02. The conditions that made it pass are in `VENDOR_LOCK.md`; the
-accumulated technical findings are in sections 09 and 10, which remain the
-reference for every later milestone.
+**Sections 00–04 are frozen.** P0 passed on 2026-09-02 and nothing since has
+changed what it did. The conditions that made it pass are in `VENDOR_LOCK.md`.
 
-**The next milestone gets its own `Agent_Task.md`.** Do not extend this one. P1
-should inherit only what it needs — the NGX contract, the cross-adapter format
-constraints, the rig conditions by reference — not the adapter-selection rules or
-the Win32 window facts, which describe finished work.
+**Sections 09 and 10 are live.** They carry what has been read from a primary
+source or observed on the rig, regardless of which milestone produced it, because
+splitting that knowledge by milestone would mean a later reader has to know which
+document to search before knowing what they are searching for. P1's *results* live
+in `VENDOR_LOCK.md`; P1's *facts* land here.
+
+**Historical note on references to `Agent_Task.md`.** That file no longer exists.
+P1 abandoned the coding-agent workflow in favour of direct work, so the pointer
+above and the section-number citations throughout `src/` are archaeology, like the
+renamed sections in the table below.
 
 ---
 
@@ -173,9 +174,14 @@ both transit directions before evaluation:
 
 ```
 old:  P1.0 NGX on GPU 1 -> P1.1 colour out -> P1.2 return -> P1.3 NR in loop
-new:  P1.0 NGX on GPU 1 -> P1.1 LOCAL EVALUATE -> P1.2 colour out
-                        -> P1.3 return -> P1.4 NR in loop
+new:  P1.0 NGX on GPU 1 -> P1.1 LOCAL EVALUATE -> P1.2 parameter liveness
+                        -> P1.3 TRANSIT -> P1.4 NR in loop -> P2 ring buffer
 ```
+
+**Status as of 2026-09-03.** P1.0, P1.1 and P1.2 are closed and their facts are
+below. **P1.3 is open**: no byte has crossed between the adapters and no transit
+figure of any kind exists. `VENDOR_LOCK.md` carries what it has and has not
+established.
 
 That ordering made sense while the pipe looked like the hard part. It stopped
 making sense the moment `CreateFeature` returned a handle on GPU 1: evaluating
@@ -195,8 +201,10 @@ decisive first:
   213 ms on the `outputs=0` adapter, and NVIDIA's own snippet log records
   the network built and 381.8 MB allocated there. Section 09 carries the
   seven-step sequence, the result-code ladder, the parameter keys and the
-  allocation table. **Nothing has been evaluated yet** — no pixels have
-  passed through the feature. That is P1.3.
+  allocation table. ~~**Nothing has been evaluated yet** — no pixels have
+  passed through the feature. That is P1.3.~~ **Superseded 2026-09-03:** P1.1
+  evaluated it and P1.2 established that its parameters are live per evaluate.
+  Both are below. The renumbering moved transit to P1.3, which is still open.
 - **The DLSS-NR path is public API and needs no effect runtime.**
   `Init_Ext` → private outputs → `CreateFeature(Reserved18)` → `EvaluateFeature`,
   with the driver's own `_nvngx.dll` as parameter provider. A working single-GPU
@@ -346,6 +354,13 @@ signature you verified.
   `Lumenite_QuantMotion` with `DEBUG_FLOW=1`. Entry kept because the failure mode
   it names is general: no task owned the README, so it drifted for eight tasks
   without anyone noticing. Give the next milestone's documentation an owner.
+  **It drifted again during P1 and was regenerated on 2026-09-03.** It had gone
+  on naming `mgpu_bridge.addon64` as the file to deploy after CI had been
+  shipping `nvngx.dll_mgpu_bridge.addon64` since P1.0b — a deploy under the old
+  name fails the snippet's caller gate with `0xBAD00002` and reads exactly like a
+  broken add-on. **Twice now, in the same document, for the same reason.** The
+  general lesson stands and is stronger: a document nobody owns drifts, and the
+  drift is invisible until it costs a launch.
 - **The `FreeLibrary`-versus-teardown race kills the process. It is not a leak.**
   Observed on the rig: with the add-on present the game died silently during the
   third of UE5's add-on load/unload probe cycles, the log ending at
@@ -557,7 +572,7 @@ signature you verified.
   | `0xBAD00007 FAIL_NotInitialized` | called on the snippet, but the **snippet's own session** was never opened |
   | `0xBAD00005 FAIL_InvalidParameter` | snippet initialised, but it read `DLSSNR.Width`/`Height` and found nothing → built a 0×0 network |
   | `0xBAD00002 FAIL_PlatformError` | the caller gate — the calling module's filename lacks `nvngx.dll` |
-  | `0xBAD0000C FAIL_OutOfDate` | a version gate at core init; **seen once and not reproduced** (see section 10) |
+  | `0xBAD0000C FAIL_OutOfDate` | a version gate at core init; **environmental, not a defect in this code** — it became persistent, then cleared twice by different means (section 10). A run that hits it is **void**. |
 
 - **`DLSSNR.Width` / `DLSSNR.Height` are the keys that matter, not
   `NVSDK_NGX_Parameter_Width`/`_Height`.** The generic keys are `"Width"` and
@@ -619,7 +634,7 @@ signature you verified.
   `*SubrectBaseX/BaseY/Width/Height` sets, `MVecScaleX/Y`. The
   no-separator naming (`DLSSNR.ColorSubrectWidth`, not
   `DLSSNR.Color.SubrectWidth`) is confirmed correct.
-- **`PollRuntimeParams - callback is NULL (core did not set it)` — OPEN.**
+- **`PollRuntimeParams - callback is NULL (core did not set it)` — CLOSED by P1.2, entry below.** Recorded as it stood, because the reasoning is what designed the experiment that settled it:
   NR expects a runtime-parameter callback the core normally installs; on
   this path it is absent. So it is **not yet known whether tuning
   parameters are read per-evaluate or baked at `CreateFeature`**. The
@@ -849,6 +864,127 @@ signature you verified.
   requires `reinterpret_cast`. Its thread-id out-param is `unsigned *`, not
   `DWORD *`. Prefer it over `CreateThread` for threads using CRT facilities.
 
+**Cross-adapter resource creation — read off the rig, 2026-09-03 (P1.3)**
+
+These were produced by a variant matrix rather than by inference, after three
+sessions of reasoning from a single collapsed `E_INVALIDARG` produced nothing.
+The method is the transferable part: **when a call is refused, vary one field per
+row and let the difference between two adjacent rows name the cause.**
+
+- **`CreateCommittedResource` on this rig refuses BOTH cross-adapter tokens,
+  independently.** Buffer, `ROW_MAJOR`, `DXGI_FORMAT_UNKNOWN`,
+  height/depth/mips = 1, size an exact multiple of 64 KB, `HEAP_TYPE_DEFAULT`,
+  node masks 1/1 — every documented requirement satisfied and echoed as numbers
+  in the log before the call:
+
+  | Heap flags | Resource flags | hr |
+  |---|---|---|
+  | `SHARED \| SHARED_CROSS_ADAPTER` | `ALLOW_CROSS_ADAPTER` | `0x80070057` |
+  | `SHARED \| SHARED_CROSS_ADAPTER` | none | `0x80070057` |
+  | `SHARED` | `ALLOW_CROSS_ADAPTER` | `0x80070057` |
+  | `SHARED` | none | **`S_OK`** |
+
+  Identical at 1280×720 and 2560×1440. Neither token is merely invalid in
+  combination with the other; each is refused on its own.
+  **Scope, narrowly.** This is the **committed** path only.
+  `CreateHeap` + `CreatePlacedResource` was the matrix's fifth row and **did not
+  execute** — the loop exited at the fourth row's success — so it is untested.
+  **Nothing here licenses the sentence "cross-adapter sharing is unsupported on
+  this rig."**
+- **`OpenExistingHeapFromAddress` succeeds on BOTH adapters over one
+  `VirtualAlloc` region**, `hr=0` on each, both resolutions.
+  `D3D12_FEATURE_EXISTING_HEAPS` reads `1` on both. This is the only
+  refusal-capable call on that path and it passed.
+- **The heap it returns carries `SHARED_CROSS_ADAPTER`, which we never
+  requested.** `ID3D12Heap::GetDesc()`, identical on both adapters:
+  `Alignment 65536`, `Properties.Type = 4 (CUSTOM)`,
+  `CPUPageProperty = 3 (WRITE_BACK)`, `MemoryPoolPreference = 1 (L0)`,
+  `Flags = 0x421` = `SHARED (0x1) | SHARED_CROSS_ADAPTER (0x20) |
+  ALLOW_SHADER_ATOMICS (0x400)`.
+  **So the flag the runtime refuses from us on a committed resource, it applies
+  itself to a heap it builds from host pages.** The two facts together are
+  narrower and more useful than either alone, and they are why the first must not
+  be written up as a hardware verdict.
+  `CreatePlacedResource` into that heap then failed `0x80070057` on both adapters
+  with initial state `COMMON` **and** `GENERIC_READ`, so state is not the
+  variable. The descriptor carried `Flags = NONE`, and D3D12 pairs a
+  `SHARED_CROSS_ADAPTER` heap with an `ALLOW_CROSS_ADAPTER` resource — leading
+  candidate, untested as of this entry.
+- **DO NOT CALL `ID3D12Debug::EnableDebugLayer()` FROM THIS CODEBASE.** Called
+  from the bridge thread after the process already held live D3D12 devices, it
+  **reset every device in the process**:
+
+  ```
+  :750  debug layer ENABLED
+  :751  D3D12CreateDevice (game adapter)  -> DXGI_ERROR_DEVICE_RESET
+  :752  D3D12CreateDevice (our adapter)   -> DXGI_ERROR_DEVICE_RESET
+  :759  already-running GPU 1 present-chain device removed, reason DEVICE_RESET
+  ```
+
+  Nine milliseconds, one reason code, including a device created long before the
+  call. The layer is documented as something enabled **before any device
+  exists**; calling it mid-process is out of contract. Recorded as a contract
+  violation and explicitly **not** as a hardware-specific claim — no
+  50-series-specific evidence was gathered.
+  **Consequence: `ID3D12InfoQueue` is unavailable to this codebase**, so the
+  runtime cannot be asked to explain a rejection in words. The variant matrix
+  above is the replacement, and it is what produced the first entry here.
+- **A probe that falls back to a variant which cannot answer the question will
+  report that variant's failure as the answer.** The P1.3 matrix originally
+  stopped at the first row returning `S_OK` — the row with no cross-adapter
+  tokens — and carried that resource into `CreateSharedHandle` /
+  `OpenSharedHandle`. `OpenSharedHandle` refused it on the second adapter, which
+  is **specified behaviour for a plain `SHARED` handle** and says nothing about
+  the adapters, and the probe's own log line called it "the call that answers
+  whether the adapters can share".
+  **A fallback is not a fallback if it changes what is being measured.** The
+  substitution has to be carried into the verdict — the verdict line now prints
+  whether the winning variant was cross-adapter eligible at all, and the
+  downstream result is defined as meaningless unless it was. This is the same
+  class of error as "a green log is not a passed task", one level up: here the
+  instrument produced a precise, correctly reported, wrong answer rather than
+  staying silent.
+
+**Cross-adapter transit and NR across it — closed 2026-09-03/04**
+
+- **Share the HEAP, not the placed resource.** A committed resource carries its
+  own implicit heap and can be shared with `CreateSharedHandle` directly. A
+  **placed** resource cannot: the heap owns the memory, so the heap is what gets
+  shared, opened on the second adapter, and had a matching resource placed into
+  it there. Passing the placed resource returns `E_INVALIDARG`, which reads
+  exactly like a hardware refusal and is not one.
+- **A resource placed in a `SHARED_CROSS_ADAPTER` heap needs
+  `ALLOW_CROSS_ADAPTER`,** including when the runtime set that heap flag itself
+  (which `OpenExistingHeapFromAddress` does). `Flags = NONE` fails
+  `E_INVALIDARG`. The initial state — `COMMON` vs `GENERIC_READ` — is **not**
+  the variable; both were tested.
+- **`SHARED_CROSS_ADAPTER` is accepted on the explicit-heap path and refused on
+  the committed path.** `CreateHeap` + `CreatePlacedResource` succeeds where
+  `CreateCommittedResource` with the same flags returns `E_INVALIDARG`. Do not
+  write this rig up as not supporting cross-adapter sharing; it supports it by
+  one route and not the other.
+- **DLSS-NR is deterministic across two evaluates within one session.** Two
+  evaluates of the same model, same input and same intensity — one against a
+  local texture, one against a payload that crossed the bus — produced
+  byte-identical output (`differing = 0` of 921,600). Previously only
+  cross-*launch* reproducibility had been shown. This matters beyond P1.4:
+  without it, any transit verdict built on a byte comparison is unfalsifiable,
+  because model non-determinism and transit corruption look identical.
+- **Transit on this rig is link-bound, and the CPU is not the cost.** Decomposed
+  at 2560×1440: CPU recording plus submission on both sides totals **0.25 ms**
+  of a ~37 ms round trip; GPU 0's fence wait is ~36 ms and GPU 1's is 2.25 ms.
+  **Pipelining alone cannot recover that** — it is execution, not
+  synchronisation. Effective throughput is ~700–850 MiB/s, which is what a
+  PCIe 3.0 ×2 chipset link delivers. Every absolute transit figure in this
+  project is a property of that interconnect.
+- **A control that still crosses the link is not a no-crossing control.** The
+  same-adapter control copies `UPLOAD heap → texture → local buffer`, and an
+  upload heap is system memory — so it crosses PCIe once. It is a one-crossing
+  baseline measured against a two-crossing run, and subtracting it does **not**
+  yield "the cost of crossing". This was written down the wrong way first and is
+  recorded because the mistake is easy to repeat: a control is only a control
+  when you can name every way it differs from the thing it controls.
+
 **LumeniteFX — `lumenite_QuantMotion.fx`, version 2026.06.16 (the one P0 uses)**
 
 - Technique `Lumenite_QuantMotion`, UI label "LUMENITE: QuantMotion". Author's
@@ -964,6 +1100,21 @@ is the first place to check for a pre-existing cause. Human-owned, like section
   A real per-pass cost needs timestamp queries and a settled scene in
   gameplay. Until then, do not compare a probe timing against the reference
   tool's 14.2 ms `evaluateGPU`, against another build, or against itself.
+  **PARTIALLY RETRACTED 2026-09-03, and the retraction is the useful part.**
+  The claim above generalises from `CreateFeature` — where the variance is real
+  (213 / 236 / 1506 ms across identical runs, cold model load) — to *all* probe
+  timings. For **transit** timings it is false, and now measured false. An
+  on-demand hotkey produced n=36 manual samples in one launch: at 2560×1440 the
+  startup sample (39.70 ms) sits **inside** the manual distribution (p50 38.70,
+  sd 1.84), and at 1280×720 the startup sample is **faster** than the manual
+  median. Foreground window makes no measurable difference either — game
+  focused p50 38.83, bridge window focused p50 38.64, both well inside their own
+  spread.
+  The untested assumption was that a menu with shaders compiling is a quieter
+  CPU environment than gameplay. Nobody had checked. **`CreateFeature` timings
+  remain contaminated; transit timings are not.** Keep the distinction: the
+  original entry is right about what it measured and wrong about what it
+  generalised to.
 - **No no-bridge baseline exists yet.** Every frame-rate figure so far was taken
   with the bridge window present and presenting. We know that *toggling the GPU 1
   effect* costs the game nothing; we do not know what the bridge itself costs
@@ -1027,14 +1178,52 @@ is the first place to check for a pre-existing cause. Human-owned, like section
   which `NGXInitValidateSnippets` evidently consults, and which reports a
   version complaint when it is stale or mid-update.
   **n=1 on the fix.** Recorded as the leading cause, not as settled.
-  **Operational rule:** if `nvngx.log` opens with that error, relaunch the
-  NVIDIA app before touching anything else. Do not go looking in
+  **CAUSE FOUND AND REPRODUCED, 2026-09-03.** After the game closes, something
+  the NVIDIA app owns is left in a state that fails `NGXInitValidateSnippets` on
+  the next launch. **Opening the NVIDIA app clears it.** That unifies every
+  earlier clearing event — an app update, a reboot, disabling the overlay — each
+  of which restarted or refreshed that app. Reproduced deliberately, with two
+  failing runs captured. Recorded as a state fault in an NVIDIA-app-hosted
+  component, not as a mechanism we have evidence for beyond that.
+  **The OTA model store is exonerated.** Both failing runs parse
+  `C:\ProgramData\NVIDIA\NGX\models` successfully and `MapProjectId` returns —
+  the store is healthy while validation fails. The `LoadMappingFileData: not an
+  array` line seen earlier was a separate, transient thing and is not this.
+  **VOID THE NGX PORTION, NOT THE LAUNCH.** A probe that never touches NGX —
+  the transit probe builds its own devices — produces valid results on a launch
+  where NGX init failed, and one such launch delivered a full set of transit
+  samples. An earlier wording of this rule voided the whole run and would have
+  discarded them.
+  **Operational rule:** if `nvngx.log` opens with that error, open the NVIDIA
+  app and relaunch before touching anything else. Do not go looking in
   `C:\ProgramData\NVIDIA\NGX\models`, do not bisect `.ini` files, and do not
   suspect the add-on — the same binary passed on either side of the outage.
   **Still true, and still a prerequisite for measurement:** an environment
   that can change state under a running experiment cannot support P1.4/P1.5
   numbers unless the telemetry block is captured with every result. A null
   result and a broken run must remain distinguishable after the fact.
+  **Second clearing event, 2026-09-03 `16:16` — a full system restart.** The
+  `16:06` run failed with the same signature. A reboot cleared it: `16:16` opened
+  with all four telemetry blocks, `Init` returned Success, and
+  `LoadMappingFileData` parsed the model store correctly and launched
+  `nvngx_update.exe` — where the `15:51` run had logged `Member file in JSON file
+  is not array, invalid data` from that same function. **So the store was in a
+  bad state and repaired itself after the restart.**
+  **Do not read this as "reboot is the fix."** The `16:06` run also enabled the
+  D3D12 debug layer mid-process and lost every device in the process (section 09),
+  and the reboot and the removal of that call happened between the same two
+  launches, so **neither is individually credited**. Two clearing events are now
+  on record by different means — an NVIDIA app relaunch (`14:44`) and a restart
+  (`16:16`) — which is itself the useful part: the failure is environmental and
+  more than one intervention shifts it. **n is still small and the operational
+  rule is unchanged: if `nvngx.log` opens with that error, the run is void.**
+  **Context worth keeping.** Before the `16:06` launch the NVIDIA overlay and the
+  NVIDIA app context-menu integration were disabled to work around a recurring
+  NGX failure. That fixed the launch failure and plausibly reintroduced the
+  mapping-file complaint, since those components are also what services the OTA
+  store. **Plausible, untested, and not worth a launch to settle while P1.3 is
+  open** — recorded so that if the model store ever needs to be read in a known
+  state, re-enabling them is the first thing to try.
 - **The NGX environment drifts under us via OTA, with the game untouched.**
   `StreamlineVersion` read `2,12,129,0 (v2.12.129-rc0)` in the morning runs
   and `2,14,0,0 (SHA 614ea534a v2.14.0-rc2)` by `14:17`. `OTAEnabled = 1`
