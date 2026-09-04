@@ -1,11 +1,12 @@
-# VENDOR_LOCK — Milestone 0 (Gate P0) and the P1.0 probe
+# VENDOR_LOCK — Milestone 0 (Gate P0) and the P1 probes
 
-The exact conditions under which P0 passed, and what the P1.0 rig runs observed.
+The exact conditions under which P0 passed, and what the P1 rig runs observed.
 Human-owned and human-observed: nothing here can be derived from the repository.
 If a later run disagrees with this file, this file describes the run that
 happened.
 
 **P0 closed:** 2026-09-02. **P1.0 probe first run:** 2026-09-03.
+**P1.3 closed:** 2026-09-03. **P1.4 closed:** 2026-09-04.
 
 ---
 
@@ -22,13 +23,14 @@ happened.
 | CI runner | `windows-latest` → Visual Studio 18 2026, MSVC 19.51.36256.0 |
 | Build command | `cmake -B build -A x64` — **no hardcoded generator**; the runner image has moved twice during P0 |
 | Link libraries | `dxgi`, `d3d12` only |
+| Deployed filename | **`nvngx.dll_mgpu_bridge.addon64`** since P1.0b. The rename is applied in `build.yml`'s staging step and nowhere else; `CMakeLists.txt` stays closed and CI still verifies the name CMake produces. |
 
 ## Rig
 
 | | |
 |---|---|
 | CPU | Ryzen 5 5600X |
-| Topology | Second GPU on **chipset** PCIe lanes, not CPU lanes. Deliberate worst case. An AM5 8×8 bifurcated CPU-lane system is the intended comparison rig. |
+| Topology | Second GPU on **chipset** PCIe lanes, not CPU lanes, negotiating **PCIe 3.0 ×2** (~1.6 GB/s theoretical, ~700–850 MiB/s observed). Deliberate worst case, and the binding constraint on every transit figure in this file. An AM5 8×8 bifurcated CPU-lane system is the intended comparison rig. |
 | GPU 0 (game) | NVIDIA RTX 5060 Ti 16GB — vendor `0x10DE`, device `0x2D04`, 16050 MB, `outputs=1` |
 | GPU 1 (target) | NVIDIA RTX 5060 Ti 16GB — same vendor/device/memory, `outputs=0` |
 | Driver | **616.56** |
@@ -42,8 +44,10 @@ display sat on different cards was wrong and is corrected here.
 
 **LUIDs observed during P0** — game `0x00000000-0x18A8C7AD`, target
 `0x00000000-0x0001382B`. **Recorded for log archaeology only.** LUIDs are
-reassigned across driver restarts and must never be persisted as configuration;
-the add-on re-derives the target every session.
+reassigned across driver restarts and reboots and must never be persisted as
+configuration; the add-on re-derives the target every session. **Confirmed by a
+restart on 2026-09-03:** the same rig came back as game `0x00011539`, target
+`0x000128A8`, and selection worked unchanged.
 
 **Windows enumerates four DXGI adapters** on this rig: the two RTX 5060 Ti and
 **two** "Microsoft Basic Render Driver" software adapters — of which only one
@@ -256,7 +260,8 @@ accepted, and NVIDIA's log records `Depth=0000000000000000` alongside
 **Open: `PollRuntimeParams - callback is NULL (core did not set it)`.** The
 echoed `intensity=0.84` proves the parameter was read, not that it was applied.
 Whether tuning is per-evaluate or baked at create is unsettled, and it decides
-whether a quality change costs a ~220 ms rebuild.
+whether a quality change costs a ~220 ms rebuild. **Settled by P1.2 — see
+below.**
 
 **Record the telemetry versions with any quoted result.** `StreamlineVersion`
 moved from `2,12,129,0` to `2,14,0,0` between runs on this same rig and driver,
@@ -291,10 +296,240 @@ evaluates could not have established any of that.
 Intensity 0 is near-passthrough. The model tracks the value; it does not merely
 respond to it.
 
+**Reproduced a third time, 2026-09-03 `16:16` and `16:34`, across a reboot.**
+Sentinels `A=B=C=0`; `A(0.00)` vs `B(1.60)` = **903,460 (98.03%)**; control
+`A(0.00)` vs `C(0.00)` = **0**. Byte-identical to the `14:44` run despite a
+system restart and reassigned LUIDs (GPU 1 `0x128a8`, previously `0x1382b`).
+Parameter liveness now survives a rebuild, a reboot **and** a LUID change. The
+LUID note near the top of this file is why that is worth stating: the add-on
+re-derives the target every session, and this is the first result that
+demonstrates the re-derivation working across a boot rather than asserting it.
+
 **`PollRuntimeParams - callback is NULL` does not mean parameters are frozen.**
 That callback is something the core normally installs and we do not need.
 Quality is adjustable at runtime with **no feature rebuild**, so the ~220 ms
 `CreateFeature` cost is not on the tuning path.
+
+## P1.3 — cross-adapter transit, **PASSED**, 2026-09-03
+
+**A payload crosses between the two adapters intact, by both routes.** Verified
+by byte comparison at 1280×720 and 2560×1440: `differing=0`, sentinel survivors
+0, on path A (shared cross-adapter heap) and path A′ (host-pinned heap opened on
+both devices).
+
+It took five builds, and two of them died to defects in the probe rather than in
+the rig. Both are recorded, because a milestone that keeps only its successes
+teaches nothing about how it was reached.
+
+### The two routes, and the shape that made A work
+
+| Route | Mechanism |
+|---|---|
+| **A** | `CreateHeap(SHARED \| SHARED_CROSS_ADAPTER)` → `CreatePlacedResource` → `CreateSharedHandle` on the **HEAP** → `OpenSharedHandle` on GPU 1 → place a matching resource there |
+| **A′** | one `VirtualAlloc` region, `OpenExistingHeapFromAddress` on both devices, a placed resource on each |
+
+**Share the HEAP, not the placed resource.** A committed resource carries its own
+implicit heap and can be shared directly; a placed resource cannot, because the
+heap owns the memory. Handing `CreateSharedHandle` the resource returns
+`E_INVALIDARG` and reads exactly like a capability refusal from the hardware. It
+is not one.
+
+Probe design: `transit_probe()` creates **its own** D3D12 device on each
+adapter, so the game's device and P0's GPU 1 device are never borrowed. Two
+resolutions per run, 1280×720 and 2560×1440. Logs of the `16:16:18` and
+`16:34:58` launches.
+
+### Retracted before it was ever recorded as a result
+
+**`A.3 OpenSharedHandle` returning `0x80070057` is NOT a capability result, and
+the probe said it was.** The `16:34` build ran a variant matrix at `A.1` and
+stopped at the first variant that returned `S_OK` — which was the row carrying
+**no cross-adapter tokens at all**. `A.2`/`A.3` therefore ran against a resource
+that was never eligible to cross an adapter, and its refusal on the second
+adapter is specified behaviour for a plain `SHARED` handle. The log line calling
+`A.3` "the call that answers whether the adapters can share" was written into the
+probe by the assistant and was wrong in that context.
+
+**That was a defect in our harness, not in the rig**, and it was caught only
+because the verdict line printed the winning variant next to the downstream
+result. The probe now prints `eligible=YES/NO` beside the A.1 verdict and defines
+the downstream result as meaningless unless it reads YES. This is recorded rather than quietly fixed because the
+failure mode — *a probe that falls back to a variant which cannot answer the
+question, then reports that variant's failure as the answer* — was not covered
+by anything in `P1_INSTRUMENT.md` section 00, and now is.
+
+### Finding 1 — committed creation refuses both cross-adapter tokens
+
+`CreateCommittedResource` on the game adapter. Buffer, `ROW_MAJOR`,
+`DXGI_FORMAT_UNKNOWN`, height/depth/mips = 1, size an exact multiple of 64 KB,
+`HEAP_TYPE_DEFAULT`, node masks 1/1. All five requirements satisfied and echoed
+as numbers in the log before the call (`A.0 desc echo`).
+
+| Heap flags | Resource flags | hr |
+|---|---|---|
+| `SHARED \| SHARED_CROSS_ADAPTER` | `ALLOW_CROSS_ADAPTER` | `0x80070057` |
+| `SHARED \| SHARED_CROSS_ADAPTER` | none | `0x80070057` |
+| `SHARED` | `ALLOW_CROSS_ADAPTER` | `0x80070057` |
+| `SHARED` | none | **`S_OK`** |
+
+Identical at both resolutions. **Each cross-adapter token is refused
+independently** — neither is merely invalid in combination with the other.
+
+**Scope, and why writing it narrowly mattered.** This is the **committed**
+creation path only. A fifth matrix row — `CreateHeap` + `CreatePlacedResource`
+with the same flags — was added afterwards and **PASSED at both resolutions**.
+So `SHARED_CROSS_ADAPTER` is not refused on this rig: it is refused on the
+*committed* path and accepted on the *explicit heap* path. This entry first read
+"untested; nothing here licenses the sentence 'cross-adapter sharing is
+unsupported on this rig'", and that caution is the only reason the finding did
+not have to be retracted a day later.
+
+### Finding 2 — the runtime sets `SHARED_CROSS_ADAPTER` itself
+
+`OpenExistingHeapFromAddress` over a single `VirtualAlloc` region succeeded on
+**both** adapters (`hr=0` on each). `ID3D12Heap::GetDesc()` on both, identical:
+
+| Field | Value |
+|---|---|
+| `SizeInBytes` | as requested, 64 KB-rounded |
+| `Alignment` | 65536 |
+| `Properties.Type` | **4 — `CUSTOM`** |
+| `CPUPageProperty` | **3 — `WRITE_BACK`** |
+| `MemoryPoolPreference` | **1 — `L0`** (system memory) |
+| `Flags` | **`0x421`** = `SHARED (0x1) \| SHARED_CROSS_ADAPTER (0x20) \| ALLOW_SHADER_ATOMICS (0x400)` |
+
+**We did not request `SHARED_CROSS_ADAPTER`. The runtime applied it.** So
+Finding 1 is not a hardware verdict: the same flag the runtime refuses from us on
+a committed resource, it sets unprompted on a heap it builds from host pages.
+The two findings together are narrower and more useful than either alone.
+
+`CreatePlacedResource` into that heap failed `0x80070057` on both adapters with
+initial state `COMMON` **and** with `GENERIC_READ`, so state was never the
+variable. The descriptor carried `Flags = NONE`. **Adding
+`ALLOW_CROSS_ADAPTER` fixed it** — confirmed by a four-row matrix over
+{flags} × {initial state}. D3D12 pairs a `SHARED_CROSS_ADAPTER` heap with an
+`ALLOW_CROSS_ADAPTER` resource, and the runtime having set that heap flag itself
+is what made the requirement non-obvious.
+
+### Finding 3 — the debug layer is unusable from here
+
+`ID3D12Debug::EnableDebugLayer()` called from the bridge thread, after the
+process already held live D3D12 devices, **reset every device in the process**:
+
+```
+:750  debug layer ENABLED
+:751  D3D12CreateDevice (game adapter)  -> DXGI_ERROR_DEVICE_RESET
+:752  D3D12CreateDevice (our adapter)   -> DXGI_ERROR_DEVICE_RESET
+:759  already-running GPU 1 present-chain device removed, reason DEVICE_RESET
+```
+
+Nine milliseconds, one reason code, including a device created long before the
+call. Removed permanently; the source carries the timestamps so it is not
+reintroduced. **Recorded as a mid-process contract violation — the layer is
+documented as something enabled before any device exists — and explicitly NOT as
+a hardware-specific claim.** No 50-series-specific evidence was gathered.
+
+Consequence for method: `ID3D12InfoQueue` is unavailable to this probe, so the
+runtime cannot be asked to explain a rejection in words. The replacement is the
+variant matrix — vary one field per row and let the difference between two rows
+name the cause. That is what produced Finding 1.
+
+### Finding 4 — transit is link-bound, and the link is the rig's floor
+
+The decomposition that settled it. `wait0` is GPU 0's fence wall-clock, `wait1`
+GPU 1's; `rec`/`sub` are CPU-side recording and submission.
+
+| 2560×1440 | median |
+|---|---|
+| `rec0 + sub0 + rec1 + sub1` — all CPU | **0.25 ms** |
+| `wait0` — GPU 0 executes | **~36 ms** |
+| `wait1` — GPU 1 executes | **2.25 ms** |
+
+CPU overhead is 0.25 ms of a ~37 ms trip, so **pipelining alone cannot recover
+this cost** — it is not synchronisation, it is execution. A same-adapter control
+(identical two copies, destination local to GPU 0) runs **~17.7 ms for one link
+crossing** against ~36 ms for two: almost exactly 2×, an effective **~700–850
+MiB/s**.
+
+**That is what a PCIe 3.0 ×2 chipset link delivers** (~1.6 GB/s theoretical),
+and this rig is deliberately that worst case — second card on chipset lanes, not
+CPU lanes. **These absolute numbers are a property of this interconnect. They do
+not judge the architecture, and no figure here may be quoted as if they did.**
+What they legitimately decide is A versus A′, because both are measured over the
+same link.
+
+**A versus A′ is NOT decided.** A first paired session showed A′ ~11% faster at
+1440p; a second session showed the two indistinguishable. Direction did not
+reproduce, so that gap is noise until shown otherwise. **Both paths are carried
+forward.** Choosing before there is a neural workload to discriminate them means
+choosing without the evidence that would.
+
+**Caveat on the control, recorded because it was written down wrongly first.**
+The control's own first copy is `UPLOAD heap → texture`, and an upload heap is
+system memory — so the control crosses PCIe once. It is a one-crossing baseline,
+not a no-crossing one, and `wait0 − control` is therefore **not** "the cost of
+crossing". A true zero-link baseline is deliberately not measured: it is not
+worth taking until there is a neural workload for it to be a baseline *of*.
+
+### What P1.3 established
+
+| | |
+|---|---|
+| A payload crosses between the adapters intact | **yes** — both paths, both resolutions, `differing=0` |
+| Path A: shared cross-adapter heap | **yes** — share the heap, place on both sides |
+| Path A′: one host allocation opened on both devices | **yes** — placed resources need `ALLOW_CROSS_ADAPTER` |
+| Which path is better | **undecided, deliberately** |
+| Any transit figure that survives leaving this rig | **no** — every number here is link-bound |
+
+## P1.4 — PASSED, 2026-09-04
+
+**DLSS-NR ran on a payload that crossed the bus, and the result came back
+unchanged.** This is the result the project was built to test. Log of the
+`mgpu.log` run whose `nvngx.log` opens with a clean telemetry block; 1280×720,
+path A, synthetic deterministic pattern.
+
+The sequence, in one command flow per leg:
+
+```
+pattern on GPU 0  ->  shared cross-adapter heap  ->  GPU 1
+                                                     EvaluateFeature(Reserved18)
+GPU 0  <-  shared cross-adapter heap  <-  NR output on GPU 1
+```
+
+| Comparison | Result |
+|---|---|
+| vs the **local NR control** (same model, same input, same intensity, no bus) | **differing = 0 of 921,600** |
+| vs the raw input pattern | differing = **13,728** |
+| Sentinel survivors in the returned buffer | **0** |
+| `EvaluateFeature` on transited input | `0x00000001 Success` |
+| Round trip incl. the evaluate | 16.07 ms |
+
+**Why the control is the whole verdict.** `ref_local` is P1.2's output A —
+captured from that evaluate, not a repeat of it — so the two runs differ in
+exactly one variable: whether the input crossed an adapter. "It looks processed"
+and "it differs from the input" are both satisfied by an uninitialised buffer,
+which is what the sentinel exists to exclude.
+
+**An unplanned cross-check makes it stronger.** `13,728` is the same count P1.2
+recorded for `A vs input` at intensity 0.00. Arrived at independently, on a
+different code path, with two adapter crossings in between. The transited result
+is not merely close to the local one — it sits at the identical distance from
+the input, which holds only if the bytes are the same bytes.
+
+**Something previously untested is now settled: NR is deterministic across two
+evaluates within one session.** P1.1's bit-identical reproduction was across
+process launches. `differing = 0` here required determinism *within* a session,
+and had it failed it would have looked exactly like transit corruption — the
+probe's inconclusive branch exists for that case and did not fire.
+
+**What P1.4 does NOT establish.** 1280×720 only. A synthetic pattern, **not the
+game's frame** — that needs the ReShade effect-runtime finish hook, which stays
+in the containment guard until the milestone that uses it, and a synthetic
+pattern is what makes a byte-exact verdict possible at all. One crossing each
+way with a CPU fence between them, no pipelining, taken during startup. **16.07
+ms is not a performance figure**: transit alone at this size measures ~10–11 ms,
+so the evaluate added roughly 5 ms on an otherwise idle adapter, and that is an
+observation about this run rather than a cost model.
 
 ## Reference DLSS-NR evaluation numbers (single-GPU, third-party tool)
 
@@ -326,8 +561,8 @@ task, not a research question.
 real and logged — an earlier doubt of mine was wrong. But `depthInterval=4` sits
 in the same status line, which reads as depth being supplied on a *cadence*, not
 absent. That tool has the game's depth buffer and no reason to test the null
-case. P1.1 tests it directly: evaluate without depth first, and on refusal bind
-a cleared depth and retry, logging both codes.
+case. **P1.1 tested it directly and depth-null was accepted on the first
+attempt.**
 
 **Tuning values** used as P1.1's starting point, taken from that tool's working
 configuration rather than invented: `Intensity 0.842`, `LocalToneStrength 1.142`,
@@ -398,6 +633,14 @@ spatially uniform input.
 | Motion-vector buffer `tFlow` | 320×180 `RG16F`, **0.220 MiB** | same |
 | GPU 1 present loop | 210.0 fps, vsync-locked | 600 frames per 2.857 s, two runs |
 | `CrossAdapterRowMajorTextureSupported` | **0** | read on the real adapter — P1 must use shared buffers with placed footprints |
+| `D3D12_FEATURE_EXISTING_HEAPS` | **1 on both adapters** | read 2026-09-03 during P1.3 — path A′ is available |
+
+**1920×1080 is owed as a measured point.** The probe measures 1280×720 and
+2560×1440; the resolution the viability argument actually rests on is 1080p, and
+it is currently reached by interpolating between the other two. Interpolation is
+exactly the kind of inference this project keeps catching in itself. Add it once
+neural rendering is running end to end, so the point is measured against a real
+workload rather than in isolation.
 
 **No no-bridge baseline was taken, deliberately.** Every figure above was measured
 with the bridge running, so the cost of the add-on's mere presence is unmeasured.
@@ -414,16 +657,29 @@ so the *deltas* hold; the absolute frame rate does not represent a clean game.
 ## Reproducing
 
 1. Build via GitHub Actions at `b307367a` or any later commit on `main`. The
-   artifact zip contains exactly `mgpu_bridge.addon64` and `gpu1.ini` — the
-   add-on's extension replaces `.dll`.
-2. Place both beside `dxgi.dll`.
+   artifact zip contains exactly `nvngx.dll_mgpu_bridge.addon64` and `gpu1.ini`
+   — the add-on's extension replaces `.dll`, and the `nvngx.dll_` prefix is what
+   satisfies the snippet's caller gate.
+2. Place both beside `dxgi.dll`, together with `nvngx_dlssnr.dll`.
 3. Apply the `ReShade.ini` and `ReShade2.ini` settings above **with the game
    closed** — ReShade rewrites both on exit.
-4. Launch. Expect exactly **one** `bridge thread spawned` line; UE5's five
+4. Set `NGXCore\LogLevel` to a non-zero `REG_DWORD` so NGX writes its own log.
+5. Launch. Expect exactly **one** `bridge thread spawned` line; UE5's five
    add-on probe cycles must produce none.
-5. Focus the bridge window, press **Home** for the GPU 1 overlay.
+6. Focus the bridge window, press **Home** for the GPU 1 overlay.
 
-`ReShade.log` is overwritten on every launch. Copy it aside before relaunching.
+**Before reading any NGX result, check `nvngx.log`'s first line.** If it is
+`NGXInitValidateSnippets: installed NGX API is older than the one used by client
+application`, **open the NVIDIA app and relaunch the game** — that is the fix,
+reproduced 2026-09-03, and every earlier clearing event (an app update, a
+reboot, a settings change) was an instance of it. Relaunching the game alone
+does not reliably clear it.
 
+**Void the NGX portion, not the launch.** The transit probe builds its own
+devices and never touches NGX, so it produces valid results on a launch where
+NGX init failed. An earlier version of this rule voided the whole run and would
+have discarded a full set of transit samples.
 
-PASSED 2026-09-03 17:11. Payload crosses intact by both routes — path A (shared cross-adapter heap) and path A′ (host-pinned). Verified by byte comparison at 1280×720 and 2560×1440, differing=0, sentinel 0. The timings it produces are not yet performance figures.
+`ReShade.log` is overwritten on every launch. Copy it, `nvngx.log` and
+`nvngx_dlssnr_*.log` aside **together** before relaunching — they are only
+interpretable as a set.
