@@ -148,6 +148,11 @@ bool transit_probe(const char *tag = "startup");
 // destination is sentinel-filled: reading too early produces surviving sentinel
 // bytes and a named diagnosis, instead of a plausible wrong answer. A shared
 // fence removes the guess and belongs to P2.
+// Bridge thread. Until this is called the capture path is inert: the event
+// handler returns immediately and the game's command list is never touched.
+// Without it P1.5 would fire on the first two frames of the process and
+// capture a loading screen, spending its one shot on a black frame.
+void capture_request();
 void capture_on_finish_effects(void *runtime, void *cmd_list, unsigned long long rtv_handle);
 void capture_poll();
 }

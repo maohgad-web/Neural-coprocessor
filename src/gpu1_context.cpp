@@ -4047,6 +4047,7 @@ namespace
     struct capture_state
     {
         std::mutex cs;
+        bool requested = false;     // the operator asked for a capture
         bool tried = false;         // allocation attempted (success or not)
         bool armed = false;         // resources exist, waiting to record
         bool recorded = false;      // the copies are in a submitted list
@@ -4106,13 +4107,29 @@ namespace
     }
 }
 
+void capture_request()
+{
+    capture_state &c = cap();
+    std::lock_guard<std::mutex> lk(c.cs);
+    if (c.done) { mgpu::diag::info("[MGPU][P1.5] capture already spent this launch - one shot "
+                                   "per process, by design"); return; }
+    if (c.requested) { mgpu::diag::info("[MGPU][P1.5] capture already armed - waiting for the "
+                                        "next game frame"); return; }
+    c.requested = true;
+    mgpu::diag::info("[MGPU][P1.5] capture REQUESTED - the next game frame allocates and arms, "
+                     "the one after it is captured. Stay in gameplay; a black source frame "
+                     "makes the verdict inconclusive and the shot is not repeatable.");
+}
+
 void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
                                unsigned long long rtv_handle)
 {
     (void)runtime_v;
     capture_state &c = cap();
     std::lock_guard<std::mutex> lk(c.cs);
-    if (c.done || c.recorded) return;
+    // Inert until requested. The operator picks the frame, because the probe
+    // cannot tell a loading screen from gameplay and only gets one.
+    if (!c.requested || c.done || c.recorded) return;
 
     ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
     ID3D12Resource *src = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)rtv_handle);

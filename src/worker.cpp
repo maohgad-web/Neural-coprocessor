@@ -500,6 +500,9 @@ namespace
                              "not a fault.", tag);
                     mgpu::diag::info(line);
                     (void)mgpu::gpu1::transit_probe(tag);
+                    // P1.5 rides the same key. It is inert until requested and
+                    // one-shot after that, so repeated presses cost nothing.
+                    mgpu::gpu1::capture_request();
                 }
 
                 // The colour must animate: a static clear cannot
