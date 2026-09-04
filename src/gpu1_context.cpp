@@ -3206,7 +3206,10 @@ bool transit_probe(const char *tag)
     }
 
     auto &S = st();
-    char line[700];
+    // P2.1 widened this from 700: the ring's comparison line carries two
+    // arms, four counts and a ratio, and a silently truncated verdict is
+    // worse than no verdict.
+    char line[1400];
 
     LUID luid1{}, luid0{};
     bool have_game_luid = false;
@@ -3993,6 +3996,386 @@ bool transit_probe(const char *tag)
                 mgpu::diag::error("[MGPU][P1.3] PAYLOAD CORRUPTED - bytes crossed but do not match "
                                   "the source. Suspect the placed footprint (row pitch / offset) "
                                   "rather than the sharing mechanism.");
+            }
+        }
+
+        // ================= P2.1: RING + COPY QUEUES ======================
+        //
+        // Everything above this line is deliberately serial: GPU 0 submits,
+        // the CPU blocks on a fence event, GPU 1 then submits, the CPU blocks
+        // again. That discipline was correct for P1 - it makes a wrong answer
+        // impossible to mistake for a slow one - and it is also the single
+        // largest artefact in every number P1 produced.
+        //
+        // P2.1 runs THE SAME BYTES OVER THE SAME HEAP TWICE, changing only the
+        // discipline:
+        //
+        //   SERIAL     one band, DIRECT-equivalent ordering, a CPU fence wait
+        //              between the two sides. P1.3's structure, reduced to
+        //              buffer copies.
+        //   PIPELINED  RING_DEPTH bands on dedicated COPY queues. GPU 0 signals
+        //              a cross-adapter shared fence after each band; GPU 1's
+        //              queue WAITS on that fence value on the GPU and consumes
+        //              the band. The CPU issues every submission without
+        //              blocking and waits exactly once, at the end.
+        //
+        // WHY BUFFER-TO-BUFFER AND NOT THE TEXTURE ROUND TRIP. The P1.3 path
+        // above stages upload -> tex0 -> shared -> tex1 -> readback. Two of
+        // those five stages are texture copies that have nothing to do with the
+        // link, and a ring cannot overlap them band-by-band without a second
+        // pass. Including them would make the A/B compare two different amounts
+        // of work and attribute the difference to pipelining. So P2.1 measures
+        // upload0 -> shared -> read2: the traversal of the shared heap and
+        // nothing else, in both arms. This is a NARROWER measurement than
+        // P1.3's, not a faster version of it, and the two numbers are not
+        // interchangeable. Say so whenever either is quoted.
+        //
+        // WHAT THIS DOES NOT MEASURE. Neither arm uses a GPU timestamp. Both
+        // are QPC wall-clock around a CPU-visible completion, so both contain
+        // queue latency and driver overhead as well as execution. Separating
+        // those needs a calibrated cross-adapter clock, which is P2.2 and is
+        // the one symbol still behind the containment guard. (The guard greps
+        // this source tree, so the API's name is deliberately not written
+        // here - naming it in a comment would fail the build as loudly as
+        // calling it, which is the guard working, not a bug.)
+        {
+            const unsigned RING_DEPTH = 4;
+
+            ID3D12CommandQueue *cq0 = nullptr, *cq1 = nullptr;
+            ID3D12CommandAllocator *ca0[RING_DEPTH] = {}, *ca1[RING_DEPTH] = {};
+            ID3D12GraphicsCommandList *cl0[RING_DEPTH] = {}, *cl1[RING_DEPTH] = {};
+            ID3D12Fence *prod0 = nullptr, *prod1 = nullptr, *donef = nullptr;
+            HANDLE prod_share = nullptr, done_ev = nullptr;
+            ID3D12Resource *read2 = nullptr;
+
+            auto p21_cleanup = [&]()
+            {
+                for (unsigned i = 0; i < RING_DEPTH; ++i)
+                {
+                    if (cl1[i] != nullptr) { cl1[i]->Release(); cl1[i] = nullptr; }
+                    if (cl0[i] != nullptr) { cl0[i]->Release(); cl0[i] = nullptr; }
+                    if (ca1[i] != nullptr) { ca1[i]->Release(); ca1[i] = nullptr; }
+                    if (ca0[i] != nullptr) { ca0[i]->Release(); ca0[i] = nullptr; }
+                }
+                if (done_ev    != nullptr) { CloseHandle(done_ev); done_ev = nullptr; }
+                if (donef      != nullptr) { donef->Release(); donef = nullptr; }
+                if (prod1      != nullptr) { prod1->Release(); prod1 = nullptr; }
+                if (prod_share != nullptr) { CloseHandle(prod_share); prod_share = nullptr; }
+                if (prod0      != nullptr) { prod0->Release(); prod0 = nullptr; }
+                if (cq1        != nullptr) { cq1->Release(); cq1 = nullptr; }
+                if (cq0        != nullptr) { cq0->Release(); cq0 = nullptr; }
+                if (read2      != nullptr) { read2->Release(); read2 = nullptr; }
+            };
+
+            // ---- the copy queues ----
+            // A COPY queue is the DMA engine, not the 3D engine. On GPU 0 that
+            // matters for a reason no benchmark shows: the game owns the 3D
+            // engine, and every P1 measurement of GPU 0 was taken in a queue
+            // behind the game's frame. A copy queue does not stand in that
+            // line. Whether that is where wait0's 15x asymmetry against wait1
+            // lives is exactly what the two arms below decide.
+            D3D12_COMMAND_QUEUE_DESC cqd{};
+            cqd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+            HRESULT rh = g0.dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&cq0));
+            if (SUCCEEDED(rh)) rh = g1.dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&cq1));
+            for (unsigned i = 0; i < RING_DEPTH && SUCCEEDED(rh); ++i)
+            {
+                rh = g0.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+                                                    IID_PPV_ARGS(&ca0[i]));
+                if (SUCCEEDED(rh))
+                    rh = g0.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca0[i],
+                                                   nullptr, IID_PPV_ARGS(&cl0[i]));
+                if (SUCCEEDED(rh)) rh = cl0[i]->Close();
+                if (SUCCEEDED(rh))
+                    rh = g1.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+                                                        IID_PPV_ARGS(&ca1[i]));
+                if (SUCCEEDED(rh))
+                    rh = g1.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca1[i],
+                                                   nullptr, IID_PPV_ARGS(&cl1[i]));
+                if (SUCCEEDED(rh)) rh = cl1[i]->Close();
+            }
+
+            // ---- the cross-adapter producer fence ----
+            // Created on GPU 0's device, opened on GPU 1's. This is the same
+            // mechanism P2.0 proved against the game's device; here both
+            // devices are ours, so a failure is ours to fix and not the
+            // application's to blame.
+            if (SUCCEEDED(rh))
+                rh = g0.dev->CreateFence(0, (D3D12_FENCE_FLAGS)(D3D12_FENCE_FLAG_SHARED |
+                                                                D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER),
+                                         IID_PPV_ARGS(&prod0));
+            if (SUCCEEDED(rh))
+                rh = g0.dev->CreateSharedHandle(prod0, nullptr, GENERIC_ALL, nullptr, &prod_share);
+            if (SUCCEEDED(rh)) rh = g1.dev->OpenSharedHandle(prod_share, IID_PPV_ARGS(&prod1));
+            if (SUCCEEDED(rh))
+                rh = g1.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&donef));
+            if (SUCCEEDED(rh))
+            {
+                done_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (done_ev == nullptr) rh = E_FAIL;
+            }
+            if (SUCCEEDED(rh)) rh = make_buf(g1.dev, bytes, D3D12_HEAP_TYPE_READBACK, &read2);
+
+            snprintf(line, sizeof line,
+                     "[MGPU][P2.1] %ux%u setup: COPY queues on both adapters, %u-deep ring, "
+                     "cross-adapter producer fence (CreateFence(SHARED|SHARED_CROSS_ADAPTER) on "
+                     "GPU 0 -> OpenSharedHandle on GPU 1): hr=0x%08X",
+                     width, height, RING_DEPTH, (unsigned)rh);
+            mgpu::diag::info(line);
+
+            if (FAILED(rh))
+            {
+                mgpu::diag::warn("[MGPU][P2.1] setup failed - the ring is skipped and the P1.3 "
+                                 "serial numbers above stand alone for this resolution. This is "
+                                 "not a transit finding: nothing was transported.");
+                p21_cleanup();
+            }
+            else
+            {
+                // Band geometry. Bands are whole rows, so every offset is a
+                // multiple of RowPitch and inherits its 256-byte alignment -
+                // there is no sub-row arithmetic anywhere in this block, which
+                // is the only reason the footprint cannot be got wrong here the
+                // way it could in P1.3.
+                const UINT pitch = fp.Footprint.RowPitch;
+                const UINT rows_per = (height + RING_DEPTH - 1) / RING_DEPTH;
+
+                // The sentinel again, and for the same reason as P1.5: a band
+                // that never arrives has to look different from a band that
+                // arrived wrong. read2 is a READBACK buffer - WRITE_BACK, L0,
+                // CPU-writable - so the fill is a memset through Map. That is
+                // the one CPU write to a readback resource in this codebase and
+                // it happens only before the GPU has been asked for anything.
+                auto sentinel_fill = [&]() -> bool
+                {
+                    unsigned char *m = nullptr;
+                    D3D12_RANGE none{0, 0};
+                    if (FAILED(read2->Map(0, &none, reinterpret_cast<void **>(&m))) ||
+                        m == nullptr) return false;
+                    for (UINT y = 0; y < height; ++y)
+                    {
+                        unsigned char *r = m + (size_t)y * pitch;
+                        for (UINT x = 0; x < width; ++x)
+                        {
+                            r[(size_t)x * 4 + 0] = SENT_R;
+                            r[(size_t)x * 4 + 1] = SENT_G;
+                            r[(size_t)x * 4 + 2] = SENT_B;
+                            r[(size_t)x * 4 + 3] = 0xFF;
+                        }
+                    }
+                    D3D12_RANGE allw{0, (SIZE_T)bytes};
+                    read2->Unmap(0, &allw);
+                    return true;
+                };
+
+                // Compare read2 against the pattern. Returns false only on a
+                // Map failure; the counts come back through the out params.
+                auto verify2 = [&](unsigned long long *differing,
+                                   unsigned long long *sentinel) -> bool
+                {
+                    *differing = 0; *sentinel = 0;
+                    const unsigned char *p2 = nullptr;
+                    D3D12_RANGE all2{0, (SIZE_T)bytes};
+                    if (FAILED(read2->Map(0, &all2, (void **)&p2)) || p2 == nullptr) return false;
+                    unsigned char *ref2 = (unsigned char *)malloc((size_t)bytes);
+                    if (ref2 != nullptr)
+                    {
+                        memset(ref2, 0, (size_t)bytes);
+                        fill_pattern(ref2, width, height, pitch);
+                        for (UINT y = 0; y < height; ++y)
+                        {
+                            const unsigned char *ra = ref2 + (size_t)y * pitch;
+                            const unsigned char *rb = p2   + (size_t)y * pitch;
+                            for (UINT x = 0; x < width; ++x)
+                            {
+                                const unsigned char *a2 = ra + (size_t)x * 4;
+                                const unsigned char *b2 = rb + (size_t)x * 4;
+                                if (a2[0] != b2[0] || a2[1] != b2[1] || a2[2] != b2[2])
+                                    ++*differing;
+                                if (b2[0] == SENT_R && b2[1] == SENT_G && b2[2] == SENT_B)
+                                    ++*sentinel;
+                            }
+                        }
+                        free(ref2);
+                    }
+                    D3D12_RANGE nothing2{0, 0};
+                    read2->Unmap(0, &nothing2);
+                    return true;
+                };
+
+                // Fence values never restart. Both arms draw from one rising
+                // sequence, because a value the fence has already passed
+                // completes instantly and a Wait on it is not a wait at all -
+                // the exact trap P2.0 hit with the sentinel signal.
+                UINT64 fv = 0;
+                LARGE_INTEGER pf{}; QueryPerformanceFrequency(&pf);
+
+                // ---- ARM 1: SERIAL. One band, CPU wait between the sides ----
+                double serial_ms = 0.0;
+                unsigned long long ser_diff = 0, ser_sent = 0;
+                bool ser_ok = sentinel_fill();
+                if (ser_ok)
+                {
+                    LARGE_INTEGER a1{}, b1{};
+                    QueryPerformanceCounter(&a1);
+
+                    ca0[0]->Reset(); cl0[0]->Reset(ca0[0], nullptr);
+                    cl0[0]->CopyBufferRegion(shared0, 0, upload0, 0, bytes);
+                    cl0[0]->Close();
+                    { ID3D12CommandList *ls[1] = { cl0[0] }; cq0->ExecuteCommandLists(1, ls); }
+                    const UINT64 v_ser0 = ++fv;
+                    cq0->Signal(prod0, v_ser0);
+                    // THE CPU BLOCKS HERE. This is the line P2.1 exists to
+                    // delete, kept in the control arm so the deletion has a
+                    // measured value rather than an asserted one.
+                    prod0->SetEventOnCompletion(v_ser0, done_ev);
+                    if (WaitForSingleObject(done_ev, 20000) != WAIT_OBJECT_0) ser_ok = false;
+
+                    if (ser_ok)
+                    {
+                        ca1[0]->Reset(); cl1[0]->Reset(ca1[0], nullptr);
+                        cl1[0]->CopyBufferRegion(read2, 0, shared1, 0, bytes);
+                        cl1[0]->Close();
+                        { ID3D12CommandList *ls[1] = { cl1[0] }; cq1->ExecuteCommandLists(1, ls); }
+                        const UINT64 v_ser1 = ++fv;
+                        cq1->Signal(donef, v_ser1);
+                        donef->SetEventOnCompletion(v_ser1, done_ev);
+                        if (WaitForSingleObject(done_ev, 20000) != WAIT_OBJECT_0) ser_ok = false;
+                    }
+                    QueryPerformanceCounter(&b1);
+                    serial_ms = qpc_ms(a1, b1, pf);
+                    if (ser_ok) ser_ok = verify2(&ser_diff, &ser_sent);
+                }
+
+                // ---- ARM 2: PIPELINED. RING_DEPTH bands, GPU-side ordering ----
+                double ring_ms = 0.0;
+                unsigned long long ring_diff = 0, ring_sent = 0;
+                bool ring_ok = sentinel_fill();
+                if (ring_ok)
+                {
+                    // Record every list first, so the submission burst below
+                    // contains no CPU work between Execute calls. Recording is
+                    // CPU time either way; putting it here keeps it out of the
+                    // window we are timing on both arms equally.
+                    for (unsigned i = 0; i < RING_DEPTH && ring_ok; ++i)
+                    {
+                        const UINT r_start = i * rows_per;
+                        if (r_start >= height) break;
+                        const UINT r_count = (r_start + rows_per > height)
+                                               ? (height - r_start) : rows_per;
+                        const UINT64 off = (UINT64)r_start * pitch;
+                        const UINT64 len = (UINT64)r_count * pitch;
+
+                        if (FAILED(ca0[i]->Reset()) ||
+                            FAILED(cl0[i]->Reset(ca0[i], nullptr))) { ring_ok = false; break; }
+                        cl0[i]->CopyBufferRegion(shared0, off, upload0, off, len);
+                        if (FAILED(cl0[i]->Close())) { ring_ok = false; break; }
+
+                        if (FAILED(ca1[i]->Reset()) ||
+                            FAILED(cl1[i]->Reset(ca1[i], nullptr))) { ring_ok = false; break; }
+                        cl1[i]->CopyBufferRegion(read2, off, shared1, off, len);
+                        if (FAILED(cl1[i]->Close())) { ring_ok = false; break; }
+                    }
+                }
+                if (ring_ok)
+                {
+                    const UINT64 base = fv;
+                    LARGE_INTEGER a2{}, b2{};
+                    QueryPerformanceCounter(&a2);
+
+                    // Producer: every band submitted back to back, each
+                    // followed by its own fence value. No CPU wait anywhere in
+                    // this loop.
+                    unsigned bands = 0;
+                    for (unsigned i = 0; i < RING_DEPTH; ++i)
+                    {
+                        if (i * rows_per >= height) break;
+                        ID3D12CommandList *ls[1] = { cl0[i] };
+                        cq0->ExecuteCommandLists(1, ls);
+                        cq0->Signal(prod0, base + i + 1);
+                        ++bands;
+                    }
+                    // Consumer: a GPU-side Wait per band. cq1 does not run
+                    // band i until prod reaches i+1, and the CPU is not
+                    // involved in that decision. Band 0 can be crossing while
+                    // band 1 is still being produced - which is the entire
+                    // claim P2.1 makes.
+                    for (unsigned i = 0; i < bands; ++i)
+                    {
+                        cq1->Wait(prod1, base + i + 1);
+                        ID3D12CommandList *ls[1] = { cl1[i] };
+                        cq1->ExecuteCommandLists(1, ls);
+                    }
+                    fv = base + bands;
+                    const UINT64 vdone = ++fv;
+                    cq1->Signal(donef, vdone);
+                    donef->SetEventOnCompletion(vdone, done_ev);
+                    if (WaitForSingleObject(done_ev, 20000) != WAIT_OBJECT_0) ring_ok = false;
+
+                    QueryPerformanceCounter(&b2);
+                    ring_ms = qpc_ms(a2, b2, pf);
+                    if (ring_ok) ring_ok = verify2(&ring_diff, &ring_sent);
+
+                    snprintf(line, sizeof line,
+                             "[MGPU][P2.1] %ux%u bands=%u rows_per_band=%u pitch=%u",
+                             width, height, bands, rows_per, pitch);
+                    mgpu::diag::info(line);
+                }
+
+                const double mib2 = (double)bytes / (1024.0 * 1024.0);
+                snprintf(line, sizeof line,
+                         "[MGPU][P2.1] %ux%u path=%s buffer-to-buffer over the shared heap, "
+                         "%.2f MiB | SERIAL(1 band, CPU wait between sides): ok=%s %.2f ms "
+                         "(%.0f MiB/s) differing=%llu sentinel=%llu | PIPELINED(%u bands, COPY "
+                         "queues, GPU-side fence wait): ok=%s %.2f ms (%.0f MiB/s) differing=%llu "
+                         "sentinel=%llu | speedup=%.2fx",
+                         width, height, path, mib2,
+                         ser_ok ? "yes" : "no", serial_ms,
+                         serial_ms > 0.0 ? (mib2 / (serial_ms / 1000.0)) : 0.0,
+                         ser_diff, ser_sent,
+                         RING_DEPTH,
+                         ring_ok ? "yes" : "no", ring_ms,
+                         ring_ms > 0.0 ? (mib2 / (ring_ms / 1000.0)) : 0.0,
+                         ring_diff, ring_sent,
+                         (ring_ms > 0.0 && serial_ms > 0.0) ? (serial_ms / ring_ms) : 0.0);
+                mgpu::diag::info(line);
+
+                // The verdict is about CORRECTNESS FIRST and speed second, in
+                // that order and never merged. A ring that is faster and wrong
+                // is not a result.
+                if (!ser_ok || !ring_ok)
+                    mgpu::diag::error("[MGPU][P2.1] PROBE INCOMPLETE - one arm did not run to "
+                                      "completion (see ok= above). No comparison is available; "
+                                      "do not read the timings.");
+                else if (ring_diff != 0 || ser_diff != 0)
+                {
+                    all_ok = false;
+                    snprintf(line, sizeof line,
+                             "[MGPU][P2.1] PROBE FAILED - payload wrong (serial differing=%llu, "
+                             "pipelined differing=%llu). If ONLY the pipelined arm differs, the "
+                             "GPU-side ordering is the suspect and the band boundaries are where "
+                             "to look: a band consumed before its producer signal would show as "
+                             "a contiguous wrong region, not scattered pixels. If BOTH differ, "
+                             "the fault is in the buffer copies and predates the ring.",
+                             ser_diff, ring_diff);
+                    mgpu::diag::error(line);
+                }
+                else
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P2.1] PROBE PASSED - both arms delivered the payload "
+                             "byte-exact with no sentinel survivors, so the %u-band ring is "
+                             "CORRECT and its %.2fx against the serial arm is a real comparison "
+                             "rather than a shorter journey. GPU 1 consumed band 0 while GPU 0 "
+                             "was still producing band 1: no CPU sat between the adapters at any "
+                             "point in the pipelined arm. NOTE THE SCOPE - this is the shared "
+                             "heap traversal alone, not P1.3's texture round trip, and neither "
+                             "number is a GPU timestamp.",
+                             RING_DEPTH, (ring_ms > 0.0) ? (serial_ms / ring_ms) : 0.0);
+                    mgpu::diag::info(line);
+                }
+
+                p21_cleanup();
             }
         }
         cleanup();
