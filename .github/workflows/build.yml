@@ -34,31 +34,33 @@ jobs:
       #                  CreateSharedHandle    OpenSharedHandle
       #   moved by P1.5  reshade_finish_effects
       #   moved by P2.0  FENCE_FLAG_SHARED
-      #   still guarded  COMMAND_LIST_TYPE_COPY            -> P2.1
-      #                  GetClockCalibration               -> P2.2
+      #   moved by P2.1  COMMAND_LIST_TYPE_COPY
+      #   still guarded  GetClockCalibration               -> P2.2
       #
-      # P2.0 is the reason FENCE_FLAG_SHARED moves and the whole of what it
-      # buys: one fence, created on the game's device, opened on the bridge's,
-      # signalled on the game's queue one frame after our copies are recorded.
-      # It replaces P1.5's frames-elapsed inference with an ordered handoff.
-      # It does NOT make the transfer asynchronous - every submission is still
-      # separated by a CPU wait, on purpose. Pipelining needs a copy queue and
-      # a ring, which is P2.1 and is why COMMAND_LIST_TYPE_COPY stays guarded;
-      # turning any of this into a performance figure needs a common clock,
-      # which is P2.2 and is why GetClockCalibration stays guarded. Widening
-      # this pattern to make a build pass deletes the guard rather than
-      # moving it.
+      # P2.0 bought the ordered handoff: a cross-adapter shared fence in place
+      # of P1.5's frames-elapsed inference. P2.1 spends it - dedicated COPY
+      # queues on both adapters and a banded ring, with GPU 1's queue waiting
+      # on GPU 0's fence value on the GPU rather than the CPU blocking between
+      # the two sides. That is the last structural change to the transport.
+      #
+      # ONE SYMBOL REMAINS AND IT IS THE IMPORTANT ONE. Every number this
+      # project has produced is QPC wall-clock around a CPU-visible completion:
+      # it contains queue latency and driver overhead as well as execution, and
+      # the two adapters have never been read against a common clock. Until
+      # GetClockCalibration moves in P2.2, nothing here is a performance figure
+      # and the logs say so at every site that prints a duration. Widening this
+      # pattern to make a build pass deletes the guard rather than moving it.
       - name: P2 containment check
         shell: bash
         run: |
-          PATTERN='COMMAND_LIST_TYPE_COPY|GetClockCalibration'
+          PATTERN='GetClockCalibration'
           FOUND=0
           for DIR in src assets; do
             [ -d "$DIR" ] || continue
             if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
           done
           if [ "$FOUND" -ne 0 ]; then
-            echo "::error::Out-of-scope symbol for P2.0"
+            echo "::error::Out-of-scope symbol for P2.1"
             exit 1
           fi
 
