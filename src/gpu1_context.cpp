@@ -4058,6 +4058,8 @@ namespace
         bool said_bad = false;      // null list or resource
         bool said_other = false;    // fired, but not on the game's adapter
         bool said_wrongq = false;   // armed, but the list belonged elsewhere
+        unsigned ev_game = 0;       // post-arm events whose list is on the game adapter
+        unsigned ev_other = 0;      // post-arm events from anywhere else
         bool tried = false;         // allocation attempted (success or not)
         bool armed = false;         // resources exist, waiting to record
         bool recorded = false;      // the copies are in a submitted list
@@ -4130,10 +4132,12 @@ void capture_request()
         // existing, so a run where arming never happened still reported armed.
         char l2[400];
         snprintf(l2, sizeof l2,
-                 "[MGPU][P1.5] already requested. event_seen=%s armed=%s recorded=%s - if "
-                 "event_seen is no, the game's runtime is not raising finish_effects at all.",
+                 "[MGPU][P1.5] already requested. event_seen=%s armed=%s recorded=%s | "
+                 "post-arm events: game_adapter=%u other=%u. If armed=yes and game_adapter=0, "
+                 "the game's runtime raised the event once and then stopped - which is a fact "
+                 "about ReShade worth recording, not a fault here.",
                  c.said_seen ? "yes" : "NO", c.armed ? "yes" : "no",
-                 c.recorded ? "yes" : "no");
+                 c.recorded ? "yes" : "no", c.ev_game, c.ev_other);
         mgpu::diag::info(l2);
         return;
     }
@@ -4394,22 +4398,44 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
     // anyway, because that was the only failure mode I had given it words for.
     // A diagnosis is only as good as the alternatives the instrument can name.
     {
+        // P1.5d. COMPARE BY ADAPTER LUID, NOT BY DEVICE POINTER. The previous
+        // build compared ID3D12Device pointers, and pointer identity is the
+        // wrong criterion here: ReShade wraps D3D12 objects, so the device
+        // behind a command list it hands us need not be the same COM object as
+        // the device behind a resource, even when both sit on the same
+        // adapter. The arm path already filtered by LUID and worked first try;
+        // the record path invented a second, stricter criterion for the same
+        // question and rejected everything. Use one criterion.
         ID3D12Device *ld = nullptr;
         const bool got = SUCCEEDED(gl->GetDevice(IID_PPV_ARGS(&ld))) && ld != nullptr;
-        const bool same = got && (ld == c.gdev);
+        LUID ll{};
+        if (got) ll = ld->GetAdapterLuid();
         if (got) ld->Release();
+
+        LUID want{};
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            want = st().game_luid;
+        }
+        const bool same = got && ll.LowPart == want.LowPart && ll.HighPart == want.HighPart;
+
+        if (same) ++c.ev_game; else ++c.ev_other;
+
         if (!same)
         {
-            // Not the game's list. Silent after the first, because both
-            // runtimes raise this every frame and we may wait several.
+            // Silent after the first: both runtimes raise this every frame.
             if (!c.said_wrongq)
             {
                 c.said_wrongq = true;
-                mgpu::diag::warn("[MGPU][P1.5] armed, but this event's command list belongs to a "
-                                 "different device - waiting for the game's runtime. Recording "
-                                 "here would build a list referencing another device's "
-                                 "resources, which executes nothing and looks like a transit "
-                                 "failure.");
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.5] armed, but this event's command list is on adapter "
+                         "%08lX-%08lX, not the game's %08lX-%08lX (got_device=%s). Recording "
+                         "here would build a list referencing another device's resources, which "
+                         "executes nothing and looks exactly like a transit failure.",
+                         (unsigned long)ll.HighPart, (unsigned long)ll.LowPart,
+                         (unsigned long)want.HighPart, (unsigned long)want.LowPart,
+                         got ? "yes" : "NO");
+                mgpu::diag::warn(line);
             }
             return;
         }
