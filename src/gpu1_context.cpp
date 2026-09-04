@@ -4048,6 +4048,15 @@ namespace
     {
         std::mutex cs;
         bool requested = false;     // the operator asked for a capture
+        // P1.5b. One-shot diagnostic latches. The 21:23 run requested a capture
+        // and nothing followed: no arm line, no failure line, nothing. Every
+        // early return in the handler was silent, so the log could not say
+        // whether the event never fired, fired on the wrong adapter, or fired
+        // with a handle we could not use. An instrument that cannot report its
+        // own failure is the failure mode this project keeps rediscovering.
+        bool said_seen = false;     // the event reached us at least once
+        bool said_bad = false;      // null list or resource
+        bool said_other = false;    // fired, but not on the game's adapter
         bool tried = false;         // allocation attempted (success or not)
         bool armed = false;         // resources exist, waiting to record
         bool recorded = false;      // the copies are in a submitted list
@@ -4113,8 +4122,20 @@ void capture_request()
     std::lock_guard<std::mutex> lk(c.cs);
     if (c.done) { mgpu::diag::info("[MGPU][P1.5] capture already spent this launch - one shot "
                                    "per process, by design"); return; }
-    if (c.requested) { mgpu::diag::info("[MGPU][P1.5] capture already armed - waiting for the "
-                                        "next game frame"); return; }
+    if (c.requested)
+    {
+        // The old wording here said "already armed", which was wrong and
+        // actively misleading: it fires on the REQUEST flag, not on resources
+        // existing, so a run where arming never happened still reported armed.
+        char l2[400];
+        snprintf(l2, sizeof l2,
+                 "[MGPU][P1.5] already requested. event_seen=%s armed=%s recorded=%s - if "
+                 "event_seen is no, the game's runtime is not raising finish_effects at all.",
+                 c.said_seen ? "yes" : "NO", c.armed ? "yes" : "no",
+                 c.recorded ? "yes" : "no");
+        mgpu::diag::info(l2);
+        return;
+    }
     c.requested = true;
     mgpu::diag::info("[MGPU][P1.5] capture REQUESTED - the next game frame allocates and arms, "
                      "the one after it is captured. Stay in gameplay; a black source frame "
@@ -4131,11 +4152,32 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
     // cannot tell a loading screen from gameplay and only gets one.
     if (!c.requested || c.done || c.recorded) return;
 
+    char line[900];
+
+    // The event reached us. Said once, because it fires every frame.
+    if (!c.said_seen)
+    {
+        c.said_seen = true;
+        mgpu::diag::info("[MGPU][P1.5] finish_effects event RECEIVED after the request - the "
+                         "hook is live. If nothing follows this line, the reason is below and "
+                         "not silence.");
+    }
+
     ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
     ID3D12Resource *src = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)rtv_handle);
-    if (gl == nullptr || src == nullptr) return;
-
-    char line[900];
+    if (gl == nullptr || src == nullptr)
+    {
+        if (!c.said_bad)
+        {
+            c.said_bad = true;
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.5] event carries an unusable pair: cmd_list=0x%p resource=0x%p. "
+                     "One of them is null, so there is nothing to record into or copy from.",
+                     (void *)gl, (void *)src);
+            mgpu::diag::warn(line);
+        }
+        return;
+    }
 
     // ---- first call: allocate, arm, and record nothing ----
     //
@@ -4145,11 +4187,22 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
     // its command list open.
     if (!c.armed)
     {
-        if (c.tried) return;
+        if (c.tried)
+        {
+            // Arming was attempted once and did not complete. Saying so beats
+            // the previous behaviour, which was to fall silent forever.
+            return;
+        }
         c.tried = true;
 
         ID3D12Device *gdev = nullptr;
-        if (FAILED(src->GetDevice(IID_PPV_ARGS(&gdev))) || gdev == nullptr) return;
+        if (FAILED(src->GetDevice(IID_PPV_ARGS(&gdev))) || gdev == nullptr)
+        {
+            mgpu::diag::warn("[MGPU][P1.5] the event's resource has no device - cannot identify "
+                             "which adapter raised it, so nothing is armed");
+            c.done = true;
+            return;
+        }
 
         // FILTER. The bridge's own effect runtime raises this event too, and
         // acting on it would capture our own 1280x720 window and call it the
@@ -4162,7 +4215,31 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
                       l.LowPart == st().game_luid.LowPart &&
                       l.HighPart == st().game_luid.HighPart;
         }
-        if (!is_game) { gdev->Release(); return; }
+        if (!is_game)
+        {
+            if (!c.said_other)
+            {
+                c.said_other = true;
+                LUID want{}; bool known = false;
+                {
+                    std::lock_guard<std::mutex> g(st().cs);
+                    want = st().game_luid; known = st().game_luid_known;
+                }
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.5] event fired on adapter %08lX-%08lX, which is NOT the "
+                         "game's (%08lX-%08lX, known=%s) - this is the bridge's own effect "
+                         "runtime and is correctly ignored. If ONLY this line appears, the "
+                         "game's runtime is not raising the event: it has no effects to run. "
+                         "Enable one effect on the game's runtime and request again.",
+                         (unsigned long)l.HighPart, (unsigned long)l.LowPart,
+                         (unsigned long)want.HighPart, (unsigned long)want.LowPart,
+                         known ? "yes" : "NO");
+                mgpu::diag::warn(line);
+            }
+            gdev->Release();
+            c.tried = false;   // this was not our adapter; stay armable
+            return;
+        }
 
         const D3D12_RESOURCE_DESC rd = src->GetDesc();
         c.gdev = gdev;   // borrowed reference kept for the lifetime of the probe
