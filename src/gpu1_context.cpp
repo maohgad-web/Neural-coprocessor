@@ -1177,6 +1177,12 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     // synthetic path, and running it here would compare a real frame against
     // a pattern's control and call the difference a finding.
     const bool P3 = (ext != nullptr);
+    // P3.1 needs the RETURN VALUE to mean "the neural stage produced a real
+    // result", not merely "nothing threw". Without this, a run where every
+    // NGX call succeeded but the model changed nothing would report true, the
+    // caller would take the native format as accepted, and a null result
+    // would be recorded as the answer. Set only in the P3 verdict below.
+    bool p3_ok = false;
     if (P3)
     {
         snprintf(line, sizeof line,
@@ -2037,7 +2043,28 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     // Still entirely local to GPU 1. No shared handles, nothing on the bus.
     // =================================================================
     {
-        const DXGI_FORMAT fmt_color = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // P3.1: the colour and output textures follow the frame when the
+        // caller asks for the native format. The byte comparisons below stay
+        // valid either way - both candidate formats are 4 bytes per pixel and
+        // every test here is byte-exactness, not colour arithmetic. The
+        // per-channel MEAN and MAX figures are the exception: they are only
+        // meaningful for R8G8B8A8, because on a packed 10:10:10:2 format they
+        // difference bit fields that straddle byte boundaries. On a
+        // native-format run, read `differing` and ignore mean/max.
+        const bool native_fmt = P3 && ext->native_format;
+        const DXGI_FORMAT fmt_color = native_fmt ? (DXGI_FORMAT)ext->dxgi_format
+                                                 : DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (native_fmt)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P3.1] NATIVE-FORMAT ATTEMPT: building the NR colour and output "
+                     "textures as DXGI %u - the game's own format - and feeding the frame "
+                     "UNCONVERTED. If every stage below succeeds, the CPU conversion P3.0 paid "
+                     "for is unnecessary. If one fails, its result code is the answer, and the "
+                     "converted run that follows still delivers this launch's P3.0 result.",
+                     ext->dxgi_format);
+            mgpu::diag::info(line);
+        }
         const DXGI_FORMAT fmt_mvec  = DXGI_FORMAT_R16G16_FLOAT;
         // R32_FLOAT rather than a real depth format: NR reads depth as a
         // plain texture, and a D32_FLOAT resource would need
@@ -2587,16 +2614,21 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
                     else
                     {
                         snprintf(line, sizeof line,
-                                 "[MGPU][P3.0] PROBE PASSED - DLSS-NR RAN ON THE GAME'S OWN "
-                                 "FRAME, ON THE SECOND ADAPTER. %ux%u of real rendered content "
-                                 "crossed the adapter boundary and was processed by the neural "
-                                 "stage: intensity %.2f vs %.2f changed %llu pixels (%.2f%%) "
-                                 "with the same-intensity control byte-identical. The chain is "
-                                 "closed end to end - game frame, boundary, model - and no "
-                                 "stage of it is synthetic any more.",
+                                 "[MGPU][P3.%s] PROBE PASSED - DLSS-NR RAN ON THE GAME'S OWN "
+                                 "FRAME, ON THE SECOND ADAPTER, IN %s. %ux%u of real rendered "
+                                 "content crossed the adapter boundary and was processed by the "
+                                 "neural stage: intensity %.2f vs %.2f changed %llu pixels "
+                                 "(%.2f%%) with the same-intensity control byte-identical. The "
+                                 "chain is closed end to end - game frame, boundary, model - "
+                                 "and no stage of it is synthetic any more.",
+                                 native_fmt ? "1" : "0",
+                                 native_fmt ? "THE GAME'S NATIVE FORMAT, UNCONVERTED - the CPU "
+                                              "conversion stage is NOT needed"
+                                            : "R8G8B8A8 after a CPU conversion",
                                  width, height, INTENSITY_LO, INTENSITY_HI, d_ab,
                                  total ? 100.0 * (double)d_ab / (double)total : 0.0);
                         mgpu::diag::info(line);
+                        p3_ok = true;
                     }
                 }
             }
@@ -2999,7 +3031,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
 
     mgpu::diag::info("[MGPU][P1.0c] create/teardown cycle complete - see the [MGPU][P1.2] lines "
                      "above for the parameter-liveness verdict");
-    return true;
+    // P1 keeps its old contract (reaching here is a pass). P3 returns whether
+    // the neural stage actually produced a result, because its caller branches
+    // on the answer rather than just logging it.
+    return P3 ? p3_ok : true;
 }
 
 // =====================================================================
@@ -5212,6 +5247,8 @@ void capture_poll()
     // CreateFeature, all on this thread.
     unsigned char *nr_in = nullptr;
     UINT nr_pitch = 0;
+    unsigned char *nr_raw = nullptr;
+    UINT nr_raw_pitch = 0;
 
     const unsigned char *pn = nullptr, *pg = nullptr;
     D3D12_RANGE all{0, (SIZE_T)c.bytes};
@@ -5285,6 +5322,14 @@ void capture_poll()
             // once the pipeline runs at all. It is called out rather than
             // buried because a silent conversion is exactly the kind of cost
             // that ends up in a performance number later with no name on it.
+            // P3.1: the frame's ORIGINAL bytes, kept alongside the converted
+            // copy. Both attempts run from CPU memory, so the capture's GPU
+            // resources can still be released before either one starts.
+            nr_raw_pitch = c.fp.Footprint.RowPitch;
+            nr_raw = (unsigned char *)malloc((size_t)nr_raw_pitch * c.height);
+            if (nr_raw != nullptr)
+                memcpy(nr_raw, pn, (size_t)nr_raw_pitch * c.height);
+
             nr_pitch = c.width * 4;
             nr_in = (unsigned char *)malloc((size_t)nr_pitch * c.height);
             if (nr_in == nullptr)
@@ -5414,15 +5459,50 @@ void capture_poll()
 
     capture_release();
 
-    if (nr_in != nullptr)
+    // P3.1: NATIVE FIRST, CONVERTED SECOND, BOTH IN ONE LAUNCH.
+    //
+    // The capture is one shot per process, so a native-format attempt that
+    // fails must not cost the launch its P3.0 result - the operator would
+    // have to relaunch, get back into gameplay and press the hotkey again to
+    // learn one boolean. Running the converted path afterwards makes the
+    // native attempt free: worst case the log gains a named failure and the
+    // launch still ends with NR having run on the game's frame.
+    //
+    // The cost of the extra attempt is one CreateFeature, measured at 179 ms
+    // at this resolution on a warm session. That is the whole price of the
+    // answer.
+    bool native_ok = false;
+    if (nr_raw != nullptr)
     {
+        ngx_input_frame ext{};
+        ext.pixels = nr_raw;
+        ext.row_pitch = nr_raw_pitch;
+        ext.dxgi_format = nr_srcfmt;
+        ext.native_format = true;
+        native_ok = ngx_probe(nr_w, nr_h, &ext);
+        free(nr_raw);
+    }
+
+    if (native_ok)
+        mgpu::diag::info("[MGPU][P3.1] NATIVE FORMAT ACCEPTED - the converted run is skipped. "
+                         "DLSS-NR consumed the game's buffer in the format the game rendered "
+                         "it, so no conversion stage belongs in this pipeline. Every earlier "
+                         "quality figure taken through the R8G8B8A8 path was measured two bits "
+                         "per channel short of what the model can actually see.");
+    else if (nr_in != nullptr)
+    {
+        mgpu::diag::warn("[MGPU][P3.1] native-format attempt did not complete - falling back to "
+                         "the converted path so this launch still produces a result. The reason "
+                         "is in the [MGPU][P1.0c] / [MGPU][P1.2] lines above, and it is the "
+                         "answer: a conversion stage is structural on this format and has to be "
+                         "budgeted, ideally as a GPU pass rather than the CPU one used here.");
         ngx_input_frame ext{};
         ext.pixels = nr_in;
         ext.row_pitch = nr_pitch;
         ext.dxgi_format = nr_srcfmt;
         (void)ngx_probe(nr_w, nr_h, &ext);
-        free(nr_in);
     }
+    if (nr_in != nullptr) free(nr_in);
 }
 
 }

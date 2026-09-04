@@ -118,9 +118,22 @@ namespace mgpu::gpu1
     // production version of this path and must not become invisible.
     struct ngx_input_frame
     {
-    const unsigned char *pixels = nullptr;
-    UINT row_pitch = 0;
-    unsigned dxgi_format = 0;
+        const unsigned char *pixels = nullptr;
+        UINT row_pitch = 0;
+        unsigned dxgi_format = 0;
+
+        // P3.1. false: `pixels` have already been converted to R8G8B8A8 and
+        // ngx_probe builds its textures in that format - the P3.0 behaviour.
+        // true: `pixels` are the frame's ORIGINAL bytes and ngx_probe builds
+        // its colour and output textures in `dxgi_format` instead, asking the
+        // question P3.0 deliberately left open - can DLSS-NR consume the
+        // game's buffer as it is rendered, with no conversion stage at all?
+        //
+        // A yes deletes a full-resolution CPU pass from every frame of any
+        // production version of this path. A no is worth having in writing
+        // too, because it makes the conversion a permanent structural cost to
+        // be budgeted on the GPU rather than wished away.
+        bool native_format = false;
     };
 
     // ext == nullptr is the P1 behaviour, unchanged: NR runs on a generated
