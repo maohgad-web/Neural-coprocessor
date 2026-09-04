@@ -121,4 +121,33 @@ namespace mgpu::gpu1
 // contain a contaminated sample and a settled one, and the DIFFERENCE between
 // them is the measurement of the contamination itself.
 bool transit_probe(const char *tag = "startup");
+
+// ---- P1.5: the host's real frame ----
+//
+// Everything before this transported a pattern we generated. P1.5 transports
+// the game's finished colour buffer: 2560x1440 R10G10B10A2_UNORM on this rig,
+// a resource we do not own, in a state we did not set.
+//
+// Three calls, in this order, and each is a no-op until the one before it has
+// succeeded:
+//
+//   capture_on_finish_effects  the ReShade event. Called on the GAME's thread
+//                              with the GAME's command list. Filters by adapter
+//                              LUID - the bridge's own runtime raises this
+//                              event too, and acting on it would capture our
+//                              own window. First call allocates and arms;
+//                              the second records the copies. One shot.
+//   capture_poll               bridge thread, once per present. Does nothing
+//                              until the capture has been recorded and enough
+//                              frames have passed for the game's queue to have
+//                              retired it, then reads, compares and reports.
+//
+// SYNCHRONISATION IS DELIBERATELY WEAK HERE AND THE PROBE SAYS SO. We do not
+// own the game's queue and cannot signal a fence on it, so "the copy has
+// completed" is inferred from frames elapsed rather than known. That is why the
+// destination is sentinel-filled: reading too early produces surviving sentinel
+// bytes and a named diagnosis, instead of a plausible wrong answer. A shared
+// fence removes the guess and belongs to P2.
+void capture_on_finish_effects(void *runtime, void *cmd_list, unsigned long long rtv_handle);
+void capture_poll();
 }

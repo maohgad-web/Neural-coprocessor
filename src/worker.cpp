@@ -524,6 +524,11 @@ namespace
                     // the ordered teardown.
                     break;
                 }
+                // P1.5: cheap, self-disarming, and does nothing at all until a
+                // frame has actually been captured. Placed after the present so
+                // its one expensive poll cannot delay a frame that was ready.
+                mgpu::gpu1::capture_poll();
+
                 ++frame;
                 if (frame == 1)
                 {

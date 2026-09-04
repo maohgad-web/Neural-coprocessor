@@ -4013,4 +4013,422 @@ bool transit_probe(const char *tag)
     return all_ok;
 }
 
+// =====================================================================
+// P1.5 - THE HOST'S REAL FRAME
+// =====================================================================
+//
+// P1.4 closed the loop on a pattern we generated: deterministic, well formed,
+// ours. That is what made a byte-exact verdict possible, and it is also the
+// last thing about the payload that was convenient. P1.5 replaces it with the
+// game's finished colour buffer - 2560x1440 R10G10B10A2_UNORM here - a
+// resource this add-on does not own and did not create.
+//
+// THE VERDICT CHANGES SHAPE, AND THAT IS THE INTERESTING PART. Real content is
+// not deterministic, so P1.4's "identical to the local control" test cannot
+// survive the move. Rather than weaken it to something softer ("it looks like
+// a frame"), the question is split in two:
+//
+//   1. TRANSIT INTEGRITY, still exact. The same command list records TWO
+//      copies of the same source: one into the cross-adapter buffer, one into
+//      an ordinary readback buffer on the game's own device. They are the same
+//      bytes by construction. What GPU 1 receives is compared against what the
+//      readback holds. Byte-identical, or not.
+//   2. NR CORRECTNESS on that payload - already established by P1.4 and NOT
+//      re-argued here. The model is deterministic within a session and
+//      produces identical output on transited input. Nothing about real
+//      content changes that, so P1.5 does not re-prove it.
+//
+// The heap is created on the GAME'S DEVICE, not on one of ours. The game's
+// command list can only reference resources from the device that created it,
+// and the ReShade event hands us that list. This is the most intrusive thing
+// this project does, so it is one-shot: one frame, then disarmed forever.
+namespace
+{
+    struct capture_state
+    {
+        std::mutex cs;
+        bool tried = false;         // allocation attempted (success or not)
+        bool armed = false;         // resources exist, waiting to record
+        bool recorded = false;      // the copies are in a submitted list
+        bool done = false;          // verdict printed; never act again
+        unsigned polls = 0;         // present-loop polls since recording
+
+        ID3D12Device *gdev = nullptr;      // the GAME's device - borrowed, not owned
+        ID3D12Heap *gheap = nullptr;       // cross-adapter heap, on the game's device
+        ID3D12Resource *gxfer = nullptr;   // placed buffer in it, game side
+        ID3D12Resource *gread = nullptr;   // plain readback, game side - the reference
+        HANDLE gshare = nullptr;
+
+        ID3D12Heap *nheap = nullptr;       // the same heap, opened on the NGX device
+        ID3D12Resource *nxfer = nullptr;
+        ID3D12Resource *nread = nullptr;   // readback on the NGX device
+
+        ID3D12CommandQueue *nq = nullptr;  // our own queue on the NGX device
+        ID3D12CommandAllocator *na = nullptr;
+        ID3D12GraphicsCommandList *nl = nullptr;
+        ID3D12Fence *nf = nullptr;
+        HANDLE nev = nullptr;
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 bytes = 0;
+        UINT width = 0, height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    };
+
+    capture_state &cap()
+    {
+        static capture_state s;
+        return s;
+    }
+
+    // Sentinel for the cross-adapter buffer. Reading before the game's queue
+    // has retired the copy shows up as surviving sentinel bytes rather than as
+    // a plausible frame, which is the whole reason it is here.
+    const unsigned char CAP_SENT = 0xA5;
+
+    void capture_release()
+    {
+        capture_state &c = cap();
+        if (c.nev   != nullptr) { CloseHandle(c.nev); c.nev = nullptr; }
+        if (c.nf    != nullptr) { c.nf->Release();    c.nf = nullptr; }
+        if (c.nl    != nullptr) { c.nl->Release();    c.nl = nullptr; }
+        if (c.na    != nullptr) { c.na->Release();    c.na = nullptr; }
+        if (c.nq    != nullptr) { c.nq->Release();    c.nq = nullptr; }
+        if (c.nread != nullptr) { c.nread->Release(); c.nread = nullptr; }
+        if (c.nxfer != nullptr) { c.nxfer->Release(); c.nxfer = nullptr; }
+        if (c.nheap != nullptr) { c.nheap->Release(); c.nheap = nullptr; }
+        if (c.gshare!= nullptr) { CloseHandle(c.gshare); c.gshare = nullptr; }
+        if (c.gread != nullptr) { c.gread->Release(); c.gread = nullptr; }
+        if (c.gxfer != nullptr) { c.gxfer->Release(); c.gxfer = nullptr; }
+        if (c.gheap != nullptr) { c.gheap->Release(); c.gheap = nullptr; }
+        c.gdev = nullptr;   // borrowed; never released here
+        c.armed = false;
+    }
+}
+
+void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
+                               unsigned long long rtv_handle)
+{
+    (void)runtime_v;
+    capture_state &c = cap();
+    std::lock_guard<std::mutex> lk(c.cs);
+    if (c.done || c.recorded) return;
+
+    ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
+    ID3D12Resource *src = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)rtv_handle);
+    if (gl == nullptr || src == nullptr) return;
+
+    char line[900];
+
+    // ---- first call: allocate, arm, and record nothing ----
+    //
+    // Allocation and recording are deliberately different frames. Creating a
+    // heap, sharing it, opening it on another device and building command
+    // objects is not work to do inside a hook on the game's render thread with
+    // its command list open.
+    if (!c.armed)
+    {
+        if (c.tried) return;
+        c.tried = true;
+
+        ID3D12Device *gdev = nullptr;
+        if (FAILED(src->GetDevice(IID_PPV_ARGS(&gdev))) || gdev == nullptr) return;
+
+        // FILTER. The bridge's own effect runtime raises this event too, and
+        // acting on it would capture our own 1280x720 window and call it the
+        // game's frame - a false positive that would look entirely correct.
+        const LUID l = gdev->GetAdapterLuid();
+        bool is_game = false;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            is_game = st().game_luid_known &&
+                      l.LowPart == st().game_luid.LowPart &&
+                      l.HighPart == st().game_luid.HighPart;
+        }
+        if (!is_game) { gdev->Release(); return; }
+
+        const D3D12_RESOURCE_DESC rd = src->GetDesc();
+        c.gdev = gdev;   // borrowed reference kept for the lifetime of the probe
+        c.width = (UINT)rd.Width; c.height = rd.Height; c.format = rd.Format;
+
+        UINT rows = 0; UINT64 rowb = 0;
+        gdev->GetCopyableFootprints(&rd, 0, 1, 0, &c.fp, &rows, &rowb, &c.bytes);
+
+        const UINT64 ALIGN = 65536;
+        const UINT64 heap_bytes = ((c.bytes + ALIGN - 1) / ALIGN) * ALIGN;
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hp.CreationNodeMask = 1; hp.VisibleNodeMask = 1;
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = heap_bytes; hd.Properties = hp; hd.Alignment = ALIGN;
+        hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED |
+                                      D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = heap_bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+        HRESULT h = gdev->CreateHeap(&hd, IID_PPV_ARGS(&c.gheap));
+        if (SUCCEEDED(h))
+            h = gdev->CreatePlacedResource(c.gheap, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, IID_PPV_ARGS(&c.gxfer));
+        if (SUCCEEDED(h))
+            h = gdev->CreateSharedHandle(c.gheap, nullptr, GENERIC_ALL, nullptr, &c.gshare);
+        if (SUCCEEDED(h)) h = make_buf(gdev, c.bytes, D3D12_HEAP_TYPE_READBACK, &c.gread);
+
+        ID3D12Device *ndev = nullptr;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            ndev = st().device;
+        }
+        if (SUCCEEDED(h) && ndev != nullptr)
+        {
+            h = ndev->OpenSharedHandle(c.gshare, IID_PPV_ARGS(&c.nheap));
+            if (SUCCEEDED(h))
+                h = ndev->CreatePlacedResource(c.nheap, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                               nullptr, IID_PPV_ARGS(&c.nxfer));
+            if (SUCCEEDED(h)) h = make_buf(ndev, c.bytes, D3D12_HEAP_TYPE_READBACK, &c.nread);
+            if (SUCCEEDED(h))
+            {
+                D3D12_COMMAND_QUEUE_DESC qd{};
+                qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                h = ndev->CreateCommandQueue(&qd, IID_PPV_ARGS(&c.nq));
+            }
+            if (SUCCEEDED(h))
+                h = ndev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 IID_PPV_ARGS(&c.na));
+            if (SUCCEEDED(h))
+                h = ndev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.na, nullptr,
+                                            IID_PPV_ARGS(&c.nl));
+            if (SUCCEEDED(h)) { h = c.nl->Close(); }
+            if (SUCCEEDED(h))
+                h = ndev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.nf));
+            if (SUCCEEDED(h))
+            {
+                c.nev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (c.nev == nullptr) h = E_FAIL;
+            }
+        }
+        else if (ndev == nullptr) h = E_FAIL;
+
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.5] arm hr=0x%08X source=%ux%u fmt=%d rowPitch=%u bytes=%llu "
+                 "(the game's finished colour buffer, on the game's own device). Heap is "
+                 "created on the GAME's device because its command list can only reference "
+                 "resources from the device that made it.",
+                 (unsigned)h, c.width, c.height, (int)c.format,
+                 (unsigned)c.fp.Footprint.RowPitch, (unsigned long long)c.bytes);
+        mgpu::diag::info(line);
+
+        // ---- WRITE THE SENTINEL, or the control cannot fire ----
+        //
+        // A DEFAULT heap comes back zeroed, not poisoned, so a "sentinel
+        // survivors" count against a buffer nobody filled would be zero on
+        // every run including the broken ones - a control that always passes,
+        // which is worse than no control at all. Fill the cross-adapter buffer
+        // with a value that cannot be mistaken for content, from GPU 1's side,
+        // before the game's copy is ever recorded.
+        if (SUCCEEDED(h))
+        {
+            ID3D12Resource *poison = nullptr;
+            h = make_buf(ndev, c.bytes, D3D12_HEAP_TYPE_UPLOAD, &poison);
+            if (SUCCEEDED(h))
+            {
+                unsigned char *m = nullptr;
+                D3D12_RANGE none{0, 0};
+                h = poison->Map(0, &none, (void **)&m);
+                if (SUCCEEDED(h) && m != nullptr)
+                {
+                    memset(m, CAP_SENT, (size_t)c.bytes);
+                    poison->Unmap(0, nullptr);
+                }
+                else h = E_FAIL;
+            }
+            if (SUCCEEDED(h)) h = c.na->Reset();
+            if (SUCCEEDED(h)) h = c.nl->Reset(c.na, nullptr);
+            if (SUCCEEDED(h))
+            {
+                c.nl->CopyBufferRegion(c.nxfer, 0, poison, 0, c.bytes);
+                h = c.nl->Close();
+            }
+            if (SUCCEEDED(h))
+            {
+                ID3D12CommandList *const ls[1] = { c.nl };
+                c.nq->ExecuteCommandLists(1, ls);
+                h = c.nq->Signal(c.nf, 99);
+                if (SUCCEEDED(h))
+                {
+                    c.nf->SetEventOnCompletion(99, c.nev);
+                    if (WaitForSingleObject(c.nev, 20000) != WAIT_OBJECT_0) h = E_FAIL;
+                }
+            }
+            if (poison != nullptr) poison->Release();
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.5] sentinel 0x%02X written across %llu bytes of the "
+                     "cross-adapter buffer from GPU 1: hr=0x%08X. Reading before the game's "
+                     "queue retires its copy now shows as surviving sentinel rather than as a "
+                     "plausible frame.",
+                     (unsigned)CAP_SENT, (unsigned long long)c.bytes, (unsigned)h);
+            mgpu::diag::info(line);
+        }
+
+        if (FAILED(h)) { capture_release(); c.done = true; return; }
+        c.armed = true;
+        return;   // record on a later frame, not this one
+    }
+
+    // ---- second call: record two copies of the same source ----
+    //
+    // Same list, same source, same instant. That is what makes the readback a
+    // valid reference for what crossed: not "a frame", THE frame, byte for
+    // byte, with no opportunity for the two to diverge.
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = src;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    gl->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION s{}, d1{}, d2{};
+    s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
+    d1.pResource = c.gxfer; d1.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    d1.PlacedFootprint = c.fp; d1.PlacedFootprint.Offset = 0;
+    d2.pResource = c.gread; d2.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    d2.PlacedFootprint = c.fp; d2.PlacedFootprint.Offset = 0;
+    gl->CopyTextureRegion(&d1, 0, 0, 0, &s, nullptr);
+    gl->CopyTextureRegion(&d2, 0, 0, 0, &s, nullptr);
+
+    // Restore EXACTLY. The game did not ask us to change its resource state and
+    // must not be able to tell that we did.
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    gl->ResourceBarrier(1, &b);
+
+    c.recorded = true;
+    c.polls = 0;
+    mgpu::diag::info("[MGPU][P1.5] capture recorded into the game's command list: one copy to "
+                     "the cross-adapter buffer, one to a local readback. Same list, same "
+                     "source, same instant - the readback is the reference for what crossed. "
+                     "The add-on will not touch the game's list again.");
+}
+
+void capture_poll()
+{
+    capture_state &c = cap();
+    std::lock_guard<std::mutex> lk(c.cs);
+    if (c.done || !c.recorded) return;
+
+    // WE DO NOT OWN THE GAME'S QUEUE, so we cannot signal a fence on it and
+    // cannot know the copy has retired. We wait a generous number of bridge
+    // presents instead, and the sentinel below is what turns "waited too
+    // little" into a named diagnosis rather than a wrong answer. A shared fence
+    // makes this exact and belongs to P2.
+    const unsigned WAIT_POLLS = 240;
+    if (++c.polls < WAIT_POLLS) return;
+    c.done = true;
+
+    char line[1000];
+    HRESULT h = c.na->Reset();
+    if (SUCCEEDED(h)) h = c.nl->Reset(c.na, nullptr);
+    if (SUCCEEDED(h))
+    {
+        c.nl->CopyBufferRegion(c.nread, 0, c.nxfer, 0, c.bytes);
+        h = c.nl->Close();
+    }
+    if (SUCCEEDED(h))
+    {
+        ID3D12CommandList *const ls[1] = { c.nl };
+        c.nq->ExecuteCommandLists(1, ls);
+        // 100, not 1: the sentinel fill already signalled 99 on this fence, and
+        // a fence value that has already been passed completes instantly - the
+        // wait would return before the copy had run.
+        h = c.nq->Signal(c.nf, 100);
+        if (SUCCEEDED(h))
+        {
+            c.nf->SetEventOnCompletion(100, c.nev);
+            if (WaitForSingleObject(c.nev, 20000) != WAIT_OBJECT_0) h = E_FAIL;
+        }
+    }
+    if (FAILED(h))
+    {
+        snprintf(line, sizeof line, "[MGPU][P1.5] GPU 1 read failed hr=0x%08X - no verdict",
+                 (unsigned)h);
+        mgpu::diag::error(line);
+        capture_release();
+        return;
+    }
+
+    const unsigned char *pn = nullptr, *pg = nullptr;
+    D3D12_RANGE all{0, (SIZE_T)c.bytes};
+    const bool mn = SUCCEEDED(c.nread->Map(0, &all, (void **)&pn)) && pn != nullptr;
+    const bool mg = SUCCEEDED(c.gread->Map(0, &all, (void **)&pg)) && pg != nullptr;
+    if (mn && mg)
+    {
+        unsigned long long diff = 0, sent = 0, nonzero = 0;
+        const unsigned long long total = (unsigned long long)c.width * c.height;
+        for (UINT y = 0; y < c.height; ++y)
+        {
+            const size_t ro = (size_t)y * c.fp.Footprint.RowPitch;
+            for (UINT x = 0; x < c.width; ++x)
+            {
+                const unsigned char *a = pn + ro + (size_t)x * 4;
+                const unsigned char *b2 = pg + ro + (size_t)x * 4;
+                if (a[0] != b2[0] || a[1] != b2[1] || a[2] != b2[2] || a[3] != b2[3]) ++diff;
+                if (a[0] == CAP_SENT && a[1] == CAP_SENT && a[2] == CAP_SENT) ++sent;
+                if (b2[0] || b2[1] || b2[2]) ++nonzero;
+            }
+        }
+        snprintf(line, sizeof line,
+                 "[MGPU][P1.5] %ux%u fmt=%d %.2f MiB | received vs sent: differing=%llu of %llu "
+                 "| sentinel survivors=%llu | source non-black pixels=%llu",
+                 c.width, c.height, (int)c.format,
+                 (double)c.bytes / (1024.0 * 1024.0), diff, total, sent, nonzero);
+        mgpu::diag::info(line);
+
+        if (sent > 0)
+        {
+            mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - sentinel bytes survived. The read "
+                              "happened before the game's queue retired the copy, or part of it "
+                              "never landed. This is the synchronisation gap the probe was built "
+                              "to expose rather than hide: we cannot signal a fence on a queue we "
+                              "do not own. Raise WAIT_POLLS or wait for P2's shared fence.");
+        }
+        else if (nonzero == 0)
+        {
+            mgpu::diag::error("[MGPU][P1.5] PROBE INCONCLUSIVE - the SOURCE frame is entirely "
+                              "black, so an all-black arrival proves nothing. Capture during "
+                              "gameplay, not on a loading screen or a faded menu.");
+        }
+        else if (diff == 0)
+        {
+            mgpu::diag::info("[MGPU][P1.5] PROBE PASSED - THE GAME'S OWN FRAME CROSSED THE "
+                             "ADAPTER BOUNDARY INTACT. Every byte received on the second adapter "
+                             "matches the reference copy taken from the same command list at the "
+                             "same instant. The payload is real rendered content at the game's "
+                             "native resolution and format, not a pattern of ours.");
+        }
+        else
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.5] PROBE FAILED - %llu of %llu pixels differ from the reference. "
+                     "Both copies came from one source in one list, so the two cannot have "
+                     "diverged before transit: this is the payload changing on the way across. "
+                     "Check the footprint arithmetic first - row pitch is %u for a %u-pixel row.",
+                     diff, total, (unsigned)c.fp.Footprint.RowPitch, c.width);
+            mgpu::diag::error(line);
+        }
+    }
+    else mgpu::diag::error("[MGPU][P1.5] readback Map failed - no verdict possible");
+
+    D3D12_RANGE nothing{0, 0};
+    if (mn) c.nread->Unmap(0, &nothing);
+    if (mg) c.gread->Unmap(0, &nothing);
+    capture_release();
+}
+
 }

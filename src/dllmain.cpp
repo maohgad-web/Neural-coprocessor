@@ -40,6 +40,7 @@
 
 #include "adapter.hpp"
 #include "diag.hpp"
+#include "gpu1_context.hpp"
 #include "worker.hpp"
 
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
@@ -106,6 +107,38 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     mgpu::adapter::on_swapchain(swapchain, resize);
 }
 
+// P1.5: the only event this add-on subscribes to that is raised on the GAME's
+// render thread with the GAME's command list open. Everything it does is
+// one-shot and self-disarming; after a single frame is captured it never
+// touches that list again.
+//
+// The handle conversions live here rather than in gpu1_context.cpp so that
+// file keeps its rule of holding no ReShade types - it takes the two native
+// pointers and nothing else. get_native() returns uint64_t, not a pointer,
+// so these are reinterpret_cast and not static_cast (P0_RECORD section 09).
+static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
+                                      reshade::api::command_list *cmd_list,
+                                      reshade::api::resource_view rtv,
+                                      reshade::api::resource_view rtv_srgb)
+{
+    (void)rtv_srgb;
+    if (runtime == nullptr || cmd_list == nullptr) return;
+
+    reshade::api::device *dev = runtime->get_device();
+    if (dev == nullptr) return;
+
+    // The resource behind the view, not the view: the copy source has to be
+    // the texture. Adapter filtering happens inside gpu1_context, which is
+    // where the game's LUID already lives.
+    const reshade::api::resource res = dev->get_resource_from_view(rtv);
+    if (res.handle == 0) return;
+
+    mgpu::gpu1::capture_on_finish_effects(
+        reinterpret_cast<void *>(runtime),
+        reinterpret_cast<void *>(static_cast<uintptr_t>(cmd_list->get_native())),
+        static_cast<unsigned long long>(res.handle));
+}
+
 // T3 instrumentation: in a clean run, no destroy_device with the game's
 // LUID appears while the game is running (acceptance). Every line carries
 // the device's LUID, so a removal names whose device it was. When the
@@ -166,6 +199,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         // T3: device lifecycle instrumentation + teardown trigger.
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
+        // P1.5: capture one real frame. Registered last because it is the only
+        // subscription that acts on the game's own command list.
+        reshade::register_event<reshade::addon_event::reshade_finish_effects>(
+            on_reshade_finish_effects);
         break;
 
     case DLL_PROCESS_DETACH:
