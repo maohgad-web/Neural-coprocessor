@@ -5857,12 +5857,42 @@ namespace
 
         // Counters. A quiet failure is a RATE, not an event, which is why the
         // summary matters more than any single line.
-        unsigned long long reuse = 0, dropped = 0, reordered = 0;
+        unsigned long long dropped = 0, reordered = 0;
         unsigned long long bad_magic = 0, contract = 0, alias = 0, overrun = 0;
+
+        // P4.0a. THE REUSE COUNTER IS GONE AND THIS REPLACES IT.
+        //
+        // P1_INSTRUMENT section 01 specifies `reuse` for a SAMPLING consumer -
+        // one that re-reads the newest seal every poll and therefore sees the
+        // same frame_index four or five times in a row. This consumer is
+        // EVENT-DRIVEN: it reads each new frame exactly once and never revisits
+        // one. `reuse` could therefore only ever be zero, and the first run
+        // duly printed `reuse=0` - a number with one possible value, reported
+        // as though it were a measurement. That is the failure family in
+        // section 00a, committed by the instrument that documents it.
+        //
+        // What the rate ratio actually is here: polls that found nothing new,
+        // over polls in total. It measures the same underlying thing - how much
+        // faster the consumer runs than the producer - out of quantities this
+        // design can actually observe.
+        unsigned long long polls = 0, idle_polls = 0;
+
+        // Every logged sample of the first build read `slot=2`, because the
+        // sample stride was 60 and the ring is 3. All 600 frames were checked
+        // across all three slots, but nothing in the log said so. The histogram
+        // says so, and the stride below is now coprime with the depth.
+        unsigned long long slot_hits[RING] = {};
 
         LARGE_INTEGER freq{};
         double lat_min = 1e30, lat_max = 0.0, lat_sum = 0.0;
         unsigned long long lat_n = 0;
+        // An outlier with no name is not a measurement either: the first run
+        // reported max=672.06 ms nine times above the mean and could not say
+        // which frame it was. The first consumed frame is also separated out -
+        // its age includes everything between arming and the first poll, which
+        // is not transit.
+        unsigned long long lat_max_frame = 0;
+        double first_lat = 0.0;
 
         // Fault injection (P1_INSTRUMENT section 04). Absent file = no fault,
         // so the shipped default is a clean run and a missing file is never an
@@ -6208,10 +6238,14 @@ void stream_poll()
     std::lock_guard<std::mutex> lk(s.cs);
     if (!s.armed || s.summarised) return;
 
+    ++s.polls;
+
     const unsigned long long completed =
         (s.nfence != nullptr) ? (unsigned long long)s.nfence->GetCompletedValue() : 0;
 
     char line[1000];
+
+    if (s.consumed >= completed) ++s.idle_polls;
 
     while (s.consumed < completed)
     {
@@ -6316,7 +6350,20 @@ void stream_poll()
                 mgpu::diag::error(line);
             }
 
-            if (got.frame_index == s.last_seen) ++s.reuse;
+            // Equal is NOT reuse here - this consumer never re-reads a frame,
+            // so an equal index means the slot held the previous frame's seal
+            // when it should have held this one. That is a genuine stale read,
+            // and calling it "reuse" (as the first build's counter did) would
+            // have filed a real fault under an expected-behaviour label.
+            if (got.frame_index == s.last_seen && s.last_seen != 0)
+            {
+                ++s.dropped;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] STALE f=%llu: the slot still holds seal %llu. The fence "
+                         "said frame %llu had landed and it had not.",
+                         f, (unsigned long long)got.frame_index, f);
+                mgpu::diag::error(line);
+            }
             else if (got.frame_index < s.last_seen)
             {
                 ++s.reordered;
@@ -6340,11 +6387,16 @@ void stream_poll()
                     ? ((double)(now.QuadPart - (long long)got.qpc_submit) * 1000.0
                        / (double)s.freq.QuadPart) : 0.0;
                 if (lat < s.lat_min) s.lat_min = lat;
-                if (lat > s.lat_max) s.lat_max = lat;
+                if (lat > s.lat_max) { s.lat_max = lat; s.lat_max_frame = got.frame_index; }
+                if (s.lat_n == 0) s.first_lat = lat;
                 s.lat_sum += lat; ++s.lat_n;
+                if (slot < stream_state::RING) ++s.slot_hits[slot];
                 s.last_seen = got.frame_index;
 
-                if ((got.frame_index % 60) == 0)
+                // 61, not 60: the stride must be COPRIME with the ring depth or
+                // every sampled line lands on the same slot and the log implies
+                // a ring that is not being used.
+                if ((got.frame_index % 61) == 0)
                 {
                     snprintf(line, sizeof line,
                              "[MGPU][SEAL] new f=%llu slot=%u gap=%llu lat=%.2fms pitch=%u "
@@ -6364,19 +6416,43 @@ void stream_poll()
     {
         s.summarised = true;
         const double mean = (s.lat_n > 0) ? (s.lat_sum / (double)s.lat_n) : 0.0;
+        // The first sample carries arm-to-first-poll time, which is not
+        // transit. Reported, and excluded from the mean beside it, so both
+        // numbers are available and neither is silently doing the other's job.
+        const double mean_x = (s.lat_n > 1)
+            ? ((s.lat_sum - s.first_lat) / (double)(s.lat_n - 1)) : 0.0;
         snprintf(line, sizeof line,
-                 "[MGPU][SEAL] summary: produced=%llu consumed=%llu new=%llu reuse=%llu "
-                 "dropped=%llu reordered=%llu overrun=%llu bad_magic=%llu contract=%llu "
-                 "alias=%llu fault=\"%s\" seal_version=%u",
-                 s.produced, s.consumed, s.lat_n, s.reuse, s.dropped, s.reordered,
+                 "[MGPU][SEAL] summary: produced=%llu consumed=%llu new=%llu dropped=%llu "
+                 "reordered=%llu overrun=%llu bad_magic=%llu contract=%llu alias=%llu "
+                 "fault=\"%s\" seal_version=%u",
+                 s.produced, s.consumed, s.lat_n, s.dropped, s.reordered,
                  s.overrun, s.bad_magic, s.contract, s.alias, s.fault, SEAL_VERSION);
         mgpu::diag::info(line);
+        {
+            // The rate ratio, out of quantities this consumer can observe, plus
+            // the proof that every slot was used. A ring whose hits are not
+            // even is a ring that is not rotating.
+            char sl[300]; size_t off = 0;
+            for (unsigned i = 0; i < stream_state::RING && off < sizeof sl - 24; ++i)
+                off += (size_t)snprintf(sl + off, sizeof sl - off, "%s%u:%llu",
+                                        (i == 0) ? "" : " ", i, s.slot_hits[i]);
+            snprintf(line, sizeof line,
+                     "[MGPU][SEAL] pacing: polls=%llu idle=%llu busy=%llu -> the consumer ran "
+                     "%.2fx the producer's rate (polls per new frame). slot hits: %s - all %u "
+                     "slots must appear and should be within one of each other.",
+                     s.polls, s.idle_polls, s.polls - s.idle_polls,
+                     (s.lat_n > 0) ? ((double)s.polls / (double)s.lat_n) : 0.0,
+                     sl, stream_state::RING);
+            mgpu::diag::info(line);
+        }
         snprintf(line, sizeof line,
-                 "[MGPU][SEAL] latency ms: min=%.2f mean=%.2f max=%.2f n=%llu. SUBMIT-TO-CONSUME "
-                 "only - it excludes the game's render before it and GPU 1's present after it, "
-                 "and it is wall-clock around a CPU-visible completion rather than a GPU "
-                 "timestamp. Perishable: this is one cabling at one link width.",
-                 (s.lat_n > 0) ? s.lat_min : 0.0, mean, s.lat_max, s.lat_n);
+                 "[MGPU][SEAL] latency ms: min=%.2f mean=%.2f max=%.2f (at f=%llu) n=%llu | "
+                 "first sample %.2f (arm-to-first-poll, NOT transit); mean excluding it %.2f. "
+                 "SUBMIT-TO-CONSUME only - it excludes the game's render before it and GPU 1's "
+                 "present after it, and it is wall-clock around a CPU-visible completion rather "
+                 "than a GPU timestamp. Perishable: one cabling, one link width.",
+                 (s.lat_n > 0) ? s.lat_min : 0.0, mean, s.lat_max, s.lat_max_frame, s.lat_n,
+                 s.first_lat, mean_x);
         mgpu::diag::info(line);
 
         const bool clean = (s.dropped == 0 && s.reordered == 0 && s.bad_magic == 0 &&
