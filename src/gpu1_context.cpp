@@ -4057,6 +4057,7 @@ namespace
         bool said_seen = false;     // the event reached us at least once
         bool said_bad = false;      // null list or resource
         bool said_other = false;    // fired, but not on the game's adapter
+        bool said_wrongq = false;   // armed, but the list belonged elsewhere
         bool tried = false;         // allocation attempted (success or not)
         bool armed = false;         // resources exist, waiting to record
         bool recorded = false;      // the copies are in a submitted list
@@ -4377,6 +4378,43 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
 
     // ---- second call: record two copies of the same source ----
     //
+    // P1.5c. THE ARM PATH FILTERED BY ADAPTER AND THIS PATH DID NOT, which is
+    // the defect that produced the 21:5x run's all-sentinel result. Both effect
+    // runtimes raise this event every frame. Once armed, the next event to
+    // arrive recorded the copies - and if that was the BRIDGE's runtime, we
+    // recorded a copy of a game-device resource into a command list belonging
+    // to the GPU 1 device. A command list cannot reference resources from
+    // another device: the work is invalid, nothing executes, and both
+    // destinations stay exactly as they were.
+    //
+    // That is precisely what the log showed: the cross-adapter buffer still
+    // held its sentinel AND the game-side readback was still zero. The readback
+    // needs no bus and no crossing, so both being untouched could never have
+    // been a synchronisation race - and the probe said "read too early"
+    // anyway, because that was the only failure mode I had given it words for.
+    // A diagnosis is only as good as the alternatives the instrument can name.
+    {
+        ID3D12Device *ld = nullptr;
+        const bool got = SUCCEEDED(gl->GetDevice(IID_PPV_ARGS(&ld))) && ld != nullptr;
+        const bool same = got && (ld == c.gdev);
+        if (got) ld->Release();
+        if (!same)
+        {
+            // Not the game's list. Silent after the first, because both
+            // runtimes raise this every frame and we may wait several.
+            if (!c.said_wrongq)
+            {
+                c.said_wrongq = true;
+                mgpu::diag::warn("[MGPU][P1.5] armed, but this event's command list belongs to a "
+                                 "different device - waiting for the game's runtime. Recording "
+                                 "here would build a list referencing another device's "
+                                 "resources, which executes nothing and looks like a transit "
+                                 "failure.");
+            }
+            return;
+        }
+    }
+
     // Same list, same source, same instant. That is what makes the readback a
     // valid reference for what crossed: not "a frame", THE frame, byte for
     // byte, with no opportunity for the two to diverge.
@@ -4486,11 +4524,21 @@ void capture_poll()
 
         if (sent > 0)
         {
-            mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - sentinel bytes survived. The read "
-                              "happened before the game's queue retired the copy, or part of it "
-                              "never landed. This is the synchronisation gap the probe was built "
-                              "to expose rather than hide: we cannot signal a fence on a queue we "
-                              "do not own. Raise WAIT_POLLS or wait for P2's shared fence.");
+            // TWO causes produce surviving sentinel and they are told apart by
+            // the reference buffer, not by this count. Say which.
+            if (nonzero == 0)
+                mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - sentinel survived AND the "
+                                  "game-side reference readback is empty. The reference needs "
+                                  "no bus, so this is NOT a transit or timing fault: the "
+                                  "recorded copies never executed at all. Suspect the command "
+                                  "list we recorded into, not the link.");
+            else
+                mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - sentinel survived while the "
+                                  "game-side reference HAS content, so the copies did run and "
+                                  "the crossing did not complete before we read. This is the "
+                                  "synchronisation gap: we cannot signal a fence on a queue we "
+                                  "do not own. Raise WAIT_POLLS, or wait for P2's shared "
+                                  "fence.");
         }
         else if (nonzero == 0)
         {
