@@ -1155,7 +1155,10 @@ namespace
 bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
 {
     auto &S = st();
-    char line[600];
+    // P3.2 widened this from 600: its verdict has to state the discipline,
+    // the counts and what the result retracts, and a truncated retraction is
+    // worse than none.
+    char line[1200];
 
     // P3.0. `ext` is the entire difference between this being a probe and
     // this being a pipeline stage. When it is null every path below is
@@ -2648,6 +2651,241 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
             if (pin != nullptr) buf_read_in->Unmap(0, &nothing);
             for (int i = 0; i < NOUT; ++i)
                 if (po[i] != nullptr) buf_read_out[i]->Unmap(0, &nothing);
+        }
+
+        // =================================================================
+        // P3.2 - A PERSISTENT FEATURE, DRIVEN REPEATEDLY, AND A SOUND TEST
+        //        OF WHETHER NR WRITES EVERY PIXEL
+        // =================================================================
+        //
+        // Two questions, one batch, no new allocations - every buffer below is
+        // one P1.2 already owns.
+        //
+        // QUESTION 1: IS THE FEATURE DRIVABLE, OR ONLY CREATABLE? Everything
+        // up to here evaluates a freshly created feature two or three times
+        // and destroys it. A pipeline evaluates one feature for the lifetime
+        // of a session. This runs the SAME handle REPEATS times per batch,
+        // twice, on one command list - and if the feature degrades, stops
+        // writing, or starts failing after n uses, this is where it shows.
+        //
+        // QUESTION 2: THE SENTINEL SURVIVORS, AND WHY THE OLD TEST CANNOT
+        // ANSWER THEM. P1.2 pre-fills each output with a fixed COLOUR and
+        // counts pixels that still hold it afterwards. That test has the
+        // same flaw P1.5e had: it is an ABSOLUTE match with no control, so a
+        // pixel NR legitimately wrote to the sentinel value is counted as one
+        // NR failed to write. The native-format run made that concrete - 1
+        // survivor in A and C, 0 in B, where the converted runs had 0
+        // throughout. On a packed 10:10:10:2 format the sentinel is being
+        // matched against bit fields that straddle byte boundaries, so an
+        // accidental match is far more likely than it is in R8G8B8A8. One
+        // pixel in 3.69 million is exactly the scale of coincidence.
+        //
+        // THE DIFFERENTIAL TEST HAS NO ABSOLUTE COLOUR IN IT. Evaluate twice
+        // at the SAME intensity, from the SAME input, into an output
+        // pre-filled with 0x00 the first time and 0xFF the second. A pixel NR
+        // wrote holds the model's value both times and matches. A pixel NR did
+        // not write holds 0x00 once and 0xFF once and cannot match. The count
+        // of differing pixels is therefore the EXACT number of unwritten
+        // pixels, with no false positives possible, in any format. If it is
+        // zero, the survivors were coincidence and the DLSSNR.Output rebind is
+        // exonerated.
+        //
+        // UAV BARRIERS BETWEEN EVALUATES, WHICH P1.2 DOES NOT ISSUE. P1.2's
+        // warning named this as a suspect and it was right to: its three
+        // evaluates happen to target three DIFFERENT textures, so there is no
+        // hazard to guard. Here every evaluate in a batch writes the SAME
+        // texture, and without a UAV barrier they may overlap. That barrier is
+        // issued below, which also means that if the survivor count changes
+        // between P1.2's discipline and this one, the barrier is the variable.
+        if (P3)
+        {
+            const int REPEATS = 8;
+            const unsigned char FILL_A = 0x00, FILL_B = 0xFF;
+
+            // The two fills go into the upload regions P1.2 used for its
+            // output sentinels. Those readbacks have been compared and
+            // unmapped, so the space is free and no new memory is needed at
+            // full resolution.
+            unsigned char *um = nullptr;
+            D3D12_RANGE nonein{0, 0};
+            HRESULT ph = buf_upload->Map(0, &nonein, reinterpret_cast<void **>(&um));
+            if (SUCCEEDED(ph) && um != nullptr)
+            {
+                memset(um + off_out[1], FILL_A, (size_t)sz_color);
+                memset(um + off_out[2], FILL_B, (size_t)sz_color);
+                buf_upload->Unmap(0, nullptr);
+            }
+
+            if (FAILED(ph))
+                mgpu::diag::warn("[MGPU][P3.2] could not map the upload buffer - skipped");
+            else
+            {
+                ph = palloc->Reset();
+                if (SUCCEEDED(ph)) ph = pcmd->Reset(palloc, nullptr);
+                if (SUCCEEDED(ph)) list_open = true;
+
+                // tex_color was left in COPY_SOURCE by P1.2's readback. NR
+                // reads it, so it goes back to the state the evaluates used.
+                if (SUCCEEDED(ph))
+                    barrier(pcmd, tex_color, D3D12_RESOURCE_STATE_COPY_SOURCE, read_state);
+
+                auto uav_barrier = [&](ID3D12Resource *r)
+                {
+                    D3D12_RESOURCE_BARRIER b{};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    b.UAV.pResource = r;
+                    pcmd->ResourceBarrier(1, &b);
+                };
+
+                // One batch: pre-fill tex_out[0] from `src_off`, evaluate
+                // REPEATS times with a UAV barrier between each, copy the
+                // result to `dst`. tex_out[0] arrives in COPY_SOURCE (P1.2's
+                // readback left it there) and is returned to COPY_SOURCE.
+                auto batch = [&](UINT64 src_off, ID3D12Resource *dst)
+                {
+                    barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION s{}, d{};
+                    s.pResource = buf_upload;
+                    s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    s.PlacedFootprint = fp_color;
+                    s.PlacedFootprint.Offset = src_off;
+                    d.pResource = tex_out[0];
+                    d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+                    barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                    params->Set("DLSSNR.Output", tex_out[0]);
+                    params->Set("DLSSNR.Intensity", INTENSITY_LO);
+                    int fails = 0;
+                    NVSDK_NGX_Result last = NVSDK_NGX_Result_Success;
+                    for (int k = 0; k < REPEATS; ++k)
+                    {
+                        params->Set("DLSSNR.Reset", 1u);
+                        last = p_evaluate(pcmd, handle, params, nullptr);
+                        if (last != NVSDK_NGX_Result_Success) ++fails;
+                        if (k + 1 < REPEATS) uav_barrier(tex_out[0]);
+                    }
+                    barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    D3D12_TEXTURE_COPY_LOCATION s2{}, d2{};
+                    s2.pResource = tex_out[0];
+                    s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    d2.pResource = dst;
+                    d2.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    d2.PlacedFootprint = fp_color;
+                    d2.PlacedFootprint.Offset = 0;
+                    pcmd->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
+
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.2] batch of %d evaluates on ONE persistent feature "
+                             "handle: failures=%d last_result=0x%08X (%s)",
+                             REPEATS, fails, (unsigned)last, ngx_result_name(last));
+                    mgpu::diag::info(line);
+                    return fails;
+                };
+
+                int f1 = 0, f2 = 0;
+                if (SUCCEEDED(ph))
+                {
+                    f1 = batch(off_out[1], buf_read_out[1]);
+                    f2 = batch(off_out[2], buf_read_out[2]);
+                    ph = pcmd->Close();
+                    list_open = false;
+                }
+                if (SUCCEEDED(ph))
+                {
+                    ID3D12CommandList *const ls[1] = { pcmd };
+                    queue->ExecuteCommandLists(1, ls);
+                    // 2, not 1: value 1 was signalled by the P1.2 flush and a
+                    // fence value already passed completes instantly.
+                    ph = queue->Signal(pfence, 2);
+                    if (SUCCEEDED(ph))
+                    {
+                        pfence->SetEventOnCompletion(2, pevent);
+                        if (WaitForSingleObject(pevent, 20000) != WAIT_OBJECT_0) ph = E_FAIL;
+                    }
+                }
+
+                if (FAILED(ph))
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.2] batch submission failed hr=0x%08X - no verdict",
+                             (unsigned)ph);
+                    mgpu::diag::error(line);
+                }
+                else
+                {
+                    const unsigned char *r1 = nullptr, *r2 = nullptr;
+                    D3D12_RANGE allr{0, (SIZE_T)sz_color};
+                    const bool m1 = SUCCEEDED(buf_read_out[1]->Map(0, &allr, (void **)&r1))
+                                    && r1 != nullptr;
+                    const bool m2 = SUCCEEDED(buf_read_out[2]->Map(0, &allr, (void **)&r2))
+                                    && r2 != nullptr;
+                    if (m1 && m2)
+                    {
+                        unsigned long long unwritten = 0;
+                        const unsigned long long tot =
+                            (unsigned long long)width * height;
+                        for (UINT y = 0; y < height; ++y)
+                        {
+                            const size_t ro = (size_t)y * fp_color.Footprint.RowPitch;
+                            for (UINT x = 0; x < width; ++x)
+                            {
+                                const unsigned char *a = r1 + ro + (size_t)x * 4;
+                                const unsigned char *b = r2 + ro + (size_t)x * 4;
+                                if (a[0] != b[0] || a[1] != b[1] ||
+                                    a[2] != b[2] || a[3] != b[3]) ++unwritten;
+                            }
+                        }
+                        if (f1 == 0 && f2 == 0 && unwritten == 0)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P3.2] PROBE PASSED - ONE FEATURE, %d EVALUATES, "
+                                     "EVERY PIXEL WRITTEN. The same handle was evaluated %d "
+                                     "times across two batches with no failure, and the two "
+                                     "runs - identical input and intensity, opposite pre-fills "
+                                     "(0x%02X and 0x%02X) - produced byte-identical output over "
+                                     "all %llu pixels. A pixel NR had not written could not have "
+                                     "matched, so THE SENTINEL SURVIVORS WERE COINCIDENCE, not "
+                                     "unwritten output: the absolute-colour test was matching "
+                                     "real content that happened to equal the fill. "
+                                     "DLSSNR.Output rebinding is exonerated. The feature is a "
+                                     "pipeline object, not a one-shot.",
+                                     REPEATS * 2, REPEATS * 2, FILL_A, FILL_B, tot);
+                            mgpu::diag::info(line);
+                        }
+                        else if (unwritten > 0)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P3.2] PROBE FAILED - %llu of %llu pixels DIFFER "
+                                     "between the two pre-fills, which is the exact count NR "
+                                     "left unwritten (evaluate failures: %d and %d). This is a "
+                                     "real gap in the model's output coverage and it is not a "
+                                     "measurement artefact - no absolute colour is involved in "
+                                     "this test. Map where they are before theorising: a border, "
+                                     "a tile edge and a scatter are three different causes.",
+                                     unwritten, tot, f1, f2);
+                            mgpu::diag::error(line);
+                        }
+                        else
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P3.2] PROBE FAILED - the output is fully written "
+                                     "but %d and %d evaluates returned a failure. The feature "
+                                     "does not survive repeated use, which is the one thing a "
+                                     "persistent pipeline requires of it.", f1, f2);
+                            mgpu::diag::error(line);
+                        }
+                    }
+                    else mgpu::diag::error("[MGPU][P3.2] readback Map failed - no verdict");
+                    D3D12_RANGE none2{0, 0};
+                    if (m1) buf_read_out[1]->Unmap(0, &none2);
+                    if (m2) buf_read_out[2]->Unmap(0, &none2);
+                }
+            }
         }
 
         // =================================================================
