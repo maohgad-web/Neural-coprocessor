@@ -4030,6 +4030,15 @@ bool transit_probe(const char *tag)
         // P1.3's, not a faster version of it, and the two numbers are not
         // interchangeable. Say so whenever either is quoted.
         //
+        // RESULT ON THE RIG, RECORDED HERE SO THE CODE DOES NOT READ AS A
+        // PROMISE IT DID NOT KEEP: eight runs, both paths, both resolutions,
+        // all eight byte-exact in both arms. The ring is correct. It is also
+        // not faster - at 1440p the pipelined arm averaged 16.25 ms against
+        // serial's 11.48 ms over four settled runs, and never won at that
+        // size. The 720p readings that looked like 2x were slow serial runs.
+        // The block is kept for the correctness result and for the ordering
+        // primitive it exercises, not as an optimisation.
+        //
         // WHAT THIS DOES NOT MEASURE. Neither arm uses a GPU timestamp. Both
         // are QPC wall-clock around a CPU-visible completion, so both contain
         // queue latency and driver overhead as well as execution. Separating
@@ -4323,12 +4332,23 @@ bool transit_probe(const char *tag)
                 }
 
                 const double mib2 = (double)bytes / (1024.0 * 1024.0);
+                // NO DERIVED RATIO IS PRINTED HERE, DELIBERATELY. The first
+                // build of this block ended the line with "speedup=%.2fx" and
+                // that single field did more damage than every other number in
+                // the probe: across eight runs it read 1.10, 0.67, 0.69, 0.94,
+                // 0.61 at 1440p and 1.08, 0.50, 1.15, 2.24, 2.00 at 720p, and
+                // every one of those figures was the ratio of two noisy
+                // wall-clock samples of size one. The two 2x readings at 720p
+                // were slow SERIAL runs, not fast rings. A ratio invites a
+                // claim; the raw pair does not. Both durations are still
+                // logged, because they are data - they are just not a
+                // comparison anyone should act on. See the verdict below.
                 snprintf(line, sizeof line,
                          "[MGPU][P2.1] %ux%u path=%s buffer-to-buffer over the shared heap, "
                          "%.2f MiB | SERIAL(1 band, CPU wait between sides): ok=%s %.2f ms "
                          "(%.0f MiB/s) differing=%llu sentinel=%llu | PIPELINED(%u bands, COPY "
                          "queues, GPU-side fence wait): ok=%s %.2f ms (%.0f MiB/s) differing=%llu "
-                         "sentinel=%llu | speedup=%.2fx",
+                         "sentinel=%llu",
                          width, height, path, mib2,
                          ser_ok ? "yes" : "no", serial_ms,
                          serial_ms > 0.0 ? (mib2 / (serial_ms / 1000.0)) : 0.0,
@@ -4336,8 +4356,7 @@ bool transit_probe(const char *tag)
                          RING_DEPTH,
                          ring_ok ? "yes" : "no", ring_ms,
                          ring_ms > 0.0 ? (mib2 / (ring_ms / 1000.0)) : 0.0,
-                         ring_diff, ring_sent,
-                         (ring_ms > 0.0 && serial_ms > 0.0) ? (serial_ms / ring_ms) : 0.0);
+                         ring_diff, ring_sent);
                 mgpu::diag::info(line);
 
                 // The verdict is about CORRECTNESS FIRST and speed second, in
@@ -4362,16 +4381,51 @@ bool transit_probe(const char *tag)
                 }
                 else
                 {
+                    // THIS IS A CORRECTNESS RESULT AND NOTHING ELSE.
+                    //
+                    // The previous wording of this line claimed "GPU 1 consumed
+                    // band 0 while GPU 0 was still producing band 1". Nothing
+                    // in this probe measures that. It is the mechanism the code
+                    // was written to produce, asserted in a PASSED line as
+                    // though it had been observed - the same mistake as the
+                    // P1.3b failure message and the EnableDebugLayer comment,
+                    // and it is removed for the same reason.
+                    //
+                    // What IS established: a %u-band ring, with dedicated COPY
+                    // queues on both adapters and GPU-side fence ordering
+                    // between them, moves the payload byte-exact. Every band
+                    // boundary held; no band was consumed before its producer
+                    // signal, because that would have left a contiguous wrong
+                    // region and differing is 0.
+                    //
+                    // WHAT IS NOT ESTABLISHED, AND WHY WE STOPPED ASKING: that
+                    // this discipline is FASTER. On the rig it was not - the
+                    // pipelined arm ran ~1.4x SLOWER than serial at 1440p, in
+                    // four settled runs out of four, while the serial arm held
+                    // to +/-2%. That is consistent with both halves crossing
+                    // the SAME link: producer and consumer contend for one
+                    // PCIe 3.0 x2 path, the total bytes over it are unchanged,
+                    // so overlap cannot add bandwidth and the extra
+                    // submissions and cross-adapter waits are pure cost.
+                    // Pipelining pays when the overlapped stages use DIFFERENT
+                    // resources - transfer against neural execution on GPU 1,
+                    // which P1.4 already showed is possible - and that is not
+                    // what this block overlaps. The ring is kept for its
+                    // correctness and its ordering primitive; its timings are
+                    // logged but are not a case for it.
                     snprintf(line, sizeof line,
-                             "[MGPU][P2.1] PROBE PASSED - both arms delivered the payload "
-                             "byte-exact with no sentinel survivors, so the %u-band ring is "
-                             "CORRECT and its %.2fx against the serial arm is a real comparison "
-                             "rather than a shorter journey. GPU 1 consumed band 0 while GPU 0 "
-                             "was still producing band 1: no CPU sat between the adapters at any "
-                             "point in the pipelined arm. NOTE THE SCOPE - this is the shared "
-                             "heap traversal alone, not P1.3's texture round trip, and neither "
-                             "number is a GPU timestamp.",
-                             RING_DEPTH, (ring_ms > 0.0) ? (serial_ms / ring_ms) : 0.0);
+                             "[MGPU][P2.1] PROBE PASSED (CORRECTNESS ONLY) - both arms delivered "
+                             "the payload byte-exact with no sentinel survivors, so the %u-band "
+                             "ring transports correctly and the GPU-side fence ordering between "
+                             "the two adapters holds at every band boundary. NO SPEED CLAIM IS "
+                             "MADE OR IMPLIED. The two durations above are single noisy "
+                             "wall-clock samples of a NARROWER path than P1.3's (shared-heap "
+                             "traversal only, no texture stages), neither is a GPU timestamp, "
+                             "and on this rig the pipelined arm has been the SLOWER of the two - "
+                             "both halves cross the same link, so overlapping them adds "
+                             "contention, not bandwidth. The overlap that could pay is transfer "
+                             "against neural execution, which this block does not test.",
+                             RING_DEPTH);
                     mgpu::diag::info(line);
                 }
 
