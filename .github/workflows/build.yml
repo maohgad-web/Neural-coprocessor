@@ -1,4 +1,4 @@
-name: P1 build
+name: build
 
 on:
   push:
@@ -15,8 +15,8 @@ permissions:
 env:
   # Source of truth: VENDOR_LOCK.md. v6.8.0, RESHADE_API_VERSION 20.
   RESHADE_SHA: 18deaa52de0c425a78b329e9cb3c497281cd00ec
-  # NVIDIA/DLSS @ main, include/ only. Pinned for P1.0; copy into VENDOR_LOCK.md
-  # once the probe has run on the rig.
+  # NVIDIA/DLSS @ main, include/ only. Pinned at P1.0 and recorded in
+  # VENDOR_LOCK.md and THIRD_PARTY.md; those three must agree.
   NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
 
 jobs:
@@ -50,7 +50,7 @@ jobs:
       # GetClockCalibration moves in P2.2, nothing here is a performance figure
       # and the logs say so at every site that prints a duration. Widening this
       # pattern to make a build pass deletes the guard rather than moving it.
-      - name: P2 containment check
+      - name: Containment check
         shell: bash
         run: |
           PATTERN='GetClockCalibration'
@@ -60,7 +60,7 @@ jobs:
             if grep -rnE "$PATTERN" "$DIR"; then FOUND=1; fi
           done
           if [ "$FOUND" -ne 0 ]; then
-            echo "::error::Out-of-scope symbol for P2.1"
+            echo "::error::Out-of-scope symbol: GetClockCalibration is still guarded (P2.2)"
             exit 1
           fi
 
@@ -169,6 +169,10 @@ jobs:
             echo "::error::assets/gpu1.ini enables techniques - a shipped preset must be empty"
             FAIL=1
           fi
+          if grep -nE '^\s*TechniqueSorting\s*=\s*\S' assets/gpu1.ini; then
+            echo "::error::assets/gpu1.ini carries a technique sort order - a shipped preset must be empty"
+            FAIL=1
+          fi
           if grep -n 'DEBUG' assets/gpu1.ini; then
             echo "::error::assets/gpu1.ini carries a debug preprocessor definition"
             FAIL=1
@@ -179,6 +183,20 @@ jobs:
       # Everything the drop-in package needs must exist before the deploy set
       # is staged, so a missing config file fails here by name rather than
       # producing a package that is quietly incomplete.
+      # The shipped default is an UNBOUNDED run. Frames=0 is a shipping
+      # decision; Frames=<n> is a measurement decision, and the two live in
+      # different places from the code that interprets them - P7.6 taught the
+      # add-on that 0 means unbounded while assets/mgpu.ini still said 3000, and
+      # nothing in a log distinguishes a deliberate bound from a stale one.
+      - name: Verify the shipped run is unbounded
+        shell: bash
+        run: |
+          if ! grep -qE '^\s*Frames\s*=\s*0\s*$' assets/mgpu.ini; then
+            echo "::error::assets/mgpu.ini does not set Frames=0 - the shipped build must be unbounded"
+            grep -nE '^\s*Frames\s*=' assets/mgpu.ini || true
+            exit 1
+          fi
+
       - name: Verify the config set is present
         shell: bash
         run: |
@@ -241,6 +259,18 @@ jobs:
           cat _deploy/gpu1.ini
           echo "--- mgpu.ini keys as shipped ---"
           grep -vE '^\s*(;|$)' _deploy/mgpu.ini || true
+
+      # The artifact is six files. Stated as a number so that a file added to
+      # assets/ without a decision cannot reach a user's game folder unnoticed.
+      - name: Verify the artifact is exactly the six-file set
+        shell: bash
+        run: |
+          COUNT=$(ls -1 _deploy | wc -l)
+          if [ "$COUNT" -ne 6 ]; then
+            echo "::error::_deploy holds $COUNT files, expected 6"
+            ls -1 _deploy
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
