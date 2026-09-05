@@ -6163,45 +6163,6 @@ namespace
         ID3D12Fence *nfence = nullptr;         // the same fence on GPU 1
 
         ID3D12Resource *nseal = nullptr;       // READBACK, RING * SEAL_STRIDE
-
-        // ---- P2.2a: GPU timestamps on GPU 1's consume list ----
-        //
-        // The first numbers in this project that are GPU TIME rather than
-        // wall-clock. Everything before this was QPC around a CPU-visible
-        // completion, so it carried queue latency and driver overhead mixed in
-        // with execution and could not tell them apart - which is why every one
-        // of those figures is filed as perishable.
-        //
-        // Five marks per consumed frame, all on the one list:
-        //   0  list start
-        //   1  after the seal copy
-        //   2  after the payload unpack (cross-adapter buffer -> NR input)
-        //   3  after EvaluateFeature
-        //   4  after the output sample copy
-        //
-        // The interesting one is 2->3: what DLSS-NR actually costs on GPU 1,
-        // on our path, against the 14.2 ms the reference tool measures on a
-        // comparable single-GPU one. That comparison is the whole architecture
-        // argument and it has never had our side of it.
-        //
-        // NOTE THIS NEEDS NO CROSS-ADAPTER CLOCK. These are all GPU 1's own
-        // timestamps on GPU 1's own queue, so GetTimestampFrequency is enough
-        // and the one symbol still behind the containment guard stays there.
-        // (Its name is deliberately not written here - the guard greps this
-        // tree, so naming it in a comment would fail the build exactly as
-        // calling it would. That is the guard working, not a bug.)
-        // Correlating GPU 0's timeline with GPU 1's - which is what a true
-        // transit time in GPU time would need - is a separate step and is
-        // deliberately not taken here.
-        ID3D12QueryHeap *tsheap = nullptr;
-        ID3D12Resource *tsread = nullptr;      // READBACK, TS_MARKS * 8 bytes
-        UINT64 ts_freq = 0;
-        bool ts_ok = false;
-        static const UINT TS_MARKS = 5;
-        double ts_sum[TS_MARKS - 1] = {};
-        double ts_min[TS_MARKS - 1] = {};
-        double ts_max[TS_MARKS - 1] = {};
-        unsigned long long ts_n = 0;
         ID3D12CommandQueue *nq = nullptr;
         ID3D12CommandAllocator *na = nullptr;
         ID3D12GraphicsCommandList *nl = nullptr;
@@ -6383,8 +6344,6 @@ namespace
         if (s.nl  != nullptr) { s.nl->Release();  s.nl = nullptr; }
         if (s.na  != nullptr) { s.na->Release();  s.na = nullptr; }
         if (s.nq  != nullptr) { s.nq->Release();  s.nq = nullptr; }
-        if (s.tsread != nullptr) { s.tsread->Release(); s.tsread = nullptr; }
-        if (s.tsheap != nullptr) { s.tsheap->Release(); s.tsheap = nullptr; }
         if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
         if (s.nfence != nullptr) { s.nfence->Release(); s.nfence = nullptr; }
         if (s.gfence_share != nullptr) { CloseHandle(s.gfence_share); s.gfence_share = nullptr; }
@@ -6758,33 +6717,6 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 s.nev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
                 if (s.nev == nullptr) h = E_FAIL;
             }
-
-            // P2.2a. A timestamp query heap and its resolve target. Failure
-            // here is NOT fatal: the stream is a correctness instrument first
-            // and it must not stop transporting because a profiler could not be
-            // built. ts_ok gates every use and the summary says when it is off.
-            if (SUCCEEDED(h))
-            {
-                D3D12_QUERY_HEAP_DESC qh{};
-                qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-                qh.Count = stream_state::TS_MARKS;
-                qh.NodeMask = 0;
-                HRESULT th = ndev->CreateQueryHeap(&qh, IID_PPV_ARGS(&s.tsheap));
-                if (SUCCEEDED(th))
-                    th = make_buf(ndev, (UINT64)stream_state::TS_MARKS * 8,
-                                  D3D12_HEAP_TYPE_READBACK, &s.tsread);
-                if (SUCCEEDED(th)) th = s.nq->GetTimestampFrequency(&s.ts_freq);
-                s.ts_ok = SUCCEEDED(th) && s.ts_freq > 0;
-                for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i) s.ts_min[i] = 1e30;
-                char tl[400];
-                snprintf(tl, sizeof tl,
-                         "[MGPU][P2.2] GPU timestamps on GPU 1: query heap + "
-                         "GetTimestampFrequency hr=0x%08X freq=%llu ticks/s -> %s. These are "
-                         "GPU time, not wall-clock; no cross-adapter clock is involved.",
-                         (unsigned)th, (unsigned long long)s.ts_freq,
-                         s.ts_ok ? "ON" : "OFF (the stream runs unprofiled)");
-                mgpu::diag::info(tl);
-            }
         }
         else if (ndev == nullptr) h = E_FAIL;
 
@@ -6997,12 +6929,8 @@ void stream_poll()
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
         if (SUCCEEDED(h))
         {
-            if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
-
             s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
                                    s.nxfer, slot_off, sizeof(MgpuSeal));
-
-            if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
 
             // ---- P4.1: the neural stage, in the SAME list as the seal read ----
             //
@@ -7023,8 +6951,6 @@ void stream_poll()
                 s.nl->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
                 barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
 
                 s.nr_params->Set("DLSSNR.Color", s.tex_in);
                 s.nr_params->Set("DLSSNR.Output", s.tex_out);
@@ -7063,8 +6989,6 @@ void stream_poll()
                     }
                 }
 
-                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
-
                 barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION ss{}, sd{};
@@ -7080,16 +7004,7 @@ void stream_poll()
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_COPY_DEST);
-
-                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
             }
-
-            // Resolve after every mark is written, never before: the resolve
-            // reads the heap on the GPU timeline and a mark recorded after it
-            // would not be in the buffer we map.
-            if (s.ts_ok && s.nr_ok)
-                s.nl->ResolveQueryData(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
-                                       stream_state::TS_MARKS, s.tsread, 0);
 
             h = s.nl->Close();
         }
@@ -7121,35 +7036,6 @@ void stream_poll()
 
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
-
-        // P2.2a: the per-stage GPU times for this frame. Read only when the
-        // neural stage is up, because with it off marks 2..4 are never written
-        // and the deltas would be garbage rather than zero.
-        if (s.ts_ok && s.nr_ok)
-        {
-            const UINT64 *tv = nullptr;
-            D3D12_RANGE tr{0, (SIZE_T)(stream_state::TS_MARKS * 8)};
-            if (SUCCEEDED(s.tsread->Map(0, &tr, (void **)&tv)) && tv != nullptr)
-            {
-                bool sane = true;
-                for (UINT i = 1; i < stream_state::TS_MARKS; ++i)
-                    if (tv[i] < tv[i - 1]) sane = false;   // a wrapped or unwritten mark
-                if (sane)
-                {
-                    for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i)
-                    {
-                        const double ms = (double)(tv[i + 1] - tv[i]) * 1000.0
-                                        / (double)s.ts_freq;
-                        s.ts_sum[i] += ms;
-                        if (ms < s.ts_min[i]) s.ts_min[i] = ms;
-                        if (ms > s.ts_max[i]) s.ts_max[i] = ms;
-                    }
-                    ++s.ts_n;
-                }
-                D3D12_RANGE tn{0, 0};
-                s.tsread->Unmap(0, &tn);
-            }
-        }
 
         // The liveness sample. Compared against the PREVIOUS frame's, not
         // against a value we chose - section 00a's rule. What a high
@@ -7359,31 +7245,6 @@ void stream_poll()
                      (s.nr_evals > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_evals - 1) : 0.0);
             mgpu::diag::info(line);
         }
-
-        if (s.ts_ok && s.ts_n > 0)
-        {
-            const double n = (double)s.ts_n;
-            snprintf(line, sizeof line,
-                     "[MGPU][P2.2] GPU TIME on GPU 1, per consumed frame, n=%llu | seal copy "
-                     "mean=%.3f | unpack (cross-adapter buffer -> NR input) mean=%.3f min=%.3f "
-                     "max=%.3f | EVALUATE mean=%.3f min=%.3f max=%.3f | output sample "
-                     "mean=%.3f ms. These are GPU 1's own timestamps on GPU 1's own queue - "
-                     "execution, not wall-clock, and no cross-adapter clock is involved. The "
-                     "evaluate figure is the one to compare against the reference tool's 14.2 ms "
-                     "evaluateGPU, and it is the first time this project has had its own side of "
-                     "that comparison. STILL PERISHABLE: one rig, one link, one resolution, one "
-                     "scene.",
-                     s.ts_n,
-                     s.ts_sum[0] / n,
-                     s.ts_sum[1] / n, s.ts_min[1], s.ts_max[1],
-                     s.ts_sum[2] / n, s.ts_min[2], s.ts_max[2],
-                     s.ts_sum[3] / n);
-            mgpu::diag::info(line);
-        }
-        else if (s.neural)
-            mgpu::diag::warn("[MGPU][P2.2] no GPU timings collected - the query heap did not "
-                             "come up, or the neural stage did not. The transport result above "
-                             "stands; there is simply no profile for this run.");
 
         const bool clean = (s.dropped == 0 && s.reordered == 0 && s.bad_magic == 0 &&
                             s.contract == 0 && s.alias == 0);
