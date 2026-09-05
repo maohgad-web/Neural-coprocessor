@@ -6313,66 +6313,6 @@ namespace
     // bridge thread, sequentially. If a consumer thread is ever added - see the
     // note in stream_poll - this becomes a lifetime bug and must be revisited
     // with it.
-    // P5.1. THE PRESENT GATE - the pipeline cleanup, and it is two fixes in one.
-    //
-    // The bridge's present loop ran at the display's refresh - 210 fps - and
-    // P5.0 copied a full frame into the backbuffer on every one of them, new
-    // or not. At 1600x900 that is ~1.2 GB/s of GPU 1 bandwidth spent
-    // re-showing frames already on screen, plus a DWM cross-adapter copy per
-    // present while GPU 1 is headless, on the SAME LINK the payload uses. The
-    // measurement arm was competing with itself.
-    //
-    // Now the loop presents only when a new neural frame exists - about 57 per
-    // second instead of 210, so three quarters of those copies and three
-    // quarters of that DWM traffic simply stop happening.
-    //
-    // AND IT FIXES THE PACING COUPLING FROM SECTION 05a AS A SIDE EFFECT. The
-    // consumer used to be polled once per present, so its cadence was the
-    // bridge swapchain's vsync - 3.23x the producer's rate on a 210 Hz panel
-    // and 1.01x on a 60 Hz one. Now the idle path blocks on the SHARED FENCE
-    // event for the next frame instead, with a short timeout as a backstop, so
-    // the consumer wakes when a frame actually lands and its rate no longer
-    // depends on what display GPU 1 is attached to.
-    //
-    // THE FENCE WAIT HAPPENS OUTSIDE THE LOCK. The stream mutex is taken by
-    // the event handler on the GAME'S render thread every frame; holding it
-    // across a wait is the one hazard in this add-on that can reach the
-    // application. The pointer and the target value are copied out under the
-    // lock, the lock is released, and only then does anything block.
-    //
-    // Returns true when the caller should present.
-    bool stream_present_gate(DWORD timeout_ms)
-    {
-        stream_state &s = str();
-        ID3D12Fence *f = nullptr;
-        UINT64 want = 0;
-        HANDLE ev = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(s.cs);
-            // Not streaming, or nothing to show on screen: behave exactly as
-            // the loop always has. The cycling colour is T5's liveness proof
-            // and must not stop because the stream is idle.
-            if (!s.armed || s.summarised || !s.nr_ok || s.profile)
-            { ++s.gate_presents; return true; }
-
-            if (s.consumed != s.presented)
-            {
-                s.presented = s.consumed;
-                ++s.gate_presents;
-                return true;
-            }
-            f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
-            ++s.gate_idle;
-        }
-
-        if (f != nullptr && ev != nullptr)
-        {
-            ++str().gate_waits;
-            f->SetEventOnCompletion(want, ev);
-            WaitForSingleObject(ev, timeout_ms);
-        }
-        return false;
-    }
 
     ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt)
     {
@@ -6637,6 +6577,82 @@ namespace
         }
         return true;
     }
+}
+
+// NOTE: at namespace scope, NOT in the anonymous namespace above. It is
+// declared in the header, so it needs external linkage; defining it beside
+// str() gave it internal linkage and worker.cpp failed to link against it.
+// The file-static helpers it calls are reachable from here because this is
+// the same translation unit.
+// P5.1. THE PRESENT GATE - the pipeline cleanup, and it is two fixes in one.
+//
+// The bridge's present loop ran at the display's refresh - 210 fps - and
+// P5.0 copied a full frame into the backbuffer on every one of them, new
+// or not. At 1600x900 that is ~1.2 GB/s of GPU 1 bandwidth spent
+// re-showing frames already on screen, plus a DWM cross-adapter copy per
+// present while GPU 1 is headless, on the SAME LINK the payload uses. The
+// measurement arm was competing with itself.
+//
+// Now the loop presents only when a new neural frame exists - about 57 per
+// second instead of 210, so three quarters of those copies and three
+// quarters of that DWM traffic simply stop happening.
+//
+// AND IT FIXES THE PACING COUPLING FROM SECTION 05a AS A SIDE EFFECT. The
+// consumer used to be polled once per present, so its cadence was the
+// bridge swapchain's vsync - 3.23x the producer's rate on a 210 Hz panel
+// and 1.01x on a 60 Hz one. Now the idle path blocks on the SHARED FENCE
+// event for the next frame instead, with a short timeout as a backstop, so
+// the consumer wakes when a frame actually lands and its rate no longer
+// depends on what display GPU 1 is attached to.
+//
+// THE FENCE WAIT HAPPENS OUTSIDE THE LOCK. The stream mutex is taken by
+// the event handler on the GAME'S render thread every frame; holding it
+// across a wait is the one hazard in this add-on that can reach the
+// application. The pointer and the target value are copied out under the
+// lock, the lock is released, and only then does anything block.
+//
+// Returns true when the caller should present.
+bool stream_present_gate(unsigned long timeout_ms)
+{
+    stream_state &s = str();
+    ID3D12Fence *f = nullptr;
+    UINT64 want = 0;
+    HANDLE ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        // Not streaming: behave exactly as the loop always has. The
+        // cycling colour is T5's liveness proof and must not stop because
+        // the stream is idle.
+        //
+        // NOTE THE CONDITION IS ONLY `armed`. An earlier version of this
+        // also short-circuited on `!nr_ok` and on `profile`, which had the
+        // gate wide open in exactly the two configurations that exist to
+        // minimise overhead - the transport-only control and the
+        // measurement run would both have presented at 210 fps and paid
+        // the full DWM cross-adapter cost this gate was written to remove.
+        // Gating is about whether a new FRAME exists, not about whether we
+        // intend to draw it: the cycling colour updating at the producer's
+        // rate instead of the display's is still a live window.
+        if (!s.armed || s.summarised)
+        { ++s.gate_presents; return true; }
+
+        if (s.consumed != s.presented)
+        {
+            s.presented = s.consumed;
+            ++s.gate_presents;
+            return true;
+        }
+        f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
+        ++s.gate_idle;
+    }
+
+    if (f != nullptr && ev != nullptr)
+    {
+        ++str().gate_waits;
+        f->SetEventOnCompletion(want, ev);
+        WaitForSingleObject(ev, timeout_ms);
+    }
+    return false;
 }
 
 void stream_request()
