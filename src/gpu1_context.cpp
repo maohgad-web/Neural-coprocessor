@@ -6384,6 +6384,43 @@ namespace
         // evaluates would report a 2-pass run's identical-rate at half its
         // true value.
         unsigned long long nr_frames = 0;
+
+        // ---- P6.2: the knobs ----
+        //
+        // Until now exactly one quality parameter was set, hardcoded:
+        // DLSSNR.Intensity = 0.84. No model, no encoding, no white point. The
+        // reference addon's own panel exposes several we never touch, and the
+        // observation that drove this - four passes fixed ghosting, noise and
+        // blur but washed the colour out - is a cumulative effect that a
+        // per-pass strength is the natural lever against.
+        //
+        // intensity[] is per pass. IntensityN in the ini overrides pass N;
+        // absent, every pass uses Intensity. A strong first pass with gentle
+        // later ones is the configuration that observation suggests, and it
+        // could not be expressed before.
+        float intensity[MAX_PASSES] = { 0.84f, 0.84f, 0.84f, 0.84f };
+        bool intensity_set[MAX_PASSES] = {};   // was it named per pass in the ini?
+        // P6.3: 0 = every pass, 1..MAX_PASSES = that pass alone. Bridge thread
+        // only - the hotkey is delivered to the bridge thread's message queue
+        // and stream_poll reads intensity[] on that same thread, which is why
+        // this needs no synchronisation of its own.
+        unsigned intensity_target = 0;
+        unsigned long long intensity_edits = 0;
+
+        // GENERIC KEYS. Every other parameter is reachable without this file
+        // knowing its name: Set.<key>=<value> in the ini is applied verbatim
+        // before every evaluate. That is deliberate - guessing NGX key names
+        // from memory is a mistake this project has already paid for, and this
+        // way the names come from whoever actually knows them rather than from
+        // me. A value containing '.' is sent as a float, otherwise as an
+        // unsigned int, and the arm line says which so a mistyped value is
+        // visible rather than silently coerced.
+        static const unsigned MAX_SETS = 12;
+        char set_key[MAX_SETS][96] = {};
+        float set_f[MAX_SETS] = {};
+        unsigned set_u[MAX_SETS] = {};
+        bool set_is_float[MAX_SETS] = {};
+        unsigned set_n = 0;
         bool nr_first = true;
         unsigned long long resync = 0;   // seals rejected, next gap check suppressed
         bool skip_next_gap = false;
@@ -6495,14 +6532,52 @@ namespace
     // Reads the file once into `buf`. False when there is nothing to read -
     // callers then keep their default, because a missing or unreadable
     // mgpu.ini must never be a reason a run does not happen.
+    // The ini is read whole into a stack buffer. 8 KB is far more than any
+    // sane config, and anything beyond it is now reported rather than dropped.
+    static const size_t INI_BYTES = 8192;
+
+    // DEFECT D, found on the rig 2026-09-05 and fixed here. This read 1023
+    // bytes into a 1024-byte buffer AND SAID NOTHING when the file was longer.
+    // The shipped mgpu.ini - whose comments I wrote - is 1419 bytes, and
+    // Passes= sits at byte 1410. Frames (82), Neural (145), Profile (395),
+    // Probes (625) and Present (896) all fall inside 1023 and worked; Passes
+    // fell outside and read as ABSENT, so two rig launches ran Passes=1 while
+    // the ini said 4 and every log line agreed with itself.
+    //
+    // The size was the trigger. The DEFECT is that truncation was silent: a
+    // key past the cutoff is indistinguishable from a key that was never
+    // written, and "absent" is a legitimate value here, so the wrong answer
+    // was perfectly well-formed. Section 00 again.
+    //
+    // Two changes, and the second one matters more than the first: the buffer
+    // is now 8 KB, and a file that does not fit is REPORTED BY NAME rather
+    // than quietly clipped.
     bool ini_slurp(char *buf, size_t n)
     {
         buf[0] = '\0';
         FILE *f = fopen("mgpu.ini", "rb");
         if (f == nullptr) return false;
         const size_t got = fread(buf, 1, n - 1, f);
+        // Is there anything left? One byte past what we took is enough to know.
+        const bool truncated = (fgetc(f) != EOF);
         fclose(f);
         buf[got] = '\0';
+        if (truncated)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                char tl[400];
+                snprintf(tl, sizeof tl,
+                         "[MGPU][P6.1] mgpu.ini is LARGER than this build reads (%zu bytes taken, "
+                         "more follow). EVERY KEY PAST THAT POINT READS AS ABSENT AND ITS DEFAULT "
+                         "IS USED SILENTLY. Shorten the file or move the keys you care about to "
+                         "the top; the values reported on the arm line are what actually took "
+                         "effect.", got);
+                mgpu::diag::error(tl);
+            }
+        }
         return got != 0;
     }
 
@@ -6522,7 +6597,7 @@ namespace
     // under a live stream can only cost.
     bool ini_read_probes()
     {
-        char buf[1024];
+        char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return false;
         const char *k = ini_find(buf, "Probes");
         return (k != nullptr) && (*k == '1');
@@ -6532,7 +6607,7 @@ namespace
     // so far has shown.
     bool ini_read_present_in()
     {
-        char buf[1024];
+        char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return false;
         const char *k = ini_find(buf, "Present");
         return (k != nullptr) && (k[0] == 'i') && (k[1] == 'n');
@@ -6544,7 +6619,7 @@ namespace
     // wrong experiment.
     unsigned ini_read_passes()
     {
-        char buf[1024];
+        char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return 1u;
         const char *k = ini_find(buf, "Passes");
         if (k == nullptr) return 1u;
@@ -6554,9 +6629,68 @@ namespace
         return (unsigned)v;
     }
 
+    // P6.2. Reads Intensity and Intensity1..IntensityN. Returns the count of
+    // per-pass overrides found, for the log.
+    unsigned ini_read_intensity(float *out, bool *named, unsigned n_passes)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0;
+        float base = 0.84f;
+        const char *k = ini_find(buf, "Intensity");
+        if (k != nullptr) base = (float)atof(k);
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out[i] = base;
+
+        unsigned named_n = 0;
+        for (unsigned i = 0; i < n_passes && i < stream_state::MAX_PASSES; ++i)
+        {
+            char key[32];
+            snprintf(key, sizeof key, "Intensity%u", i + 1);
+            const char *p2 = ini_find(buf, key);
+            if (p2 != nullptr) { out[i] = (float)atof(p2); named[i] = true; ++named_n; }
+        }
+        return named_n;
+    }
+
+    // P6.2. Set.<key>=<value>, up to MAX_SETS of them. Scans line by line
+    // rather than by key name, because the whole point is not to know the names.
+    unsigned ini_read_sets(char (*keys)[96], float *fv, unsigned *uv, bool *isf)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0;
+        unsigned n = 0;
+        const char *p2 = buf;
+        while (*p2 != '\0' && n < stream_state::MAX_SETS)
+        {
+            const char *q = p2;
+            while (*q == ' ' || *q == '\t') ++q;
+            if (*q != ';' && *q != '#' && strncmp(q, "Set.", 4) == 0)
+            {
+                const char *ks = q + 4;
+                const char *eq = ks;
+                while (*eq != '\0' && *eq != '=' && *eq != '\r' && *eq != '\n') ++eq;
+                if (*eq == '=' && eq > ks && (size_t)(eq - ks) < 95)
+                {
+                    memcpy(keys[n], ks, (size_t)(eq - ks));
+                    keys[n][eq - ks] = '\0';
+                    const char *vs = eq + 1;
+                    bool dot = false;
+                    for (const char *c = vs; *c != '\0' && *c != '\r' && *c != '\n'; ++c)
+                        if (*c == '.') { dot = true; break; }
+                    isf[n] = dot;
+                    if (dot) fv[n] = (float)atof(vs);
+                    else     uv[n] = (unsigned)strtoul(vs, nullptr, 10);
+                    ++n;
+                }
+            }
+            while (*p2 != '\0' && *p2 != '\n') ++p2;
+            if (*p2 == '\n') ++p2;
+        }
+        return n;
+    }
+
     unsigned long long stream_read_frames()
     {
-        char buf[1024];
+        char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return 600ull;
         const char *k = ini_find(buf, "Frames");
         if (k == nullptr) return 600ull;
@@ -6569,7 +6703,7 @@ namespace
     // P5.1: Profile=1 strips display and liveness sampling for measurement runs.
     bool stream_read_profile()
     {
-        char buf[1024];
+        char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return false;
         const char *k = ini_find(buf, "Profile");
         return (k != nullptr) && (*k == '1');
@@ -6578,7 +6712,7 @@ namespace
     // Returns false when the file explicitly says Neural=0.
     bool stream_read_neural()
     {
-        char buf[1024];
+        char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return true;
         const char *k = ini_find(buf, "Neural");
         return (k == nullptr) || (*k != '0');
@@ -6587,7 +6721,7 @@ namespace
     void stream_read_fault(char *out, size_t n)
     {
         snprintf(out, n, "none");
-        char buf[1024];
+        char buf[INI_BYTES];
         if (!ini_slurp(buf, sizeof buf)) return;
         const char *k = ini_find(buf, "Fault");
         if (k == nullptr) return;
@@ -6897,6 +7031,75 @@ bool probes_enabled()
     return ini_read_probes();
 }
 
+// ---- P6.3: intensity on the hotkeys ----
+//
+// Until now Intensity was read from mgpu.ini once, at arm time. Finding the
+// right value therefore cost one game launch per value, with the scene reset
+// each time and the comparison spread across runs - the same cross-run problem
+// that has confounded half the measurements in this project.
+//
+// This works for one specific reason: P1.2 established that NGX parameters are
+// LIVE PER EVALUATE (intensity 0.00 vs 1.60 changed 98.03% of pixels while the
+// same-value control was byte-identical), and the pass loop sets them fresh
+// every frame. So a value changed between frames takes effect on the very next
+// one, with no rebuild, no re-arm and no relaunch.
+//
+// Bridge thread only, by construction: RegisterHotKey delivers WM_HOTKEY to the
+// thread that registered it, which is the bridge thread, which is also the only
+// thread that reads intensity[]. Nothing here needs a lock.
+
+// Cycle which pass the steps act on: all -> 1 -> 2 -> ... -> passes -> all.
+void intensity_cycle_target()
+{
+    stream_state &s = str();
+    const unsigned n = (s.passes >= 1 && s.passes <= stream_state::MAX_PASSES) ? s.passes : 1u;
+    s.intensity_target = (s.intensity_target >= n) ? 0u : s.intensity_target + 1u;
+
+    char l[400];
+    int w = snprintf(l, sizeof l, "[MGPU][P6.3] intensity target -> ");
+    if (s.intensity_target == 0) w += snprintf(l + w, sizeof l - (size_t)w, "ALL passes");
+    else                         w += snprintf(l + w, sizeof l - (size_t)w, "pass %u only",
+                                               s.intensity_target);
+    w += snprintf(l + w, sizeof l - (size_t)w, " | now:");
+    for (unsigned i = 0; i < n && (size_t)w < sizeof l; ++i)
+        w += snprintf(l + w, sizeof l - (size_t)w, " p%u=%.2f", i + 1, s.intensity[i]);
+    mgpu::diag::info(l);
+}
+
+// One step up or down. STEP and the clamp are deliberate: 1.60 was exercised in
+// P1.2 and worked, so the ceiling is above 1.0 and is not a guess about what
+// the model accepts - it is a bound on how far one keypress can take you.
+void intensity_step(int dir)
+{
+    stream_state &s = str();
+    const unsigned n = (s.passes >= 1 && s.passes <= stream_state::MAX_PASSES) ? s.passes : 1u;
+    const float STEP = 0.05f;
+    const float LO = 0.0f, HI = 2.0f;
+
+    for (unsigned i = 0; i < n; ++i)
+    {
+        if (s.intensity_target != 0 && s.intensity_target != i + 1) continue;
+        float v = s.intensity[i] + STEP * (float)dir;
+        if (v < LO) v = LO;
+        if (v > HI) v = HI;
+        s.intensity[i] = v;
+    }
+    ++s.intensity_edits;
+
+    char l[400];
+    int w = snprintf(l, sizeof l, "[MGPU][P6.3] intensity %s (%s) ->",
+                     (dir > 0) ? "UP  " : "DOWN",
+                     (s.intensity_target == 0) ? "all passes" : "one pass");
+    for (unsigned i = 0; i < n && (size_t)w < sizeof l; ++i)
+        w += snprintf(l + w, sizeof l - (size_t)w, " p%u=%.2f%s", i + 1, s.intensity[i],
+                      (s.intensity_target == i + 1) ? "<" : "");
+    if ((size_t)w < sizeof l)
+        snprintf(l + w, sizeof l - (size_t)w,
+                 "%s", s.armed ? " (live from the next frame)"
+                               : " (stream not armed yet - this is the starting value)");
+    mgpu::diag::info(l);
+}
+
 void stream_request()
 {
     stream_state &s = str();
@@ -6915,7 +7118,7 @@ void stream_request()
     s.profile = stream_read_profile();
     s.present_in = ini_read_present_in();
     {
-        char buf[1024];
+        char buf[INI_BYTES];
         const bool have = ini_slurp(buf, sizeof buf);
         const char *k = have ? ini_find(buf, "Passes") : nullptr;
         const long long asked = (k != nullptr) ? atoll(k) : 1;
@@ -6930,6 +7133,39 @@ void stream_request()
                      asked, s.passes, stream_state::MAX_PASSES, s.passes, asked);
             mgpu::diag::warn(pl);
         }
+    }
+
+    // P6.2. Read after `passes`, because the per-pass overrides only make
+    // sense once we know how many passes there are.
+    {
+        const unsigned named = ini_read_intensity(s.intensity, s.intensity_set, s.passes);
+        s.set_n = ini_read_sets(s.set_key, s.set_f, s.set_u, s.set_is_float);
+
+        char kl[900];
+        int w = snprintf(kl, sizeof kl, "[MGPU][P6.2] knobs | intensity");
+        for (unsigned i = 0; i < s.passes && w > 0 && (size_t)w < sizeof kl; ++i)
+            w += snprintf(kl + w, sizeof kl - (size_t)w, " p%u=%.3f%s",
+                          i + 1, s.intensity[i], s.intensity_set[i] ? "*" : "");
+        if (w > 0 && (size_t)w < sizeof kl)
+            w += snprintf(kl + w, sizeof kl - (size_t)w,
+                          " (%u per-pass override%s, * marks them)", named,
+                          (named == 1) ? "" : "s");
+        for (unsigned i = 0; i < s.set_n && w > 0 && (size_t)w < sizeof kl; ++i)
+        {
+            if (s.set_is_float[i])
+                w += snprintf(kl + w, sizeof kl - (size_t)w, " | %s=%.4f(f)",
+                              s.set_key[i], s.set_f[i]);
+            else
+                w += snprintf(kl + w, sizeof kl - (size_t)w, " | %s=%u(u)",
+                              s.set_key[i], s.set_u[i]);
+        }
+        if (w > 0 && (size_t)w < sizeof kl)
+            snprintf(kl + w, sizeof kl - (size_t)w,
+                     ". Set.* keys are passed to NGX VERBATIM and this add-on does not "
+                     "know whether the snippet reads them - a key listed here was SENT, "
+                     "not necessarily HONOURED. Intensity is the only one proven live "
+                     "(P1.2: 0.00 vs 1.60 changed 98.03%% of pixels).");
+        mgpu::diag::info(kl);
     }
 
     // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
@@ -7284,7 +7520,27 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 void stream_poll()
 {
     stream_state &s = str();
-    std::lock_guard<std::mutex> lk(s.cs);
+    // DEFECT E, found on the rig 2026-09-05 by running Passes=2 and watching the
+    // GAME slow down from ~60 to ~49.8 fps.
+    //
+    // This was a lock_guard held for the whole function - INCLUDING the fence
+    // wait below, which blocks until GPU 1 has finished the unpack, every
+    // evaluate and the sample. stream_on_finish_effects takes this same mutex
+    // on the GAME'S RENDER THREAD every frame. So the game's render thread was
+    // waiting on GPU 1's neural work, once per frame.
+    //
+    // The header has warned about exactly this since P4.0 - "holding it across
+    // a wait is the one hazard in this add-on that can reach the application" -
+    // and P5.1 applied that discipline to stream_present_gate. stream_poll was
+    // never checked against it.
+    //
+    // It was invisible at one pass because GPU 1's ~8 ms fitted inside the
+    // frame interval. Two passes is ~16 ms against ~17 ms, and the game fell
+    // over the edge. THE ARCHITECTURE'S CLAIM - that neural work is free to the
+    // game - was true of the design and false of this build.
+    //
+    // unique_lock, not lock_guard, so the wait can happen with it released.
+    std::unique_lock<std::mutex> lk(s.cs);
     if (!s.armed || s.summarised) return;
 
     // WHY THIS IS STILL CALLED FROM THE PRESENT LOOP, AND WHY THAT IS WRONG.
@@ -7447,7 +7703,17 @@ void stream_poll()
                     s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
                     s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.width);
                     s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
-                    s.nr_params->Set("DLSSNR.Intensity", 0.84f);
+                    // P6.2: per pass, not one hardcoded value for all of them.
+                    s.nr_params->Set("DLSSNR.Intensity", s.intensity[pi]);
+                    // P6.2: whatever the ini named, verbatim, before every
+                    // evaluate. Applied AFTER Intensity so a Set.DLSSNR.Intensity
+                    // line deliberately wins - that is the escape hatch if the
+                    // per-pass path ever needs to be bypassed.
+                    for (unsigned si = 0; si < s.set_n; ++si)
+                    {
+                        if (s.set_is_float[si]) s.nr_params->Set(s.set_key[si], s.set_f[si]);
+                        else                    s.nr_params->Set(s.set_key[si], s.set_u[si]);
+                    }
                     // RESET ON THE FIRST FRAME ONLY, PER HANDLE. Every probe
                     // before the stream set Reset=1 on every evaluate, because
                     // each was an independent experiment and history between
@@ -7536,7 +7802,23 @@ void stream_poll()
             if (SUCCEEDED(h))
             {
                 s.nf->SetEventOnCompletion(s.nf_value, s.nev);
-                if (WaitForSingleObject(s.nev, 5000) != WAIT_OBJECT_0) h = E_FAIL;
+                // DEFECT E. THE ONLY BLOCKING CALL IN THIS FUNCTION, AND IT
+                // RUNS WITH THE MUTEX RELEASED. What the game thread does while
+                // we are here is exactly what it should be free to do: record
+                // its copies, signal its own fence, advance `produced`. None of
+                // that touches the bridge-side objects this loop is using
+                // (s.nl, s.nq, s.nev are bridge thread only), and the seal for
+                // this frame was copied into s.nseal by the GPU before the wait
+                // can clear - so nothing read after re-acquiring is stale.
+                //
+                // If the producer laps us while we are unlocked, that is the
+                // overrun condition and the check at the top of the next
+                // iteration names it. Being lapped is a fact about our speed;
+                // blocking the game to avoid it never was.
+                lk.unlock();
+                const DWORD wr = WaitForSingleObject(s.nev, 5000);
+                lk.lock();
+                if (wr != WAIT_OBJECT_0) h = E_FAIL;
             }
         }
         if (FAILED(h)) { s.consumed = f; continue; }
@@ -7799,6 +8081,27 @@ void stream_poll()
                      s.nr_fails, s.nr_same,
                      (s.nr_frames > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_frames - 1) : 0.0,
                      s.passes);
+            mgpu::diag::info(line);
+        }
+
+        if (s.neural)
+        {
+            int w = snprintf(line, sizeof line,
+                             "[MGPU][P6.3] intensity AT THE END of this run:");
+            for (unsigned i = 0; i < s.passes && (size_t)w < sizeof line; ++i)
+                w += snprintf(line + w, sizeof line - (size_t)w, " p%u=%.2f",
+                              i + 1, s.intensity[i]);
+            if ((size_t)w < sizeof line)
+                snprintf(line + w, sizeof line - (size_t)w,
+                         " | %llu hotkey edit%s during the run. %s",
+                         s.intensity_edits, (s.intensity_edits == 1) ? "" : "s",
+                         (s.intensity_edits != 0)
+                           ? "THE VALUE CHANGED WHILE THIS RAN, so the frames in this summary "
+                             "were NOT all produced at the same strength - the timings and the "
+                             "identical-rate above cover a moving target and must not be quoted "
+                             "as a figure for any one value."
+                           : "Unchanged from the ini for the whole run, so the summary above "
+                             "describes a single configuration.");
             mgpu::diag::info(line);
         }
 

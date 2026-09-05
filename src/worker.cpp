@@ -46,6 +46,13 @@
 // P1.3g. Hotkey id, process-unique. RegisterHotKey(nullptr, id, ...) scopes the
 // id to the calling THREAD, so a collision is only possible with ourselves.
 #define MGPU_HOTKEY_ID 0x4D47   // 'MG'
+// P6.3. Three more, ids adjacent to the first so a collision report names the
+// block rather than a lone key. CTRL+ALT is kept as the modifier for the same
+// reason it was chosen for F10: a bare function key is claimed by games freely,
+// and ReShade owns Home. F12 is deliberately avoided - debuggers take it.
+#define MGPU_HOTKEY_INT_TARGET 0x4D48   // CTRL+ALT+F8  - cycle which pass
+#define MGPU_HOTKEY_INT_DOWN   0x4D49   // CTRL+ALT+F9  - one step down
+#define MGPU_HOTKEY_INT_UP     0x4D4A   // CTRL+ALT+F11 - one step up
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -361,6 +368,29 @@ namespace
                                            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10) != FALSE)
                         {
                             hotkey_ok = true;
+                            // P6.3: the intensity keys. Each is independent -
+                            // one failing does not cost the others, and the log
+                            // names exactly which are available, because a key
+                            // that silently did not register is a knob the
+                            // operator will press and believe.
+                            const bool k_t = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_TARGET,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8) != FALSE;
+                            const bool k_d = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN,
+                                                MOD_CONTROL | MOD_ALT, VK_F9) != FALSE;
+                            const bool k_u = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_UP,
+                                                MOD_CONTROL | MOD_ALT, VK_F11) != FALSE;
+                            char ik[420];
+                            snprintf(ik, sizeof ik,
+                                     "[MGPU][P6.3] intensity hotkeys: CTRL+ALT+F8 cycle target "
+                                     "(all/p1/p2/...) = %s | CTRL+ALT+F9 down = %s | CTRL+ALT+F11 "
+                                     "up = %s. Steps of 0.05, clamped 0.00-2.00, live from the "
+                                     "next frame - NGX parameters are set per evaluate, so no "
+                                     "re-arm and no relaunch. DOWN and UP repeat when held; the "
+                                     "target key does not.",
+                                     k_t ? "OK" : "FAILED", k_d ? "OK" : "FAILED",
+                                     k_u ? "OK" : "FAILED");
+                            if (k_t && k_d && k_u) mgpu::diag::info(ik);
+                            else                   mgpu::diag::warn(ik);
                             mgpu::diag::info("[MGPU][P1.3g] hotkey registered: CTRL+ALT+F10 runs the "
                                              "transit probe on demand, from any foreground window. "
                                              "Press it once the game has settled - in gameplay, not "
@@ -469,10 +499,23 @@ namespace
                 // be mistaken for a shutdown.
                 MSG m;
                 bool run_transit = false;
+                // P6.3. Accumulated, not acted on inside the drain: a held key
+                // can deliver several messages per drain and each one should
+                // count, but the pump must finish first for the same reason the
+                // transit probe waits - pumping is what keeps this thread from
+                // stalling anything that broadcasts to top-level windows.
+                int int_delta = 0;
+                unsigned int_cycles = 0;
                 while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
                 {
                     if (m.message == WM_QUIT)
                         continue;
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_TARGET)
+                    { ++int_cycles; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_DOWN)
+                    { --int_delta; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_UP)
+                    { ++int_delta; continue; }
                     // P1.3g. WM_HOTKEY is thread-posted, not window-posted, so
                     // it arrives here with hwnd == nullptr and never reaches a
                     // window procedure. Flag it and run the probe AFTER the
@@ -487,6 +530,14 @@ namespace
                     TranslateMessage(&m);
                     DispatchMessageW(&m);
                 }
+
+                // P6.3. Target first, then the steps, so pressing F8 and F9 in
+                // the same drain does what the operator meant: retarget, then
+                // step the thing they just selected.
+                for (unsigned c = 0; c < int_cycles; ++c)
+                    mgpu::gpu1::intensity_cycle_target();
+                for (int d = 0; d < int_delta; ++d)  mgpu::gpu1::intensity_step(+1);
+                for (int d = 0; d > int_delta; --d)  mgpu::gpu1::intensity_step(-1);
 
                 if (run_transit)
                 {
@@ -673,7 +724,10 @@ namespace
         if (hotkey_ok)
         {
             UnregisterHotKey(nullptr, MGPU_HOTKEY_ID);
-            mgpu::diag::info("[MGPU][P1.3g] hotkey unregistered");
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_TARGET);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
+            mgpu::diag::info("[MGPU][P1.3g] hotkeys unregistered (transit + P6.3 intensity)");
         }
 
         mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (gpu1::shutdown [present chain -> "

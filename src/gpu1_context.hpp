@@ -237,6 +237,25 @@ void capture_poll();
 // mgpu.ini to run the old chain again, with the stream deliberately not armed.
 bool probes_enabled();
 
+// P6.3. BRIDGE THREAD ONLY - both of these are called from the hotkey handler
+// in the message pump, which runs on the bridge thread, and they touch state
+// that only the bridge thread reads. Do not call them from anywhere else.
+//
+// Intensity used to be read from mgpu.ini once at arm time, so finding a value
+// cost one game launch per value. NGX parameters are live per evaluate (P1.2)
+// and the pass loop sets them every frame, so a change here takes effect on the
+// next frame with no re-arm and no relaunch.
+//
+// intensity_cycle_target picks what the steps act on: all passes, or one of
+// them. intensity_step moves it by one increment, clamped, and logs the whole
+// per-pass ladder each time so the log says what was on screen when.
+//
+// A run whose intensity was edited mid-stream says so in its own summary: the
+// frames it covers were not all produced at the same strength, and its timings
+// must not be quoted as a figure for any single value.
+void intensity_cycle_target();
+void intensity_step(int dir);
+
 // Bridge thread. Arms the stream; inert until called, one stream per process.
 // Reads Fault= from mgpu.ini beside the add-on - absent means no fault, so the
 // shipped default is a clean run and a missing file is never an error.
