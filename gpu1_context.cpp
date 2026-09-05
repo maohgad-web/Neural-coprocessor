@@ -11,6 +11,7 @@
                       // Cumulative include: also brings in dxgi1_2/
                       // dxgi1_3/dxgi.h.
 #include <cstdio>
+#include <cstdlib>   // atoll, malloc/free - used throughout; made explicit for P5.0
 #include <cstring>
 #include <mutex>
 
@@ -74,6 +75,7 @@ namespace
         HANDLE fence_event = nullptr;
         UINT64 fence_value = 0;
         bool present_failed_logged = false;
+        bool neural_shown = false;   // P5.0: one-shot "the window is live" log
     };
 
     state &st()
@@ -315,7 +317,16 @@ bool create_present_chain(HWND hwnd)
         DXGI_SWAP_CHAIN_DESC1 scd{};
         scd.Width = width;
         scd.Height = height;
-        scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // P5.0: R10G10B10A2_UNORM, not R8G8B8A8. The bridge's backbuffer is now
+        // a COPY DESTINATION for the neural output, and CopyTextureRegion
+        // requires the two formats to match exactly - there is no conversion in
+        // a copy, and a converting blit would need a shader, which would need
+        // d3dcompiler, which would need a new link library. CMakeLists.txt is
+        // closed, so matching the game's format is not a shortcut here: it is
+        // the only route. The game renders R10G10B10A2 (DXGI 24) and P3.1
+        // established NR consumes and produces it unconverted, so the whole
+        // chain is now one format end to end.
+        scd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
         scd.SampleDesc.Count = 1;
         scd.SampleDesc.Quality = 0;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -477,6 +488,15 @@ bool create_present_chain(HWND hwnd)
 // translation unit, so detaching them from the state cannot expose a
 // dangling pointer to any other caller (has_present_chain and
 // device_removed_reason both read under the same lock).
+namespace
+{
+    // P5.0. Defined with the stream, below. Returns the neural output texture
+    // when one is live, or nullptr. Takes the stream's own lock briefly and
+    // never while holding this file's - stream_poll nests them the other way
+    // round, and the two orders together would be a cycle.
+    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt);
+}
+
 bool present_frame(float r, float g, float b)
 {
     auto &S = st();
@@ -578,12 +598,99 @@ bool present_frame(float r, float g, float b)
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cl->ResourceBarrier(1, &barrier);
 
-    const float color[4] = { r, g, b, 1.0f };
-    cl->ClearRenderTargetView(rtv, color, 0, nullptr);
+    // ---- P5.0: SHOW THE NEURAL OUTPUT ----
+    //
+    // Every verdict this project has produced is a byte comparison. Nothing has
+    // ever been looked at. That is a real gap: temporal ghosting from
+    // DLSSNR.Reset=0 accumulating history, an inverted channel order, a
+    // half-updated region - none of them moves a counter, and all of them are
+    // obvious in one glance.
+    //
+    // A 1:1 CENTRED CROP, NOT A SCALED VIEW. The backbuffer is 1280x720 and the
+    // neural output is the game's full frame, and there is no way to downscale
+    // without a shader (see the format note at the swapchain). A crop is
+    // therefore not a compromise on the way to something better - it is the
+    // only honest option available, and it happens to be the right one: every
+    // pixel shown is exactly a pixel NR produced, with no resampling standing
+    // between the model's output and the eye.
+    //
+    // When no neural output exists - before the stream is armed, or after it
+    // has run to its bound and released - this falls back to the cycling clear
+    // colour. That fallback is also the signal that the stream has ended.
+    UINT nw = 0, nh = 0;
+    DXGI_FORMAT nfmt = DXGI_FORMAT_UNKNOWN;
+    ID3D12Resource *nsrc = stream_present_source(nw, nh, nfmt);
+    // The format check is not paranoia: the copy is silent about a mismatch at
+    // record time and would fail at execute, taking the device with it.
+    if (nsrc != nullptr && nfmt == DXGI_FORMAT_R10G10B10A2_UNORM &&
+        nw >= 1 && nh >= 1)
+    {
+        const UINT cw = (nw < 1280u) ? nw : 1280u;
+        const UINT ch = (nh < 720u)  ? nh : 720u;
+        const UINT left = (nw - cw) / 2u;
+        const UINT top  = (nh - ch) / 2u;
 
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    cl->ResourceBarrier(1, &barrier);
+        // The backbuffer went PRESENT -> RENDER_TARGET above for the clear.
+        // Take it on to COPY_DEST. The clear still happens first, so a crop
+        // smaller than the backbuffer leaves the cycling colour as a border
+        // rather than undefined pixels.
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        const float color_pre[4] = { r, g, b, 1.0f };
+        cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
+        cl->ResourceBarrier(1, &barrier);
+
+        D3D12_RESOURCE_BARRIER nb{};
+        nb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        nb.Transition.pResource = nsrc;
+        nb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        nb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        nb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cl->ResourceBarrier(1, &nb);
+
+        D3D12_TEXTURE_COPY_LOCATION ps{}, pd{};
+        ps.pResource = nsrc;
+        ps.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        ps.SubresourceIndex = 0;
+        pd.pResource = backbuffer[index];
+        pd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        pd.SubresourceIndex = 0;
+        D3D12_BOX pbox{ left, top, 0, left + cw, top + ch, 1 };
+        cl->CopyTextureRegion(&pd, 0, 0, 0, &ps, &pbox);
+
+        nb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        nb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cl->ResourceBarrier(1, &nb);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cl->ResourceBarrier(1, &barrier);
+
+        bool say = false;
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            if (!S.neural_shown) { S.neural_shown = true; say = true; }
+        }
+        if (say)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P5.0] the bridge window is now showing the NEURAL OUTPUT - a "
+                     "%ux%u 1:1 crop from the centre of the %ux%u frame, no scaling and no "
+                     "resampling. Every pixel on screen is a pixel DLSS-NR produced on the "
+                     "second adapter. The cycling colour returns when the stream ends.",
+                     cw, ch, nw, nh);
+            mgpu::diag::info(line);
+        }
+    }
+    else
+    {
+        const float color[4] = { r, g, b, 1.0f };
+        cl->ClearRenderTargetView(rtv, color, 0, nullptr);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cl->ResourceBarrier(1, &barrier);
+    }
 
     hr = cl->Close();
     if (FAILED(hr))
@@ -1152,10 +1259,50 @@ namespace
     HRESULT transit_make_device(LUID want, ID3D12Device **out);
 }
 
-bool ngx_probe(UINT width, UINT height)
+bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
 {
     auto &S = st();
-    char line[600];
+    // P3.2 widened this from 600: its verdict has to state the discipline,
+    // the counts and what the result retracts, and a truncated retraction is
+    // worse than none.
+    char line[1200];
+
+    // P3.0. `ext` is the entire difference between this being a probe and
+    // this being a pipeline stage. When it is null every path below is
+    // byte-identical to the P1 build that has been passing since P1.0 -
+    // that is deliberate, and it is why this milestone is a parameter
+    // rather than a fork: the four probes that already work must not be
+    // able to regress because P3 was added.
+    //
+    // When it is non-null, the colour input is the GAME'S OWN FRAME, already
+    // carried across the adapter boundary by the P1.5 capture path and
+    // waited on by P2.0's shared fence, and this call is the last stage of
+    // the chain the whole project exists to build:
+    //
+    //   game frame -> cross the boundary -> DLSS-NR on GPU 1
+    //
+    // Two things change with it and nothing else does. The upload writes the
+    // supplied pixels instead of fill_pattern, and P1.4's transit block is
+    // skipped - P1.4 compares against a control that only exists for the
+    // synthetic path, and running it here would compare a real frame against
+    // a pattern's control and call the difference a finding.
+    const bool P3 = (ext != nullptr);
+    // P3.1 needs the RETURN VALUE to mean "the neural stage produced a real
+    // result", not merely "nothing threw". Without this, a run where every
+    // NGX call succeeded but the model changed nothing would report true, the
+    // caller would take the native format as accepted, and a null result
+    // would be recorded as the answer. Set only in the P3 verdict below.
+    bool p3_ok = false;
+    if (P3)
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][P3.0] ngx_probe entered with an EXTERNAL frame: %ux%u src_pitch=%u "
+                 "src_dxgi_fmt=%u. This is the game's own transited frame, not a pattern of "
+                 "ours. The P1.2 intensity comparison below now runs against real rendered "
+                 "content; the P1.4 transit block is skipped by design.",
+                 width, height, ext->row_pitch, ext->dxgi_format);
+        mgpu::diag::info(line);
+    }
 
     // The device and its LUID are copied out under the lock and every NGX
     // call happens outside it. CreateFeature took 1.16 s on the reference
@@ -1671,7 +1818,27 @@ bool ngx_probe(UINT width, UINT height)
                  data_path_n);
         mgpu::diag::info(line);
 
-        if (r != NVSDK_NGX_Result_Success)
+        // P3.0. THE SECOND INIT IS EXPECTED NOT TO BE A FIRST INIT. The
+        // session opened by the startup call is deliberately never shut down
+        // (see the teardown note - Shutdown1 is where P1.0b faulted), so by
+        // the time a captured frame arrives NGX has been initialised in this
+        // process for minutes. What a re-Init returns in that state is not
+        // documented anywhere we trust, so this does not guess: it logs the
+        // result and CONTINUES, because the session it would be establishing
+        // is known to be open already. If the code turns out to matter, it is
+        // in the line above and the failure will surface at CreateFeature
+        // with its own result - which is a better place to read it than an
+        // abort here on an assumption.
+        if (P3 && r != NVSDK_NGX_Result_Success)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P3.0] re-Init returned 0x%08X (%s) and is being IGNORED: this is "
+                     "the second Init of a session that was never shut down. Continuing to "
+                     "CreateFeature, which is where a genuinely broken session will say so.",
+                     (unsigned)r, ngx_result_name(r));
+            mgpu::diag::warn(line);
+        }
+        else if (r != NVSDK_NGX_Result_Success)
         {
             // FAIL_OutOfDate here is a KNOWN INTERMITTENT and almost
             // certainly not a defect in this add-on. Seen twice: once with
@@ -1986,7 +2153,28 @@ bool ngx_probe(UINT width, UINT height)
     // Still entirely local to GPU 1. No shared handles, nothing on the bus.
     // =================================================================
     {
-        const DXGI_FORMAT fmt_color = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // P3.1: the colour and output textures follow the frame when the
+        // caller asks for the native format. The byte comparisons below stay
+        // valid either way - both candidate formats are 4 bytes per pixel and
+        // every test here is byte-exactness, not colour arithmetic. The
+        // per-channel MEAN and MAX figures are the exception: they are only
+        // meaningful for R8G8B8A8, because on a packed 10:10:10:2 format they
+        // difference bit fields that straddle byte boundaries. On a
+        // native-format run, read `differing` and ignore mean/max.
+        const bool native_fmt = P3 && ext->native_format;
+        const DXGI_FORMAT fmt_color = native_fmt ? (DXGI_FORMAT)ext->dxgi_format
+                                                 : DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (native_fmt)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P3.1] NATIVE-FORMAT ATTEMPT: building the NR colour and output "
+                     "textures as DXGI %u - the game's own format - and feeding the frame "
+                     "UNCONVERTED. If every stage below succeeds, the CPU conversion P3.0 paid "
+                     "for is unnecessary. If one fails, its result code is the answer, and the "
+                     "converted run that follows still delivers this launch's P3.0 result.",
+                     ext->dxgi_format);
+            mgpu::diag::info(line);
+        }
         const DXGI_FORMAT fmt_mvec  = DXGI_FORMAT_R16G16_FLOAT;
         // R32_FLOAT rather than a real depth format: NR reads depth as a
         // plain texture, and a D32_FLOAT resource would need
@@ -2097,7 +2285,23 @@ bool ngx_probe(UINT width, UINT height)
             // subrect and MVecScale values a lower-resolution motion buffer
             // needs.
             memset(mapped + off_mvec, 0, (size_t)(off_out[0] - off_mvec));
-            fill_pattern(mapped + fp_color.Offset, width, height, fp_color.Footprint.RowPitch);
+            if (P3)
+            {
+                // The game's frame, row by row. Two pitches are in play and
+                // they are not the same number: the source is whatever the
+                // capture produced on the game's device, the destination is
+                // whatever GetCopyableFootprints chose for GPU 1's texture.
+                // Copying by bytes rather than by rows is the classic way to
+                // get a sheared image that still "transfers correctly".
+                const UINT copy = (ext->row_pitch < fp_color.Footprint.RowPitch)
+                                    ? ext->row_pitch : fp_color.Footprint.RowPitch;
+                for (UINT y = 0; y < height; ++y)
+                    memcpy(mapped + fp_color.Offset + (size_t)y * fp_color.Footprint.RowPitch,
+                           ext->pixels + (size_t)y * ext->row_pitch, copy);
+            }
+            else
+                fill_pattern(mapped + fp_color.Offset, width, height,
+                             fp_color.Footprint.RowPitch);
             for (int i = 0; i < NOUT; ++i)
                 for (UINT y = 0; y < height; ++y)
                 {
@@ -2496,6 +2700,47 @@ bool ngx_probe(UINT width, UINT height)
                              total ? 100.0 * (double)d_ab / (double)total : 0.0, m_ab, x_ab);
                     mgpu::diag::info(line);
                 }
+
+                // ---- the P3.0 verdict ----
+                // Same evidence, different question. P1.2 asked whether the
+                // parameters were live. P3.0 asks whether the thing NR just
+                // processed was the application's frame - and the answer is
+                // carried by d_ab being non-zero on content we did not
+                // generate, with the A/C control still clean. A pattern and a
+                // real frame are not distinguishable from the numbers alone,
+                // which is why this line states the provenance rather than
+                // inferring it: the pixels came from the capture path, which
+                // had already proved them byte-identical to what the game
+                // rendered.
+                if (P3)
+                {
+                    if (d_ab == 0)
+                        mgpu::diag::error("[MGPU][P3.0] PROBE FAILED - DLSS-NR produced "
+                                          "byte-identical output at both intensities on the "
+                                          "game's own frame. Either the model did not run or it "
+                                          "did nothing to this content. Read the CreateFeature "
+                                          "and Evaluate results above before assuming the "
+                                          "former.");
+                    else
+                    {
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P3.%s] PROBE PASSED - DLSS-NR RAN ON THE GAME'S OWN "
+                                 "FRAME, ON THE SECOND ADAPTER, IN %s. %ux%u of real rendered "
+                                 "content crossed the adapter boundary and was processed by the "
+                                 "neural stage: intensity %.2f vs %.2f changed %llu pixels "
+                                 "(%.2f%%) with the same-intensity control byte-identical. The "
+                                 "chain is closed end to end - game frame, boundary, model - "
+                                 "and no stage of it is synthetic any more.",
+                                 native_fmt ? "1" : "0",
+                                 native_fmt ? "THE GAME'S NATIVE FORMAT, UNCONVERTED - the CPU "
+                                              "conversion stage is NOT needed"
+                                            : "R8G8B8A8 after a CPU conversion",
+                                 width, height, INTENSITY_LO, INTENSITY_HI, d_ab,
+                                 total ? 100.0 * (double)d_ab / (double)total : 0.0);
+                        mgpu::diag::info(line);
+                        p3_ok = true;
+                    }
+                }
             }
 
             // P1.4 needs the LOCAL NR output as its control, and the mapping
@@ -2514,6 +2759,442 @@ bool ngx_probe(UINT width, UINT height)
             for (int i = 0; i < NOUT; ++i)
                 if (po[i] != nullptr) buf_read_out[i]->Unmap(0, &nothing);
         }
+
+        // =================================================================
+        // P3.2 - A PERSISTENT FEATURE, DRIVEN REPEATEDLY, AND A SOUND TEST
+        //        OF WHETHER NR WRITES EVERY PIXEL
+        // =================================================================
+        //
+        // Two questions, one batch, no new allocations - every buffer below is
+        // one P1.2 already owns.
+        //
+        // QUESTION 1: IS THE FEATURE DRIVABLE, OR ONLY CREATABLE? Everything
+        // up to here evaluates a freshly created feature two or three times
+        // and destroys it. A pipeline evaluates one feature for the lifetime
+        // of a session. This runs the SAME handle REPEATS times per batch,
+        // twice, on one command list - and if the feature degrades, stops
+        // writing, or starts failing after n uses, this is where it shows.
+        //
+        // QUESTION 2: THE SENTINEL SURVIVORS, AND WHY THE OLD TEST CANNOT
+        // ANSWER THEM. P1.2 pre-fills each output with a fixed COLOUR and
+        // counts pixels that still hold it afterwards. That test has the
+        // same flaw P1.5e had: it is an ABSOLUTE match with no control, so a
+        // pixel NR legitimately wrote to the sentinel value is counted as one
+        // NR failed to write. The native-format run made that concrete - 1
+        // survivor in A and C, 0 in B, where the converted runs had 0
+        // throughout. On a packed 10:10:10:2 format the sentinel is being
+        // matched against bit fields that straddle byte boundaries, so an
+        // accidental match is far more likely than it is in R8G8B8A8. One
+        // pixel in 3.69 million is exactly the scale of coincidence.
+        //
+        // THE DIFFERENTIAL TEST HAS NO ABSOLUTE COLOUR IN IT. Evaluate twice
+        // at the SAME intensity, from the SAME input, into an output
+        // pre-filled with 0x00 the first time and 0xFF the second. A pixel NR
+        // wrote holds the model's value both times and matches. A pixel NR did
+        // not write holds 0x00 once and 0xFF once and cannot match. The count
+        // of differing pixels is therefore the EXACT number of unwritten
+        // pixels, with no false positives possible, in any format. If it is
+        // zero, the survivors were coincidence and the DLSSNR.Output rebind is
+        // exonerated.
+        //
+        // UAV BARRIERS BETWEEN EVALUATES, WHICH P1.2 DOES NOT ISSUE. P1.2's
+        // warning named this as a suspect and it was right to: its three
+        // evaluates happen to target three DIFFERENT textures, so there is no
+        // hazard to guard. Here every evaluate in a batch writes the SAME
+        // texture, and without a UAV barrier they may overlap. That barrier is
+        // issued below, which also means that if the survivor count changes
+        // between P1.2's discipline and this one, the barrier is the variable.
+        if (P3)
+        {
+            const int REPEATS = 8;
+            const unsigned char FILL_A = 0x00, FILL_B = 0xFF;
+
+            // The two fills go into the upload regions P1.2 used for its
+            // output sentinels. Those readbacks have been compared and
+            // unmapped, so the space is free and no new memory is needed at
+            // full resolution.
+            unsigned char *um = nullptr;
+            D3D12_RANGE nonein{0, 0};
+            HRESULT ph = buf_upload->Map(0, &nonein, reinterpret_cast<void **>(&um));
+            if (SUCCEEDED(ph) && um != nullptr)
+            {
+                memset(um + off_out[1], FILL_A, (size_t)sz_color);
+                memset(um + off_out[2], FILL_B, (size_t)sz_color);
+                buf_upload->Unmap(0, nullptr);
+            }
+
+            if (FAILED(ph))
+                mgpu::diag::warn("[MGPU][P3.2] could not map the upload buffer - skipped");
+            else
+            {
+                ph = palloc->Reset();
+                if (SUCCEEDED(ph)) ph = pcmd->Reset(palloc, nullptr);
+                if (SUCCEEDED(ph)) list_open = true;
+
+                // tex_color was left in COPY_SOURCE by P1.2's readback. NR
+                // reads it, so it goes back to the state the evaluates used.
+                if (SUCCEEDED(ph))
+                    barrier(pcmd, tex_color, D3D12_RESOURCE_STATE_COPY_SOURCE, read_state);
+
+                auto uav_barrier = [&](ID3D12Resource *r)
+                {
+                    D3D12_RESOURCE_BARRIER b{};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    b.UAV.pResource = r;
+                    pcmd->ResourceBarrier(1, &b);
+                };
+
+                // One batch: pre-fill tex_out[0] from `src_off`, evaluate
+                // REPEATS times with a UAV barrier between each, copy the
+                // result to `dst`. tex_out[0] arrives in COPY_SOURCE (P1.2's
+                // readback left it there) and is returned to COPY_SOURCE.
+                auto batch = [&](UINT64 src_off, ID3D12Resource *dst)
+                {
+                    barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION s{}, d{};
+                    s.pResource = buf_upload;
+                    s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    s.PlacedFootprint = fp_color;
+                    s.PlacedFootprint.Offset = src_off;
+                    d.pResource = tex_out[0];
+                    d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    pcmd->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+                    barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                    params->Set("DLSSNR.Output", tex_out[0]);
+                    params->Set("DLSSNR.Intensity", INTENSITY_LO);
+                    int fails = 0;
+                    NVSDK_NGX_Result last = NVSDK_NGX_Result_Success;
+                    for (int k = 0; k < REPEATS; ++k)
+                    {
+                        params->Set("DLSSNR.Reset", 1u);
+                        last = p_evaluate(pcmd, handle, params, nullptr);
+                        if (last != NVSDK_NGX_Result_Success) ++fails;
+                        if (k + 1 < REPEATS) uav_barrier(tex_out[0]);
+                    }
+                    barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    D3D12_TEXTURE_COPY_LOCATION s2{}, d2{};
+                    s2.pResource = tex_out[0];
+                    s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    d2.pResource = dst;
+                    d2.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    d2.PlacedFootprint = fp_color;
+                    d2.PlacedFootprint.Offset = 0;
+                    pcmd->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
+
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.2] batch of %d evaluates on ONE persistent feature "
+                             "handle: failures=%d last_result=0x%08X (%s)",
+                             REPEATS, fails, (unsigned)last, ngx_result_name(last));
+                    mgpu::diag::info(line);
+                    return fails;
+                };
+
+                int f1 = 0, f2 = 0;
+                if (SUCCEEDED(ph))
+                {
+                    f1 = batch(off_out[1], buf_read_out[1]);
+                    f2 = batch(off_out[2], buf_read_out[2]);
+                    ph = pcmd->Close();
+                    list_open = false;
+                }
+                if (SUCCEEDED(ph))
+                {
+                    ID3D12CommandList *const ls[1] = { pcmd };
+                    queue->ExecuteCommandLists(1, ls);
+                    // 2, not 1: value 1 was signalled by the P1.2 flush and a
+                    // fence value already passed completes instantly.
+                    ph = queue->Signal(pfence, 2);
+                    if (SUCCEEDED(ph))
+                    {
+                        pfence->SetEventOnCompletion(2, pevent);
+                        if (WaitForSingleObject(pevent, 20000) != WAIT_OBJECT_0) ph = E_FAIL;
+                    }
+                }
+
+                if (FAILED(ph))
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.2] batch submission failed hr=0x%08X - no verdict",
+                             (unsigned)ph);
+                    mgpu::diag::error(line);
+                }
+                else
+                {
+                    const unsigned char *r1 = nullptr, *r2 = nullptr;
+                    D3D12_RANGE allr{0, (SIZE_T)sz_color};
+                    const bool m1 = SUCCEEDED(buf_read_out[1]->Map(0, &allr, (void **)&r1))
+                                    && r1 != nullptr;
+                    const bool m2 = SUCCEEDED(buf_read_out[2]->Map(0, &allr, (void **)&r2))
+                                    && r2 != nullptr;
+                    if (m1 && m2)
+                    {
+                        unsigned long long unwritten = 0;
+                        const unsigned long long tot =
+                            (unsigned long long)width * height;
+                        for (UINT y = 0; y < height; ++y)
+                        {
+                            const size_t ro = (size_t)y * fp_color.Footprint.RowPitch;
+                            for (UINT x = 0; x < width; ++x)
+                            {
+                                const unsigned char *a = r1 + ro + (size_t)x * 4;
+                                const unsigned char *b = r2 + ro + (size_t)x * 4;
+                                if (a[0] != b[0] || a[1] != b[1] ||
+                                    a[2] != b[2] || a[3] != b[3]) ++unwritten;
+                            }
+                        }
+                        if (f1 == 0 && f2 == 0 && unwritten == 0)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P3.2] PROBE PASSED - ONE FEATURE, %d EVALUATES, "
+                                     "EVERY PIXEL WRITTEN. The same handle was evaluated %d "
+                                     "times across two batches with no failure, and the two "
+                                     "runs - identical input and intensity, opposite pre-fills "
+                                     "(0x%02X and 0x%02X) - produced byte-identical output over "
+                                     "all %llu pixels. A pixel NR had not written could not have "
+                                     "matched, so THE SENTINEL SURVIVORS WERE COINCIDENCE, not "
+                                     "unwritten output: the absolute-colour test was matching "
+                                     "real content that happened to equal the fill. "
+                                     "DLSSNR.Output rebinding is exonerated. The feature is a "
+                                     "pipeline object, not a one-shot.",
+                                     REPEATS * 2, REPEATS * 2, FILL_A, FILL_B, tot);
+                            mgpu::diag::info(line);
+                        }
+                        else if (unwritten > 0)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P3.2] PROBE FAILED - %llu of %llu pixels DIFFER "
+                                     "between the two pre-fills, which is the exact count NR "
+                                     "left unwritten (evaluate failures: %d and %d). This is a "
+                                     "real gap in the model's output coverage and it is not a "
+                                     "measurement artefact - no absolute colour is involved in "
+                                     "this test. Map where they are before theorising: a border, "
+                                     "a tile edge and a scatter are three different causes.",
+                                     unwritten, tot, f1, f2);
+                            mgpu::diag::error(line);
+                        }
+                        else
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P3.2] PROBE FAILED - the output is fully written "
+                                     "but %d and %d evaluates returned a failure. The feature "
+                                     "does not survive repeated use, which is the one thing a "
+                                     "persistent pipeline requires of it.", f1, f2);
+                            mgpu::diag::error(line);
+                        }
+                    }
+                    else mgpu::diag::error("[MGPU][P3.2] readback Map failed - no verdict");
+                    D3D12_RANGE none2{0, 0};
+                    if (m1) buf_read_out[1]->Unmap(0, &none2);
+                    if (m2) buf_read_out[2]->Unmap(0, &none2);
+                }
+            }
+        }
+
+        // =================================================================
+        // P4.2 - DOES DLSS-NR READ DEPTH? THE PAYLOAD QUESTION.
+        // =================================================================
+        //
+        // Every evaluate this project has ever run passed depth as NULL and
+        // motion vectors as ZERO, and NR accepted all of them. "Accepted" is
+        // not "unaffected", and the difference sets the payload for the entire
+        // architecture:
+        //
+        //   depth not read  -> colour only crosses. The design is what we built.
+        //   depth read      -> depth must cross too. R32_FLOAT at 1440p is
+        //                      ~14.7 MB against ~14.06 MB of colour, so the
+        //                      per-frame payload roughly DOUBLES on a link that
+        //                      is already the binding constraint.
+        //
+        // Motion vectors are deliberately not part of this question. P0_RECORD
+        // records QuantMotion deriving flow from colour ON GPU 1 at 0.13-0.17
+        // ms, and the reference tool already runs that substitution with zero
+        // failures over 3000 evaluates - so flow is produced where it is
+        // consumed and never crosses. Depth cannot be derived that way, which
+        // is why it is the only open half.
+        //
+        // THE TEST IS A CONTROL, NOT AN OBSERVATION. Two evaluates, identical
+        // in every respect - same real frame, same intensity, same Reset - with
+        // exactly one variable: whether a depth texture is bound. Byte-compare
+        // the outputs.
+        //
+        //   differing == 0  -> the feature did not read depth AT ALL on this
+        //                      path. Not "depth is optional": not read.
+        //   differing > 0   -> it read it, and depth joins the payload.
+        //
+        // THE DEPTH IS A GRADIENT, NOT A CONSTANT, AND THAT MATTERS. A cleared
+        // depth carries no more information than no depth, so identical output
+        // would be ambiguous between "ignores depth" and "a flat depth happens
+        // to mean the same as none". A varying field removes that reading: if
+        // NR looks at depth at all, a plane sweeping front-to-back cannot
+        // produce the same bytes as no depth.
+        if (P3 && !used_depth)
+        {
+            unsigned long long d_diff = 0;
+            bool ok42 = true;
+            const unsigned long long total42 = (unsigned long long)width * height;
+
+            // A front-to-back gradient in R32_FLOAT, written into the upload
+            // region P1.2 already reserved for depth.
+            {
+                unsigned char *um = nullptr;
+                D3D12_RANGE none{0, 0};
+                if (SUCCEEDED(buf_upload->Map(0, &none, reinterpret_cast<void **>(&um))) &&
+                    um != nullptr)
+                {
+                    for (UINT y = 0; y < height; ++y)
+                    {
+                        unsigned char *row = um + fp_depth.Offset
+                                           + (size_t)y * fp_depth.Footprint.RowPitch;
+                        for (UINT x = 0; x < width; ++x)
+                        {
+                            const float d = (height > 1)
+                                ? ((float)y / (float)(height - 1)) : 0.5f;
+                            memcpy(row + (size_t)x * 4, &d, 4);
+                        }
+                    }
+                    buf_upload->Unmap(0, nullptr);
+                }
+                else ok42 = false;
+            }
+
+            // Pass 1: NO depth key has ever been set in this session (the
+            // `!used_depth` guard above is what guarantees that - P1.2's retry
+            // path binds depth, and if it fired there is no null-depth arm to
+            // compare against and this probe correctly does not run).
+            auto run42 = [&](bool bind_depth, ID3D12Resource *dst, UINT64 fence_v) -> bool
+            {
+                HRESULT h = palloc->Reset();
+                if (SUCCEEDED(h)) h = pcmd->Reset(palloc, nullptr);
+                if (!SUCCEEDED(h)) return false;
+                list_open = true;
+
+                if (bind_depth)
+                {
+                    barrier(pcmd, tex_depth, read_state, D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION ds{}, dd{};
+                    ds.pResource = buf_upload;
+                    ds.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    ds.PlacedFootprint = fp_depth;
+                    dd.pResource = tex_depth;
+                    dd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    pcmd->CopyTextureRegion(&dd, 0, 0, 0, &ds, nullptr);
+                    barrier(pcmd, tex_depth, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
+
+                    params->Set("DLSSNR.Depth", tex_depth);
+                    params->Set("DLSSNR.DepthSubrectBaseX", 0u);
+                    params->Set("DLSSNR.DepthSubrectBaseY", 0u);
+                    params->Set("DLSSNR.DepthSubrectWidth",  (unsigned int)width);
+                    params->Set("DLSSNR.DepthSubrectHeight", (unsigned int)height);
+                }
+
+                params->Set("DLSSNR.Output", tex_out[0]);
+                params->Set("DLSSNR.Intensity", INTENSITY_LO);
+                params->Set("DLSSNR.Reset", 1u);
+                const NVSDK_NGX_Result er = p_evaluate(pcmd, handle, params, nullptr);
+
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.2] EvaluateFeature depth=%s: result=0x%08X (%s)",
+                         bind_depth ? "GRADIENT (bound)" : "null",
+                         (unsigned)er, ngx_result_name(er));
+                mgpu::diag::info(line);
+
+                barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION os{}, od{};
+                os.pResource = tex_out[0];
+                os.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                od.pResource = dst;
+                od.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                od.PlacedFootprint = fp_color;
+                od.PlacedFootprint.Offset = 0;
+                pcmd->CopyTextureRegion(&od, 0, 0, 0, &os, nullptr);
+                barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                h = pcmd->Close();
+                list_open = false;
+                if (FAILED(h) || er != NVSDK_NGX_Result_Success) return false;
+                ID3D12CommandList *const ls[1] = { pcmd };
+                queue->ExecuteCommandLists(1, ls);
+                if (FAILED(queue->Signal(pfence, fence_v))) return false;
+                pfence->SetEventOnCompletion(fence_v, pevent);
+                return WaitForSingleObject(pevent, 20000) == WAIT_OBJECT_0;
+            };
+
+            if (ok42) ok42 = run42(false, buf_read_out[1], 3);
+            if (ok42) ok42 = run42(true,  buf_read_out[2], 4);
+
+            if (ok42)
+            {
+                const unsigned char *a = nullptr, *b = nullptr;
+                D3D12_RANGE all{0, (SIZE_T)sz_color};
+                const bool ma = SUCCEEDED(buf_read_out[1]->Map(0, &all, (void **)&a)) && a != nullptr;
+                const bool mb = SUCCEEDED(buf_read_out[2]->Map(0, &all, (void **)&b)) && b != nullptr;
+                if (ma && mb)
+                {
+                    for (UINT y = 0; y < height; ++y)
+                    {
+                        const size_t ro = (size_t)y * fp_color.Footprint.RowPitch;
+                        for (UINT x = 0; x < width; ++x)
+                        {
+                            const unsigned char *pa = a + ro + (size_t)x * 4;
+                            const unsigned char *pb = b + ro + (size_t)x * 4;
+                            if (pa[0] != pb[0] || pa[1] != pb[1] ||
+                                pa[2] != pb[2] || pa[3] != pb[3]) ++d_diff;
+                        }
+                    }
+                }
+                else ok42 = false;
+                D3D12_RANGE none{0, 0};
+                if (ma) buf_read_out[1]->Unmap(0, &none);
+                if (mb) buf_read_out[2]->Unmap(0, &none);
+            }
+
+            if (!ok42)
+                mgpu::diag::error("[MGPU][P4.2] PROBE INCOMPLETE - one arm did not run to "
+                                  "completion. No comparison is available; the depth question "
+                                  "stays open rather than being answered by a partial run.");
+            else if (d_diff == 0)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.2] DEPTH IS NOT READ - %ux%u, all %llu pixels byte-identical "
+                         "with a null depth and with a front-to-back gradient bound. Two "
+                         "evaluates, one variable. A feature that read depth could not return "
+                         "the same bytes for no depth and for a sweeping plane, so this is not "
+                         "'depth is optional' - it is not being sampled on this path at all. "
+                         "CONSEQUENCE: the per-frame payload is COLOUR ONLY. Depth never crosses "
+                         "the link, and the ~2x payload the architecture was budgeting for does "
+                         "not exist. SCOPE: this is preset=0 with the parameters this add-on "
+                         "sets; a different preset or guidance mode may read it, and that is a "
+                         "separate question from whether THIS configuration does.",
+                         width, height, total42);
+                mgpu::diag::info(line);
+            }
+            else
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.2] DEPTH IS READ - %llu of %llu pixels (%.2f%%) differ "
+                         "between a null depth and a bound gradient. The feature samples it, so "
+                         "the game's real depth buffer has to reach GPU 1 and the per-frame "
+                         "payload grows by an R32_FLOAT frame - roughly DOUBLE at this "
+                         "resolution, on the link that is already the constraint. Next question "
+                         "is not whether to carry it but whether a reduced-precision or "
+                         "lower-cadence depth is enough; P0_RECORD's reference tool runs "
+                         "depthInterval=4, which is exactly that idea.",
+                         d_diff, total42, total42 ? 100.0 * (double)d_diff / (double)total42 : 0.0);
+                mgpu::diag::info(line);
+            }
+        }
+        else if (P3)
+            mgpu::diag::warn("[MGPU][P4.2] skipped - P1.2's retry path already bound a depth "
+                             "texture this session, so there is no null-depth arm left to "
+                             "compare against. The result would be a comparison of two "
+                             "depth-bound runs, which answers nothing.");
 
         // =================================================================
         // P1.4 - DLSS-NR INSIDE THE LOOP, ACROSS THE BUS
@@ -2543,7 +3224,10 @@ bool ngx_probe(UINT width, UINT height)
         // pattern
         // is what makes the byte comparison possible at all; real content would
         // trade the verdict for a screenshot.
-        if (ref_local != nullptr && st().game_luid_known)
+        // !P3: P1.4's control is the LOCAL NR output for the SYNTHETIC
+        // pattern. Running it against a real frame would compare two
+        // different inputs and report the difference as a transit fault.
+        if (!P3 && ref_local != nullptr && st().game_luid_known)
         {
             ID3D12Device *dev0 = nullptr;
             ID3D12CommandQueue *q0 = nullptr;
@@ -2893,7 +3577,10 @@ bool ngx_probe(UINT width, UINT height)
 
     mgpu::diag::info("[MGPU][P1.0c] create/teardown cycle complete - see the [MGPU][P1.2] lines "
                      "above for the parameter-liveness verdict");
-    return true;
+    // P1 keeps its old contract (reaching here is a pass). P3 returns whether
+    // the neural stage actually produced a result, because its caller branches
+    // on the answer rather than just logging it.
+    return P3 ? p3_ok : true;
 }
 
 // =====================================================================
@@ -3206,7 +3893,10 @@ bool transit_probe(const char *tag)
     }
 
     auto &S = st();
-    char line[700];
+    // P2.1 widened this from 700: the ring's comparison line carries two
+    // arms, four counts and a ratio, and a silently truncated verdict is
+    // worse than no verdict.
+    char line[1400];
 
     LUID luid1{}, luid0{};
     bool have_game_luid = false;
@@ -3995,6 +4685,440 @@ bool transit_probe(const char *tag)
                                   "rather than the sharing mechanism.");
             }
         }
+
+        // ================= P2.1: RING + COPY QUEUES ======================
+        //
+        // Everything above this line is deliberately serial: GPU 0 submits,
+        // the CPU blocks on a fence event, GPU 1 then submits, the CPU blocks
+        // again. That discipline was correct for P1 - it makes a wrong answer
+        // impossible to mistake for a slow one - and it is also the single
+        // largest artefact in every number P1 produced.
+        //
+        // P2.1 runs THE SAME BYTES OVER THE SAME HEAP TWICE, changing only the
+        // discipline:
+        //
+        //   SERIAL     one band, DIRECT-equivalent ordering, a CPU fence wait
+        //              between the two sides. P1.3's structure, reduced to
+        //              buffer copies.
+        //   PIPELINED  RING_DEPTH bands on dedicated COPY queues. GPU 0 signals
+        //              a cross-adapter shared fence after each band; GPU 1's
+        //              queue WAITS on that fence value on the GPU and consumes
+        //              the band. The CPU issues every submission without
+        //              blocking and waits exactly once, at the end.
+        //
+        // WHY BUFFER-TO-BUFFER AND NOT THE TEXTURE ROUND TRIP. The P1.3 path
+        // above stages upload -> tex0 -> shared -> tex1 -> readback. Two of
+        // those five stages are texture copies that have nothing to do with the
+        // link, and a ring cannot overlap them band-by-band without a second
+        // pass. Including them would make the A/B compare two different amounts
+        // of work and attribute the difference to pipelining. So P2.1 measures
+        // upload0 -> shared -> read2: the traversal of the shared heap and
+        // nothing else, in both arms. This is a NARROWER measurement than
+        // P1.3's, not a faster version of it, and the two numbers are not
+        // interchangeable. Say so whenever either is quoted.
+        //
+        // RESULT ON THE RIG, RECORDED HERE SO THE CODE DOES NOT READ AS A
+        // PROMISE IT DID NOT KEEP: eight runs, both paths, both resolutions,
+        // all eight byte-exact in both arms. The ring is correct. It is also
+        // not faster - at 1440p the pipelined arm averaged 16.25 ms against
+        // serial's 11.48 ms over four settled runs, and never won at that
+        // size. The 720p readings that looked like 2x were slow serial runs.
+        // The block is kept for the correctness result and for the ordering
+        // primitive it exercises, not as an optimisation.
+        //
+        // WHAT THIS DOES NOT MEASURE. Neither arm uses a GPU timestamp. Both
+        // are QPC wall-clock around a CPU-visible completion, so both contain
+        // queue latency and driver overhead as well as execution. Separating
+        // those needs a calibrated cross-adapter clock, which is P2.2 and is
+        // the one symbol still behind the containment guard. (The guard greps
+        // this source tree, so the API's name is deliberately not written
+        // here - naming it in a comment would fail the build as loudly as
+        // calling it, which is the guard working, not a bug.)
+        {
+            const unsigned RING_DEPTH = 4;
+
+            ID3D12CommandQueue *cq0 = nullptr, *cq1 = nullptr;
+            ID3D12CommandAllocator *ca0[RING_DEPTH] = {}, *ca1[RING_DEPTH] = {};
+            ID3D12GraphicsCommandList *cl0[RING_DEPTH] = {}, *cl1[RING_DEPTH] = {};
+            ID3D12Fence *prod0 = nullptr, *prod1 = nullptr, *donef = nullptr;
+            HANDLE prod_share = nullptr, done_ev = nullptr;
+            ID3D12Resource *read2 = nullptr;
+
+            auto p21_cleanup = [&]()
+            {
+                for (unsigned i = 0; i < RING_DEPTH; ++i)
+                {
+                    if (cl1[i] != nullptr) { cl1[i]->Release(); cl1[i] = nullptr; }
+                    if (cl0[i] != nullptr) { cl0[i]->Release(); cl0[i] = nullptr; }
+                    if (ca1[i] != nullptr) { ca1[i]->Release(); ca1[i] = nullptr; }
+                    if (ca0[i] != nullptr) { ca0[i]->Release(); ca0[i] = nullptr; }
+                }
+                if (done_ev    != nullptr) { CloseHandle(done_ev); done_ev = nullptr; }
+                if (donef      != nullptr) { donef->Release(); donef = nullptr; }
+                if (prod1      != nullptr) { prod1->Release(); prod1 = nullptr; }
+                if (prod_share != nullptr) { CloseHandle(prod_share); prod_share = nullptr; }
+                if (prod0      != nullptr) { prod0->Release(); prod0 = nullptr; }
+                if (cq1        != nullptr) { cq1->Release(); cq1 = nullptr; }
+                if (cq0        != nullptr) { cq0->Release(); cq0 = nullptr; }
+                if (read2      != nullptr) { read2->Release(); read2 = nullptr; }
+            };
+
+            // ---- the copy queues ----
+            // A COPY queue is the DMA engine, not the 3D engine. On GPU 0 that
+            // matters for a reason no benchmark shows: the game owns the 3D
+            // engine, and every P1 measurement of GPU 0 was taken in a queue
+            // behind the game's frame. A copy queue does not stand in that
+            // line. Whether that is where wait0's 15x asymmetry against wait1
+            // lives is exactly what the two arms below decide.
+            D3D12_COMMAND_QUEUE_DESC cqd{};
+            cqd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+            HRESULT rh = g0.dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&cq0));
+            if (SUCCEEDED(rh)) rh = g1.dev->CreateCommandQueue(&cqd, IID_PPV_ARGS(&cq1));
+            for (unsigned i = 0; i < RING_DEPTH && SUCCEEDED(rh); ++i)
+            {
+                rh = g0.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+                                                    IID_PPV_ARGS(&ca0[i]));
+                if (SUCCEEDED(rh))
+                    rh = g0.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca0[i],
+                                                   nullptr, IID_PPV_ARGS(&cl0[i]));
+                if (SUCCEEDED(rh)) rh = cl0[i]->Close();
+                if (SUCCEEDED(rh))
+                    rh = g1.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+                                                        IID_PPV_ARGS(&ca1[i]));
+                if (SUCCEEDED(rh))
+                    rh = g1.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca1[i],
+                                                   nullptr, IID_PPV_ARGS(&cl1[i]));
+                if (SUCCEEDED(rh)) rh = cl1[i]->Close();
+            }
+
+            // ---- the cross-adapter producer fence ----
+            // Created on GPU 0's device, opened on GPU 1's. This is the same
+            // mechanism P2.0 proved against the game's device; here both
+            // devices are ours, so a failure is ours to fix and not the
+            // application's to blame.
+            if (SUCCEEDED(rh))
+                rh = g0.dev->CreateFence(0, (D3D12_FENCE_FLAGS)(D3D12_FENCE_FLAG_SHARED |
+                                                                D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER),
+                                         IID_PPV_ARGS(&prod0));
+            if (SUCCEEDED(rh))
+                rh = g0.dev->CreateSharedHandle(prod0, nullptr, GENERIC_ALL, nullptr, &prod_share);
+            if (SUCCEEDED(rh)) rh = g1.dev->OpenSharedHandle(prod_share, IID_PPV_ARGS(&prod1));
+            if (SUCCEEDED(rh))
+                rh = g1.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&donef));
+            if (SUCCEEDED(rh))
+            {
+                done_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (done_ev == nullptr) rh = E_FAIL;
+            }
+            if (SUCCEEDED(rh)) rh = make_buf(g1.dev, bytes, D3D12_HEAP_TYPE_READBACK, &read2);
+
+            snprintf(line, sizeof line,
+                     "[MGPU][P2.1] %ux%u setup: COPY queues on both adapters, %u-deep ring, "
+                     "cross-adapter producer fence (CreateFence(SHARED|SHARED_CROSS_ADAPTER) on "
+                     "GPU 0 -> OpenSharedHandle on GPU 1): hr=0x%08X",
+                     width, height, RING_DEPTH, (unsigned)rh);
+            mgpu::diag::info(line);
+
+            if (FAILED(rh))
+            {
+                mgpu::diag::warn("[MGPU][P2.1] setup failed - the ring is skipped and the P1.3 "
+                                 "serial numbers above stand alone for this resolution. This is "
+                                 "not a transit finding: nothing was transported.");
+                p21_cleanup();
+            }
+            else
+            {
+                // Band geometry. Bands are whole rows, so every offset is a
+                // multiple of RowPitch and inherits its 256-byte alignment -
+                // there is no sub-row arithmetic anywhere in this block, which
+                // is the only reason the footprint cannot be got wrong here the
+                // way it could in P1.3.
+                const UINT pitch = fp.Footprint.RowPitch;
+                const UINT rows_per = (height + RING_DEPTH - 1) / RING_DEPTH;
+
+                // The sentinel again, and for the same reason as P1.5: a band
+                // that never arrives has to look different from a band that
+                // arrived wrong. read2 is a READBACK buffer - WRITE_BACK, L0,
+                // CPU-writable - so the fill is a memset through Map. That is
+                // the one CPU write to a readback resource in this codebase and
+                // it happens only before the GPU has been asked for anything.
+                auto sentinel_fill = [&]() -> bool
+                {
+                    unsigned char *m = nullptr;
+                    D3D12_RANGE none{0, 0};
+                    if (FAILED(read2->Map(0, &none, reinterpret_cast<void **>(&m))) ||
+                        m == nullptr) return false;
+                    for (UINT y = 0; y < height; ++y)
+                    {
+                        unsigned char *r = m + (size_t)y * pitch;
+                        for (UINT x = 0; x < width; ++x)
+                        {
+                            r[(size_t)x * 4 + 0] = SENT_R;
+                            r[(size_t)x * 4 + 1] = SENT_G;
+                            r[(size_t)x * 4 + 2] = SENT_B;
+                            r[(size_t)x * 4 + 3] = 0xFF;
+                        }
+                    }
+                    D3D12_RANGE allw{0, (SIZE_T)bytes};
+                    read2->Unmap(0, &allw);
+                    return true;
+                };
+
+                // Compare read2 against the pattern. Returns false only on a
+                // Map failure; the counts come back through the out params.
+                auto verify2 = [&](unsigned long long *differing,
+                                   unsigned long long *sentinel) -> bool
+                {
+                    *differing = 0; *sentinel = 0;
+                    const unsigned char *p2 = nullptr;
+                    D3D12_RANGE all2{0, (SIZE_T)bytes};
+                    if (FAILED(read2->Map(0, &all2, (void **)&p2)) || p2 == nullptr) return false;
+                    unsigned char *ref2 = (unsigned char *)malloc((size_t)bytes);
+                    if (ref2 != nullptr)
+                    {
+                        memset(ref2, 0, (size_t)bytes);
+                        fill_pattern(ref2, width, height, pitch);
+                        for (UINT y = 0; y < height; ++y)
+                        {
+                            const unsigned char *ra = ref2 + (size_t)y * pitch;
+                            const unsigned char *rb = p2   + (size_t)y * pitch;
+                            for (UINT x = 0; x < width; ++x)
+                            {
+                                const unsigned char *a2 = ra + (size_t)x * 4;
+                                const unsigned char *b2 = rb + (size_t)x * 4;
+                                if (a2[0] != b2[0] || a2[1] != b2[1] || a2[2] != b2[2])
+                                    ++*differing;
+                                if (b2[0] == SENT_R && b2[1] == SENT_G && b2[2] == SENT_B)
+                                    ++*sentinel;
+                            }
+                        }
+                        free(ref2);
+                    }
+                    D3D12_RANGE nothing2{0, 0};
+                    read2->Unmap(0, &nothing2);
+                    return true;
+                };
+
+                // Fence values never restart. Both arms draw from one rising
+                // sequence, because a value the fence has already passed
+                // completes instantly and a Wait on it is not a wait at all -
+                // the exact trap P2.0 hit with the sentinel signal.
+                UINT64 fv = 0;
+                LARGE_INTEGER pf{}; QueryPerformanceFrequency(&pf);
+
+                // ---- ARM 1: SERIAL. One band, CPU wait between the sides ----
+                double serial_ms = 0.0;
+                unsigned long long ser_diff = 0, ser_sent = 0;
+                bool ser_ok = sentinel_fill();
+                if (ser_ok)
+                {
+                    LARGE_INTEGER a1{}, b1{};
+                    QueryPerformanceCounter(&a1);
+
+                    ca0[0]->Reset(); cl0[0]->Reset(ca0[0], nullptr);
+                    cl0[0]->CopyBufferRegion(shared0, 0, upload0, 0, bytes);
+                    cl0[0]->Close();
+                    { ID3D12CommandList *ls[1] = { cl0[0] }; cq0->ExecuteCommandLists(1, ls); }
+                    const UINT64 v_ser0 = ++fv;
+                    cq0->Signal(prod0, v_ser0);
+                    // THE CPU BLOCKS HERE. This is the line P2.1 exists to
+                    // delete, kept in the control arm so the deletion has a
+                    // measured value rather than an asserted one.
+                    prod0->SetEventOnCompletion(v_ser0, done_ev);
+                    if (WaitForSingleObject(done_ev, 20000) != WAIT_OBJECT_0) ser_ok = false;
+
+                    if (ser_ok)
+                    {
+                        ca1[0]->Reset(); cl1[0]->Reset(ca1[0], nullptr);
+                        cl1[0]->CopyBufferRegion(read2, 0, shared1, 0, bytes);
+                        cl1[0]->Close();
+                        { ID3D12CommandList *ls[1] = { cl1[0] }; cq1->ExecuteCommandLists(1, ls); }
+                        const UINT64 v_ser1 = ++fv;
+                        cq1->Signal(donef, v_ser1);
+                        donef->SetEventOnCompletion(v_ser1, done_ev);
+                        if (WaitForSingleObject(done_ev, 20000) != WAIT_OBJECT_0) ser_ok = false;
+                    }
+                    QueryPerformanceCounter(&b1);
+                    serial_ms = qpc_ms(a1, b1, pf);
+                    if (ser_ok) ser_ok = verify2(&ser_diff, &ser_sent);
+                }
+
+                // ---- ARM 2: PIPELINED. RING_DEPTH bands, GPU-side ordering ----
+                double ring_ms = 0.0;
+                unsigned long long ring_diff = 0, ring_sent = 0;
+                bool ring_ok = sentinel_fill();
+                if (ring_ok)
+                {
+                    // Record every list first, so the submission burst below
+                    // contains no CPU work between Execute calls. Recording is
+                    // CPU time either way; putting it here keeps it out of the
+                    // window we are timing on both arms equally.
+                    for (unsigned i = 0; i < RING_DEPTH && ring_ok; ++i)
+                    {
+                        const UINT r_start = i * rows_per;
+                        if (r_start >= height) break;
+                        const UINT r_count = (r_start + rows_per > height)
+                                               ? (height - r_start) : rows_per;
+                        const UINT64 off = (UINT64)r_start * pitch;
+                        const UINT64 len = (UINT64)r_count * pitch;
+
+                        if (FAILED(ca0[i]->Reset()) ||
+                            FAILED(cl0[i]->Reset(ca0[i], nullptr))) { ring_ok = false; break; }
+                        cl0[i]->CopyBufferRegion(shared0, off, upload0, off, len);
+                        if (FAILED(cl0[i]->Close())) { ring_ok = false; break; }
+
+                        if (FAILED(ca1[i]->Reset()) ||
+                            FAILED(cl1[i]->Reset(ca1[i], nullptr))) { ring_ok = false; break; }
+                        cl1[i]->CopyBufferRegion(read2, off, shared1, off, len);
+                        if (FAILED(cl1[i]->Close())) { ring_ok = false; break; }
+                    }
+                }
+                if (ring_ok)
+                {
+                    const UINT64 base = fv;
+                    LARGE_INTEGER a2{}, b2{};
+                    QueryPerformanceCounter(&a2);
+
+                    // Producer: every band submitted back to back, each
+                    // followed by its own fence value. No CPU wait anywhere in
+                    // this loop.
+                    unsigned bands = 0;
+                    for (unsigned i = 0; i < RING_DEPTH; ++i)
+                    {
+                        if (i * rows_per >= height) break;
+                        ID3D12CommandList *ls[1] = { cl0[i] };
+                        cq0->ExecuteCommandLists(1, ls);
+                        cq0->Signal(prod0, base + i + 1);
+                        ++bands;
+                    }
+                    // Consumer: a GPU-side Wait per band. cq1 does not run
+                    // band i until prod reaches i+1, and the CPU is not
+                    // involved in that decision. Band 0 can be crossing while
+                    // band 1 is still being produced - which is the entire
+                    // claim P2.1 makes.
+                    for (unsigned i = 0; i < bands; ++i)
+                    {
+                        cq1->Wait(prod1, base + i + 1);
+                        ID3D12CommandList *ls[1] = { cl1[i] };
+                        cq1->ExecuteCommandLists(1, ls);
+                    }
+                    fv = base + bands;
+                    const UINT64 vdone = ++fv;
+                    cq1->Signal(donef, vdone);
+                    donef->SetEventOnCompletion(vdone, done_ev);
+                    if (WaitForSingleObject(done_ev, 20000) != WAIT_OBJECT_0) ring_ok = false;
+
+                    QueryPerformanceCounter(&b2);
+                    ring_ms = qpc_ms(a2, b2, pf);
+                    if (ring_ok) ring_ok = verify2(&ring_diff, &ring_sent);
+
+                    snprintf(line, sizeof line,
+                             "[MGPU][P2.1] %ux%u bands=%u rows_per_band=%u pitch=%u",
+                             width, height, bands, rows_per, pitch);
+                    mgpu::diag::info(line);
+                }
+
+                const double mib2 = (double)bytes / (1024.0 * 1024.0);
+                // NO DERIVED RATIO IS PRINTED HERE, DELIBERATELY. The first
+                // build of this block ended the line with "speedup=%.2fx" and
+                // that single field did more damage than every other number in
+                // the probe: across eight runs it read 1.10, 0.67, 0.69, 0.94,
+                // 0.61 at 1440p and 1.08, 0.50, 1.15, 2.24, 2.00 at 720p, and
+                // every one of those figures was the ratio of two noisy
+                // wall-clock samples of size one. The two 2x readings at 720p
+                // were slow SERIAL runs, not fast rings. A ratio invites a
+                // claim; the raw pair does not. Both durations are still
+                // logged, because they are data - they are just not a
+                // comparison anyone should act on. See the verdict below.
+                snprintf(line, sizeof line,
+                         "[MGPU][P2.1] %ux%u path=%s buffer-to-buffer over the shared heap, "
+                         "%.2f MiB | SERIAL(1 band, CPU wait between sides): ok=%s %.2f ms "
+                         "(%.0f MiB/s) differing=%llu sentinel=%llu | PIPELINED(%u bands, COPY "
+                         "queues, GPU-side fence wait): ok=%s %.2f ms (%.0f MiB/s) differing=%llu "
+                         "sentinel=%llu",
+                         width, height, path, mib2,
+                         ser_ok ? "yes" : "no", serial_ms,
+                         serial_ms > 0.0 ? (mib2 / (serial_ms / 1000.0)) : 0.0,
+                         ser_diff, ser_sent,
+                         RING_DEPTH,
+                         ring_ok ? "yes" : "no", ring_ms,
+                         ring_ms > 0.0 ? (mib2 / (ring_ms / 1000.0)) : 0.0,
+                         ring_diff, ring_sent);
+                mgpu::diag::info(line);
+
+                // The verdict is about CORRECTNESS FIRST and speed second, in
+                // that order and never merged. A ring that is faster and wrong
+                // is not a result.
+                if (!ser_ok || !ring_ok)
+                    mgpu::diag::error("[MGPU][P2.1] PROBE INCOMPLETE - one arm did not run to "
+                                      "completion (see ok= above). No comparison is available; "
+                                      "do not read the timings.");
+                else if (ring_diff != 0 || ser_diff != 0)
+                {
+                    all_ok = false;
+                    snprintf(line, sizeof line,
+                             "[MGPU][P2.1] PROBE FAILED - payload wrong (serial differing=%llu, "
+                             "pipelined differing=%llu). If ONLY the pipelined arm differs, the "
+                             "GPU-side ordering is the suspect and the band boundaries are where "
+                             "to look: a band consumed before its producer signal would show as "
+                             "a contiguous wrong region, not scattered pixels. If BOTH differ, "
+                             "the fault is in the buffer copies and predates the ring.",
+                             ser_diff, ring_diff);
+                    mgpu::diag::error(line);
+                }
+                else
+                {
+                    // THIS IS A CORRECTNESS RESULT AND NOTHING ELSE.
+                    //
+                    // The previous wording of this line claimed "GPU 1 consumed
+                    // band 0 while GPU 0 was still producing band 1". Nothing
+                    // in this probe measures that. It is the mechanism the code
+                    // was written to produce, asserted in a PASSED line as
+                    // though it had been observed - the same mistake as the
+                    // P1.3b failure message and the EnableDebugLayer comment,
+                    // and it is removed for the same reason.
+                    //
+                    // What IS established: a %u-band ring, with dedicated COPY
+                    // queues on both adapters and GPU-side fence ordering
+                    // between them, moves the payload byte-exact. Every band
+                    // boundary held; no band was consumed before its producer
+                    // signal, because that would have left a contiguous wrong
+                    // region and differing is 0.
+                    //
+                    // WHAT IS NOT ESTABLISHED, AND WHY WE STOPPED ASKING: that
+                    // this discipline is FASTER. On the rig it was not - the
+                    // pipelined arm ran ~1.4x SLOWER than serial at 1440p, in
+                    // four settled runs out of four, while the serial arm held
+                    // to +/-2%. That is consistent with both halves crossing
+                    // the SAME link: producer and consumer contend for one
+                    // PCIe 3.0 x2 path, the total bytes over it are unchanged,
+                    // so overlap cannot add bandwidth and the extra
+                    // submissions and cross-adapter waits are pure cost.
+                    // Pipelining pays when the overlapped stages use DIFFERENT
+                    // resources - transfer against neural execution on GPU 1,
+                    // which P1.4 already showed is possible - and that is not
+                    // what this block overlaps. The ring is kept for its
+                    // correctness and its ordering primitive; its timings are
+                    // logged but are not a case for it.
+                    snprintf(line, sizeof line,
+                             "[MGPU][P2.1] PROBE PASSED (CORRECTNESS ONLY) - both arms delivered "
+                             "the payload byte-exact with no sentinel survivors, so the %u-band "
+                             "ring transports correctly and the GPU-side fence ordering between "
+                             "the two adapters holds at every band boundary. NO SPEED CLAIM IS "
+                             "MADE OR IMPLIED. The two durations above are single noisy "
+                             "wall-clock samples of a NARROWER path than P1.3's (shared-heap "
+                             "traversal only, no texture stages), neither is a GPU timestamp, "
+                             "and on this rig the pipelined arm has been the SLOWER of the two - "
+                             "both halves cross the same link, so overlapping them adds "
+                             "contention, not bandwidth. The overlap that could pay is transfer "
+                             "against neural execution, which this block does not test.",
+                             RING_DEPTH);
+                    mgpu::diag::info(line);
+                }
+
+                p21_cleanup();
+            }
+        }
         cleanup();
     }
 
@@ -4060,6 +5184,17 @@ namespace
         bool said_wrongq = false;   // armed, but the list belonged elsewhere
         unsigned ev_game = 0;       // post-arm events whose list is on the game adapter
         unsigned ev_other = 0;      // post-arm events from anywhere else
+
+        // P2.0: the shared fence. Created on the GAME's device, signalled on the
+        // GAME's queue after the copies have been submitted, waited on from the
+        // NGX device. This replaces counting bridge presents and hoping - the
+        // one deliberately weak thing left in P1.5.
+        ID3D12Fence *gfence = nullptr;      // game side
+        HANDLE gfence_share = nullptr;
+        ID3D12Fence *nfence = nullptr;      // the same fence, opened on GPU 1
+        bool fence_ok = false;              // the cross-adapter pair exists
+        bool signalled = false;             // Signal has been issued on the game queue
+        const UINT64 SIG = 1;
         bool tried = false;         // allocation attempted (success or not)
         bool armed = false;         // resources exist, waiting to record
         bool recorded = false;      // the copies are in a submitted list
@@ -4110,6 +5245,9 @@ namespace
         if (c.nread != nullptr) { c.nread->Release(); c.nread = nullptr; }
         if (c.nxfer != nullptr) { c.nxfer->Release(); c.nxfer = nullptr; }
         if (c.nheap != nullptr) { c.nheap->Release(); c.nheap = nullptr; }
+        if (c.nfence != nullptr) { c.nfence->Release(); c.nfence = nullptr; }
+        if (c.gfence_share != nullptr) { CloseHandle(c.gfence_share); c.gfence_share = nullptr; }
+        if (c.gfence != nullptr) { c.gfence->Release(); c.gfence = nullptr; }
         if (c.gshare!= nullptr) { CloseHandle(c.gshare); c.gshare = nullptr; }
         if (c.gread != nullptr) { c.gread->Release(); c.gread = nullptr; }
         if (c.gxfer != nullptr) { c.gxfer->Release(); c.gxfer = nullptr; }
@@ -4147,7 +5285,7 @@ void capture_request()
                      "makes the verdict inconclusive and the shot is not repeatable.");
 }
 
-void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
+void capture_on_finish_effects(void *runtime_v, void *cmd_list_v, void *cmd_queue_v,
                                unsigned long long rtv_handle)
 {
     (void)runtime_v;
@@ -4155,6 +5293,44 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
     std::lock_guard<std::mutex> lk(c.cs);
     // Inert until requested. The operator picks the frame, because the probe
     // cannot tell a loading screen from gameplay and only gets one.
+    // P2.0. SIGNAL ON THE FRAME AFTER RECORDING, NOT THE SAME ONE. Queue
+    // operations happen in submission order, and ReShade executes the list we
+    // recorded into AFTER this event returns. Signalling here would place the
+    // signal ahead of our own copies and the wait would clear before the data
+    // existed - a race that produces a plausible frame most of the time and a
+    // torn one occasionally, which is the worst possible failure shape.
+    //
+    // By the next event on this adapter, the previous frame's list has been
+    // submitted (it had to be, to present), so a Signal now lands behind it.
+    if (c.recorded && !c.signalled && c.fence_ok && !c.done)
+    {
+        ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
+        if (gq != nullptr)
+        {
+            ID3D12Device *qd = nullptr;
+            LUID ql{};
+            const bool got = SUCCEEDED(gq->GetDevice(IID_PPV_ARGS(&qd))) && qd != nullptr;
+            if (got) { ql = qd->GetAdapterLuid(); qd->Release(); }
+            LUID want{};
+            {
+                std::lock_guard<std::mutex> g(st().cs);
+                want = st().game_luid;
+            }
+            if (got && ql.LowPart == want.LowPart && ql.HighPart == want.HighPart)
+            {
+                const HRESULT sh2 = gq->Signal(c.gfence, c.SIG);
+                c.signalled = SUCCEEDED(sh2);
+                char sl[400];
+                snprintf(sl, sizeof sl,
+                         "[MGPU][P2.0] Signal(%llu) issued on the GAME's queue, one frame after "
+                         "the copies were recorded so queue order puts it behind them: hr=0x%08X",
+                         (unsigned long long)c.SIG, (unsigned)sh2);
+                mgpu::diag::info(sl);
+            }
+        }
+        return;   // nothing else to do on this event
+    }
+
     if (!c.requested || c.done || c.recorded) return;
 
     char line[900];
@@ -4323,6 +5499,39 @@ void capture_on_finish_effects(void *runtime_v, void *cmd_list_v,
                  (unsigned)c.fp.Footprint.RowPitch, (unsigned long long)c.bytes);
         mgpu::diag::info(line);
 
+        // ---- P2.0: the cross-adapter shared fence ----
+        //
+        // A fence created SHARED | SHARED_CROSS_ADAPTER on the game's device and
+        // opened on the NGX device is the only way to know the game's queue has
+        // retired our copies. We cannot ask that queue anything - but we can be
+        // told by it. Capability is logged rather than assumed: cross-adapter
+        // fences are a separate support question from cross-adapter heaps, and
+        // this rig has answered only the second.
+        if (SUCCEEDED(h) && ndev != nullptr)
+        {
+            HRESULT fh = gdev->CreateFence(0, (D3D12_FENCE_FLAGS)(D3D12_FENCE_FLAG_SHARED |
+                                                                  D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER),
+                                           IID_PPV_ARGS(&c.gfence));
+            if (SUCCEEDED(fh))
+                fh = gdev->CreateSharedHandle(c.gfence, nullptr, GENERIC_ALL, nullptr,
+                                              &c.gfence_share);
+            if (SUCCEEDED(fh))
+                fh = ndev->OpenSharedHandle(c.gfence_share, IID_PPV_ARGS(&c.nfence));
+            c.fence_ok = SUCCEEDED(fh) && c.nfence != nullptr;
+            snprintf(line, sizeof line,
+                     "[MGPU][P2.0] cross-adapter shared fence: CreateFence(SHARED|"
+                     "SHARED_CROSS_ADAPTER) on the game's device -> CreateSharedHandle -> "
+                     "OpenSharedHandle on the NGX device: hr=0x%08X. %s",
+                     (unsigned)fh,
+                     c.fence_ok
+                       ? "The read below waits on this instead of counting frames - the guess is gone."
+                       : "UNAVAILABLE on this rig; falling back to the frame-count wait, which is "
+                         "a guess and is labelled as one in the verdict.");
+            mgpu::diag::info(line);
+            // A missing fence is not fatal: the frame-count path still works and
+            // the sentinel still catches a premature read.
+        }
+
         // ---- WRITE THE SENTINEL, or the control cannot fire ----
         //
         // A DEFAULT heap comes back zeroed, not poisoned, so a "sentinel
@@ -4481,14 +5690,70 @@ void capture_poll()
     std::lock_guard<std::mutex> lk(c.cs);
     if (c.done || !c.recorded) return;
 
-    // WE DO NOT OWN THE GAME'S QUEUE, so we cannot signal a fence on it and
-    // cannot know the copy has retired. We wait a generous number of bridge
-    // presents instead, and the sentinel below is what turns "waited too
-    // little" into a named diagnosis rather than a wrong answer. A shared fence
-    // makes this exact and belongs to P2.
+    // ---- P2.0: wait on the shared fence, not on a frame count ----
+    //
+    // P1.5 counted bridge presents because we could not signal on a queue we
+    // do not own. We can: ReShade hands us the game's immediate queue, and a
+    // fence created SHARED | SHARED_CROSS_ADAPTER on the game's device and
+    // opened on ours is visible to both. The signal was issued on the frame
+    // AFTER the copies were recorded, so queue order puts it behind them; when
+    // it lands, the crossing is complete by definition rather than by guess.
+    //
+    // POLLED, NOT BLOCKED. GetCompletedValue is a read, and capture_poll runs
+    // under the same mutex the game-thread event handler takes. Blocking here
+    // on SetEventOnCompletion would hold that lock across a wait on work owned
+    // by another process's queue - the one place in this add-on where a stall
+    // could reach into the game's render thread. Once per present is frequent
+    // enough; the fence is either past SIG or it is not.
+    //
+    // WAIT_POLLS survives as the bound and as the fallback. When the shared
+    // fence could not be created (fence_ok false) or could not be signalled
+    // (signalled false), this is exactly P1.5's frames-elapsed guess and the
+    // verdict below says which mode produced it. When the fence exists but
+    // never reaches SIG within the bound, that is itself the finding - the
+    // handoff did not complete - and it is reported as such rather than read
+    // early and blamed on transit.
     const unsigned WAIT_POLLS = 240;
-    if (++c.polls < WAIT_POLLS) return;
+    ++c.polls;
+
+    const bool fence_mode = c.fence_ok && c.signalled && c.nfence != nullptr;
+    bool fence_landed = false;
+
+    if (fence_mode)
+    {
+        fence_landed = (c.nfence->GetCompletedValue() >= c.SIG);
+        if (!fence_landed && c.polls < WAIT_POLLS) return;
+    }
+    else
+    {
+        if (c.polls < WAIT_POLLS) return;
+    }
+
     c.done = true;
+
+    {
+        char mline[400];
+        if (fence_mode && fence_landed)
+            snprintf(mline, sizeof mline,
+                     "[MGPU][P2.0] handoff CONFIRMED by shared fence: the game's queue passed "
+                     "value %llu after %u bridge presents. The read below is ordered behind the "
+                     "copies, not merely later than them.",
+                     (unsigned long long)c.SIG, c.polls);
+        else if (fence_mode)
+            snprintf(mline, sizeof mline,
+                     "[MGPU][P2.0] shared fence NEVER REACHED %llu in %u bridge presents "
+                     "(completed=%llu). Reading anyway so the buffers can be described, but any "
+                     "sentinel survivors below are the unfinished handoff, not transit.",
+                     (unsigned long long)c.SIG, c.polls,
+                     (unsigned long long)c.nfence->GetCompletedValue());
+        else
+            snprintf(mline, sizeof mline,
+                     "[MGPU][P2.0] FALLBACK MODE - no shared fence (created=%s signalled=%s). "
+                     "Completion is inferred from %u elapsed bridge presents, exactly as P1.5 "
+                     "did. Treat the verdict as timing-dependent.",
+                     c.fence_ok ? "yes" : "no", c.signalled ? "yes" : "no", c.polls);
+        mgpu::diag::info(mline);
+    }
 
     char line[1000];
     HRESULT h = c.na->Reset();
@@ -4520,6 +5785,16 @@ void capture_poll()
         capture_release();
         return;
     }
+
+    // P3.0: the converted copy of the arrived frame, built while the readback
+    // is still mapped and consumed after it is not. Declared out here because
+    // ngx_probe must NOT be called with a D3D12 resource mapped - it creates
+    // its own resources, submits its own work and blocks for over a second on
+    // CreateFeature, all on this thread.
+    unsigned char *nr_in = nullptr;
+    UINT nr_pitch = 0;
+    unsigned char *nr_raw = nullptr;
+    UINT nr_raw_pitch = 0;
 
     const unsigned char *pn = nullptr, *pg = nullptr;
     D3D12_RANGE all{0, (SIZE_T)c.bytes};
@@ -4580,6 +5855,82 @@ void capture_poll()
                      "BOTH buffers - content, not survival.)",
                      total, nonzero, c.width, c.height, (int)c.format, sent_ref);
             mgpu::diag::info(line);
+
+            // ---- P3.0: hand the arrived frame to the neural stage ----
+            //
+            // THE CONVERSION IS A KNOWN COST AND IT IS NOT A PRODUCTION PATH.
+            // The game renders R10G10B10A2 and ngx_probe builds its colour
+            // texture as R8G8B8A8, so this drops two bits per channel on the
+            // CPU, at 3.7 million pixels, once. That is acceptable for a
+            // one-shot probe and unacceptable per frame. Whether DLSS-NR will
+            // accept R10G10B10A2 directly - which would delete this stage
+            // entirely - is NOT answered here and is the first thing to test
+            // once the pipeline runs at all. It is called out rather than
+            // buried because a silent conversion is exactly the kind of cost
+            // that ends up in a performance number later with no name on it.
+            // P3.1: the frame's ORIGINAL bytes, kept alongside the converted
+            // copy. Both attempts run from CPU memory, so the capture's GPU
+            // resources can still be released before either one starts.
+            nr_raw_pitch = c.fp.Footprint.RowPitch;
+            nr_raw = (unsigned char *)malloc((size_t)nr_raw_pitch * c.height);
+            if (nr_raw != nullptr)
+                memcpy(nr_raw, pn, (size_t)nr_raw_pitch * c.height);
+
+            nr_pitch = c.width * 4;
+            nr_in = (unsigned char *)malloc((size_t)nr_pitch * c.height);
+            if (nr_in == nullptr)
+                mgpu::diag::warn("[MGPU][P3.0] out of memory converting the frame - the neural "
+                                 "stage is skipped, the P1.5 verdict above still stands");
+            else
+            {
+                const int f = (int)c.format;
+                bool ok_fmt = true;
+                for (UINT y = 0; y < c.height && ok_fmt; ++y)
+                {
+                    const unsigned char *srow = pn + (size_t)y * c.fp.Footprint.RowPitch;
+                    unsigned char *drow = nr_in + (size_t)y * nr_pitch;
+                    for (UINT x = 0; x < c.width; ++x)
+                    {
+                        const unsigned char *sp = srow + (size_t)x * 4;
+                        unsigned char *dp = drow + (size_t)x * 4;
+                        if (f == 24)   // R10G10B10A2_UNORM - the game's format on this rig
+                        {
+                            unsigned v = (unsigned)sp[0] | ((unsigned)sp[1] << 8) |
+                                         ((unsigned)sp[2] << 16) | ((unsigned)sp[3] << 24);
+                            dp[0] = (unsigned char)(( v        & 0x3FF) >> 2);
+                            dp[1] = (unsigned char)(((v >> 10) & 0x3FF) >> 2);
+                            dp[2] = (unsigned char)(((v >> 20) & 0x3FF) >> 2);
+                            dp[3] = 0xFF;
+                        }
+                        else if (f == 28 || f == 29)        // R8G8B8A8_UNORM / _SRGB
+                        { dp[0]=sp[0]; dp[1]=sp[1]; dp[2]=sp[2]; dp[3]=0xFF; }
+                        else if (f == 87 || f == 91)        // B8G8R8A8_UNORM / _SRGB
+                        { dp[0]=sp[2]; dp[1]=sp[1]; dp[2]=sp[0]; dp[3]=0xFF; }
+                        else { ok_fmt = false; break; }
+                    }
+                }
+                if (!ok_fmt)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.0] the captured frame is DXGI format %d, which this "
+                             "converter does not handle. The neural stage is skipped rather "
+                             "than fed bytes it would misread - a wrong conversion here would "
+                             "produce a plausible NR result on a corrupted image, which is the "
+                             "worst outcome available. Add the case and rerun.", f);
+                    mgpu::diag::error(line);
+                    free(nr_in); nr_in = nullptr;
+                }
+                else
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][P3.0] frame converted for the neural stage: DXGI %d -> "
+                             "R8G8B8A8_UNORM, %ux%u, %u bytes/row. Two bits per channel were "
+                             "discarded; see the note in the source before quoting any quality "
+                             "result from this run.",
+                             f, c.width, c.height, nr_pitch);
+                    mgpu::diag::info(line);
+                }
+            }
         }
         else if (nonzero == 0)
         {
@@ -4594,9 +5945,12 @@ void capture_poll()
             if (diff >= total / 2)
                 mgpu::diag::error("[MGPU][P1.5] PROBE FAILED - most of the buffer is still "
                                   "sentinel and the reference has content, so the copies ran but "
-                                  "the crossing had not completed when we read. This is the "
-                                  "synchronisation gap: we cannot signal a fence on a queue we "
-                                  "do not own. Raise WAIT_POLLS, or wait for P2's shared fence.");
+                                  "the crossing had not completed when we read. In fallback mode "
+                                  "this is the frames-elapsed guess being wrong and the bound "
+                                  "should rise; in fence mode it is a real finding - the fence "
+                                  "reports the copies retired and the bytes did not arrive, "
+                                  "which means the ordering assumption itself is wrong. The "
+                                  "[MGPU][P2.0] line above says which mode this was.");
             else
             {
                 snprintf(line, sizeof line,
@@ -4625,7 +5979,1578 @@ void capture_poll()
     D3D12_RANGE nothing{0, 0};
     if (mn) c.nread->Unmap(0, &nothing);
     if (mg) c.gread->Unmap(0, &nothing);
+
+    // ---- P3.0: the last stage ----
+    //
+    // Released FIRST, then evaluated. capture_release frees the cross-adapter
+    // heap, the shared fence and both readbacks; ngx_probe is about to create
+    // several full-resolution textures plus its own upload and readback
+    // buffers on the same adapter, and holding the capture's ~28 MiB of
+    // mappable allocations across that is free memory pressure for no reason.
+    // The frame is already a CPU copy by this point and does not depend on any
+    // of it.
+    //
+    // This runs on the BRIDGE THREAD, the same thread the startup ngx_probe
+    // ran on, which is what makes reusing the retained NGX session legitimate.
+    // It will block for roughly a second in CreateFeature at native
+    // resolution; the bridge's present loop pauses for that long and the game
+    // is unaffected, because nothing here touches the game's device.
+    // Snapshotted before the release, not read through `c` after it.
+    // capture_release does not currently clear these three, but depending on
+    // that is depending on the internals of another function to stay the way
+    // they are - and a stale width here would be a wrongly-shaped NR run with
+    // no obvious symptom.
+    const UINT nr_w = c.width, nr_h = c.height;
+    const unsigned nr_srcfmt = (unsigned)c.format;
+
     capture_release();
+
+    // P3.1: NATIVE FIRST, CONVERTED SECOND, BOTH IN ONE LAUNCH.
+    //
+    // The capture is one shot per process, so a native-format attempt that
+    // fails must not cost the launch its P3.0 result - the operator would
+    // have to relaunch, get back into gameplay and press the hotkey again to
+    // learn one boolean. Running the converted path afterwards makes the
+    // native attempt free: worst case the log gains a named failure and the
+    // launch still ends with NR having run on the game's frame.
+    //
+    // The cost of the extra attempt is one CreateFeature, measured at 179 ms
+    // at this resolution on a warm session. That is the whole price of the
+    // answer.
+    bool native_ok = false;
+    if (nr_raw != nullptr)
+    {
+        ngx_input_frame ext{};
+        ext.pixels = nr_raw;
+        ext.row_pitch = nr_raw_pitch;
+        ext.dxgi_format = nr_srcfmt;
+        ext.native_format = true;
+        native_ok = ngx_probe(nr_w, nr_h, &ext);
+        free(nr_raw);
+    }
+
+    if (native_ok)
+        mgpu::diag::info("[MGPU][P3.1] NATIVE FORMAT ACCEPTED - the converted run is skipped. "
+                         "DLSS-NR consumed the game's buffer in the format the game rendered "
+                         "it, so no conversion stage belongs in this pipeline. Every earlier "
+                         "quality figure taken through the R8G8B8A8 path was measured two bits "
+                         "per channel short of what the model can actually see.");
+    else if (nr_in != nullptr)
+    {
+        mgpu::diag::warn("[MGPU][P3.1] native-format attempt did not complete - falling back to "
+                         "the converted path so this launch still produces a result. The reason "
+                         "is in the [MGPU][P1.0c] / [MGPU][P1.2] lines above, and it is the "
+                         "answer: a conversion stage is structural on this format and has to be "
+                         "budgeted, ideally as a GPU pass rather than the CPU one used here.");
+        ngx_input_frame ext{};
+        ext.pixels = nr_in;
+        ext.row_pitch = nr_pitch;
+        ext.dxgi_format = nr_srcfmt;
+        (void)ngx_probe(nr_w, nr_h, &ext);
+    }
+    if (nr_in != nullptr) free(nr_in);
+}
+
+// =====================================================================
+// P4.0 - THE STREAM: continuous per-frame capture into a ring, with the seal
+// =====================================================================
+//
+// Everything before this was a probe: one frame, one question, one answer, one
+// shot per process. This is the first stage that RUNS - every game frame, into
+// a ring of slots, for as long as it is armed.
+//
+// That changes what can go wrong, completely. P1_INSTRUMENT.md section 00
+// lists thirteen transit failures and calls the second half of them QUIET:
+// torn, stale, dropped, duplicated, reordered, slot-aliased. Not one of them
+// is reachable by a one-shot probe, and not one of them is visible to a person
+// watching the bridge window - a stream that consistently delivers frame N-4
+// looks perfect on static content. The seal is the instrument that makes them
+// nameable, and section 06 committed to shipping it with the first task that
+// transits a stream. This is that task.
+//
+// WHAT THIS DOES NOT DO, stated up front so the log is not over-read:
+//
+//   - It does NOT verify pixels per frame. The seal proves IDENTITY, ORDER and
+//     AGE. P1.5 already proved the payload crosses byte-exact, and re-proving
+//     that every frame would cost a full-resolution readback per frame and
+//     measure the instrument instead of the transit.
+//   - The `barcode` field is written as 0 and NOT CHECKED. It needs a shader
+//     that renders the frame index into the pixels (P1_INSTRUMENT section 03),
+//     which does not exist yet. Writing frame_index into it here would produce
+//     a check that compares a value against itself and always passes - the
+//     exact shape of the failures section 00a records. Zero and unchecked is
+//     honest; self-comparison would not be.
+//   - It does NOT run the neural stage. Feeding this stream to a persistent
+//     DLSS-NR feature is the next step and is deliberately separate: if both
+//     landed in one commit, a failure would not say which half.
+//
+// SELF-LIMITING BY DESIGN. This is the first code in the project that adds
+// per-frame work to the GAME'S command list, so it stops on its own after
+// its frame bound (Frames= in mgpu.ini, default 600) and prints a summary. A
+// build that misbehaves costs a
+// bounded number of frames rather than the rest of the session.
+namespace
+{
+    // The seal. Layout is fixed and shared by both ends; the static_assert is
+    // the requirement and the comment is a courtesy (P1_INSTRUMENT section 01
+    // records an earlier draft that asserted 64 while listing 56 bytes).
+    struct MgpuSeal
+    {
+        unsigned int  magic;          // 'MGPU'
+        unsigned int  seal_version;
+        unsigned long long frame_index;
+        unsigned long long qpc_submit;
+        unsigned long long payload_bytes;
+        unsigned int  width;
+        unsigned int  height;
+        unsigned int  dxgi_format;
+        unsigned int  row_pitch;      // the FOOTPRINT pitch, not width * bpp
+        unsigned int  slot_index;
+        unsigned int  barcode;        // 0 = not implemented; see the note above
+        unsigned int  reserved[2];
+    };
+    static_assert(sizeof(MgpuSeal) == 64, "seal layout changed");
+
+    const unsigned int SEAL_MAGIC   = 0x5550474Du;   // 'MGPU' little-endian
+    const unsigned int SEAL_VERSION = 1u;
+
+    // 512, not 64: D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT. The payload in each
+    // slot must start on that boundary, so the seal lives in space that would
+    // have been padding anyway and costs nothing.
+    const UINT64 SEAL_STRIDE = 512;
+
+    struct stream_state
+    {
+        std::mutex cs;
+
+        // RING DEPTH IS A NAMED CONSTANT, NEVER A HARDCODED 2. P0_RECORD's
+        // multi-pass note requires this: depth is entangled with the fence and
+        // ownership logic, and changing it later means reopening the
+        // synchronisation design.
+        //
+        // RAISED 3 -> 6 on 2026-09-05, as a MITIGATION and not a fix. The
+        // consumer is driven from the bridge's present loop, so its poll
+        // cadence is whatever the bridge swapchain's vsync is. Measured: 3.23x
+        // the producer's rate on the 210 Hz display, and 1.01x once the bridge
+        // card drove a 60 Hz monitor - one poll per produced frame, with the
+        // whole safety margin gone. Nothing overran, because each poll drains
+        // the entire backlog, but the margin is what protects against a hitch
+        // and against a game running faster than the bridge's refresh.
+        //
+        // Six slots costs ~50 MB at 1080p and buys back the margin the display
+        // took away. THE ACTUAL FIX IS TO STOP PACING THE CONSUMER WITH THE
+        // PRESENTER - see the note in stream_poll.
+        static const unsigned RING = 6;
+
+        // The bound. See the header comment. Overridable with Frames= in
+        // mgpu.ini so the window can be watched for longer than fifteen
+        // seconds; the default is unchanged.
+        unsigned long long max_frames = 600;
+
+        bool requested = false, tried = false, armed = false;
+        bool finished = false, summarised = false;
+        bool said_other = false, said_overrun = false;
+
+        ID3D12Device *gdev = nullptr;          // borrowed
+        ID3D12Heap *gheap = nullptr, *nheap = nullptr;
+        ID3D12Resource *gxfer = nullptr, *nxfer = nullptr;
+        ID3D12Resource *gup = nullptr;         // UPLOAD, RING seals, game side
+        unsigned char *gup_cpu = nullptr;      // persistently mapped
+        HANDLE gshare = nullptr;
+
+        ID3D12Fence *gfence = nullptr;         // produced-count, game side
+        HANDLE gfence_share = nullptr;
+        ID3D12Fence *nfence = nullptr;         // the same fence on GPU 1
+
+        ID3D12Resource *nseal = nullptr;       // READBACK, RING * SEAL_STRIDE
+
+        // ---- P2.2a: GPU timestamps on GPU 1's consume list ----
+        //
+        // The first numbers in this project that are GPU TIME rather than
+        // wall-clock. Everything before this was QPC around a CPU-visible
+        // completion, so it carried queue latency and driver overhead mixed in
+        // with execution and could not tell them apart - which is why every one
+        // of those figures is filed as perishable.
+        //
+        // Five marks per consumed frame, all on the one list:
+        //   0  list start
+        //   1  after the seal copy
+        //   2  after the payload unpack (cross-adapter buffer -> NR input)
+        //   3  after EvaluateFeature
+        //   4  after the output sample copy
+        //
+        // The interesting one is 2->3: what DLSS-NR actually costs on GPU 1,
+        // on our path, against the 14.2 ms the reference tool measures on a
+        // comparable single-GPU one. That comparison is the whole architecture
+        // argument and it has never had our side of it.
+        //
+        // NOTE THIS NEEDS NO CROSS-ADAPTER CLOCK. These are all GPU 1's own
+        // timestamps on GPU 1's own queue, so GetTimestampFrequency is enough
+        // and the one symbol still behind the containment guard stays there.
+        // (Its name is deliberately not written here - the guard greps this
+        // tree, so naming it in a comment would fail the build exactly as
+        // calling it would. That is the guard working, not a bug.)
+        // Correlating GPU 0's timeline with GPU 1's - which is what a true
+        // transit time in GPU time would need - is a separate step and is
+        // deliberately not taken here.
+        ID3D12QueryHeap *tsheap = nullptr;
+        ID3D12Resource *tsread = nullptr;      // READBACK, TS_MARKS * 8 bytes
+        UINT64 ts_freq = 0;
+        bool ts_ok = false;
+        static const UINT TS_MARKS = 5;
+        double ts_sum[TS_MARKS - 1] = {};
+        double ts_min[TS_MARKS - 1] = {};
+        double ts_max[TS_MARKS - 1] = {};
+        unsigned long long ts_n = 0;
+        ID3D12CommandQueue *nq = nullptr;
+        ID3D12CommandAllocator *na = nullptr;
+        ID3D12GraphicsCommandList *nl = nullptr;
+        ID3D12Fence *nf = nullptr;
+        HANDLE nev = nullptr;
+        UINT64 nf_value = 0;
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 payload_bytes = 0, slot_bytes = 0;
+        UINT width = 0, height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+        unsigned long long produced = 0;   // frames recorded into the game's list
+        unsigned long long consumed = 0;   // frames whose seal has been checked
+        unsigned long long last_seen = 0;
+
+        // Counters. A quiet failure is a RATE, not an event, which is why the
+        // summary matters more than any single line.
+        unsigned long long dropped = 0, reordered = 0;
+        unsigned long long bad_magic = 0, contract = 0, alias = 0, overrun = 0;
+
+        // P4.0a. THE REUSE COUNTER IS GONE AND THIS REPLACES IT.
+        //
+        // P1_INSTRUMENT section 01 specifies `reuse` for a SAMPLING consumer -
+        // one that re-reads the newest seal every poll and therefore sees the
+        // same frame_index four or five times in a row. This consumer is
+        // EVENT-DRIVEN: it reads each new frame exactly once and never revisits
+        // one. `reuse` could therefore only ever be zero, and the first run
+        // duly printed `reuse=0` - a number with one possible value, reported
+        // as though it were a measurement. That is the failure family in
+        // section 00a, committed by the instrument that documents it.
+        //
+        // What the rate ratio actually is here: polls that found nothing new,
+        // over polls in total. It measures the same underlying thing - how much
+        // faster the consumer runs than the producer - out of quantities this
+        // design can actually observe.
+        unsigned long long polls = 0, idle_polls = 0;
+
+        // Every logged sample of the first build read `slot=2`, because the
+        // sample stride was 60 and the ring is 3. All 600 frames were checked
+        // across all three slots, but nothing in the log said so. The histogram
+        // says so, and the stride below is now coprime with the depth.
+        unsigned long long slot_hits[RING] = {};
+
+        LARGE_INTEGER freq{};
+        double lat_min = 1e30, lat_max = 0.0, lat_sum = 0.0;
+        unsigned long long lat_n = 0;
+        // An outlier with no name is not a measurement either: the first run
+        // reported max=672.06 ms nine times above the mean and could not say
+        // which frame it was. The first consumed frame is also separated out -
+        // its age includes everything between arming and the first poll, which
+        // is not transit.
+        unsigned long long lat_max_frame = 0;
+        double first_lat = 0.0;
+
+        // Fault injection (P1_INSTRUMENT section 04). Absent file = no fault,
+        // so the shipped default is a clean run and a missing file is never an
+        // error.
+        char fault[32] = "none";
+        bool fault_unimpl = false;   // a name was given that this build cannot inject
+
+        // ---- P5.1: pipeline cleanup ----
+        // `presented` is the value `consumed` had when the bridge last put a
+        // frame on screen. The two being equal means there is nothing new to
+        // show, and the present is skipped entirely.
+        unsigned long long presented = 0;
+        HANDLE gate_ev = nullptr;
+        unsigned long long gate_waits = 0, gate_presents = 0, gate_idle = 0;
+        // Profile=1 in mgpu.ini strips the instrument down to what a shipping
+        // build would carry: no on-screen output, no liveness sample. The seal
+        // stays - it is the correctness check, it is 64 bytes, and a
+        // measurement run that silently stops checking identity is how a
+        // corrupted stream gets recorded as a fast one.
+        bool profile = false;
+
+        // ---- P4.1: the persistent neural stage ----
+        // Opt-OUT (mgpu.ini Neural=0), because running without it is now the
+        // control rather than the default: the pace of the consumer with and
+        // without NR is the comparison that answers whether it keeps up.
+        bool neural = true;
+        bool nr_tried = false, nr_ok = false;
+        NVSDK_NGX_Parameter *nr_params = nullptr;
+        NVSDK_NGX_Handle *nr_handle = nullptr;
+        ngx_pf_evaluate_feature nr_eval = nullptr;
+        ngx_pf_release_feature nr_release = nullptr;
+        ID3D12Resource *tex_in = nullptr, *tex_out = nullptr, *nr_read = nullptr;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT nr_fp{};   // the 64x4 liveness sample
+        unsigned char nr_prev[1024] = {};
+        bool nr_have_prev = false;
+        unsigned long long nr_evals = 0, nr_fails = 0, nr_same = 0;
+        bool nr_first = true;
+        unsigned long long resync = 0;   // seals rejected, next gap check suppressed
+        bool skip_next_gap = false;
+    };
+
+    stream_state &str()
+    {
+        static stream_state s;
+        return s;
+    }
+
+    // P5.0. Forward-declared above present_frame. Copies out the pointer and
+    // geometry under the stream's lock and returns immediately - the caller
+    // does GPU work with it, and holding a lock the GAME'S render thread takes
+    // every frame across that work is the one thing this add-on must never do.
+    //
+    // Safe to hand out a raw pointer here only because both the caller and the
+    // only code that releases it (stream_release, from stream_poll) run on the
+    // bridge thread, sequentially. If a consumer thread is ever added - see the
+    // note in stream_poll - this becomes a lifetime bug and must be revisited
+    // with it.
+
+    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt)
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (!s.nr_ok || s.tex_out == nullptr || s.profile) return nullptr;
+        w = s.width; h = s.height; fmt = s.format;
+        return s.tex_out;
+    }
+
+    // Read Fault= out of mgpu.ini beside the add-on. Deliberately tiny and
+    // deliberately failure-tolerant: this must never be a reason a run does not
+    // happen.
+    // P5.0: Frames=<n> raises or lowers the stream's self-imposed bound. The
+    // default of 600 is about fifteen seconds, which was right while the only
+    // output was a log line and is too short to look at anything. Clamped at
+    // both ends: below 60 there is nothing to measure, and the bound exists to
+    // stop a misbehaving build costing the whole session.
+    unsigned long long stream_read_frames()
+    {
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return 600ull;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return 600ull;
+        const char *k = strstr(buf, "Frames=");
+        if (k == nullptr) return 600ull;
+        const long long v = atoll(k + 7);
+        if (v < 60) return 60ull;
+        if (v > 100000) return 100000ull;
+        return (unsigned long long)v;
+    }
+
+    // P5.1: Profile=1 strips display and liveness sampling for measurement runs.
+    bool stream_read_profile()
+    {
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return false;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return false;
+        const char *k = strstr(buf, "Profile=");
+        return (k != nullptr) && (k[8] == '1');
+    }
+
+    // Returns false when the file explicitly says Neural=0.
+    bool stream_read_neural()
+    {
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return true;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return true;
+        const char *k = strstr(buf, "Neural=");
+        return (k == nullptr) || (k[7] != '0');
+    }
+
+    void stream_read_fault(char *out, size_t n)
+    {
+        snprintf(out, n, "none");
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return;
+        const char *k = strstr(buf, "Fault=");
+        if (k == nullptr) return;
+        k += 6;
+        size_t i = 0;
+        while (i + 1 < n && k[i] != '\0' && k[i] != '\r' && k[i] != '\n' && k[i] != ' ')
+        { out[i] = k[i]; ++i; }
+        out[i] = '\0';
+        if (i == 0) snprintf(out, n, "none");
+    }
+
+    void stream_release()
+    {
+        stream_state &s = str();
+        // The NGX feature first: it holds references to tex_in/tex_out.
+        if (s.nr_handle != nullptr && s.nr_release != nullptr)
+            (void)s.nr_release(s.nr_handle);
+        s.nr_handle = nullptr;
+        if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
+        if (s.tex_out != nullptr) { s.tex_out->Release(); s.tex_out = nullptr; }
+        if (s.tex_in  != nullptr) { s.tex_in->Release();  s.tex_in = nullptr; }
+        // nr_params is NOT destroyed: it is the core's capability block and the
+        // NGX session is deliberately kept open for the process lifetime.
+        if (s.gup != nullptr && s.gup_cpu != nullptr) { s.gup->Unmap(0, nullptr); }
+        s.gup_cpu = nullptr;
+        if (s.nev != nullptr) { CloseHandle(s.nev); s.nev = nullptr; }
+        if (s.nf  != nullptr) { s.nf->Release();  s.nf = nullptr; }
+        if (s.nl  != nullptr) { s.nl->Release();  s.nl = nullptr; }
+        if (s.na  != nullptr) { s.na->Release();  s.na = nullptr; }
+        if (s.nq  != nullptr) { s.nq->Release();  s.nq = nullptr; }
+        if (s.gate_ev != nullptr) { CloseHandle(s.gate_ev); s.gate_ev = nullptr; }
+        if (s.tsread != nullptr) { s.tsread->Release(); s.tsread = nullptr; }
+        if (s.tsheap != nullptr) { s.tsheap->Release(); s.tsheap = nullptr; }
+        if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
+        if (s.nfence != nullptr) { s.nfence->Release(); s.nfence = nullptr; }
+        if (s.gfence_share != nullptr) { CloseHandle(s.gfence_share); s.gfence_share = nullptr; }
+        if (s.gfence != nullptr) { s.gfence->Release(); s.gfence = nullptr; }
+        if (s.nxfer != nullptr) { s.nxfer->Release(); s.nxfer = nullptr; }
+        if (s.nheap != nullptr) { s.nheap->Release(); s.nheap = nullptr; }
+        if (s.gup   != nullptr) { s.gup->Release();   s.gup = nullptr; }
+        if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
+        if (s.gheap != nullptr) { s.gheap->Release(); s.gheap = nullptr; }
+        if (s.gshare!= nullptr) { CloseHandle(s.gshare); s.gshare = nullptr; }
+        s.gdev = nullptr;
+        s.armed = false;
+    }
+}
+
+namespace
+{
+    // P4.1. Bring up a PERSISTENT DLSS-NR stage on GPU 1, sized and formatted
+    // to the stream. Called once, lazily, on the bridge thread, after the first
+    // seal has told us the geometry is real.
+    //
+    // It re-resolves and re-Inits rather than borrowing anything from
+    // ngx_probe. That is legitimate and was proved by P3.0: the NGX session is
+    // never shut down, and a second full Init -> GetCapabilityParameters ->
+    // snippet Init_Ext -> PopulateParameters_Impl sequence returns Success and
+    // yields a NEW parameter block and a NEW feature handle. Independence is
+    // worth more here than sharing: this stage outlives every probe, and a
+    // probe's teardown must not be able to take it down.
+    bool stream_nr_create(stream_state &s, ID3D12Device *ndev)
+    {
+        char line[900];
+
+        ngx_modules mods;
+        mods.core = GetModuleHandleW(L"_nvngx.dll");
+        if (mods.core == nullptr) mods.core = LoadLibraryW(L"_nvngx.dll");
+        mods.snippet = GetModuleHandleW(L"nvngx_dlssnr.dll");
+        if (mods.snippet == nullptr) mods.snippet = LoadLibraryW(L"nvngx_dlssnr.dll");
+        if (mods.core == nullptr || mods.snippet == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] NGX modules not reachable - the stream runs "
+                              "transport-only and says so in the summary");
+            return false;
+        }
+
+        char w[8][160] = {};
+        ngx_pf_init           p_init  = (ngx_pf_init)          ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
+        ngx_pf_get_cap_params p_caps  = (ngx_pf_get_cap_params)ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w[1], sizeof w[1]);
+        ngx_pf_init_ext       p_iext  = (ngx_pf_init_ext)      ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext", w[2], sizeof w[2]);
+        ngx_pf_populate_params p_pop  = (ngx_pf_populate_params)ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl", w[3], sizeof w[3]);
+        ngx_pf_create_feature p_cre   = (ngx_pf_create_feature)ngx_resolve(mods, "NVSDK_NGX_D3D12_CreateFeature",           ngx_prefer::snippet, w[4], sizeof w[4]);
+        s.nr_eval    = (ngx_pf_evaluate_feature)ngx_resolve(mods, "NVSDK_NGX_D3D12_EvaluateFeature", ngx_prefer::snippet, w[5], sizeof w[5]);
+        s.nr_release = (ngx_pf_release_feature) ngx_resolve(mods, "NVSDK_NGX_D3D12_ReleaseFeature",  ngx_prefer::snippet, w[6], sizeof w[6]);
+        if (p_init == nullptr || p_caps == nullptr || p_iext == nullptr || p_pop == nullptr ||
+            p_cre == nullptr || s.nr_eval == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] an NGX entry point did not resolve - transport-only");
+            return false;
+        }
+
+        wchar_t data_path[MAX_PATH] = {};
+        {
+            wchar_t mp[MAX_PATH] = {};
+            const DWORD n = GetModuleFileNameW(mgpu::module_handle(), mp, MAX_PATH);
+            if (n != 0 && n < MAX_PATH)
+            {
+                size_t cut = 0;
+                for (size_t i = 0; i + 1 < (size_t)n; ++i) if (mp[i] == L'\\') cut = i + 1;
+                for (size_t i = 0; i < cut; ++i) data_path[i] = mp[i];
+            }
+        }
+
+        NVSDK_NGX_FeatureCommonInfo common{};
+        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
+        // A non-Success here is expected and ignored for the same reason P3.0
+        // ignores it: this is the Nth Init of a session that was never shut
+        // down. CreateFeature below is where a genuinely broken session says so.
+        snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
+                 (unsigned)r, ngx_result_name(r));
+        mgpu::diag::info(line);
+
+        r = p_caps(&s.nr_params);
+        if (r != NVSDK_NGX_Result_Success || s.nr_params == nullptr)
+        {
+            snprintf(line, sizeof line, "[MGPU][P4.1] GetCapabilityParameters failed 0x%08X (%s)",
+                     (unsigned)r, ngx_result_name(r));
+            mgpu::diag::error(line);
+            return false;
+        }
+        (void)p_iext(0ULL, data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);
+        (void)p_pop(s.nr_params);
+        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
+        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+
+        // NATIVE FORMAT, no conversion. P3.1 established DLSS-NR consumes the
+        // game's R10G10B10A2 buffer as rendered, so the stream hands it over
+        // untouched and no per-frame conversion pass exists in this pipeline.
+        HRESULT h = make_tex(ndev, s.width, s.height, s.format,
+                             D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_in);
+        if (SUCCEEDED(h))
+            h = make_tex(ndev, s.width, s.height, s.format,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_out);
+        if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
+        if (FAILED(h))
+        {
+            snprintf(line, sizeof line, "[MGPU][P4.1] resource creation failed hr=0x%08X", (unsigned)h);
+            mgpu::diag::error(line);
+            return false;
+        }
+
+        // The liveness sample: a 64x4 corner of the OUTPUT, 1024 bytes, copied
+        // once per frame. It is a rate check, not a quality check - see the
+        // summary text for exactly what a high identical-rate does and does not
+        // mean.
+        s.nr_fp.Offset = 0;
+        s.nr_fp.Footprint.Format = s.format;
+        s.nr_fp.Footprint.Width = 64;
+        s.nr_fp.Footprint.Height = 4;
+        s.nr_fp.Footprint.Depth = 1;
+        s.nr_fp.Footprint.RowPitch = 256;
+
+        // CreateFeature records init work into the list it is handed, and that
+        // work must execute before anything it touched is released - P1.0's
+        // teardown crash. One list, closed, executed, waited.
+        HRESULT ch = s.na->Reset();
+        if (SUCCEEDED(ch)) ch = s.nl->Reset(s.na, nullptr);
+        if (SUCCEEDED(ch))
+        {
+            const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
+            r = p_cre(s.nl, (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                      s.nr_params, &s.nr_handle);
+            LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
+            LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.1] CreateFeature(Reserved18) %ux%u fmt=%d: result=0x%08X (%s) "
+                     "handle=0x%p elapsed=%.0fms",
+                     s.width, s.height, (int)s.format, (unsigned)r, ngx_result_name(r),
+                     (void *)s.nr_handle,
+                     (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
+            mgpu::diag::info(line);
+            ch = s.nl->Close();
+        }
+        if (SUCCEEDED(ch))
+        {
+            ID3D12CommandList *const ls[1] = { s.nl };
+            s.nq->ExecuteCommandLists(1, ls);
+            ++s.nf_value;
+            ch = s.nq->Signal(s.nf, s.nf_value);
+            if (SUCCEEDED(ch))
+            {
+                s.nf->SetEventOnCompletion(s.nf_value, s.nev);
+                if (WaitForSingleObject(s.nev, 20000) != WAIT_OBJECT_0) ch = E_FAIL;
+            }
+        }
+        if (FAILED(ch) || r != NVSDK_NGX_Result_Success || s.nr_handle == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] the neural stage did not come up - the stream "
+                              "continues TRANSPORT-ONLY and the summary says so");
+            return false;
+        }
+        return true;
+    }
+}
+
+// NOTE: at namespace scope, NOT in the anonymous namespace above. It is
+// declared in the header, so it needs external linkage; defining it beside
+// str() gave it internal linkage and worker.cpp failed to link against it.
+// The file-static helpers it calls are reachable from here because this is
+// the same translation unit.
+// P5.1. THE PRESENT GATE - the pipeline cleanup, and it is two fixes in one.
+//
+// The bridge's present loop ran at the display's refresh - 210 fps - and
+// P5.0 copied a full frame into the backbuffer on every one of them, new
+// or not. At 1600x900 that is ~1.2 GB/s of GPU 1 bandwidth spent
+// re-showing frames already on screen, plus a DWM cross-adapter copy per
+// present while GPU 1 is headless, on the SAME LINK the payload uses. The
+// measurement arm was competing with itself.
+//
+// Now the loop presents only when a new neural frame exists - about 57 per
+// second instead of 210, so three quarters of those copies and three
+// quarters of that DWM traffic simply stop happening.
+//
+// AND IT FIXES THE PACING COUPLING FROM SECTION 05a AS A SIDE EFFECT. The
+// consumer used to be polled once per present, so its cadence was the
+// bridge swapchain's vsync - 3.23x the producer's rate on a 210 Hz panel
+// and 1.01x on a 60 Hz one. Now the idle path blocks on the SHARED FENCE
+// event for the next frame instead, with a short timeout as a backstop, so
+// the consumer wakes when a frame actually lands and its rate no longer
+// depends on what display GPU 1 is attached to.
+//
+// THE FENCE WAIT HAPPENS OUTSIDE THE LOCK. The stream mutex is taken by
+// the event handler on the GAME'S render thread every frame; holding it
+// across a wait is the one hazard in this add-on that can reach the
+// application. The pointer and the target value are copied out under the
+// lock, the lock is released, and only then does anything block.
+//
+// Returns true when the caller should present.
+bool stream_present_gate(unsigned long timeout_ms)
+{
+    stream_state &s = str();
+    ID3D12Fence *f = nullptr;
+    UINT64 want = 0;
+    HANDLE ev = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        // Not streaming: behave exactly as the loop always has. The
+        // cycling colour is T5's liveness proof and must not stop because
+        // the stream is idle.
+        //
+        // NOTE THE CONDITION IS ONLY `armed`. An earlier version of this
+        // also short-circuited on `!nr_ok` and on `profile`, which had the
+        // gate wide open in exactly the two configurations that exist to
+        // minimise overhead - the transport-only control and the
+        // measurement run would both have presented at 210 fps and paid
+        // the full DWM cross-adapter cost this gate was written to remove.
+        // Gating is about whether a new FRAME exists, not about whether we
+        // intend to draw it: the cycling colour updating at the producer's
+        // rate instead of the display's is still a live window.
+        if (!s.armed || s.summarised)
+        { ++s.gate_presents; return true; }
+
+        if (s.consumed != s.presented)
+        {
+            s.presented = s.consumed;
+            ++s.gate_presents;
+            return true;
+        }
+        f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
+        ++s.gate_idle;
+    }
+
+    if (f != nullptr && ev != nullptr)
+    {
+        ++str().gate_waits;
+        f->SetEventOnCompletion(want, ev);
+        WaitForSingleObject(ev, timeout_ms);
+    }
+    return false;
+}
+
+void stream_request()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (s.finished)
+    {
+        mgpu::diag::info("[MGPU][P4.0] stream already ran to its bound this launch. One stream "
+                         "per process, by design - restart to run another.");
+        return;
+    }
+    if (s.requested) return;
+    s.requested = true;
+    stream_read_fault(s.fault, sizeof s.fault);
+    s.neural = stream_read_neural();
+    s.max_frames = stream_read_frames();
+    s.profile = stream_read_profile();
+
+    // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
+    // accepted ANY string, so a name this build cannot inject - "drop" and
+    // "stale" were both tried - silently injected nothing, the run came back
+    // with every counter zero, and the fault-injected warning then declared
+    // that "the checker did not trip and the instrument is not yet
+    // trustworthy". That is a FALSE ACCUSATION AGAINST A WORKING CHECKER,
+    // produced by the instrument's own permissiveness. An unknown name is now
+    // refused loudly, by name, with the implemented set listed.
+    {
+        static const char *KNOWN[] = { "none", "pitch", "alias", "magic", "drop", "stale" };
+        bool ok = false;
+        for (unsigned i = 0; i < sizeof KNOWN / sizeof KNOWN[0]; ++i)
+            if (strcmp(s.fault, KNOWN[i]) == 0) { ok = true; break; }
+        if (!ok)
+        {
+            char e[500];
+            snprintf(e, sizeof e,
+                     "[MGPU][P4.0] mgpu.ini requests Fault=\"%s\", which this build CANNOT "
+                     "inject. Implemented: pitch, alias, magic, drop, stale. Running clean "
+                     "instead - and the summary will say so, because a run that injects nothing "
+                     "and reports all-zero counters would otherwise read as a checker that "
+                     "failed to trip. NOT implemented: tear, which needs the barcode shader to "
+                     "have anything to check against.", s.fault);
+            mgpu::diag::error(e);
+            s.fault_unimpl = true;
+            snprintf(s.fault, sizeof s.fault, "none");
+        }
+    }
+    char l[500];
+    snprintf(l, sizeof l,
+             "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\", "
+             "neural=%s, profile=%s. "
+             "Every game frame from the next one is sealed and transited until the bound is "
+             "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
+             "measures identity and ordering correctly and tells you nothing about anything "
+             "else.",
+             stream_state::RING, s.max_frames, s.fault,
+             s.neural ? "ON (P4.1 - DLSS-NR runs on every consumed frame)"
+                      : "off (P4.0 transport-only control)",
+             s.profile ? "ON (no on-screen output, no liveness sample - measurement run)"
+                       : "off");
+    mgpu::diag::info(l);
+}
+
+// Game thread, every frame, with the game's command list open.
+void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
+                              unsigned long long rtv_handle)
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (!s.requested || s.finished) return;
+
+    ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
+    ID3D12Resource *src = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)rtv_handle);
+    ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
+    if (gl == nullptr || src == nullptr || gq == nullptr) return;
+
+    // FILTER FIRST, ALWAYS. The bridge's own effect runtime raises this event
+    // too, and by LUID rather than by pointer: ReShade wraps D3D12 objects, so
+    // a pointer comparison rejects every event including the right ones.
+    ID3D12Device *ld = nullptr;
+    if (FAILED(gl->GetDevice(IID_PPV_ARGS(&ld))) || ld == nullptr) return;
+    const LUID ll = ld->GetAdapterLuid();
+    ld->Release();
+    {
+        LUID want{}; bool known = false;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            want = st().game_luid; known = st().game_luid_known;
+        }
+        if (!known || ll.LowPart != want.LowPart || ll.HighPart != want.HighPart)
+        {
+            if (!s.said_other)
+            {
+                s.said_other = true;
+                mgpu::diag::info("[MGPU][P4.0] ignoring events from the bridge's own runtime "
+                                 "(correct - said once)");
+            }
+            return;
+        }
+    }
+
+    char line[900];
+
+    // ---- arm on the first game-adapter event, record nothing ----
+    if (!s.armed)
+    {
+        if (s.tried) return;
+        s.tried = true;
+
+        ID3D12Device *gdev = nullptr;
+        if (FAILED(src->GetDevice(IID_PPV_ARGS(&gdev))) || gdev == nullptr) return;
+        s.gdev = gdev;
+
+        QueryPerformanceFrequency(&s.freq);
+
+        const D3D12_RESOURCE_DESC rd = src->GetDesc();
+        s.width = (UINT)rd.Width; s.height = rd.Height; s.format = rd.Format;
+        UINT rows = 0; UINT64 rowb = 0;
+        gdev->GetCopyableFootprints(&rd, 0, 1, 0, &s.fp, &rows, &rowb, &s.payload_bytes);
+
+        // One slot = seal (padded to the placement alignment) + payload,
+        // rounded up so that every slot offset is itself 512-aligned. Whole
+        // slots only: sub-slot arithmetic is how a ring aliases.
+        s.slot_bytes = ((SEAL_STRIDE + s.payload_bytes + SEAL_STRIDE - 1) / SEAL_STRIDE)
+                       * SEAL_STRIDE;
+
+        const UINT64 ALIGN = 65536;
+        const UINT64 heap_bytes =
+            ((s.slot_bytes * stream_state::RING + ALIGN - 1) / ALIGN) * ALIGN;
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hp.CreationNodeMask = 1; hp.VisibleNodeMask = 1;
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = heap_bytes; hd.Properties = hp; hd.Alignment = ALIGN;
+        hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED |
+                                      D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = heap_bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+        HRESULT h = gdev->CreateHeap(&hd, IID_PPV_ARGS(&s.gheap));
+        if (SUCCEEDED(h))
+            h = gdev->CreatePlacedResource(s.gheap, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                           nullptr, IID_PPV_ARGS(&s.gxfer));
+        if (SUCCEEDED(h))
+            h = gdev->CreateSharedHandle(s.gheap, nullptr, GENERIC_ALL, nullptr, &s.gshare);
+
+        // The seal staging buffer, persistently mapped. One UPLOAD buffer with
+        // RING seal slots: the CPU writes slot k while the GPU may still be
+        // reading slot k-1, which is what the ring is for.
+        if (SUCCEEDED(h))
+            h = make_buf(gdev, SEAL_STRIDE * stream_state::RING,
+                         D3D12_HEAP_TYPE_UPLOAD, &s.gup);
+        if (SUCCEEDED(h))
+        {
+            D3D12_RANGE none{0, 0};
+            h = s.gup->Map(0, &none, reinterpret_cast<void **>(&s.gup_cpu));
+            if (SUCCEEDED(h) && s.gup_cpu != nullptr)
+                memset(s.gup_cpu, 0, (size_t)(SEAL_STRIDE * stream_state::RING));
+            else h = E_FAIL;
+        }
+
+        // The produced-count fence. Its value IS the frame index, which is why
+        // there is only one of them for the whole ring.
+        if (SUCCEEDED(h))
+            h = gdev->CreateFence(0, (D3D12_FENCE_FLAGS)(D3D12_FENCE_FLAG_SHARED |
+                                                         D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER),
+                                  IID_PPV_ARGS(&s.gfence));
+        if (SUCCEEDED(h))
+            h = gdev->CreateSharedHandle(s.gfence, nullptr, GENERIC_ALL, nullptr,
+                                         &s.gfence_share);
+
+        ID3D12Device *ndev = nullptr;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            ndev = st().device;
+        }
+        if (SUCCEEDED(h) && ndev != nullptr)
+        {
+            h = ndev->OpenSharedHandle(s.gshare, IID_PPV_ARGS(&s.nheap));
+            if (SUCCEEDED(h))
+                h = ndev->CreatePlacedResource(s.nheap, 0, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                               nullptr, IID_PPV_ARGS(&s.nxfer));
+            if (SUCCEEDED(h)) h = ndev->OpenSharedHandle(s.gfence_share,
+                                                         IID_PPV_ARGS(&s.nfence));
+            if (SUCCEEDED(h))
+                h = make_buf(ndev, SEAL_STRIDE * stream_state::RING,
+                             D3D12_HEAP_TYPE_READBACK, &s.nseal);
+            if (SUCCEEDED(h))
+            {
+                D3D12_COMMAND_QUEUE_DESC qd{};
+                qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                h = ndev->CreateCommandQueue(&qd, IID_PPV_ARGS(&s.nq));
+            }
+            if (SUCCEEDED(h))
+                h = ndev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 IID_PPV_ARGS(&s.na));
+            if (SUCCEEDED(h))
+                h = ndev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.na, nullptr,
+                                            IID_PPV_ARGS(&s.nl));
+            if (SUCCEEDED(h)) h = s.nl->Close();
+            if (SUCCEEDED(h))
+                h = ndev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.nf));
+            if (SUCCEEDED(h))
+            {
+                s.nev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (s.nev == nullptr) h = E_FAIL;
+            }
+            if (SUCCEEDED(h))
+            {
+                s.gate_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (s.gate_ev == nullptr) h = E_FAIL;
+            }
+
+            // P2.2a. A timestamp query heap and its resolve target. Failure
+            // here is NOT fatal: the stream is a correctness instrument first
+            // and it must not stop transporting because a profiler could not be
+            // built. ts_ok gates every use and the summary says when it is off.
+            if (SUCCEEDED(h))
+            {
+                D3D12_QUERY_HEAP_DESC qh{};
+                qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+                qh.Count = stream_state::TS_MARKS;
+                qh.NodeMask = 0;
+                HRESULT th = ndev->CreateQueryHeap(&qh, IID_PPV_ARGS(&s.tsheap));
+                if (SUCCEEDED(th))
+                    th = make_buf(ndev, (UINT64)stream_state::TS_MARKS * 8,
+                                  D3D12_HEAP_TYPE_READBACK, &s.tsread);
+                if (SUCCEEDED(th)) th = s.nq->GetTimestampFrequency(&s.ts_freq);
+                s.ts_ok = SUCCEEDED(th) && s.ts_freq > 0;
+                for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i) s.ts_min[i] = 1e30;
+                char tl[400];
+                snprintf(tl, sizeof tl,
+                         "[MGPU][P2.2] GPU timestamps on GPU 1: query heap + "
+                         "GetTimestampFrequency hr=0x%08X freq=%llu ticks/s -> %s. These are "
+                         "GPU time, not wall-clock; no cross-adapter clock is involved.",
+                         (unsigned)th, (unsigned long long)s.ts_freq,
+                         s.ts_ok ? "ON" : "OFF (the stream runs unprofiled)");
+                mgpu::diag::info(tl);
+            }
+        }
+        else if (ndev == nullptr) h = E_FAIL;
+
+        snprintf(line, sizeof line,
+                 "[MGPU][P4.0] stream arm hr=0x%08X source=%ux%u fmt=%d rowPitch=%u "
+                 "payload=%llu slot=%llu ring=%u heap=%llu bytes. The heap is created on the "
+                 "GAME's device: its command list can only reference resources from the device "
+                 "that made it.",
+                 (unsigned)h, s.width, s.height, (int)s.format,
+                 (unsigned)s.fp.Footprint.RowPitch, (unsigned long long)s.payload_bytes,
+                 (unsigned long long)s.slot_bytes, stream_state::RING,
+                 (unsigned long long)heap_bytes);
+        mgpu::diag::info(line);
+
+        if (FAILED(h))
+        {
+            mgpu::diag::error("[MGPU][P4.0] arm failed - the stream is inert for this launch and "
+                              "the game's command list is never touched");
+            s.finished = true;
+            stream_release();
+            return;
+        }
+        s.armed = true;
+        return;    // record nothing on the arming frame
+    }
+
+    // ---- SIGNAL THE PREVIOUS FRAME, THEN RECORD THIS ONE ----
+    //
+    // The same ordering rule P2.0 established, now generalised to a stream.
+    // ReShade executes the list we recorded into AFTER this handler returns, so
+    // a signal issued in the same event sits AHEAD of our own copies and would
+    // clear before the data existed. By the time the next event arrives, the
+    // previous frame's list has necessarily been submitted - it had to be, to
+    // present - so a Signal here lands behind it. One fence, whose value is the
+    // count of frames whose copies are known to have been submitted.
+    if (s.produced > 0)
+        (void)gq->Signal(s.gfence, s.produced);
+
+    if (s.produced >= s.max_frames)
+    {
+        // Bound reached. Stop touching the game's list; the bridge thread
+        // prints the summary once the last frames have been consumed.
+        s.finished = true;
+        return;
+    }
+
+    const unsigned long long fi = s.produced + 1;
+
+    // FAULT "drop": burn frame index 40 without writing anything for it. The
+    // fence still advances, so the consumer is told frame 40 landed and finds
+    // whatever the slot held three frames ago. Expected diagnosis: REORDERED at
+    // f=40 (the slot holds an older index), then DROPPED gap=2 at f=41.
+    // Deliberately models a PRODUCER drop - a frame the game rendered that
+    // never made it into the ring - which is a different failure from the
+    // consumer falling behind, and is counted separately for that reason.
+    if (strcmp(s.fault, "drop") == 0 && fi == 40)
+    {
+        s.produced = fi;
+        return;
+    }
+
+    const unsigned slot = (unsigned)((fi - 1) % stream_state::RING);
+    const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+
+    MgpuSeal seal{};
+    seal.magic = SEAL_MAGIC;
+    seal.seal_version = SEAL_VERSION;
+    seal.frame_index = fi;
+    seal.qpc_submit = (unsigned long long)now.QuadPart;
+    seal.payload_bytes = s.payload_bytes;
+    seal.width = s.width;
+    seal.height = s.height;
+    seal.dxgi_format = (unsigned)s.format;
+    seal.row_pitch = s.fp.Footprint.RowPitch;
+    seal.slot_index = slot;
+    seal.barcode = 0;      // NOT IMPLEMENTED - see the note at the top
+
+    // Fault injection. Each of these corrupts exactly one field, so the
+    // checker's diagnosis names the field it was given. Absent = none.
+    if (strcmp(s.fault, "pitch") == 0 && fi == 30) seal.row_pitch += 20;
+    if (strcmp(s.fault, "alias") == 0 && fi == 30) seal.slot_index =
+        (slot + 1) % stream_state::RING;
+    if (strcmp(s.fault, "magic") == 0 && fi == 30) seal.magic = 0xDEADBEEFu;
+
+    memcpy(s.gup_cpu + (size_t)(slot * SEAL_STRIDE), &seal, sizeof seal);
+
+    // Seal first, payload second, in one list. Command-list order guarantees
+    // the seal is written before the pixels within the same submission, and the
+    // single fence signal covers both.
+    gl->CopyBufferRegion(s.gxfer, slot_off, s.gup, (UINT64)slot * SEAL_STRIDE, sizeof(MgpuSeal));
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = src;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    gl->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
+    cs.pResource = src; cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    cs.SubresourceIndex = 0;
+    cd.pResource = s.gxfer; cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    cd.PlacedFootprint = s.fp; cd.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+    gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+
+    // Restore EXACTLY. The game did not ask us to change its resource state and
+    // must not be able to tell that we did.
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    gl->ResourceBarrier(1, &b);
+
+    s.produced = fi;
+}
+
+// Bridge thread, once per present. Cheap and does nothing until frames exist.
+void stream_poll()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (!s.armed || s.summarised) return;
+
+    // WHY THIS IS STILL CALLED FROM THE PRESENT LOOP, AND WHY THAT IS WRONG.
+    //
+    // One poll per bridge present ties the consumer's cadence to the bridge
+    // swapchain's vsync. That was invisible while GPU 1 was headless and its
+    // present loop ran at 210 fps; attaching a 60 Hz monitor made it 1.01x the
+    // producer's rate and the coupling became the limiting factor.
+    //
+    // The right design is a consumer that blocks on the shared fence event for
+    // frame consumed+1 and wakes exactly when it lands - display-independent,
+    // lower latency, no polling at all. That needs the consumer off the bridge
+    // thread, and it is NOT written here on purpose: the stream mutex is also
+    // taken by stream_on_finish_effects on the GAME'S RENDER THREAD every
+    // frame, so a consumer thread that held it across a GPU wait would stall
+    // the game. Getting that locking wrong is the one bug in this add-on that
+    // could reach into the application, and it is not something to write blind
+    // against a rig I cannot run.
+    //
+    // So: ring depth absorbs it for now (see RING), the summary says loudly
+    // when the margin is gone, and the real fix lands with the display path
+    // that actually needs it.
+    ++s.polls;
+
+    const unsigned long long completed =
+        (s.nfence != nullptr) ? (unsigned long long)s.nfence->GetCompletedValue() : 0;
+
+    char line[1000];
+
+    if (s.consumed >= completed) ++s.idle_polls;
+
+    // P4.1: bring the neural stage up on the first frame that is actually
+    // consumable. Not at arm time - the geometry is only trustworthy once a
+    // seal has carried it across, and CreateFeature costs ~180 ms that would
+    // otherwise be spent before we knew the stream worked at all.
+    if (s.neural && !s.nr_tried && s.consumed < completed)
+    {
+        s.nr_tried = true;
+        ID3D12Device *ndev = nullptr;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            ndev = st().device;
+        }
+        s.nr_ok = (ndev != nullptr) && stream_nr_create(s, ndev);
+    }
+
+    while (s.consumed < completed)
+    {
+        const unsigned long long f = s.consumed + 1;
+
+        // The slot for frame f has been recycled if the producer is more than
+        // RING frames ahead. That is a real, nameable condition - THE CONSUMER
+        // FELL BEHIND - and it is emphatically NOT a producer drop. Conflating
+        // the two would report our own slowness as the game's fault.
+        if (completed >= f + stream_state::RING)
+        {
+            ++s.overrun;
+            s.consumed = f;
+            if (!s.said_overrun)
+            {
+                s.said_overrun = true;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] CONSUMER OVERRUN at f=%llu: the producer is %llu frames "
+                         "ahead of us and ring depth is %u, so this slot was rewritten before it "
+                         "was read. This is OUR slowness, not a dropped frame - counted "
+                         "separately for exactly that reason. Said once; the summary carries the "
+                         "total.",
+                         f, completed - f, stream_state::RING);
+                mgpu::diag::warn(line);
+            }
+            continue;
+        }
+
+        unsigned slot = (unsigned)((f - 1) % stream_state::RING);
+
+        // FAULT "stale": read the PREVIOUS slot once, at f=40. This is a
+        // consumer-side injection on purpose - it models the ring's indexing
+        // being wrong rather than the transport being wrong, and those have
+        // different fixes. Expected diagnosis: RING ALIAS (the seal's own
+        // slot_index will not match the slot we read) plus REORDERED.
+        if (strcmp(s.fault, "stale") == 0 && f == 40)
+            slot = (slot + stream_state::RING - 1) % stream_state::RING;
+
+        const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
+
+        HRESULT h = s.na->Reset();
+        if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
+        if (SUCCEEDED(h))
+        {
+            if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+
+            s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
+                                   s.nxfer, slot_off, sizeof(MgpuSeal));
+
+            if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+            // ---- P4.1: the neural stage, in the SAME list as the seal read ----
+            //
+            // Unpack this slot's payload into the NR input, evaluate, and take a
+            // small sample of the output. One list, one submission, one wait per
+            // consumed frame - which is also why the consumer's pace with the
+            // stage attached is directly comparable to its pace without it.
+            if (s.nr_ok)
+            {
+                D3D12_TEXTURE_COPY_LOCATION us{}, ud{};
+                us.pResource = s.nxfer;
+                us.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                us.PlacedFootprint = s.fp;
+                us.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+                ud.pResource = s.tex_in;
+                ud.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                ud.SubresourceIndex = 0;
+                s.nl->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
+                barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+
+                s.nr_params->Set("DLSSNR.Color", s.tex_in);
+                s.nr_params->Set("DLSSNR.Output", s.tex_out);
+                s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+                s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+                s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.width);
+                s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.height);
+                s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+                s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+                s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.width);
+                s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
+                s.nr_params->Set("DLSSNR.Intensity", 0.84f);
+                // RESET ON THE FIRST FRAME ONLY. Every probe so far set Reset=1
+                // on every evaluate, because each was an independent experiment
+                // and history between them would have contaminated the control.
+                // A stream is the opposite case: dlssnr_prev_output is temporal
+                // history and it is supposed to carry. This is the first code in
+                // the project that lets NR accumulate across frames, and if the
+                // output ever looks smeared or ghosted, this line is the first
+                // thing to try at 1.
+                s.nr_params->Set("DLSSNR.Reset", s.nr_first ? 1u : 0u);
+                s.nr_first = false;
+
+                const NVSDK_NGX_Result er =
+                    s.nr_eval(s.nl, s.nr_handle, s.nr_params, nullptr);
+                ++s.nr_evals;
+                if (er != NVSDK_NGX_Result_Success)
+                {
+                    ++s.nr_fails;
+                    if (s.nr_fails <= 3)
+                    {
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P4.1] EvaluateFeature f=%llu: 0x%08X (%s)",
+                                 f, (unsigned)er, ngx_result_name(er));
+                        mgpu::diag::error(line);
+                    }
+                }
+
+                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+
+                if (!s.profile)
+                {
+                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION ss{}, sd{};
+                ss.pResource = s.tex_out;
+                ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                ss.SubresourceIndex = 0;
+                sd.pResource = s.nr_read;
+                sd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                sd.PlacedFootprint = s.nr_fp;
+                D3D12_BOX box{ 0, 0, 0, 64, 4, 1 };
+                s.nl->CopyTextureRegion(&sd, 0, 0, 0, &ss, &box);
+                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
+                barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+
+                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
+            }
+
+            // Resolve after every mark is written, never before: the resolve
+            // reads the heap on the GPU timeline and a mark recorded after it
+            // would not be in the buffer we map.
+            if (s.ts_ok && s.nr_ok)
+                s.nl->ResolveQueryData(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                       stream_state::TS_MARKS, s.tsread, 0);
+
+            h = s.nl->Close();
+        }
+        if (SUCCEEDED(h))
+        {
+            ID3D12CommandList *const ls[1] = { s.nl };
+            s.nq->ExecuteCommandLists(1, ls);
+            ++s.nf_value;
+            h = s.nq->Signal(s.nf, s.nf_value);
+            if (SUCCEEDED(h))
+            {
+                s.nf->SetEventOnCompletion(s.nf_value, s.nev);
+                if (WaitForSingleObject(s.nev, 5000) != WAIT_OBJECT_0) h = E_FAIL;
+            }
+        }
+        if (FAILED(h)) { s.consumed = f; continue; }
+
+        MgpuSeal got{};
+        const unsigned char *m = nullptr;
+        D3D12_RANGE rr{ (SIZE_T)(slot * SEAL_STRIDE),
+                        (SIZE_T)(slot * SEAL_STRIDE + sizeof(MgpuSeal)) };
+        if (SUCCEEDED(s.nseal->Map(0, &rr, (void **)&m)) && m != nullptr)
+        {
+            memcpy(&got, m + (size_t)(slot * SEAL_STRIDE), sizeof got);
+            D3D12_RANGE none{0, 0};
+            s.nseal->Unmap(0, &none);
+        }
+        else { s.consumed = f; continue; }
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+
+        // P2.2a: the per-stage GPU times for this frame. Read only when the
+        // neural stage is up, because with it off marks 2..4 are never written
+        // and the deltas would be garbage rather than zero.
+        if (s.ts_ok && s.nr_ok)
+        {
+            const UINT64 *tv = nullptr;
+            D3D12_RANGE tr{0, (SIZE_T)(stream_state::TS_MARKS * 8)};
+            if (SUCCEEDED(s.tsread->Map(0, &tr, (void **)&tv)) && tv != nullptr)
+            {
+                bool sane = true;
+                for (UINT i = 1; i < stream_state::TS_MARKS; ++i)
+                    if (tv[i] < tv[i - 1]) sane = false;   // a wrapped or unwritten mark
+                if (sane)
+                {
+                    for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i)
+                    {
+                        const double ms = (double)(tv[i + 1] - tv[i]) * 1000.0
+                                        / (double)s.ts_freq;
+                        s.ts_sum[i] += ms;
+                        if (ms < s.ts_min[i]) s.ts_min[i] = ms;
+                        if (ms > s.ts_max[i]) s.ts_max[i] = ms;
+                    }
+                    ++s.ts_n;
+                }
+                D3D12_RANGE tn{0, 0};
+                s.tsread->Unmap(0, &tn);
+            }
+        }
+
+        // The liveness sample. Compared against the PREVIOUS frame's, not
+        // against a value we chose - section 00a's rule. What a high
+        // identical-rate means is ambiguous by construction and the summary
+        // says so: a static scene produces identical NR output legitimately.
+        // It is a rate to be read alongside the scene, not a verdict.
+        if (s.nr_ok && !s.profile)
+        {
+            unsigned char *sm = nullptr;
+            D3D12_RANGE sr{0, 1024};
+            if (SUCCEEDED(s.nr_read->Map(0, &sr, (void **)&sm)) && sm != nullptr)
+            {
+                if (s.nr_have_prev && memcmp(sm, s.nr_prev, 1024) == 0) ++s.nr_same;
+                memcpy(s.nr_prev, sm, 1024);
+                s.nr_have_prev = true;
+                D3D12_RANGE nn{0, 0};
+                s.nr_read->Unmap(0, &nn);
+            }
+        }
+
+        if (got.magic != SEAL_MAGIC || got.seal_version != SEAL_VERSION)
+        {
+            ++s.bad_magic;
+            snprintf(line, sizeof line,
+                     "[MGPU][SEAL] BAD MAGIC f=%llu slot=%u: magic=0x%08X version=%u. Nothing "
+                     "arrived at this offset, or the two ends disagree about the layout.",
+                     f, slot, got.magic, got.seal_version);
+            mgpu::diag::error(line);
+            // DEFECT B, found on the rig 2026-09-04. A rejected seal never
+            // reaches the frame_index bookkeeping below, so `last_seen` stays
+            // where it was and the NEXT frame computes gap=2 and reports a
+            // DROPPED that did not happen. The magic run showed exactly that:
+            // one injected corruption, two counters, and a producer blamed for
+            // a fault entirely on the consumer's side. One rejected seal is
+            // one failure; the following frame resynchronises silently and is
+            // counted here so the suppression is visible rather than implied.
+            ++s.resync;
+            s.skip_next_gap = true;
+        }
+        else
+        {
+            if (got.slot_index != slot)
+            {
+                ++s.alias;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] RING ALIAS f=%llu: seal claims slot %u, read from slot %u",
+                         f, got.slot_index, slot);
+                mgpu::diag::error(line);
+            }
+            if (got.width != s.width || got.height != s.height ||
+                got.dxgi_format != (unsigned)s.format ||
+                got.row_pitch != s.fp.Footprint.RowPitch ||
+                got.payload_bytes != s.payload_bytes)
+            {
+                ++s.contract;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] CONTRACT MISMATCH f=%llu: seal %ux%u fmt=%u pitch=%u "
+                         "bytes=%llu | expected %ux%u fmt=%u pitch=%u bytes=%llu",
+                         f, got.width, got.height, got.dxgi_format, got.row_pitch,
+                         (unsigned long long)got.payload_bytes,
+                         s.width, s.height, (unsigned)s.format,
+                         (unsigned)s.fp.Footprint.RowPitch,
+                         (unsigned long long)s.payload_bytes);
+                mgpu::diag::error(line);
+            }
+
+            // Equal is NOT reuse here - this consumer never re-reads a frame,
+            // so an equal index means the slot held the previous frame's seal
+            // when it should have held this one. That is a genuine stale read,
+            // and calling it "reuse" (as the first build's counter did) would
+            // have filed a real fault under an expected-behaviour label.
+            if (got.frame_index == s.last_seen && s.last_seen != 0)
+            {
+                ++s.dropped;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] STALE f=%llu: the slot still holds seal %llu. The fence "
+                         "said frame %llu had landed and it had not.",
+                         f, (unsigned long long)got.frame_index, f);
+                mgpu::diag::error(line);
+            }
+            else if (got.frame_index < s.last_seen)
+            {
+                ++s.reordered;
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] REORDERED f=%llu: seal says %llu, last seen %llu",
+                         f, (unsigned long long)got.frame_index, s.last_seen);
+                mgpu::diag::error(line);
+            }
+            else
+            {
+                const unsigned long long gap = got.frame_index - s.last_seen;
+                if (s.skip_next_gap)
+                {
+                    // Resynchronising after a rejected seal - see DEFECT B.
+                    s.skip_next_gap = false;
+                }
+                else if (s.last_seen != 0 && gap != 1)
+                {
+                    ++s.dropped;
+                    snprintf(line, sizeof line,
+                             "[MGPU][SEAL] DROPPED f=%llu gap=%llu (last_new=%llu)",
+                             f, gap, s.last_seen);
+                    mgpu::diag::error(line);
+                }
+                const double lat = (s.freq.QuadPart > 0)
+                    ? ((double)(now.QuadPart - (long long)got.qpc_submit) * 1000.0
+                       / (double)s.freq.QuadPart) : 0.0;
+                if (lat < s.lat_min) s.lat_min = lat;
+                if (lat > s.lat_max) { s.lat_max = lat; s.lat_max_frame = got.frame_index; }
+                if (s.lat_n == 0) s.first_lat = lat;
+                s.lat_sum += lat; ++s.lat_n;
+                if (slot < stream_state::RING) ++s.slot_hits[slot];
+                s.last_seen = got.frame_index;
+
+                // 61, not 60: the stride must be COPRIME with the ring depth or
+                // every sampled line lands on the same slot and the log implies
+                // a ring that is not being used.
+                if ((got.frame_index % 61) == 0)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][SEAL] new f=%llu slot=%u gap=%llu lat=%.2fms pitch=%u "
+                             "fmt=%u bytes=%llu bc=%u(unimplemented) OK",
+                             (unsigned long long)got.frame_index, slot, gap, lat,
+                             got.row_pitch, got.dxgi_format,
+                             (unsigned long long)got.payload_bytes, got.barcode);
+                    mgpu::diag::info(line);
+                }
+            }
+        }
+        s.consumed = f;
+    }
+
+    // ---- summary, once, after the producer has stopped and drained ----
+    if (s.finished && s.consumed >= s.produced && !s.summarised)
+    {
+        s.summarised = true;
+        const double mean = (s.lat_n > 0) ? (s.lat_sum / (double)s.lat_n) : 0.0;
+        // The first sample carries arm-to-first-poll time, which is not
+        // transit. Reported, and excluded from the mean beside it, so both
+        // numbers are available and neither is silently doing the other's job.
+        const double mean_x = (s.lat_n > 1)
+            ? ((s.lat_sum - s.first_lat) / (double)(s.lat_n - 1)) : 0.0;
+        snprintf(line, sizeof line,
+                 "[MGPU][SEAL] summary: produced=%llu consumed=%llu new=%llu dropped=%llu "
+                 "reordered=%llu overrun=%llu bad_magic=%llu contract=%llu alias=%llu "
+                 "resync=%llu fault=\"%s\"%s seal_version=%u",
+                 s.produced, s.consumed, s.lat_n, s.dropped, s.reordered,
+                 s.overrun, s.bad_magic, s.contract, s.alias, s.resync, s.fault,
+                 s.fault_unimpl ? " (an UNIMPLEMENTED fault was requested - see the error above; "
+                                  "this ran clean and proves nothing about the checker)" : "",
+                 SEAL_VERSION);
+        mgpu::diag::info(line);
+        {
+            // The rate ratio, out of quantities this consumer can observe, plus
+            // the proof that every slot was used. A ring whose hits are not
+            // even is a ring that is not rotating.
+            char sl[300]; size_t off = 0;
+            for (unsigned i = 0; i < stream_state::RING && off < sizeof sl - 24; ++i)
+                off += (size_t)snprintf(sl + off, sizeof sl - off, "%s%u:%llu",
+                                        (i == 0) ? "" : " ", i, s.slot_hits[i]);
+            const double ratio = (s.lat_n > 0) ? ((double)s.polls / (double)s.lat_n) : 0.0;
+            snprintf(line, sizeof line,
+                     "[MGPU][SEAL] pacing: polls=%llu idle=%llu busy=%llu -> the consumer ran "
+                     "%.2fx the producer's rate (polls per new frame). slot hits: %s - all %u "
+                     "slots must appear and should be within one of each other.",
+                     s.polls, s.idle_polls, s.polls - s.idle_polls, ratio,
+                     sl, stream_state::RING);
+            mgpu::diag::info(line);
+            if (ratio < 1.5)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] PACING MARGIN GONE (%.2fx). The consumer is polled once "
+                         "per bridge PRESENT, so its cadence is the bridge swapchain's refresh "
+                         "rate - a property of whichever display GPU 1 is attached to, and "
+                         "nothing to do with this pipeline. Measured 3.23x on a 210 Hz display "
+                         "and 1.01x on a 60 Hz one. Ring depth %u is currently absorbing it and "
+                         "overrun is still 0, but a game faster than that refresh, or one hitch, "
+                         "would drop frames for a reason that is purely an artefact of how the "
+                         "consumer is scheduled. The fix is a consumer that waits on the shared "
+                         "fence instead of riding the present loop.",
+                         ratio, stream_state::RING);
+                mgpu::diag::warn(line);
+            }
+        }
+        snprintf(line, sizeof line,
+                 "[MGPU][SEAL] latency ms: min=%.2f mean=%.2f max=%.2f (at f=%llu) n=%llu | "
+                 "first sample %.2f (arm-to-first-poll, NOT transit); mean excluding it %.2f. "
+                 "SUBMIT-TO-CONSUME only - it excludes the game's render before it and GPU 1's "
+                 "present after it, and it is wall-clock around a CPU-visible completion rather "
+                 "than a GPU timestamp. Perishable: one cabling, one link width.",
+                 (s.lat_n > 0) ? s.lat_min : 0.0, mean, s.lat_max, s.lat_max_frame, s.lat_n,
+                 s.first_lat, mean_x);
+        mgpu::diag::info(line);
+
+        if (s.neural)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.1] neural stage: %s | evaluates=%llu failures=%llu | output "
+                     "sample identical to the previous frame %llu times (%.1f%%). ONE feature "
+                     "handle for the whole stream, DLSSNR.Reset=1 on the first frame only so "
+                     "temporal history carries. The identical-rate is NOT a verdict: a static "
+                     "scene produces identical output legitimately, so read it against what was "
+                     "on screen. A rate near 100%% with a moving scene is the signal that NR "
+                     "stopped writing.",
+                     s.nr_ok ? "UP" : "NOT RUNNING (transport-only)",
+                     s.nr_evals, s.nr_fails, s.nr_same,
+                     (s.nr_evals > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_evals - 1) : 0.0);
+            mgpu::diag::info(line);
+        }
+
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P5.1] present gate: presents=%llu idle=%llu fence waits=%llu. The "
+                     "bridge presented once per NEW neural frame instead of once per vsync, so "
+                     "the full-frame backbuffer copy and the DWM cross-adapter copy of this "
+                     "window happen at the producer's rate rather than the display's. The idle "
+                     "path blocks on the shared fence, so the consumer's cadence no longer "
+                     "depends on which display GPU 1 is attached to.%s",
+                     s.gate_presents, s.gate_idle, s.gate_waits,
+                     s.profile ? " PROFILE MODE: no on-screen output and no liveness sample this "
+                                 "run - the identical-rate above is therefore absent by design, "
+                                 "not a failure." : "");
+            mgpu::diag::info(line);
+        }
+
+        if (s.ts_ok && s.ts_n > 0)
+        {
+            const double n = (double)s.ts_n;
+            snprintf(line, sizeof line,
+                     "[MGPU][P2.2] GPU TIME on GPU 1, per consumed frame, n=%llu | seal copy "
+                     "mean=%.3f | unpack (cross-adapter buffer -> NR input) mean=%.3f min=%.3f "
+                     "max=%.3f | EVALUATE mean=%.3f min=%.3f max=%.3f | output sample "
+                     "mean=%.3f ms. These are GPU 1's own timestamps on GPU 1's own queue - "
+                     "execution, not wall-clock, and no cross-adapter clock is involved. The "
+                     "evaluate figure is the one to compare against the reference tool's 14.2 ms "
+                     "evaluateGPU, and it is the first time this project has had its own side of "
+                     "that comparison. STILL PERISHABLE: one rig, one link, one resolution, one "
+                     "scene.",
+                     s.ts_n,
+                     s.ts_sum[0] / n,
+                     s.ts_sum[1] / n, s.ts_min[1], s.ts_max[1],
+                     s.ts_sum[2] / n, s.ts_min[2], s.ts_max[2],
+                     s.ts_sum[3] / n);
+            mgpu::diag::info(line);
+        }
+        else if (s.neural)
+            mgpu::diag::warn("[MGPU][P2.2] no GPU timings collected - the query heap did not "
+                             "come up, or the neural stage did not. The transport result above "
+                             "stands; there is simply no profile for this run.");
+
+        const bool clean = (s.dropped == 0 && s.reordered == 0 && s.bad_magic == 0 &&
+                            s.contract == 0 && s.alias == 0);
+        if (strcmp(s.fault, "none") != 0)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.0] FAULT-INJECTED RUN (\"%s\") - this is a NEGATIVE CONTROL and "
+                     "must NOT be recorded as a clean stream. Acceptance is that the counter "
+                     "matching the injected fault is non-zero above; a clean summary here means "
+                     "the checker did not trip and the instrument is not yet trustworthy.",
+                     s.fault);
+            mgpu::diag::warn(line);
+        }
+        else if (clean && s.lat_n > 0)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.0] STREAM PASSED - %llu game frames sealed, transited and "
+                     "checked with no drop, no reorder, no alias and no contract mismatch. "
+                     "Identity, ordering and age hold across a continuous stream, which is the "
+                     "first thing in this project that a one-shot probe could not have shown. "
+                     "NOTE THE SCOPE: pixels are NOT verified per frame (P1.5 established the "
+                     "payload crosses byte-exact) and the barcode is unimplemented, so "
+                     "seal-to-pixel identity is UNCHECKED. A green run here is not evidence "
+                     "until the fault-injection runs in P1_INSTRUMENT section 04 have been seen "
+                     "to trip this same checker.",
+                     s.produced);
+            mgpu::diag::info(line);
+        }
+        else
+        {
+            mgpu::diag::error("[MGPU][P4.0] STREAM FAILED - see the counters above; each "
+                              "non-zero one names its own failure and they have different "
+                              "causes. Do not average them into a verdict.");
+        }
+        stream_release();
+    }
 }
 
 }
