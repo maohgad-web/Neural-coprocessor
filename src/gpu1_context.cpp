@@ -5899,6 +5899,23 @@ namespace
         // error.
         char fault[32] = "none";
         bool fault_unimpl = false;   // a name was given that this build cannot inject
+
+        // ---- P4.1: the persistent neural stage ----
+        // Opt-OUT (mgpu.ini Neural=0), because running without it is now the
+        // control rather than the default: the pace of the consumer with and
+        // without NR is the comparison that answers whether it keeps up.
+        bool neural = true;
+        bool nr_tried = false, nr_ok = false;
+        NVSDK_NGX_Parameter *nr_params = nullptr;
+        NVSDK_NGX_Handle *nr_handle = nullptr;
+        ngx_pf_evaluate_feature nr_eval = nullptr;
+        ngx_pf_release_feature nr_release = nullptr;
+        ID3D12Resource *tex_in = nullptr, *tex_out = nullptr, *nr_read = nullptr;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT nr_fp{};   // the 64x4 liveness sample
+        unsigned char nr_prev[1024] = {};
+        bool nr_have_prev = false;
+        unsigned long long nr_evals = 0, nr_fails = 0, nr_same = 0;
+        bool nr_first = true;
         unsigned long long resync = 0;   // seals rejected, next gap check suppressed
         bool skip_next_gap = false;
     };
@@ -5912,6 +5929,19 @@ namespace
     // Read Fault= out of mgpu.ini beside the add-on. Deliberately tiny and
     // deliberately failure-tolerant: this must never be a reason a run does not
     // happen.
+    // Returns false when the file explicitly says Neural=0.
+    bool stream_read_neural()
+    {
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return true;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return true;
+        const char *k = strstr(buf, "Neural=");
+        return (k == nullptr) || (k[7] != '0');
+    }
+
     void stream_read_fault(char *out, size_t n)
     {
         snprintf(out, n, "none");
@@ -5934,6 +5964,15 @@ namespace
     void stream_release()
     {
         stream_state &s = str();
+        // The NGX feature first: it holds references to tex_in/tex_out.
+        if (s.nr_handle != nullptr && s.nr_release != nullptr)
+            (void)s.nr_release(s.nr_handle);
+        s.nr_handle = nullptr;
+        if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
+        if (s.tex_out != nullptr) { s.tex_out->Release(); s.tex_out = nullptr; }
+        if (s.tex_in  != nullptr) { s.tex_in->Release();  s.tex_in = nullptr; }
+        // nr_params is NOT destroyed: it is the core's capability block and the
+        // NGX session is deliberately kept open for the process lifetime.
         if (s.gup != nullptr && s.gup_cpu != nullptr) { s.gup->Unmap(0, nullptr); }
         s.gup_cpu = nullptr;
         if (s.nev != nullptr) { CloseHandle(s.nev); s.nev = nullptr; }
@@ -5956,6 +5995,156 @@ namespace
     }
 }
 
+namespace
+{
+    // P4.1. Bring up a PERSISTENT DLSS-NR stage on GPU 1, sized and formatted
+    // to the stream. Called once, lazily, on the bridge thread, after the first
+    // seal has told us the geometry is real.
+    //
+    // It re-resolves and re-Inits rather than borrowing anything from
+    // ngx_probe. That is legitimate and was proved by P3.0: the NGX session is
+    // never shut down, and a second full Init -> GetCapabilityParameters ->
+    // snippet Init_Ext -> PopulateParameters_Impl sequence returns Success and
+    // yields a NEW parameter block and a NEW feature handle. Independence is
+    // worth more here than sharing: this stage outlives every probe, and a
+    // probe's teardown must not be able to take it down.
+    bool stream_nr_create(stream_state &s, ID3D12Device *ndev)
+    {
+        char line[900];
+
+        ngx_modules mods;
+        mods.core = GetModuleHandleW(L"_nvngx.dll");
+        if (mods.core == nullptr) mods.core = LoadLibraryW(L"_nvngx.dll");
+        mods.snippet = GetModuleHandleW(L"nvngx_dlssnr.dll");
+        if (mods.snippet == nullptr) mods.snippet = LoadLibraryW(L"nvngx_dlssnr.dll");
+        if (mods.core == nullptr || mods.snippet == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] NGX modules not reachable - the stream runs "
+                              "transport-only and says so in the summary");
+            return false;
+        }
+
+        char w[8][160] = {};
+        ngx_pf_init           p_init  = (ngx_pf_init)          ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
+        ngx_pf_get_cap_params p_caps  = (ngx_pf_get_cap_params)ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w[1], sizeof w[1]);
+        ngx_pf_init_ext       p_iext  = (ngx_pf_init_ext)      ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext", w[2], sizeof w[2]);
+        ngx_pf_populate_params p_pop  = (ngx_pf_populate_params)ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl", w[3], sizeof w[3]);
+        ngx_pf_create_feature p_cre   = (ngx_pf_create_feature)ngx_resolve(mods, "NVSDK_NGX_D3D12_CreateFeature",           ngx_prefer::snippet, w[4], sizeof w[4]);
+        s.nr_eval    = (ngx_pf_evaluate_feature)ngx_resolve(mods, "NVSDK_NGX_D3D12_EvaluateFeature", ngx_prefer::snippet, w[5], sizeof w[5]);
+        s.nr_release = (ngx_pf_release_feature) ngx_resolve(mods, "NVSDK_NGX_D3D12_ReleaseFeature",  ngx_prefer::snippet, w[6], sizeof w[6]);
+        if (p_init == nullptr || p_caps == nullptr || p_iext == nullptr || p_pop == nullptr ||
+            p_cre == nullptr || s.nr_eval == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] an NGX entry point did not resolve - transport-only");
+            return false;
+        }
+
+        wchar_t data_path[MAX_PATH] = {};
+        {
+            wchar_t mp[MAX_PATH] = {};
+            const DWORD n = GetModuleFileNameW(mgpu::module_handle(), mp, MAX_PATH);
+            if (n != 0 && n < MAX_PATH)
+            {
+                size_t cut = 0;
+                for (size_t i = 0; i + 1 < (size_t)n; ++i) if (mp[i] == L'\\') cut = i + 1;
+                for (size_t i = 0; i < cut; ++i) data_path[i] = mp[i];
+            }
+        }
+
+        NVSDK_NGX_FeatureCommonInfo common{};
+        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
+        // A non-Success here is expected and ignored for the same reason P3.0
+        // ignores it: this is the Nth Init of a session that was never shut
+        // down. CreateFeature below is where a genuinely broken session says so.
+        snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
+                 (unsigned)r, ngx_result_name(r));
+        mgpu::diag::info(line);
+
+        r = p_caps(&s.nr_params);
+        if (r != NVSDK_NGX_Result_Success || s.nr_params == nullptr)
+        {
+            snprintf(line, sizeof line, "[MGPU][P4.1] GetCapabilityParameters failed 0x%08X (%s)",
+                     (unsigned)r, ngx_result_name(r));
+            mgpu::diag::error(line);
+            return false;
+        }
+        (void)p_iext(0ULL, data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);
+        (void)p_pop(s.nr_params);
+        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
+        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+
+        // NATIVE FORMAT, no conversion. P3.1 established DLSS-NR consumes the
+        // game's R10G10B10A2 buffer as rendered, so the stream hands it over
+        // untouched and no per-frame conversion pass exists in this pipeline.
+        HRESULT h = make_tex(ndev, s.width, s.height, s.format,
+                             D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_in);
+        if (SUCCEEDED(h))
+            h = make_tex(ndev, s.width, s.height, s.format,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_out);
+        if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
+        if (FAILED(h))
+        {
+            snprintf(line, sizeof line, "[MGPU][P4.1] resource creation failed hr=0x%08X", (unsigned)h);
+            mgpu::diag::error(line);
+            return false;
+        }
+
+        // The liveness sample: a 64x4 corner of the OUTPUT, 1024 bytes, copied
+        // once per frame. It is a rate check, not a quality check - see the
+        // summary text for exactly what a high identical-rate does and does not
+        // mean.
+        s.nr_fp.Offset = 0;
+        s.nr_fp.Footprint.Format = s.format;
+        s.nr_fp.Footprint.Width = 64;
+        s.nr_fp.Footprint.Height = 4;
+        s.nr_fp.Footprint.Depth = 1;
+        s.nr_fp.Footprint.RowPitch = 256;
+
+        // CreateFeature records init work into the list it is handed, and that
+        // work must execute before anything it touched is released - P1.0's
+        // teardown crash. One list, closed, executed, waited.
+        HRESULT ch = s.na->Reset();
+        if (SUCCEEDED(ch)) ch = s.nl->Reset(s.na, nullptr);
+        if (SUCCEEDED(ch))
+        {
+            const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
+            r = p_cre(s.nl, (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                      s.nr_params, &s.nr_handle);
+            LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
+            LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.1] CreateFeature(Reserved18) %ux%u fmt=%d: result=0x%08X (%s) "
+                     "handle=0x%p elapsed=%.0fms",
+                     s.width, s.height, (int)s.format, (unsigned)r, ngx_result_name(r),
+                     (void *)s.nr_handle,
+                     (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
+            mgpu::diag::info(line);
+            ch = s.nl->Close();
+        }
+        if (SUCCEEDED(ch))
+        {
+            ID3D12CommandList *const ls[1] = { s.nl };
+            s.nq->ExecuteCommandLists(1, ls);
+            ++s.nf_value;
+            ch = s.nq->Signal(s.nf, s.nf_value);
+            if (SUCCEEDED(ch))
+            {
+                s.nf->SetEventOnCompletion(s.nf_value, s.nev);
+                if (WaitForSingleObject(s.nev, 20000) != WAIT_OBJECT_0) ch = E_FAIL;
+            }
+        }
+        if (FAILED(ch) || r != NVSDK_NGX_Result_Success || s.nr_handle == nullptr)
+        {
+            mgpu::diag::error("[MGPU][P4.1] the neural stage did not come up - the stream "
+                              "continues TRANSPORT-ONLY and the summary says so");
+            return false;
+        }
+        return true;
+    }
+}
+
 void stream_request()
 {
     stream_state &s = str();
@@ -5969,6 +6158,7 @@ void stream_request()
     if (s.requested) return;
     s.requested = true;
     stream_read_fault(s.fault, sizeof s.fault);
+    s.neural = stream_read_neural();
 
     // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
     // accepted ANY string, so a name this build cannot inject - "drop" and
@@ -6000,12 +6190,15 @@ void stream_request()
     }
     char l[500];
     snprintf(l, sizeof l,
-             "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\". "
+             "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\", "
+             "neural=%s. "
              "Every game frame from the next one is sealed and transited until the bound is "
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
              "else.",
-             stream_state::RING, stream_state::STREAM_MAX_FRAMES, s.fault);
+             stream_state::RING, stream_state::STREAM_MAX_FRAMES, s.fault,
+             s.neural ? "ON (P4.1 - DLSS-NR runs on every consumed frame)"
+                      : "off (P4.0 transport-only control)");
     mgpu::diag::info(l);
 }
 
@@ -6293,6 +6486,21 @@ void stream_poll()
 
     if (s.consumed >= completed) ++s.idle_polls;
 
+    // P4.1: bring the neural stage up on the first frame that is actually
+    // consumable. Not at arm time - the geometry is only trustworthy once a
+    // seal has carried it across, and CreateFeature costs ~180 ms that would
+    // otherwise be spent before we knew the stream worked at all.
+    if (s.neural && !s.nr_tried && s.consumed < completed)
+    {
+        s.nr_tried = true;
+        ID3D12Device *ndev = nullptr;
+        {
+            std::lock_guard<std::mutex> g(st().cs);
+            ndev = st().device;
+        }
+        s.nr_ok = (ndev != nullptr) && stream_nr_create(s, ndev);
+    }
+
     while (s.consumed < completed)
     {
         const unsigned long long f = s.consumed + 1;
@@ -6338,6 +6546,81 @@ void stream_poll()
         {
             s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
                                    s.nxfer, slot_off, sizeof(MgpuSeal));
+
+            // ---- P4.1: the neural stage, in the SAME list as the seal read ----
+            //
+            // Unpack this slot's payload into the NR input, evaluate, and take a
+            // small sample of the output. One list, one submission, one wait per
+            // consumed frame - which is also why the consumer's pace with the
+            // stage attached is directly comparable to its pace without it.
+            if (s.nr_ok)
+            {
+                D3D12_TEXTURE_COPY_LOCATION us{}, ud{};
+                us.pResource = s.nxfer;
+                us.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                us.PlacedFootprint = s.fp;
+                us.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+                ud.pResource = s.tex_in;
+                ud.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                ud.SubresourceIndex = 0;
+                s.nl->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
+                barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                s.nr_params->Set("DLSSNR.Color", s.tex_in);
+                s.nr_params->Set("DLSSNR.Output", s.tex_out);
+                s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+                s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+                s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.width);
+                s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.height);
+                s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+                s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+                s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.width);
+                s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
+                s.nr_params->Set("DLSSNR.Intensity", 0.84f);
+                // RESET ON THE FIRST FRAME ONLY. Every probe so far set Reset=1
+                // on every evaluate, because each was an independent experiment
+                // and history between them would have contaminated the control.
+                // A stream is the opposite case: dlssnr_prev_output is temporal
+                // history and it is supposed to carry. This is the first code in
+                // the project that lets NR accumulate across frames, and if the
+                // output ever looks smeared or ghosted, this line is the first
+                // thing to try at 1.
+                s.nr_params->Set("DLSSNR.Reset", s.nr_first ? 1u : 0u);
+                s.nr_first = false;
+
+                const NVSDK_NGX_Result er =
+                    s.nr_eval(s.nl, s.nr_handle, s.nr_params, nullptr);
+                ++s.nr_evals;
+                if (er != NVSDK_NGX_Result_Success)
+                {
+                    ++s.nr_fails;
+                    if (s.nr_fails <= 3)
+                    {
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P4.1] EvaluateFeature f=%llu: 0x%08X (%s)",
+                                 f, (unsigned)er, ngx_result_name(er));
+                        mgpu::diag::error(line);
+                    }
+                }
+
+                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION ss{}, sd{};
+                ss.pResource = s.tex_out;
+                ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                ss.SubresourceIndex = 0;
+                sd.pResource = s.nr_read;
+                sd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                sd.PlacedFootprint = s.nr_fp;
+                D3D12_BOX box{ 0, 0, 0, 64, 4, 1 };
+                s.nl->CopyTextureRegion(&sd, 0, 0, 0, &ss, &box);
+                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+            }
+
             h = s.nl->Close();
         }
         if (SUCCEEDED(h))
@@ -6368,6 +6651,25 @@ void stream_poll()
 
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
+
+        // The liveness sample. Compared against the PREVIOUS frame's, not
+        // against a value we chose - section 00a's rule. What a high
+        // identical-rate means is ambiguous by construction and the summary
+        // says so: a static scene produces identical NR output legitimately.
+        // It is a rate to be read alongside the scene, not a verdict.
+        if (s.nr_ok)
+        {
+            unsigned char *sm = nullptr;
+            D3D12_RANGE sr{0, 1024};
+            if (SUCCEEDED(s.nr_read->Map(0, &sr, (void **)&sm)) && sm != nullptr)
+            {
+                if (s.nr_have_prev && memcmp(sm, s.nr_prev, 1024) == 0) ++s.nr_same;
+                memcpy(s.nr_prev, sm, 1024);
+                s.nr_have_prev = true;
+                D3D12_RANGE nn{0, 0};
+                s.nr_read->Unmap(0, &nn);
+            }
+        }
 
         if (got.magic != SEAL_MAGIC || got.seal_version != SEAL_VERSION)
         {
@@ -6527,6 +6829,22 @@ void stream_poll()
                  (s.lat_n > 0) ? s.lat_min : 0.0, mean, s.lat_max, s.lat_max_frame, s.lat_n,
                  s.first_lat, mean_x);
         mgpu::diag::info(line);
+
+        if (s.neural)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P4.1] neural stage: %s | evaluates=%llu failures=%llu | output "
+                     "sample identical to the previous frame %llu times (%.1f%%). ONE feature "
+                     "handle for the whole stream, DLSSNR.Reset=1 on the first frame only so "
+                     "temporal history carries. The identical-rate is NOT a verdict: a static "
+                     "scene produces identical output legitimately, so read it against what was "
+                     "on screen. A rate near 100%% with a moving scene is the signal that NR "
+                     "stopped writing.",
+                     s.nr_ok ? "UP" : "NOT RUNNING (transport-only)",
+                     s.nr_evals, s.nr_fails, s.nr_same,
+                     (s.nr_evals > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_evals - 1) : 0.0);
+            mgpu::diag::info(line);
+        }
 
         const bool clean = (s.dropped == 0 && s.reordered == 0 && s.bad_magic == 0 &&
                             s.contract == 0 && s.alias == 0);
