@@ -1052,13 +1052,24 @@ configuration, not instrument overhead.
 Annotated 2026-09-05 rather than edited, so that what was owed and what was paid
 are both legible.
 
-1. **Fault injection — STILL OWED, and it is the largest open item in the
-   project.** Unchanged. `Fault=` implements `pitch`, `alias`, `magic`, `drop`
-   and `stale`; `drop`, `reorder` and `overrun` have since been seen to leave
-   zero under real conditions, but `bad_magic`, `contract` and `alias` have never
-   been observed to trip. Until they have, every `STREAM PASSED` line means "the
-   checker did not object", not "the checker works". This is `../METHOD.md` §1 owed
-   against this project's own instrument.
+1. **Fault injection — MOSTLY DISCHARGED, and this entry was wrong when it was
+   written.** It said fault injection had never been run. `FACTS.md` §09 carries
+   a verified P4 entry recording the opposite: `pitch`, `alias` and `magic` were
+   each injected on the rig, each producing its own named diagnosis and nothing
+   else, and an unknown fault name was confirmed to be refused loudly. `drop` and
+   `stale` were never injected — the counters they would drive were exercised by
+   real conditions during the two-pass run instead, which is not the same thing.
+
+   Two records in this repository contradicted each other and the wrong one was
+   the more recent. It survived the assembly of these files because the newer
+   document was trusted over the verified ledger, and it was caught by the person
+   who had actually run the faults. Corrected rather than deleted: **a stale
+   claim that understates what was done is as much a defect as one that
+   overstates it**, and this one had already been built on before anyone noticed.
+
+   What remains genuinely owed is narrower: none of the five has been re-proven
+   since P6.4 rewrote the consumer to skip superseded frames. The checker code is
+   unchanged; the cadence it runs at is not.
 2. **Evaluate-floor instability in `Profile=0` (7.73 vs 12.12) — still
    unexplained.** Two back-to-back `Profile=1` runs would discriminate and have
    not been taken.
