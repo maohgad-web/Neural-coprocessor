@@ -7727,6 +7727,30 @@ void stream_poll()
 
         const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
 
+        // ---- P6.4: DO NOT RUN NR ON A FRAME THAT IS ALREADY STALE ----
+        //
+        // stream_poll consumes EVERY arrived frame before it returns, and the
+        // loop presents once afterwards. When the consumer is behind, that
+        // meant evaluating six frames and showing the last one. The Passes=2
+        // run on 2026-09-05 did exactly that: 2651 frames of neural work, 451
+        // presents - 83% of it computed and discarded, which is what turned
+        // "17.5 ms of work against a 16.9 ms budget" into a 9 fps window.
+        //
+        // The seal is still read for every frame, because identity and ordering
+        // are the point of the instrument and cost microseconds. Only the
+        // EVALUATES are skipped, and only for frames a newer one has already
+        // superseded. Those are counted separately from `dropped`: a frame we
+        // chose not to denoise because it was already old is not the same event
+        // as a frame the transport lost, and conflating them would report our
+        // own scheduling as a fault.
+        //
+        // DECLARED HERE, at the frame's scope, NOT inside the command-list
+        // block below: the timestamp read and the liveness sample both test it
+        // and both live after that block closes.
+        const bool newest = (f >= completed);
+        const bool run_nr = s.nr_ok && newest && s.neural;
+        if (!newest) ++s.nr_skipped;
+
         HRESULT h = s.na->Reset();
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
         if (SUCCEEDED(h))
@@ -7744,27 +7768,6 @@ void stream_poll()
             // small sample of the output. One list, one submission, one wait per
             // consumed frame - which is also why the consumer's pace with the
             // stage attached is directly comparable to its pace without it.
-            // ---- P6.4: DO NOT RUN NR ON A FRAME THAT IS ALREADY STALE ----
-            //
-            // stream_poll consumes EVERY arrived frame before it returns, and
-            // the loop presents once afterwards. When the consumer is behind,
-            // that meant evaluating six frames and showing the last one. The
-            // Passes=2 run on 2026-09-05 did exactly that: 2651 frames of
-            // neural work, 451 presents - 83% of it computed and discarded,
-            // which is what turned "17.5 ms of work against a 16.9 ms budget"
-            // into a 9 fps window.
-            //
-            // The seal is still read for every frame, because identity and
-            // ordering are the point of the instrument and cost microseconds.
-            // Only the EVALUATES are skipped, and only for frames that a newer
-            // one has already superseded. Those are counted separately from
-            // `dropped`: a frame we chose not to denoise because it was already
-            // old is not the same event as a frame the transport lost, and
-            // conflating them would report our own scheduling as a fault.
-            const bool newest = (f >= completed);
-            const bool run_nr = s.nr_ok && newest && s.neural;
-            if (!newest) ++s.nr_skipped;
-
             if (run_nr)
             {
                 D3D12_TEXTURE_COPY_LOCATION us{}, ud{};
