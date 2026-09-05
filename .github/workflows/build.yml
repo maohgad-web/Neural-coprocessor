@@ -149,6 +149,48 @@ jobs:
           echo "ADDON_PATH=$ADDON" >> "$GITHUB_ENV"
           echo "Output verified: $ADDON"
 
+      # SHIPPED PRESETS MUST BE EMPTY, and this is checked rather than trusted.
+      #
+      # assets/gpu1.ini once shipped enabling Lumenite_QuantMotion with
+      # DEBUG_FLOW=1, because it had been copied out of a working game folder
+      # and ReShade's AutoSavePreset writes whatever the last session left
+      # enabled back into any preset that lives beside a game. Every fresh
+      # install then drew a motion-flow debug view over the neural output. It
+      # cost a night of wrong hypotheses and invalidated two measurement runs
+      # before the P1.6 guard named it in the log.
+      #
+      # The fix is not "remember to clean the file". The fix is that a preset
+      # enabling anything cannot leave CI.
+      - name: Verify shipped presets are empty
+        shell: bash
+        run: |
+          FAIL=0
+          if grep -nE '^\s*Techniques\s*=\s*\S' assets/gpu1.ini; then
+            echo "::error::assets/gpu1.ini enables techniques - a shipped preset must be empty"
+            FAIL=1
+          fi
+          if grep -n 'DEBUG' assets/gpu1.ini; then
+            echo "::error::assets/gpu1.ini carries a debug preprocessor definition"
+            FAIL=1
+          fi
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "assets/gpu1.ini is clean."
+
+      # Everything the drop-in package needs must exist before the deploy set
+      # is staged, so a missing config file fails here by name rather than
+      # producing a package that is quietly incomplete.
+      - name: Verify the config set is present
+        shell: bash
+        run: |
+          MISSING=0
+          for F in assets/gpu1.ini assets/mgpu.ini assets/ReShade2.ini assets/README.txt LICENSE; do
+            if [ ! -f "$F" ]; then
+              echo "::error::missing $F"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+
       # The artifact is the complete deploy set: every file here goes into
       # <game>\...\Binaries\Win64\ beside dxgi.dll, at the zip root.
       # Staged into one directory on purpose — upload-artifact roots the zip
@@ -176,13 +218,29 @@ jobs:
         run: |
           mkdir -p _deploy
           cp "$ADDON_PATH" _deploy/nvngx.dll_mgpu_bridge.addon64
-          cp assets/gpu1.ini _deploy/
+          # The complete drop-in set. mgpu.ini in particular MUST ship beside
+          # the add-on: P7.2 resolves it from the add-on's own directory rather
+          # than the working directory, so a package without it silently runs
+          # every setting at its default and the log says which file it read.
+          cp assets/gpu1.ini      _deploy/
+          cp assets/mgpu.ini      _deploy/
+          cp assets/ReShade2.ini  _deploy/
+          cp assets/README.txt    _deploy/
+          cp LICENSE              _deploy/
           ls -l _deploy
           test -f _deploy/nvngx.dll_mgpu_bridge.addon64
+          test -f _deploy/mgpu.ini
           case "$(ls _deploy)" in
             *nvngx.dll_*) ;;
             *) echo "::error::Deploy set does not carry the nvngx.dll_ caller-gate prefix"; exit 1 ;;
           esac
+          # Printed into the build log so what a build ships is a matter of
+          # record, rather than something to be downloaded and unzipped later
+          # to find out.
+          echo "--- gpu1.ini as shipped ---"
+          cat _deploy/gpu1.ini
+          echo "--- mgpu.ini keys as shipped ---"
+          grep -vE '^\s*(;|$)' _deploy/mgpu.ini || true
 
       - uses: actions/upload-artifact@v4
         with:
