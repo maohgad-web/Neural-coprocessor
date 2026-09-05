@@ -220,6 +220,23 @@ void capture_poll();
 // deliberately not attached: if both landed in one commit, a failure would not
 // say which half.
 
+// P5.2. Any thread. True only when mgpu.ini says Probes=1.
+//
+// DEFECT C: the one-shot probe chain (P1.3 transit, P1.5 capture and the P3.x
+// ngx_probe it leads into) and the P4.1 stream both armed from the same hotkey,
+// which put TWO independent NGX consumers on ONE shared parameter block -
+// GetCapabilityParameters returns the core's block, not a per-caller one. The
+// probe's teardown then destroyed it under the running stream. The visible
+// symptom was a neural image with the colours wrong while every transport
+// counter stayed clean, which is precisely the failure shape the seal cannot
+// see: the bytes arrived, the consumer was broken.
+//
+// The destroy is now suppressed while the stream holds the block, and the
+// probes themselves are opt-in and default OFF - they are answered questions,
+// and re-running them under a live stream can only cost. Set Probes=1 in
+// mgpu.ini to run the old chain again, with the stream deliberately not armed.
+bool probes_enabled();
+
 // Bridge thread. Arms the stream; inert until called, one stream per process.
 // Reads Fault= from mgpu.ini beside the add-on - absent means no fault, so the
 // shipped default is a clean run and a missing file is never an error.

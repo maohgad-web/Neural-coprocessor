@@ -1257,6 +1257,31 @@ namespace
     // command objects inline rather than borrowing transit_side, so nothing
     // else has to move.
     HRESULT transit_make_device(LUID want, ID3D12Device **out);
+
+    // P5.2. DEFECT C, found on the rig 2026-09-05. The one-shot probe chain
+    // and the P4.1 persistent neural stage BOTH take their parameter block
+    // from NVSDK_NGX_D3D12_GetCapabilityParameters, and that call does not
+    // hand out a fresh block per caller - it hands out the core's capability
+    // block. stream_release has said so in a comment since P4.1 ("nr_params
+    // is NOT destroyed: it is the core's capability block") and acted on it.
+    // The probe's teardown did not: it called DestroyParameters
+    // unconditionally, which destroyed the block the LIVE stream still held
+    // and still wrote DLSSNR.Color / DLSSNR.Output into every frame.
+    //
+    // The symptom was a neural image with the colours wrong and NOTHING else
+    // out of place - every seal counter zero, gap=1 throughout. That is the
+    // section 00 failure shape exactly: the transport was healthy and the
+    // instrument had no way to say the consumer was broken.
+    //
+    // Latent, not new. In the P5.0 run the probe chain finished (P3.1 at
+    // :280) before the stream's NR came up (P5.0 at :735) and the destroy
+    // landed on a block nobody else held. P5.1 moved stream_poll() ahead of
+    // present_frame() in the worker loop, which reversed that order and put
+    // the destroy in the middle of a live stream.
+    //
+    // Returns true when the stream's neural stage holds the block. Takes the
+    // stream's own lock; defined with the stream further down.
+    bool stream_nr_live();
 }
 
 bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
@@ -1675,15 +1700,36 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         }
         if (params != nullptr)
         {
-            // The capability map is driver-allocated and the header states
-            // it must be freed this way - never with delete or free.
-            mgpu::diag::info("[MGPU][P1.0c] teardown: DestroyParameters ...");
-            const NVSDK_NGX_Result r = p_destroy(params);
-            snprintf(line, sizeof line,
-                     "[MGPU][P1.0c] teardown: DestroyParameters result=0x%08X (%s)",
-                     (unsigned)r, ngx_result_name(r));
-            mgpu::diag::info(line);
-            params = nullptr;
+            // P5.2 / DEFECT C. GetCapabilityParameters returns the CORE's
+            // block, not a per-caller one, so destroying it here destroys it
+            // for every other holder in the process. When the P4.1 stream is
+            // live it is such a holder, and this call is what turned its
+            // output into wrong colours while leaving every transport counter
+            // clean. The block is deliberately never freed in that case - the
+            // NGX session is already kept open for the process lifetime for
+            // the same reason (see the teardown note above), so this leaks
+            // nothing that was not already held on purpose.
+            if (stream_nr_live())
+            {
+                mgpu::diag::warn("[MGPU][P1.0c] teardown: DestroyParameters SKIPPED - the P4.1 "
+                                 "stream holds the same capability block (GetCapabilityParameters "
+                                 "returns the core's block, not a per-caller one). Destroying it "
+                                 "here would pull the parameter map out from under a running "
+                                 "neural stage. See P1_INSTRUMENT defect C.");
+                params = nullptr;
+            }
+            else
+            {
+                // The capability map is driver-allocated and the header states
+                // it must be freed this way - never with delete or free.
+                mgpu::diag::info("[MGPU][P1.0c] teardown: DestroyParameters ...");
+                const NVSDK_NGX_Result r = p_destroy(params);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.0c] teardown: DestroyParameters result=0x%08X (%s)",
+                         (unsigned)r, ngx_result_name(r));
+                mgpu::diag::info(line);
+                params = nullptr;
+            }
         }
 
         // ---- 2b. the P1.1 local resources ----
@@ -6323,6 +6369,18 @@ namespace
         return s.tex_out;
     }
 
+    // P5.2 / DEFECT C. Declared up beside ngx_probe; defined here, where the
+    // stream state it reads already is. True only while the persistent neural
+    // stage actually holds the capability block - `nr_ok` alone is not the
+    // test, because the block is taken before the feature is created and must
+    // be protected from that moment on.
+    bool stream_nr_live()
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        return s.nr_params != nullptr;
+    }
+
     // Read Fault= out of mgpu.ini beside the add-on. Deliberately tiny and
     // deliberately failure-tolerant: this must never be a reason a run does not
     // happen.
@@ -6331,17 +6389,80 @@ namespace
     // output was a log line and is too short to look at anything. Clamped at
     // both ends: below 60 there is nothing to measure, and the bound exists to
     // stop a misbehaving build costing the whole session.
+    // ---- P5.2: the ini reader, fixed ----
+    //
+    // Every reader below used strstr on the whole file. strstr does not know
+    // what a comment is, so a line reading "; Set Neural to 0 for the control"
+    // would have been found BEFORE the real Neural= key and silently disabled
+    // the neural stage - a config file whose own documentation changes its
+    // meaning. That was caught by reading a draft ini rather than by any
+    // check, which is the same class of miss as section 00a.
+    //
+    // ini_find returns a pointer just past "<key>=" for the first occurrence
+    // that starts a line (leading spaces and tabs allowed) and is not preceded
+    // on that line by ';' or '#'. Returns nullptr when there is no such line.
+    const char *ini_find(const char *buf, const char *key)
+    {
+        const size_t klen = strlen(key);
+        const char *p = buf;
+        while (*p != '\0')
+        {
+            // p is at the start of a line. Skip leading blanks.
+            const char *q = p;
+            while (*q == ' ' || *q == '\t') ++q;
+            if (*q != ';' && *q != '#' &&
+                strncmp(q, key, klen) == 0 && q[klen] == '=')
+                return q + klen + 1;
+            // advance to the next line
+            while (*p != '\0' && *p != '\n') ++p;
+            if (*p == '\n') ++p;
+        }
+        return nullptr;
+    }
+
+    // Reads the file once into `buf`. False when there is nothing to read -
+    // callers then keep their default, because a missing or unreadable
+    // mgpu.ini must never be a reason a run does not happen.
+    bool ini_slurp(char *buf, size_t n)
+    {
+        buf[0] = '\0';
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return false;
+        const size_t got = fread(buf, 1, n - 1, f);
+        fclose(f);
+        buf[got] = '\0';
+        return got != 0;
+    }
+
+    // P5.2. DEFECT C's second half. The one-shot probe chain (P1.3 transit,
+    // P1.5 capture, and the P3.x ngx_probe it leads into) and the P4.1
+    // persistent stream both armed from the SAME hotkey press, so every
+    // stream run also ran a second, independent NGX consumer against the same
+    // shared parameter block - setting DLSSNR.Color, DLSSNR.Output and the
+    // subrect keys for its own textures in between the stream's frames.
+    // Skipping the destroy (above) stops the block being pulled away, but two
+    // writers on one block is not a thing to leave running under a
+    // measurement.
+    //
+    // So the probes are now OPT-IN and default OFF: the hotkey arms the
+    // stream alone unless mgpu.ini says Probes=1. The probes are answered
+    // questions - P1.3, P1.5, P3.0-P3.2 are all closed - and re-running them
+    // under a live stream can only cost.
+    bool ini_read_probes()
+    {
+        char buf[1024];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, "Probes");
+        return (k != nullptr) && (*k == '1');
+    }
+
     unsigned long long stream_read_frames()
     {
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return 600ull;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return 600ull;
-        const char *k = strstr(buf, "Frames=");
+        char buf[1024];
+        if (!ini_slurp(buf, sizeof buf)) return 600ull;
+        const char *k = ini_find(buf, "Frames");
         if (k == nullptr) return 600ull;
-        const long long v = atoll(k + 7);
+        const long long v = atoll(k);
         if (v < 60) return 60ull;
         if (v > 100000) return 100000ull;
         return (unsigned long long)v;
@@ -6350,41 +6471,28 @@ namespace
     // P5.1: Profile=1 strips display and liveness sampling for measurement runs.
     bool stream_read_profile()
     {
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return false;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return false;
-        const char *k = strstr(buf, "Profile=");
-        return (k != nullptr) && (k[8] == '1');
+        char buf[1024];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, "Profile");
+        return (k != nullptr) && (*k == '1');
     }
 
     // Returns false when the file explicitly says Neural=0.
     bool stream_read_neural()
     {
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return true;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return true;
-        const char *k = strstr(buf, "Neural=");
-        return (k == nullptr) || (k[7] != '0');
+        char buf[1024];
+        if (!ini_slurp(buf, sizeof buf)) return true;
+        const char *k = ini_find(buf, "Neural");
+        return (k == nullptr) || (*k != '0');
     }
 
     void stream_read_fault(char *out, size_t n)
     {
         snprintf(out, n, "none");
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return;
-        const char *k = strstr(buf, "Fault=");
+        char buf[1024];
+        if (!ini_slurp(buf, sizeof buf)) return;
+        const char *k = ini_find(buf, "Fault");
         if (k == nullptr) return;
-        k += 6;
         size_t i = 0;
         while (i + 1 < n && k[i] != '\0' && k[i] != '\r' && k[i] != '\n' && k[i] != ' ')
         { out[i] = k[i]; ++i; }
@@ -6653,6 +6761,11 @@ bool stream_present_gate(unsigned long timeout_ms)
         WaitForSingleObject(ev, timeout_ms);
     }
     return false;
+}
+
+bool probes_enabled()
+{
+    return ini_read_probes();
 }
 
 void stream_request()

@@ -494,18 +494,44 @@ namespace
                     char tag[64];
                     snprintf(tag, sizeof tag, "manual %u @frame %llu",
                              manual_runs, (unsigned long long)frame);
-                    snprintf(line, sizeof line,
-                             "[MGPU][P1.3g] hotkey - running transit probe (%s). The present loop "
-                             "stalls for the duration; a gap in the frame counter here is this, "
-                             "not a fault.", tag);
-                    mgpu::diag::info(line);
-                    (void)mgpu::gpu1::transit_probe(tag);
-                    // P1.5 rides the same key. It is inert until requested and
-                    // one-shot after that, so repeated presses cost nothing.
-                    mgpu::gpu1::capture_request();
-                    // P4.0 rides the same key: one stream per process, armed on
-                    // demand so the operator picks gameplay rather than a menu.
-                    mgpu::gpu1::stream_request();
+                    // P5.2 / DEFECT C. The probe chain and the stream are now
+                    // MUTUALLY EXCLUSIVE, and the log says which one this press
+                    // armed. They used to arm together, which put two
+                    // independent NGX consumers on the one shared capability
+                    // block and produced a neural image with the colours wrong
+                    // while every seal counter stayed clean. A silent overlap of
+                    // two paths is the section 00a failure shape; naming the
+                    // path on every press is what stops it recurring unseen.
+                    if (mgpu::gpu1::probes_enabled())
+                    {
+                        // Its own buffer: the enclosing `line` is 320 bytes and
+                        // this message is longer, and a truncated log line is a
+                        // wrong answer that looks like a right one.
+                        char pl[512];
+                        snprintf(pl, sizeof pl,
+                                 "[MGPU][P1.3g] hotkey - PROBE CHAIN (mgpu.ini Probes=1): transit "
+                                 "probe (%s), then P1.5 capture and the P3.x neural probe. The "
+                                 "P4.0 stream is NOT armed on this press - the probes take the "
+                                 "same NGX parameter block the stream would hold. The present "
+                                 "loop stalls for the duration; a gap in the frame counter here "
+                                 "is this, not a fault.", tag);
+                        mgpu::diag::info(pl);
+                        (void)mgpu::gpu1::transit_probe(tag);
+                        // P1.5 rides the same key. It is inert until requested and
+                        // one-shot after that, so repeated presses cost nothing.
+                        mgpu::gpu1::capture_request();
+                    }
+                    else
+                    {
+                        mgpu::diag::info("[MGPU][P4.0] hotkey - STREAM (mgpu.ini Probes absent or "
+                                         "0, the default). The one-shot probe chain is NOT run: "
+                                         "P1.3, P1.5 and P3.0-P3.2 are closed questions and they "
+                                         "share the neural stage's parameter block. Set Probes=1 "
+                                         "to run them instead - the stream is then not armed.");
+                        // P4.0: one stream per process, armed on demand so the
+                        // operator picks gameplay rather than a menu.
+                        mgpu::gpu1::stream_request();
+                    }
                 }
 
                 // The colour must animate: a static clear cannot
