@@ -80,7 +80,8 @@ NVIDIA is redistributed here.
 
 ## Install
 
-See [INSTALL.txt](INSTALL.txt) — but two things decide whether it works at all:
+See [assets/README.txt](assets/README.txt), which is also the `README.txt` in the
+download — but two things decide whether it works at all:
 
 **ReShade must be installed with add-on support.** The effects-only build never
 loads `.addon64` files and says nothing about it. No error, no log line, because
