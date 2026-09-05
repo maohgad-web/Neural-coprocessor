@@ -10,8 +10,10 @@ This is research code with published measurements. It is not a product.
 | [RESULTS.md](RESULTS.md) | what was measured, on what, with what caveats |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | how a frame gets to the second GPU and back |
 | [METHOD.md](METHOD.md) | the working rules, and what they cost to learn |
+| [VENDOR_LOCK.md](VENDOR_LOCK.md) | the machine, driver and configuration every number was taken on |
 | [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) | prior work, AI use, disclaimer |
 | [THIRD_PARTY.md](THIRD_PARTY.md) | licences and provenance |
+| [history/](history/) | the milestone record, the verified-facts ledger, the instrument design |
 
 ---
 

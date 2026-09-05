@@ -27,8 +27,6 @@ zip.
 Public, but not part of the download. A reader who wants to know how this was
 built or why a decision was made comes here.
 
-| File | Why it stays |
-|---|---|
 ### The root — what someone sees on landing
 
 Seven files and three directories. Everything here is addressed to a reader.
@@ -41,10 +39,17 @@ Seven files and three directories. Everything here is addressed to a reader.
 | `METHOD.md` | the working rules and what each one cost |
 | `ACKNOWLEDGEMENTS.md` | prior work, AI use with named failures, disclaimer |
 | `THIRD_PARTY.md` | licences, pinned SHAs, provenance |
+| `VENDOR_LOCK.md` | the machine, driver and configuration every number was taken on |
 | `LICENSE` | |
 | `src/`, `CMakeLists.txt`, `.github/`, `assets/`, `.gitignore` | the build |
 | `tools/provenance_scan.py` | the shingle scan behind `THIRD_PARTY.md`'s provenance section |
 | `tools/mgpu-sysinfo.ps1` | machine description; how `RESULTS.md`'s machine table was produced |
+
+**`VENDOR_LOCK.md` stays in the root**, decided 2026-09-05. It answers "on what?",
+which is a question the results themselves raise — a reader checking a figure
+needs it, not just a reader reconstructing the project's path. It is now only the
+rig, the vendor stack and the reproduce steps; the milestone results that had
+accumulated in it moved to `history/RECORD.md`.
 
 ### `history/` — the working record
 
@@ -56,10 +61,19 @@ unfinished workspace rather than a product.
 
 | File | |
 |---|---|
-| `history/P0_RECORD.md` | the verified-facts ledger. §09 invariants, §10 unexplained observations. |
-| `history/P1_INSTRUMENT.md` | the instrument design and the four instrument-failure incidents |
-| `history/P5_P6_RECORD.md` | **not currently committed — commit it, into `history/`.** |
-| `history/VENDOR_LOCK.md` | the rig, the driver, the configuration each result was taken under |
+| `history/RECORD.md` | the chronological milestone record, P0 → P7 |
+| `history/FACTS.md` | the verified-facts ledger — §09 invariants, §10 unexplained observations. **This is the file other documents cite.** |
+| `history/P1_INSTRUMENT.md` | the instrument design, unedited, and the four instrument-failure incidents |
+
+**`P0_RECORD.md`, `P5_P6_RECORD.md` and the unapplied P4 additions no longer
+exist as separate files.** They were assembled — by line-range extraction, not
+rewritten — into `RECORD.md` and `FACTS.md`. The assembly is diffable against the
+originals in git history, which is the point: a regeneration from memory could
+not have been checked.
+
+Assembling them found a real gap. **P4 had never been merged into any committed
+file**, so the project's most consequential finding — depth is not sampled,
+therefore the payload is colour only — existed only in a loose patch.
 
 **`Agent_Task.md` is deleted, and the reasoning matters more than the file.** An
 earlier version of this manifest argued for keeping it as evidence for
@@ -76,10 +90,11 @@ in git history for anyone who wants it.
 **`AGENT_PROMPT.md` does not exist** and was carried into an earlier version of
 this list from memory without checking the tree. Removed.
 
-**Adding a `history/` prefix breaks every cross-reference into these four
-files.** Fix the links in the same commit as the move, and re-run check 5 below
-afterwards — a moved file with a stale link is worse than a file in the wrong
-place.
+**The `history/` prefix breaks every cross-reference into these files**, and the
+relative direction reverses for references going the other way. Both sets are
+fixed; re-run check 5 below after the move lands, because a relocated file with a
+stale link reads as a deleted one, which is the opposite of the reason for
+keeping it.
 
 ---
 
@@ -88,7 +103,7 @@ place.
 | File | Disposition |
 |---|---|
 | `github_search_code_patch.md` | superseded working note. **Delete** — it is in git history either way, and nothing cites it. |
-| `ngx_probe_patch.md` | same. Its content is in `P0_RECORD.md` §09 and `ARCHITECTURE.md`. |
+| `ngx_probe_patch.md` | same. Its content is in `history/FACTS.md` §09 and `ARCHITECTURE.md`. |
 | `INSTALL.txt` | **`README.md` links it and it does not exist as a repo file** — `dist/README.txt` is the shipped one. Either commit it at the repo root or point the README link at `dist/README.txt`. Do not leave the link broken. |
 
 ---
