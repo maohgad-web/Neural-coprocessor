@@ -11,6 +11,7 @@
                       // Cumulative include: also brings in dxgi1_2/
                       // dxgi1_3/dxgi.h.
 #include <cstdio>
+#include <cstdlib>   // atoll, malloc/free - used throughout; made explicit for P5.0
 #include <cstring>
 #include <mutex>
 
@@ -74,6 +75,7 @@ namespace
         HANDLE fence_event = nullptr;
         UINT64 fence_value = 0;
         bool present_failed_logged = false;
+        bool neural_shown = false;   // P5.0: one-shot "the window is live" log
     };
 
     state &st()
@@ -315,7 +317,16 @@ bool create_present_chain(HWND hwnd)
         DXGI_SWAP_CHAIN_DESC1 scd{};
         scd.Width = width;
         scd.Height = height;
-        scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // P5.0: R10G10B10A2_UNORM, not R8G8B8A8. The bridge's backbuffer is now
+        // a COPY DESTINATION for the neural output, and CopyTextureRegion
+        // requires the two formats to match exactly - there is no conversion in
+        // a copy, and a converting blit would need a shader, which would need
+        // d3dcompiler, which would need a new link library. CMakeLists.txt is
+        // closed, so matching the game's format is not a shortcut here: it is
+        // the only route. The game renders R10G10B10A2 (DXGI 24) and P3.1
+        // established NR consumes and produces it unconverted, so the whole
+        // chain is now one format end to end.
+        scd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
         scd.SampleDesc.Count = 1;
         scd.SampleDesc.Quality = 0;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -477,6 +488,15 @@ bool create_present_chain(HWND hwnd)
 // translation unit, so detaching them from the state cannot expose a
 // dangling pointer to any other caller (has_present_chain and
 // device_removed_reason both read under the same lock).
+namespace
+{
+    // P5.0. Defined with the stream, below. Returns the neural output texture
+    // when one is live, or nullptr. Takes the stream's own lock briefly and
+    // never while holding this file's - stream_poll nests them the other way
+    // round, and the two orders together would be a cycle.
+    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt);
+}
+
 bool present_frame(float r, float g, float b)
 {
     auto &S = st();
@@ -578,12 +598,99 @@ bool present_frame(float r, float g, float b)
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cl->ResourceBarrier(1, &barrier);
 
-    const float color[4] = { r, g, b, 1.0f };
-    cl->ClearRenderTargetView(rtv, color, 0, nullptr);
+    // ---- P5.0: SHOW THE NEURAL OUTPUT ----
+    //
+    // Every verdict this project has produced is a byte comparison. Nothing has
+    // ever been looked at. That is a real gap: temporal ghosting from
+    // DLSSNR.Reset=0 accumulating history, an inverted channel order, a
+    // half-updated region - none of them moves a counter, and all of them are
+    // obvious in one glance.
+    //
+    // A 1:1 CENTRED CROP, NOT A SCALED VIEW. The backbuffer is 1280x720 and the
+    // neural output is the game's full frame, and there is no way to downscale
+    // without a shader (see the format note at the swapchain). A crop is
+    // therefore not a compromise on the way to something better - it is the
+    // only honest option available, and it happens to be the right one: every
+    // pixel shown is exactly a pixel NR produced, with no resampling standing
+    // between the model's output and the eye.
+    //
+    // When no neural output exists - before the stream is armed, or after it
+    // has run to its bound and released - this falls back to the cycling clear
+    // colour. That fallback is also the signal that the stream has ended.
+    UINT nw = 0, nh = 0;
+    DXGI_FORMAT nfmt = DXGI_FORMAT_UNKNOWN;
+    ID3D12Resource *nsrc = stream_present_source(nw, nh, nfmt);
+    // The format check is not paranoia: the copy is silent about a mismatch at
+    // record time and would fail at execute, taking the device with it.
+    if (nsrc != nullptr && nfmt == DXGI_FORMAT_R10G10B10A2_UNORM &&
+        nw >= 1 && nh >= 1)
+    {
+        const UINT cw = (nw < 1280u) ? nw : 1280u;
+        const UINT ch = (nh < 720u)  ? nh : 720u;
+        const UINT left = (nw - cw) / 2u;
+        const UINT top  = (nh - ch) / 2u;
 
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    cl->ResourceBarrier(1, &barrier);
+        // The backbuffer went PRESENT -> RENDER_TARGET above for the clear.
+        // Take it on to COPY_DEST. The clear still happens first, so a crop
+        // smaller than the backbuffer leaves the cycling colour as a border
+        // rather than undefined pixels.
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        const float color_pre[4] = { r, g, b, 1.0f };
+        cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
+        cl->ResourceBarrier(1, &barrier);
+
+        D3D12_RESOURCE_BARRIER nb{};
+        nb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        nb.Transition.pResource = nsrc;
+        nb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        nb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        nb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cl->ResourceBarrier(1, &nb);
+
+        D3D12_TEXTURE_COPY_LOCATION ps{}, pd{};
+        ps.pResource = nsrc;
+        ps.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        ps.SubresourceIndex = 0;
+        pd.pResource = backbuffer[index];
+        pd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        pd.SubresourceIndex = 0;
+        D3D12_BOX pbox{ left, top, 0, left + cw, top + ch, 1 };
+        cl->CopyTextureRegion(&pd, 0, 0, 0, &ps, &pbox);
+
+        nb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        nb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cl->ResourceBarrier(1, &nb);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cl->ResourceBarrier(1, &barrier);
+
+        bool say = false;
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            if (!S.neural_shown) { S.neural_shown = true; say = true; }
+        }
+        if (say)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P5.0] the bridge window is now showing the NEURAL OUTPUT - a "
+                     "%ux%u 1:1 crop from the centre of the %ux%u frame, no scaling and no "
+                     "resampling. Every pixel on screen is a pixel DLSS-NR produced on the "
+                     "second adapter. The cycling colour returns when the stream ends.",
+                     cw, ch, nw, nh);
+            mgpu::diag::info(line);
+        }
+    }
+    else
+    {
+        const float color[4] = { r, g, b, 1.0f };
+        cl->ClearRenderTargetView(rtv, color, 0, nullptr);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cl->ResourceBarrier(1, &barrier);
+    }
 
     hr = cl->Close();
     if (FAILED(hr))
@@ -5979,7 +6086,8 @@ void capture_poll()
 //
 // SELF-LIMITING BY DESIGN. This is the first code in the project that adds
 // per-frame work to the GAME'S command list, so it stops on its own after
-// STREAM_MAX_FRAMES and prints a summary. A build that misbehaves costs a
+// its frame bound (Frames= in mgpu.ini, default 600) and prints a summary. A
+// build that misbehaves costs a
 // bounded number of frames rather than the rest of the session.
 namespace
 {
@@ -6034,8 +6142,10 @@ namespace
         // PRESENTER - see the note in stream_poll.
         static const unsigned RING = 6;
 
-        // The bound. See the header comment.
-        static const unsigned long long STREAM_MAX_FRAMES = 600;
+        // The bound. See the header comment. Overridable with Frames= in
+        // mgpu.ini so the window can be watched for longer than fifteen
+        // seconds; the default is unchanged.
+        unsigned long long max_frames = 600;
 
         bool requested = false, tried = false, armed = false;
         bool finished = false, summarised = false;
@@ -6140,9 +6250,49 @@ namespace
         return s;
     }
 
+    // P5.0. Forward-declared above present_frame. Copies out the pointer and
+    // geometry under the stream's lock and returns immediately - the caller
+    // does GPU work with it, and holding a lock the GAME'S render thread takes
+    // every frame across that work is the one thing this add-on must never do.
+    //
+    // Safe to hand out a raw pointer here only because both the caller and the
+    // only code that releases it (stream_release, from stream_poll) run on the
+    // bridge thread, sequentially. If a consumer thread is ever added - see the
+    // note in stream_poll - this becomes a lifetime bug and must be revisited
+    // with it.
+    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt)
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (!s.nr_ok || s.tex_out == nullptr) return nullptr;
+        w = s.width; h = s.height; fmt = s.format;
+        return s.tex_out;
+    }
+
     // Read Fault= out of mgpu.ini beside the add-on. Deliberately tiny and
     // deliberately failure-tolerant: this must never be a reason a run does not
     // happen.
+    // P5.0: Frames=<n> raises or lowers the stream's self-imposed bound. The
+    // default of 600 is about fifteen seconds, which was right while the only
+    // output was a log line and is too short to look at anything. Clamped at
+    // both ends: below 60 there is nothing to measure, and the bound exists to
+    // stop a misbehaving build costing the whole session.
+    unsigned long long stream_read_frames()
+    {
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return 600ull;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return 600ull;
+        const char *k = strstr(buf, "Frames=");
+        if (k == nullptr) return 600ull;
+        const long long v = atoll(k + 7);
+        if (v < 60) return 60ull;
+        if (v > 100000) return 100000ull;
+        return (unsigned long long)v;
+    }
+
     // Returns false when the file explicitly says Neural=0.
     bool stream_read_neural()
     {
@@ -6373,6 +6523,7 @@ void stream_request()
     s.requested = true;
     stream_read_fault(s.fault, sizeof s.fault);
     s.neural = stream_read_neural();
+    s.max_frames = stream_read_frames();
 
     // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
     // accepted ANY string, so a name this build cannot inject - "drop" and
@@ -6410,7 +6561,7 @@ void stream_request()
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
              "else.",
-             stream_state::RING, stream_state::STREAM_MAX_FRAMES, s.fault,
+             stream_state::RING, s.max_frames, s.fault,
              s.neural ? "ON (P4.1 - DLSS-NR runs on every consumed frame)"
                       : "off (P4.0 transport-only control)");
     mgpu::diag::info(l);
@@ -6604,7 +6755,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     if (s.produced > 0)
         (void)gq->Signal(s.gfence, s.produced);
 
-    if (s.produced >= stream_state::STREAM_MAX_FRAMES)
+    if (s.produced >= s.max_frames)
     {
         // Bound reached. Stop touching the game's list; the bridge thread
         // prints the summary once the last frames have been consumed.
