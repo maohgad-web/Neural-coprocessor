@@ -37,6 +37,26 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <cstdio>     // P1.6: snprintf. This file had no formatted logging before.
+
+// ---- P6.4: the overlay panel ----
+//
+// reshade.hpp wires up the ImGui function table ONLY when IMGUI_VERSION_NUM is
+// already defined when it is included - the block is #if'd on that - and the
+// table is bound inside register_addon. So imgui.h has to come first, in THIS
+// translation unit, because this is where register_addon is called.
+//
+// GUARDED, because the ImGui headers are a dependency this repo may not carry
+// and a build that fails on the rig at 3am is worse than a build with no panel.
+// Without them the add-on compiles exactly as before and the P6.3 hotkeys are
+// the control; the startup log says which of the two you got, so a missing
+// panel is never a mystery.
+#if defined(__has_include)
+#  if __has_include(<imgui.h>)
+#    define MGPU_HAVE_IMGUI 1
+#    include <imgui.h>
+#  endif
+#endif
+
 #include <reshade.hpp>
 
 #include "adapter.hpp"
@@ -207,6 +227,95 @@ namespace
     }
 }
 
+#if defined(MGPU_HAVE_IMGUI)
+// The panel. Drawn into the BRIDGE runtime's overlay - press Home over the
+// bridge window to open it.
+//
+// Everything it touches goes through the plain-scalar accessors in
+// gpu1_context.hpp, so this stays the only file that knows about both ReShade
+// and the stream.
+//
+// Deliberately read-then-write, never read-modify-write across a frame: the
+// callback runs on the presenting thread, the stream runs on the bridge thread,
+// and holding a value across the gap is how a slider fights with a hotkey.
+static void draw_mgpu_overlay(reshade::api::effect_runtime *)
+{
+    mgpu::gpu1::ui_state st;
+    mgpu::gpu1::ui_read(st);
+
+    if (!st.armed)
+    {
+        ImGui::TextUnformatted("Stream not armed. Press CTRL+ALT+F10 in gameplay.");
+        ImGui::TextUnformatted("Values set here become the starting values.");
+    }
+    else if (st.summarised)
+    {
+        ImGui::TextUnformatted("Stream finished - it ran to its bound. Restart to run another.");
+    }
+
+    bool neural = st.neural;
+    if (ImGui::Checkbox("Neural stage", &neural))
+        mgpu::gpu1::ui_set_neural(neural);
+    ImGui::SameLine();
+    ImGui::TextDisabled(st.nr_ok ? "(up)" : "(not running - transport only)");
+
+    int passes = (int)st.passes;
+    ImGui::TextUnformatted("Passes");
+    for (unsigned i = 1; i <= st.max_passes; ++i)
+    {
+        char lab[8];
+        snprintf(lab, sizeof lab, "x%u", i);
+        if (i > 1) ImGui::SameLine();
+        if (ImGui::RadioButton(lab, &passes, (int)i))
+            mgpu::gpu1::ui_set_passes(i);
+    }
+    // Formatted with snprintf and handed over finished. ImGui's Text family is
+    // varargs, and this add-on cannot test-compile against the ImGui the repo
+    // will actually use - a finished string cannot be mis-forwarded.
+    char note[160];
+    snprintf(note, sizeof note,
+             "All %u handles were created at arm, so this costs nothing to change.",
+             st.max_passes);
+    ImGui::TextUnformatted(note);
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Intensity (0.00 - 2.00)");
+
+    float all = st.intensity[0];
+    if (ImGui::SliderFloat("all passes", &all, 0.0f, 2.0f, "%.2f"))
+        mgpu::gpu1::ui_set_intensity(0, all);
+
+    for (unsigned i = 0; i < st.passes && i < st.max_passes; ++i)
+    {
+        char lab[24];
+        snprintf(lab, sizeof lab, "pass %u", i + 1);
+        float v = st.intensity[i];
+        if (ImGui::SliderFloat(lab, &v, 0.0f, 2.0f, "%.2f"))
+            mgpu::gpu1::ui_set_intensity(i + 1, v);
+    }
+    ImGui::TextDisabled("Live from the next frame - NGX parameters are set per evaluate.");
+
+    if (st.armed)
+    {
+        ImGui::Separator();
+        char c1[160], c2[200];
+        snprintf(c1, sizeof c1, "produced %llu   consumed %llu", st.produced, st.consumed);
+        snprintf(c2, sizeof c2, "dropped %llu   overrun %llu   nr skipped %llu",
+                 st.dropped, st.overrun, st.skipped);
+        ImGui::TextUnformatted(c1);
+        ImGui::TextUnformatted(c2);
+        ImGui::TextDisabled("skipped = seal checked, neural work not run because a newer");
+        ImGui::TextDisabled("frame was already waiting. Not a drop.");
+        if (st.overrun != 0)
+            ImGui::TextDisabled("overrun climbing = GPU 1 is past its budget at this pass count.");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Anything changed here makes this run a TUNING run, not a");
+    ImGui::TextDisabled("measurement - the summary in the log will say so.");
+}
+#endif
+
 // P1.5: the only event this add-on subscribes to that is raised on the GAME's
 // render thread with the GAME's command list open. Everything it does is
 // one-shot and self-disarming; after a single frame is captured it never
@@ -346,6 +455,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // subscription that acts on the game's own command list.
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(
             on_reshade_finish_effects);
+#if defined(MGPU_HAVE_IMGUI)
+        reshade::register_overlay("MGPU Bridge", draw_mgpu_overlay);
+        reshade::log::message(reshade::log::level::info,
+            "[MGPU][P6.4] overlay panel registered - open the ReShade overlay (Home) over the "
+            "BRIDGE window to get passes, the neural on/off and the intensity sliders. The "
+            "CTRL+ALT+F8/F9/F11 hotkeys still work and drive the same values.");
+#else
+        reshade::log::message(reshade::log::level::warning,
+            "[MGPU][P6.4] NO OVERLAY PANEL IN THIS BUILD - imgui.h was not on the include path "
+            "when this compiled, and reshade.hpp only wires up the ImGui function table when "
+            "IMGUI_VERSION_NUM is defined ahead of it. Nothing else is affected: use the "
+            "CTRL+ALT+F8 / F9 / F11 hotkeys, which drive exactly the same values. Add the "
+            "ReShade deps' imgui headers to the include path to get the panel.");
+#endif
         break;
 
     case DLL_PROCESS_DETACH:
@@ -368,6 +491,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         //   the FreeLibrary happens first the GPU 1 device is simply leaked
         //   - explicitly in scope at P0. A hang is not.
         (void)lpReserved;
+#if defined(MGPU_HAVE_IMGUI)
+        reshade::unregister_overlay("MGPU Bridge", draw_mgpu_overlay);
+#endif
         mgpu::worker::stop();
         reshade::unregister_addon(hModule);
         break;

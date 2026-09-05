@@ -237,6 +237,39 @@ void capture_poll();
 // mgpu.ini to run the old chain again, with the stream deliberately not armed.
 bool probes_enabled();
 
+// ---- P6.4: what the overlay panel reads and writes ----
+//
+// Plain scalars on purpose. This header names no ReShade type and no ImGui
+// type, and the panel that drives these lives in dllmain.cpp where those
+// headers already are - the same separation that has kept gpu1_context free of
+// ReShade since T3.
+//
+// ANY THREAD: the overlay callback runs on whichever thread presents the
+// runtime it belongs to, not the bridge thread, so these take the stream's lock
+// internally. They are tiny and never block - a UI callback that can stall is a
+// UI callback that can stall a present.
+struct ui_state
+{
+    bool armed = false, summarised = false, neural = false, nr_ok = false;
+    bool profile = false, present_in = false;
+    unsigned passes = 1, max_passes = 4;
+    float intensity[4] = {};
+    unsigned long long consumed = 0, produced = 0, dropped = 0, overrun = 0, skipped = 0;
+};
+void ui_read(ui_state &out);
+
+// Pass count, live. Every NGX feature handle is created at arm time, so this is
+// only a count change - nothing is created or destroyed, and it takes effect on
+// the next consumed frame. Clamped to 1..max_passes.
+void ui_set_passes(unsigned n);
+
+// pass_1based == 0 sets every pass; otherwise that one. Clamped 0.0..2.0.
+void ui_set_intensity(unsigned pass_1based, float v);
+
+// Turn the neural stage off without tearing it down - the handles stay alive so
+// it can come back without a 400 ms CreateFeature stall.
+void ui_set_neural(bool on);
+
 // P6.3. BRIDGE THREAD ONLY - both of these are called from the hotkey handler
 // in the message pump, which runs on the bridge thread, and they touch state
 // that only the bridge thread reads. Do not call them from anywhere else.

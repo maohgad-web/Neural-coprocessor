@@ -6406,6 +6406,9 @@ namespace
         // this needs no synchronisation of its own.
         unsigned intensity_target = 0;
         unsigned long long intensity_edits = 0;
+        // P6.4: frames whose seal was checked but whose neural work was
+        // deliberately skipped because a newer frame was already waiting.
+        unsigned long long nr_skipped = 0;
 
         // GENERIC KEYS. Every other parameter is reachable without this file
         // knowing its name: Set.<key>=<value> in the ini is applied verbatim
@@ -6863,9 +6866,11 @@ namespace
             h = make_tex(ndev, s.width, s.height, s.format,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_out);
-        // P6.0: the ping-pong partner. Created only when it will be used, so a
-        // Passes=1 run allocates exactly what P5 allocated.
-        if (SUCCEEDED(h) && s.passes > 1)
+        // P6.4: always created now. The pass count is changeable at runtime, so
+        // "will it be used" is no longer knowable at arm time, and allocating it
+        // lazily would mean a CreateFeature-sized stall the first time someone
+        // moved the slider.
+        if (SUCCEEDED(h))
             h = make_tex(ndev, s.width, s.height, s.format,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_pong);
@@ -6901,16 +6906,24 @@ namespace
         if (SUCCEEDED(ch))
         {
             LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
-            for (unsigned i = 0; i < s.passes; ++i)
+            // P6.4: MAX_PASSES handles, not `passes` of them. The pass count is
+            // now changeable while the stream runs, and CreateFeature takes
+            // 200-450 ms - doing that mid-stream would stall the consumer for
+            // twenty frames and show up as a fault that was really a UI click.
+            // Paying for all four up front costs about a second of arm time and
+            // three extra sets of history buffers; the weight heap is shared
+            // (the snippet log says "Released network resources after FINAL
+            // feature release", so it is refcounted, not duplicated).
+            for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
             {
                 const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
                 r = p_cre(s.nl, (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
                           s.nr_params, &s.nr_handle[i]);
                 LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
                 snprintf(line, sizeof line,
-                         "[MGPU][P4.1] CreateFeature(Reserved18) pass %u/%u %ux%u fmt=%d: "
+                         "[MGPU][P4.1] CreateFeature(Reserved18) handle %u/%u %ux%u fmt=%d: "
                          "result=0x%08X (%s) handle=0x%p elapsed=%.0fms",
-                         i + 1, s.passes, s.width, s.height, (int)s.format,
+                         i + 1, stream_state::MAX_PASSES, s.width, s.height, (int)s.format,
                          (unsigned)r, ngx_result_name(r), (void *)s.nr_handle[i],
                          (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
                 mgpu::diag::info(line);
@@ -6931,7 +6944,7 @@ namespace
             }
         }
         bool all = (SUCCEEDED(ch) && r == NVSDK_NGX_Result_Success);
-        for (unsigned i = 0; i < s.passes && all; ++i)
+        for (unsigned i = 0; i < stream_state::MAX_PASSES && all; ++i)
             if (s.nr_handle[i] == nullptr) all = false;
         if (!all)
         {
@@ -6944,7 +6957,8 @@ namespace
                               "the stream.");
             return false;
         }
-        // With Passes=1 this is tex_out, exactly as P5 had it.
+        // Recomputed after every consume as well, because `passes` can change
+        // under us now. With Passes=1 this is tex_out, exactly as P5 had it.
         s.nr_final = (s.passes % 2u == 1u) ? s.tex_out : s.tex_pong;
         return true;
     }
@@ -7047,6 +7061,93 @@ bool probes_enabled()
 // Bridge thread only, by construction: RegisterHotKey delivers WM_HOTKEY to the
 // thread that registered it, which is the bridge thread, which is also the only
 // thread that reads intensity[]. Nothing here needs a lock.
+
+// ---- P6.4: the accessors the overlay panel drives ----
+//
+// BRIDGE THREAD ONLY is NOT true of these - the ReShade overlay callback runs
+// on whichever thread presents the runtime it belongs to. So unlike the hotkey
+// helpers above, these take the stream's lock. They are deliberately tiny and
+// never block on anything: a UI callback that can stall is a UI callback that
+// can stall a present.
+//
+// gpu1_context still names no ReShade and no ImGui type. The panel lives in
+// dllmain.cpp, where those headers already are, and talks to the stream through
+// plain scalars - the same rule that has kept this file portable since T3.
+void ui_read(ui_state &out)
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    out.armed       = s.armed;
+    out.summarised  = s.summarised;
+    out.neural      = s.neural;
+    out.nr_ok       = s.nr_ok;
+    out.passes      = s.passes;
+    out.max_passes  = stream_state::MAX_PASSES;
+    out.profile     = s.profile;
+    out.present_in  = s.present_in;
+    for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out.intensity[i] = s.intensity[i];
+    out.consumed    = s.consumed;
+    out.produced    = s.produced;
+    out.dropped     = s.dropped;
+    out.overrun     = s.overrun;
+    out.skipped     = s.nr_skipped;
+}
+
+void ui_set_passes(unsigned n)
+{
+    if (n < 1) n = 1;
+    if (n > stream_state::MAX_PASSES) n = stream_state::MAX_PASSES;
+    stream_state &s = str();
+    unsigned was;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        was = s.passes;
+        if (was == n) return;
+        s.passes = n;
+        // Every handle exists from arm time, so this is a count change and
+        // nothing is created or destroyed here. nr_final is recomputed on the
+        // next consumed frame.
+        ++s.intensity_edits;
+    }
+    char l[300];
+    snprintf(l, sizeof l,
+             "[MGPU][P6.4] passes %u -> %u, live from the next frame. Handles for all %u were "
+             "created at arm, so nothing is built or torn down here.",
+             was, n, stream_state::MAX_PASSES);
+    mgpu::diag::info(l);
+}
+
+void ui_set_intensity(unsigned pass_1based, float v)
+{
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (pass_1based == 0)
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.intensity[i] = v;
+    else if (pass_1based <= stream_state::MAX_PASSES)
+        s.intensity[pass_1based - 1] = v;
+    ++s.intensity_edits;
+}
+
+void ui_set_neural(bool on)
+{
+    stream_state &s = str();
+    bool was;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        was = s.neural;
+        if (was == on) return;
+        // nr_ok is NOT cleared: the feature handles stay alive so this can be
+        // switched back without a 400 ms stall. The consume loop tests `neural`.
+        s.neural = on;
+        ++s.intensity_edits;
+    }
+    char l[260];
+    snprintf(l, sizeof l, "[MGPU][P6.4] neural stage %s (handles kept alive either way)",
+             on ? "ON" : "OFF - transport only, the window shows the last neural frame");
+    mgpu::diag::info(l);
+}
 
 // Cycle which pass the steps act on: all -> 1 -> 2 -> ... -> passes -> all.
 void intensity_cycle_target()
@@ -7643,7 +7744,28 @@ void stream_poll()
             // small sample of the output. One list, one submission, one wait per
             // consumed frame - which is also why the consumer's pace with the
             // stage attached is directly comparable to its pace without it.
-            if (s.nr_ok)
+            // ---- P6.4: DO NOT RUN NR ON A FRAME THAT IS ALREADY STALE ----
+            //
+            // stream_poll consumes EVERY arrived frame before it returns, and
+            // the loop presents once afterwards. When the consumer is behind,
+            // that meant evaluating six frames and showing the last one. The
+            // Passes=2 run on 2026-09-05 did exactly that: 2651 frames of
+            // neural work, 451 presents - 83% of it computed and discarded,
+            // which is what turned "17.5 ms of work against a 16.9 ms budget"
+            // into a 9 fps window.
+            //
+            // The seal is still read for every frame, because identity and
+            // ordering are the point of the instrument and cost microseconds.
+            // Only the EVALUATES are skipped, and only for frames that a newer
+            // one has already superseded. Those are counted separately from
+            // `dropped`: a frame we chose not to denoise because it was already
+            // old is not the same event as a frame the transport lost, and
+            // conflating them would report our own scheduling as a fault.
+            const bool newest = (f >= completed);
+            const bool run_nr = s.nr_ok && newest && s.neural;
+            if (!newest) ++s.nr_skipped;
+
+            if (run_nr)
             {
                 D3D12_TEXTURE_COPY_LOCATION us{}, ud{};
                 us.pResource = s.nxfer;
@@ -7752,6 +7874,9 @@ void stream_poll()
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
                 s.nr_first = false;
+                // P6.4: `passes` can change between frames now, so the final
+                // texture is recomputed here rather than fixed at arm time.
+                s.nr_final = (s.passes % 2u == 1u) ? s.tex_out : s.tex_pong;
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
 
@@ -7787,7 +7912,7 @@ void stream_poll()
             // Resolve after every mark is written, never before: the resolve
             // reads the heap on the GPU timeline and a mark recorded after it
             // would not be in the buffer we map.
-            if (s.ts_ok && s.nr_ok)
+            if (s.ts_ok && run_nr)
                 s.nl->ResolveQueryData(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
                                        stream_state::TS_MARKS, s.tsread, 0);
 
@@ -7841,7 +7966,11 @@ void stream_poll()
         // P2.2a: the per-stage GPU times for this frame. Read only when the
         // neural stage is up, because with it off marks 2..4 are never written
         // and the deltas would be garbage rather than zero.
-        if (s.ts_ok && s.nr_ok)
+        // P6.4: only when the evaluates actually happened. On a skipped frame
+        // marks 2..4 are never written and the deltas would be whatever the
+        // previous resolve left behind - a stale number that looks exactly like
+        // a real one.
+        if (s.ts_ok && run_nr)
         {
             const UINT64 *tv = nullptr;
             D3D12_RANGE tr{0, (SIZE_T)(stream_state::TS_MARKS * 8)};
@@ -7872,7 +8001,7 @@ void stream_poll()
         // identical-rate means is ambiguous by construction and the summary
         // says so: a static scene produces identical NR output legitimately.
         // It is a rate to be read alongside the scene, not a verdict.
-        if (s.nr_ok && !s.profile)
+        if (run_nr && !s.profile)
         {
             unsigned char *sm = nullptr;
             D3D12_RANGE sr{0, 1024};
@@ -8066,7 +8195,10 @@ void stream_poll()
             snprintf(line, sizeof line,
                      "[MGPU][P4.1] neural stage: %s | passes=%u | evaluates=%llu (=%llu frames "
                      "x %u passes) failures=%llu | output sample identical to the previous frame "
-                     "%llu times (%.1f%%). ONE FEATURE HANDLE PER PASS, DLSSNR.Reset=1 on the "
+                     "%llu times (%.1f%%) | %llu frames had their NEURAL WORK SKIPPED because a "
+                     "newer frame was already waiting - those are not drops, their seals were "
+                     "checked and they are counted here so the evaluate count and the frame "
+                     "count are not expected to agree. ONE FEATURE HANDLE PER PASS, DLSSNR.Reset=1 on the "
                      "first frame only, so each pass's temporal history is its OWN output a "
                      "frame ago rather than the previous pass of this frame. NOTE evaluates "
                      "COUNTS PASSES, not frames - divide by %u before comparing it with the "
@@ -8080,6 +8212,7 @@ void stream_poll()
                      (s.passes > 0) ? s.nr_evals / s.passes : s.nr_evals, s.passes,
                      s.nr_fails, s.nr_same,
                      (s.nr_frames > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_frames - 1) : 0.0,
+                     s.nr_skipped,
                      s.passes);
             mgpu::diag::info(line);
         }
