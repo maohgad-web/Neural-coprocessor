@@ -235,4 +235,21 @@ void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
 // arrived, checks each seal, and prints the summary once the producer has
 // stopped and drained.
 void stream_poll();
+
+// P5.1. Bridge thread, called immediately before present_frame. Returns true
+// when the bridge should put a frame on screen.
+//
+// While the stream is running with an on-screen output, that is once per NEW
+// neural frame rather than once per vsync - which removes three quarters of the
+// full-frame backbuffer copies and three quarters of the DWM cross-adapter
+// copies of the bridge window, both of which were competing with the payload
+// for the same link. When there is nothing new it blocks on the shared fence
+// (outside the stream's lock) for up to `timeout_ms`, so the consumer wakes on
+// a frame landing rather than on a vblank, and its cadence stops depending on
+// which display GPU 1 is attached to.
+//
+// Returns true unconditionally when the stream is idle or in profile mode, so
+// the cycling clear colour - T5's liveness proof - keeps running as it always
+// has.
+bool stream_present_gate(unsigned long timeout_ms);
 }

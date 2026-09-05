@@ -522,6 +522,16 @@ namespace
                 const float cg = 0.5f + 0.5f * std::sin(ph + TAU / 3.0f);
                 const float cb = 0.5f + 0.5f * std::sin(ph + 2.0f * TAU / 3.0f);
 
+                // P5.1. Poll first, then decide whether there is anything worth
+                // presenting. When the stream is running this paces the loop to
+                // NEW neural frames instead of to vsync; when it is idle the
+                // gate returns true every time and the loop behaves exactly as
+                // T5 shipped it. The gate does the waiting itself, so a false
+                // return means "nothing new, and we have already slept".
+                mgpu::gpu1::stream_poll();
+                if (!mgpu::gpu1::stream_present_gate(4))
+                    continue;
+
                 if (!mgpu::gpu1::present_frame(cr, cg, cb))
                 {
                     // The first failure is already logged with its step,
@@ -534,9 +544,6 @@ namespace
                 // frame has actually been captured. Placed after the present so
                 // its one expensive poll cannot delay a frame that was ready.
                 mgpu::gpu1::capture_poll();
-                // P4.0: same placement, same reason - after the present, so a
-                // seal readback cannot delay a frame that was ready.
-                mgpu::gpu1::stream_poll();
 
                 ++frame;
                 if (frame == 1)

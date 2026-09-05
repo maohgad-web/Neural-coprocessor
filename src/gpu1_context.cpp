@@ -6163,6 +6163,45 @@ namespace
         ID3D12Fence *nfence = nullptr;         // the same fence on GPU 1
 
         ID3D12Resource *nseal = nullptr;       // READBACK, RING * SEAL_STRIDE
+
+        // ---- P2.2a: GPU timestamps on GPU 1's consume list ----
+        //
+        // The first numbers in this project that are GPU TIME rather than
+        // wall-clock. Everything before this was QPC around a CPU-visible
+        // completion, so it carried queue latency and driver overhead mixed in
+        // with execution and could not tell them apart - which is why every one
+        // of those figures is filed as perishable.
+        //
+        // Five marks per consumed frame, all on the one list:
+        //   0  list start
+        //   1  after the seal copy
+        //   2  after the payload unpack (cross-adapter buffer -> NR input)
+        //   3  after EvaluateFeature
+        //   4  after the output sample copy
+        //
+        // The interesting one is 2->3: what DLSS-NR actually costs on GPU 1,
+        // on our path, against the 14.2 ms the reference tool measures on a
+        // comparable single-GPU one. That comparison is the whole architecture
+        // argument and it has never had our side of it.
+        //
+        // NOTE THIS NEEDS NO CROSS-ADAPTER CLOCK. These are all GPU 1's own
+        // timestamps on GPU 1's own queue, so GetTimestampFrequency is enough
+        // and the one symbol still behind the containment guard stays there.
+        // (Its name is deliberately not written here - the guard greps this
+        // tree, so naming it in a comment would fail the build exactly as
+        // calling it would. That is the guard working, not a bug.)
+        // Correlating GPU 0's timeline with GPU 1's - which is what a true
+        // transit time in GPU time would need - is a separate step and is
+        // deliberately not taken here.
+        ID3D12QueryHeap *tsheap = nullptr;
+        ID3D12Resource *tsread = nullptr;      // READBACK, TS_MARKS * 8 bytes
+        UINT64 ts_freq = 0;
+        bool ts_ok = false;
+        static const UINT TS_MARKS = 5;
+        double ts_sum[TS_MARKS - 1] = {};
+        double ts_min[TS_MARKS - 1] = {};
+        double ts_max[TS_MARKS - 1] = {};
+        unsigned long long ts_n = 0;
         ID3D12CommandQueue *nq = nullptr;
         ID3D12CommandAllocator *na = nullptr;
         ID3D12GraphicsCommandList *nl = nullptr;
@@ -6224,6 +6263,20 @@ namespace
         char fault[32] = "none";
         bool fault_unimpl = false;   // a name was given that this build cannot inject
 
+        // ---- P5.1: pipeline cleanup ----
+        // `presented` is the value `consumed` had when the bridge last put a
+        // frame on screen. The two being equal means there is nothing new to
+        // show, and the present is skipped entirely.
+        unsigned long long presented = 0;
+        HANDLE gate_ev = nullptr;
+        unsigned long long gate_waits = 0, gate_presents = 0, gate_idle = 0;
+        // Profile=1 in mgpu.ini strips the instrument down to what a shipping
+        // build would carry: no on-screen output, no liveness sample. The seal
+        // stays - it is the correctness check, it is 64 bytes, and a
+        // measurement run that silently stops checking identity is how a
+        // corrupted stream gets recorded as a fast one.
+        bool profile = false;
+
         // ---- P4.1: the persistent neural stage ----
         // Opt-OUT (mgpu.ini Neural=0), because running without it is now the
         // control rather than the default: the pace of the consumer with and
@@ -6260,11 +6313,72 @@ namespace
     // bridge thread, sequentially. If a consumer thread is ever added - see the
     // note in stream_poll - this becomes a lifetime bug and must be revisited
     // with it.
+    // P5.1. THE PRESENT GATE - the pipeline cleanup, and it is two fixes in one.
+    //
+    // The bridge's present loop ran at the display's refresh - 210 fps - and
+    // P5.0 copied a full frame into the backbuffer on every one of them, new
+    // or not. At 1600x900 that is ~1.2 GB/s of GPU 1 bandwidth spent
+    // re-showing frames already on screen, plus a DWM cross-adapter copy per
+    // present while GPU 1 is headless, on the SAME LINK the payload uses. The
+    // measurement arm was competing with itself.
+    //
+    // Now the loop presents only when a new neural frame exists - about 57 per
+    // second instead of 210, so three quarters of those copies and three
+    // quarters of that DWM traffic simply stop happening.
+    //
+    // AND IT FIXES THE PACING COUPLING FROM SECTION 05a AS A SIDE EFFECT. The
+    // consumer used to be polled once per present, so its cadence was the
+    // bridge swapchain's vsync - 3.23x the producer's rate on a 210 Hz panel
+    // and 1.01x on a 60 Hz one. Now the idle path blocks on the SHARED FENCE
+    // event for the next frame instead, with a short timeout as a backstop, so
+    // the consumer wakes when a frame actually lands and its rate no longer
+    // depends on what display GPU 1 is attached to.
+    //
+    // THE FENCE WAIT HAPPENS OUTSIDE THE LOCK. The stream mutex is taken by
+    // the event handler on the GAME'S render thread every frame; holding it
+    // across a wait is the one hazard in this add-on that can reach the
+    // application. The pointer and the target value are copied out under the
+    // lock, the lock is released, and only then does anything block.
+    //
+    // Returns true when the caller should present.
+    bool stream_present_gate(DWORD timeout_ms)
+    {
+        stream_state &s = str();
+        ID3D12Fence *f = nullptr;
+        UINT64 want = 0;
+        HANDLE ev = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(s.cs);
+            // Not streaming, or nothing to show on screen: behave exactly as
+            // the loop always has. The cycling colour is T5's liveness proof
+            // and must not stop because the stream is idle.
+            if (!s.armed || s.summarised || !s.nr_ok || s.profile)
+            { ++s.gate_presents; return true; }
+
+            if (s.consumed != s.presented)
+            {
+                s.presented = s.consumed;
+                ++s.gate_presents;
+                return true;
+            }
+            f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
+            ++s.gate_idle;
+        }
+
+        if (f != nullptr && ev != nullptr)
+        {
+            ++str().gate_waits;
+            f->SetEventOnCompletion(want, ev);
+            WaitForSingleObject(ev, timeout_ms);
+        }
+        return false;
+    }
+
     ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt)
     {
         stream_state &s = str();
         std::lock_guard<std::mutex> lk(s.cs);
-        if (!s.nr_ok || s.tex_out == nullptr) return nullptr;
+        if (!s.nr_ok || s.tex_out == nullptr || s.profile) return nullptr;
         w = s.width; h = s.height; fmt = s.format;
         return s.tex_out;
     }
@@ -6291,6 +6405,19 @@ namespace
         if (v < 60) return 60ull;
         if (v > 100000) return 100000ull;
         return (unsigned long long)v;
+    }
+
+    // P5.1: Profile=1 strips display and liveness sampling for measurement runs.
+    bool stream_read_profile()
+    {
+        FILE *f = fopen("mgpu.ini", "rb");
+        if (f == nullptr) return false;
+        char buf[512] = {};
+        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        if (got == 0) return false;
+        const char *k = strstr(buf, "Profile=");
+        return (k != nullptr) && (k[8] == '1');
     }
 
     // Returns false when the file explicitly says Neural=0.
@@ -6344,6 +6471,9 @@ namespace
         if (s.nl  != nullptr) { s.nl->Release();  s.nl = nullptr; }
         if (s.na  != nullptr) { s.na->Release();  s.na = nullptr; }
         if (s.nq  != nullptr) { s.nq->Release();  s.nq = nullptr; }
+        if (s.gate_ev != nullptr) { CloseHandle(s.gate_ev); s.gate_ev = nullptr; }
+        if (s.tsread != nullptr) { s.tsread->Release(); s.tsread = nullptr; }
+        if (s.tsheap != nullptr) { s.tsheap->Release(); s.tsheap = nullptr; }
         if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
         if (s.nfence != nullptr) { s.nfence->Release(); s.nfence = nullptr; }
         if (s.gfence_share != nullptr) { CloseHandle(s.gfence_share); s.gfence_share = nullptr; }
@@ -6524,6 +6654,7 @@ void stream_request()
     stream_read_fault(s.fault, sizeof s.fault);
     s.neural = stream_read_neural();
     s.max_frames = stream_read_frames();
+    s.profile = stream_read_profile();
 
     // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
     // accepted ANY string, so a name this build cannot inject - "drop" and
@@ -6556,14 +6687,16 @@ void stream_request()
     char l[500];
     snprintf(l, sizeof l,
              "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\", "
-             "neural=%s. "
+             "neural=%s, profile=%s. "
              "Every game frame from the next one is sealed and transited until the bound is "
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
              "else.",
              stream_state::RING, s.max_frames, s.fault,
              s.neural ? "ON (P4.1 - DLSS-NR runs on every consumed frame)"
-                      : "off (P4.0 transport-only control)");
+                      : "off (P4.0 transport-only control)",
+             s.profile ? "ON (no on-screen output, no liveness sample - measurement run)"
+                       : "off");
     mgpu::diag::info(l);
 }
 
@@ -6716,6 +6849,38 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             {
                 s.nev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
                 if (s.nev == nullptr) h = E_FAIL;
+            }
+            if (SUCCEEDED(h))
+            {
+                s.gate_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (s.gate_ev == nullptr) h = E_FAIL;
+            }
+
+            // P2.2a. A timestamp query heap and its resolve target. Failure
+            // here is NOT fatal: the stream is a correctness instrument first
+            // and it must not stop transporting because a profiler could not be
+            // built. ts_ok gates every use and the summary says when it is off.
+            if (SUCCEEDED(h))
+            {
+                D3D12_QUERY_HEAP_DESC qh{};
+                qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+                qh.Count = stream_state::TS_MARKS;
+                qh.NodeMask = 0;
+                HRESULT th = ndev->CreateQueryHeap(&qh, IID_PPV_ARGS(&s.tsheap));
+                if (SUCCEEDED(th))
+                    th = make_buf(ndev, (UINT64)stream_state::TS_MARKS * 8,
+                                  D3D12_HEAP_TYPE_READBACK, &s.tsread);
+                if (SUCCEEDED(th)) th = s.nq->GetTimestampFrequency(&s.ts_freq);
+                s.ts_ok = SUCCEEDED(th) && s.ts_freq > 0;
+                for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i) s.ts_min[i] = 1e30;
+                char tl[400];
+                snprintf(tl, sizeof tl,
+                         "[MGPU][P2.2] GPU timestamps on GPU 1: query heap + "
+                         "GetTimestampFrequency hr=0x%08X freq=%llu ticks/s -> %s. These are "
+                         "GPU time, not wall-clock; no cross-adapter clock is involved.",
+                         (unsigned)th, (unsigned long long)s.ts_freq,
+                         s.ts_ok ? "ON" : "OFF (the stream runs unprofiled)");
+                mgpu::diag::info(tl);
             }
         }
         else if (ndev == nullptr) h = E_FAIL;
@@ -6929,8 +7094,12 @@ void stream_poll()
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
         if (SUCCEEDED(h))
         {
+            if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+
             s.nl->CopyBufferRegion(s.nseal, (UINT64)slot * SEAL_STRIDE,
                                    s.nxfer, slot_off, sizeof(MgpuSeal));
+
+            if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
 
             // ---- P4.1: the neural stage, in the SAME list as the seal read ----
             //
@@ -6951,6 +7120,8 @@ void stream_poll()
                 s.nl->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
                 barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
 
                 s.nr_params->Set("DLSSNR.Color", s.tex_in);
                 s.nr_params->Set("DLSSNR.Output", s.tex_out);
@@ -6989,6 +7160,10 @@ void stream_poll()
                     }
                 }
 
+                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+
+                if (!s.profile)
+                {
                 barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION ss{}, sd{};
@@ -7002,9 +7177,19 @@ void stream_poll()
                 s.nl->CopyTextureRegion(&sd, 0, 0, 0, &ss, &box);
                 barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
                 barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_COPY_DEST);
+
+                if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
             }
+
+            // Resolve after every mark is written, never before: the resolve
+            // reads the heap on the GPU timeline and a mark recorded after it
+            // would not be in the buffer we map.
+            if (s.ts_ok && s.nr_ok)
+                s.nl->ResolveQueryData(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                       stream_state::TS_MARKS, s.tsread, 0);
 
             h = s.nl->Close();
         }
@@ -7037,12 +7222,41 @@ void stream_poll()
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
 
+        // P2.2a: the per-stage GPU times for this frame. Read only when the
+        // neural stage is up, because with it off marks 2..4 are never written
+        // and the deltas would be garbage rather than zero.
+        if (s.ts_ok && s.nr_ok)
+        {
+            const UINT64 *tv = nullptr;
+            D3D12_RANGE tr{0, (SIZE_T)(stream_state::TS_MARKS * 8)};
+            if (SUCCEEDED(s.tsread->Map(0, &tr, (void **)&tv)) && tv != nullptr)
+            {
+                bool sane = true;
+                for (UINT i = 1; i < stream_state::TS_MARKS; ++i)
+                    if (tv[i] < tv[i - 1]) sane = false;   // a wrapped or unwritten mark
+                if (sane)
+                {
+                    for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i)
+                    {
+                        const double ms = (double)(tv[i + 1] - tv[i]) * 1000.0
+                                        / (double)s.ts_freq;
+                        s.ts_sum[i] += ms;
+                        if (ms < s.ts_min[i]) s.ts_min[i] = ms;
+                        if (ms > s.ts_max[i]) s.ts_max[i] = ms;
+                    }
+                    ++s.ts_n;
+                }
+                D3D12_RANGE tn{0, 0};
+                s.tsread->Unmap(0, &tn);
+            }
+        }
+
         // The liveness sample. Compared against the PREVIOUS frame's, not
         // against a value we chose - section 00a's rule. What a high
         // identical-rate means is ambiguous by construction and the summary
         // says so: a static scene produces identical NR output legitimately.
         // It is a rate to be read alongside the scene, not a verdict.
-        if (s.nr_ok)
+        if (s.nr_ok && !s.profile)
         {
             unsigned char *sm = nullptr;
             D3D12_RANGE sr{0, 1024};
@@ -7245,6 +7459,46 @@ void stream_poll()
                      (s.nr_evals > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_evals - 1) : 0.0);
             mgpu::diag::info(line);
         }
+
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P5.1] present gate: presents=%llu idle=%llu fence waits=%llu. The "
+                     "bridge presented once per NEW neural frame instead of once per vsync, so "
+                     "the full-frame backbuffer copy and the DWM cross-adapter copy of this "
+                     "window happen at the producer's rate rather than the display's. The idle "
+                     "path blocks on the shared fence, so the consumer's cadence no longer "
+                     "depends on which display GPU 1 is attached to.%s",
+                     s.gate_presents, s.gate_idle, s.gate_waits,
+                     s.profile ? " PROFILE MODE: no on-screen output and no liveness sample this "
+                                 "run - the identical-rate above is therefore absent by design, "
+                                 "not a failure." : "");
+            mgpu::diag::info(line);
+        }
+
+        if (s.ts_ok && s.ts_n > 0)
+        {
+            const double n = (double)s.ts_n;
+            snprintf(line, sizeof line,
+                     "[MGPU][P2.2] GPU TIME on GPU 1, per consumed frame, n=%llu | seal copy "
+                     "mean=%.3f | unpack (cross-adapter buffer -> NR input) mean=%.3f min=%.3f "
+                     "max=%.3f | EVALUATE mean=%.3f min=%.3f max=%.3f | output sample "
+                     "mean=%.3f ms. These are GPU 1's own timestamps on GPU 1's own queue - "
+                     "execution, not wall-clock, and no cross-adapter clock is involved. The "
+                     "evaluate figure is the one to compare against the reference tool's 14.2 ms "
+                     "evaluateGPU, and it is the first time this project has had its own side of "
+                     "that comparison. STILL PERISHABLE: one rig, one link, one resolution, one "
+                     "scene.",
+                     s.ts_n,
+                     s.ts_sum[0] / n,
+                     s.ts_sum[1] / n, s.ts_min[1], s.ts_max[1],
+                     s.ts_sum[2] / n, s.ts_min[2], s.ts_max[2],
+                     s.ts_sum[3] / n);
+            mgpu::diag::info(line);
+        }
+        else if (s.neural)
+            mgpu::diag::warn("[MGPU][P2.2] no GPU timings collected - the query heap did not "
+                             "come up, or the neural stage did not. The transport result above "
+                             "stands; there is simply no profile for this run.");
 
         const bool clean = (s.dropped == 0 && s.reordered == 0 && s.bad_magic == 0 &&
                             s.contract == 0 && s.alias == 0);
