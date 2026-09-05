@@ -515,6 +515,12 @@ namespace
     // round, and the two orders together would be a cycle.
     ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt,
                                           D3D12_RESOURCE_STATES &rest);
+
+    // P7.4. Same arrangement, for the LEFT half of a split present: the frame
+    // as it arrived from the game, before the model. Returns nullptr unless
+    // the mode is split AND a neural output exists to put beside it - half a
+    // comparison would read as the model producing nothing.
+    ID3D12Resource *stream_present_split_left(D3D12_RESOURCE_STATES &rest);
 }
 
 bool present_frame(float r, float g, float b)
