@@ -2889,6 +2889,207 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         }
 
         // =================================================================
+        // P4.2 - DOES DLSS-NR READ DEPTH? THE PAYLOAD QUESTION.
+        // =================================================================
+        //
+        // Every evaluate this project has ever run passed depth as NULL and
+        // motion vectors as ZERO, and NR accepted all of them. "Accepted" is
+        // not "unaffected", and the difference sets the payload for the entire
+        // architecture:
+        //
+        //   depth not read  -> colour only crosses. The design is what we built.
+        //   depth read      -> depth must cross too. R32_FLOAT at 1440p is
+        //                      ~14.7 MB against ~14.06 MB of colour, so the
+        //                      per-frame payload roughly DOUBLES on a link that
+        //                      is already the binding constraint.
+        //
+        // Motion vectors are deliberately not part of this question. P0_RECORD
+        // records QuantMotion deriving flow from colour ON GPU 1 at 0.13-0.17
+        // ms, and the reference tool already runs that substitution with zero
+        // failures over 3000 evaluates - so flow is produced where it is
+        // consumed and never crosses. Depth cannot be derived that way, which
+        // is why it is the only open half.
+        //
+        // THE TEST IS A CONTROL, NOT AN OBSERVATION. Two evaluates, identical
+        // in every respect - same real frame, same intensity, same Reset - with
+        // exactly one variable: whether a depth texture is bound. Byte-compare
+        // the outputs.
+        //
+        //   differing == 0  -> the feature did not read depth AT ALL on this
+        //                      path. Not "depth is optional": not read.
+        //   differing > 0   -> it read it, and depth joins the payload.
+        //
+        // THE DEPTH IS A GRADIENT, NOT A CONSTANT, AND THAT MATTERS. A cleared
+        // depth carries no more information than no depth, so identical output
+        // would be ambiguous between "ignores depth" and "a flat depth happens
+        // to mean the same as none". A varying field removes that reading: if
+        // NR looks at depth at all, a plane sweeping front-to-back cannot
+        // produce the same bytes as no depth.
+        if (P3 && !used_depth)
+        {
+            unsigned long long d_diff = 0;
+            bool ok42 = true;
+            const unsigned long long total42 = (unsigned long long)width * height;
+
+            // A front-to-back gradient in R32_FLOAT, written into the upload
+            // region P1.2 already reserved for depth.
+            {
+                unsigned char *um = nullptr;
+                D3D12_RANGE none{0, 0};
+                if (SUCCEEDED(buf_upload->Map(0, &none, reinterpret_cast<void **>(&um))) &&
+                    um != nullptr)
+                {
+                    for (UINT y = 0; y < height; ++y)
+                    {
+                        unsigned char *row = um + fp_depth.Offset
+                                           + (size_t)y * fp_depth.Footprint.RowPitch;
+                        for (UINT x = 0; x < width; ++x)
+                        {
+                            const float d = (height > 1)
+                                ? ((float)y / (float)(height - 1)) : 0.5f;
+                            memcpy(row + (size_t)x * 4, &d, 4);
+                        }
+                    }
+                    buf_upload->Unmap(0, nullptr);
+                }
+                else ok42 = false;
+            }
+
+            // Pass 1: NO depth key has ever been set in this session (the
+            // `!used_depth` guard above is what guarantees that - P1.2's retry
+            // path binds depth, and if it fired there is no null-depth arm to
+            // compare against and this probe correctly does not run).
+            auto run42 = [&](bool bind_depth, ID3D12Resource *dst, UINT64 fence_v) -> bool
+            {
+                HRESULT h = palloc->Reset();
+                if (SUCCEEDED(h)) h = pcmd->Reset(palloc, nullptr);
+                if (!SUCCEEDED(h)) return false;
+                list_open = true;
+
+                if (bind_depth)
+                {
+                    barrier(pcmd, tex_depth, read_state, D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION ds{}, dd{};
+                    ds.pResource = buf_upload;
+                    ds.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    ds.PlacedFootprint = fp_depth;
+                    dd.pResource = tex_depth;
+                    dd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    pcmd->CopyTextureRegion(&dd, 0, 0, 0, &ds, nullptr);
+                    barrier(pcmd, tex_depth, D3D12_RESOURCE_STATE_COPY_DEST, read_state);
+
+                    params->Set("DLSSNR.Depth", tex_depth);
+                    params->Set("DLSSNR.DepthSubrectBaseX", 0u);
+                    params->Set("DLSSNR.DepthSubrectBaseY", 0u);
+                    params->Set("DLSSNR.DepthSubrectWidth",  (unsigned int)width);
+                    params->Set("DLSSNR.DepthSubrectHeight", (unsigned int)height);
+                }
+
+                params->Set("DLSSNR.Output", tex_out[0]);
+                params->Set("DLSSNR.Intensity", INTENSITY_LO);
+                params->Set("DLSSNR.Reset", 1u);
+                const NVSDK_NGX_Result er = p_evaluate(pcmd, handle, params, nullptr);
+
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.2] EvaluateFeature depth=%s: result=0x%08X (%s)",
+                         bind_depth ? "GRADIENT (bound)" : "null",
+                         (unsigned)er, ngx_result_name(er));
+                mgpu::diag::info(line);
+
+                barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION os{}, od{};
+                os.pResource = tex_out[0];
+                os.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                od.pResource = dst;
+                od.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                od.PlacedFootprint = fp_color;
+                od.PlacedFootprint.Offset = 0;
+                pcmd->CopyTextureRegion(&od, 0, 0, 0, &os, nullptr);
+                barrier(pcmd, tex_out[0], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                h = pcmd->Close();
+                list_open = false;
+                if (FAILED(h) || er != NVSDK_NGX_Result_Success) return false;
+                ID3D12CommandList *const ls[1] = { pcmd };
+                queue->ExecuteCommandLists(1, ls);
+                if (FAILED(queue->Signal(pfence, fence_v))) return false;
+                pfence->SetEventOnCompletion(fence_v, pevent);
+                return WaitForSingleObject(pevent, 20000) == WAIT_OBJECT_0;
+            };
+
+            if (ok42) ok42 = run42(false, buf_read_out[1], 3);
+            if (ok42) ok42 = run42(true,  buf_read_out[2], 4);
+
+            if (ok42)
+            {
+                const unsigned char *a = nullptr, *b = nullptr;
+                D3D12_RANGE all{0, (SIZE_T)sz_color};
+                const bool ma = SUCCEEDED(buf_read_out[1]->Map(0, &all, (void **)&a)) && a != nullptr;
+                const bool mb = SUCCEEDED(buf_read_out[2]->Map(0, &all, (void **)&b)) && b != nullptr;
+                if (ma && mb)
+                {
+                    for (UINT y = 0; y < height; ++y)
+                    {
+                        const size_t ro = (size_t)y * fp_color.Footprint.RowPitch;
+                        for (UINT x = 0; x < width; ++x)
+                        {
+                            const unsigned char *pa = a + ro + (size_t)x * 4;
+                            const unsigned char *pb = b + ro + (size_t)x * 4;
+                            if (pa[0] != pb[0] || pa[1] != pb[1] ||
+                                pa[2] != pb[2] || pa[3] != pb[3]) ++d_diff;
+                        }
+                    }
+                }
+                else ok42 = false;
+                D3D12_RANGE none{0, 0};
+                if (ma) buf_read_out[1]->Unmap(0, &none);
+                if (mb) buf_read_out[2]->Unmap(0, &none);
+            }
+
+            if (!ok42)
+                mgpu::diag::error("[MGPU][P4.2] PROBE INCOMPLETE - one arm did not run to "
+                                  "completion. No comparison is available; the depth question "
+                                  "stays open rather than being answered by a partial run.");
+            else if (d_diff == 0)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.2] DEPTH IS NOT READ - %ux%u, all %llu pixels byte-identical "
+                         "with a null depth and with a front-to-back gradient bound. Two "
+                         "evaluates, one variable. A feature that read depth could not return "
+                         "the same bytes for no depth and for a sweeping plane, so this is not "
+                         "'depth is optional' - it is not being sampled on this path at all. "
+                         "CONSEQUENCE: the per-frame payload is COLOUR ONLY. Depth never crosses "
+                         "the link, and the ~2x payload the architecture was budgeting for does "
+                         "not exist. SCOPE: this is preset=0 with the parameters this add-on "
+                         "sets; a different preset or guidance mode may read it, and that is a "
+                         "separate question from whether THIS configuration does.",
+                         width, height, total42);
+                mgpu::diag::info(line);
+            }
+            else
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.2] DEPTH IS READ - %llu of %llu pixels (%.2f%%) differ "
+                         "between a null depth and a bound gradient. The feature samples it, so "
+                         "the game's real depth buffer has to reach GPU 1 and the per-frame "
+                         "payload grows by an R32_FLOAT frame - roughly DOUBLE at this "
+                         "resolution, on the link that is already the constraint. Next question "
+                         "is not whether to carry it but whether a reduced-precision or "
+                         "lower-cadence depth is enough; P0_RECORD's reference tool runs "
+                         "depthInterval=4, which is exactly that idea.",
+                         d_diff, total42, total42 ? 100.0 * (double)d_diff / (double)total42 : 0.0);
+                mgpu::diag::info(line);
+            }
+        }
+        else if (P3)
+            mgpu::diag::warn("[MGPU][P4.2] skipped - P1.2's retry path already bound a depth "
+                             "texture this session, so there is no null-depth arm left to "
+                             "compare against. The result would be a comparison of two "
+                             "depth-bound runs, which answers nothing.");
+
+        // =================================================================
         // P1.4 - DLSS-NR INSIDE THE LOOP, ACROSS THE BUS
         // =================================================================
         //
@@ -5817,8 +6018,21 @@ namespace
         // RING DEPTH IS A NAMED CONSTANT, NEVER A HARDCODED 2. P0_RECORD's
         // multi-pass note requires this: depth is entangled with the fence and
         // ownership logic, and changing it later means reopening the
-        // synchronisation design. Three is a starting value, not a result.
-        static const unsigned RING = 3;
+        // synchronisation design.
+        //
+        // RAISED 3 -> 6 on 2026-09-05, as a MITIGATION and not a fix. The
+        // consumer is driven from the bridge's present loop, so its poll
+        // cadence is whatever the bridge swapchain's vsync is. Measured: 3.23x
+        // the producer's rate on the 210 Hz display, and 1.01x once the bridge
+        // card drove a 60 Hz monitor - one poll per produced frame, with the
+        // whole safety margin gone. Nothing overran, because each poll drains
+        // the entire backlog, but the margin is what protects against a hitch
+        // and against a game running faster than the bridge's refresh.
+        //
+        // Six slots costs ~50 MB at 1080p and buys back the margin the display
+        // took away. THE ACTUAL FIX IS TO STOP PACING THE CONSUMER WITH THE
+        // PRESENTER - see the note in stream_poll.
+        static const unsigned RING = 6;
 
         // The bound. See the header comment.
         static const unsigned long long STREAM_MAX_FRAMES = 600;
@@ -6477,6 +6691,26 @@ void stream_poll()
     std::lock_guard<std::mutex> lk(s.cs);
     if (!s.armed || s.summarised) return;
 
+    // WHY THIS IS STILL CALLED FROM THE PRESENT LOOP, AND WHY THAT IS WRONG.
+    //
+    // One poll per bridge present ties the consumer's cadence to the bridge
+    // swapchain's vsync. That was invisible while GPU 1 was headless and its
+    // present loop ran at 210 fps; attaching a 60 Hz monitor made it 1.01x the
+    // producer's rate and the coupling became the limiting factor.
+    //
+    // The right design is a consumer that blocks on the shared fence event for
+    // frame consumed+1 and wakes exactly when it lands - display-independent,
+    // lower latency, no polling at all. That needs the consumer off the bridge
+    // thread, and it is NOT written here on purpose: the stream mutex is also
+    // taken by stream_on_finish_effects on the GAME'S RENDER THREAD every
+    // frame, so a consumer thread that held it across a GPU wait would stall
+    // the game. Getting that locking wrong is the one bug in this add-on that
+    // could reach into the application, and it is not something to write blind
+    // against a rig I cannot run.
+    //
+    // So: ring depth absorbs it for now (see RING), the summary says loudly
+    // when the margin is gone, and the real fix lands with the display path
+    // that actually needs it.
     ++s.polls;
 
     const unsigned long long completed =
@@ -6811,14 +7045,29 @@ void stream_poll()
             for (unsigned i = 0; i < stream_state::RING && off < sizeof sl - 24; ++i)
                 off += (size_t)snprintf(sl + off, sizeof sl - off, "%s%u:%llu",
                                         (i == 0) ? "" : " ", i, s.slot_hits[i]);
+            const double ratio = (s.lat_n > 0) ? ((double)s.polls / (double)s.lat_n) : 0.0;
             snprintf(line, sizeof line,
                      "[MGPU][SEAL] pacing: polls=%llu idle=%llu busy=%llu -> the consumer ran "
                      "%.2fx the producer's rate (polls per new frame). slot hits: %s - all %u "
                      "slots must appear and should be within one of each other.",
-                     s.polls, s.idle_polls, s.polls - s.idle_polls,
-                     (s.lat_n > 0) ? ((double)s.polls / (double)s.lat_n) : 0.0,
+                     s.polls, s.idle_polls, s.polls - s.idle_polls, ratio,
                      sl, stream_state::RING);
             mgpu::diag::info(line);
+            if (ratio < 1.5)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][SEAL] PACING MARGIN GONE (%.2fx). The consumer is polled once "
+                         "per bridge PRESENT, so its cadence is the bridge swapchain's refresh "
+                         "rate - a property of whichever display GPU 1 is attached to, and "
+                         "nothing to do with this pipeline. Measured 3.23x on a 210 Hz display "
+                         "and 1.01x on a 60 Hz one. Ring depth %u is currently absorbing it and "
+                         "overrun is still 0, but a game faster than that refresh, or one hitch, "
+                         "would drop frames for a reason that is purely an artefact of how the "
+                         "consumer is scheduled. The fix is a consumer that waits on the shared "
+                         "fence instead of riding the present loop.",
+                         ratio, stream_state::RING);
+                mgpu::diag::warn(line);
+            }
         }
         snprintf(line, sizeof line,
                  "[MGPU][SEAL] latency ms: min=%.2f mean=%.2f max=%.2f (at f=%llu) n=%llu | "
