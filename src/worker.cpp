@@ -58,6 +58,14 @@
 // the overlay to change the view puts the overlay in the shot. The comparison
 // has to be filmable without the instrument on screen.
 #define MGPU_HOTKEY_VIEW       0x4D4B   // CTRL+ALT+F7  - cycle present mode
+// P7.5: the seam, moved with nothing on screen but the game. Four ids rather
+// than one plus a modifier read at press time, because RegisterHotKey delivers
+// only the exact combination it was registered for - a SHIFT held over
+// CTRL+ALT+LEFT does not arrive as CTRL+ALT+LEFT, it arrives as nothing.
+#define MGPU_HOTKEY_SEAM_L     0x4D4C   // CTRL+ALT+LEFT
+#define MGPU_HOTKEY_SEAM_R     0x4D4D   // CTRL+ALT+RIGHT
+#define MGPU_HOTKEY_SEAM_LC    0x4D4E   // CTRL+ALT+SHIFT+LEFT  (coarse)
+#define MGPU_HOTKEY_SEAM_RC    0x4D4F   // CTRL+ALT+SHIFT+RIGHT (coarse)
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -386,6 +394,24 @@ namespace
                                                 MOD_CONTROL | MOD_ALT, VK_F11) != FALSE;
                             const bool k_v = RegisterHotKey(nullptr, MGPU_HOTKEY_VIEW,
                                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7) != FALSE;
+                            const bool s_l  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L,
+                                                MOD_CONTROL | MOD_ALT, VK_LEFT) != FALSE;
+                            const bool s_r  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R,
+                                                MOD_CONTROL | MOD_ALT, VK_RIGHT) != FALSE;
+                            const bool s_lc = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC,
+                                                MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_LEFT) != FALSE;
+                            const bool s_rc = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_RC,
+                                                MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_RIGHT) != FALSE;
+                            char sk[400];
+                            snprintf(sk, sizeof sk,
+                                     "[MGPU][P7.5] seam hotkeys: CTRL+ALT+LEFT/RIGHT move the split "
+                                     "seam = %s/%s | add SHIFT for a coarse step = %s/%s. They "
+                                     "repeat when held and need NO overlay open, so the seam can be "
+                                     "dragged across a face while the game is the only thing on "
+                                     "screen - which is the point of having them at all.",
+                                     s_l ? "OK" : "FAILED", s_r ? "OK" : "FAILED",
+                                     s_lc ? "OK" : "FAILED", s_rc ? "OK" : "FAILED");
+                            mgpu::diag::info(sk);
                             char vk[300];
                             snprintf(vk, sizeof vk,
                                      "[MGPU][P7.4] view hotkey: CTRL+ALT+F7 cycles output -> input "
@@ -523,6 +549,8 @@ namespace
                 int int_delta = 0;
                 unsigned int_cycles = 0;
                 unsigned view_cycles = 0;
+                int seam_delta = 0;
+                int seam_coarse = 0;
                 while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
                 {
                     if (m.message == WM_QUIT)
@@ -535,6 +563,14 @@ namespace
                     { ++int_delta; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
                     { ++view_cycles; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_L)
+                    { --seam_delta; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_R)
+                    { ++seam_delta; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_LC)
+                    { --seam_coarse; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_RC)
+                    { ++seam_coarse; continue; }
                     // P1.3g. WM_HOTKEY is thread-posted, not window-posted, so
                     // it arrives here with hwnd == nullptr and never reaches a
                     // window procedure. Flag it and run the probe AFTER the
@@ -570,6 +606,14 @@ namespace
                     for (unsigned c = 0; c < view_cycles; ++c) mode = (mode + 1) % 3;
                     mgpu::gpu1::ui_set_present_mode(mode);
                 }
+
+                // P7.5. Seam steps, applied after the view so that pressing F7
+                // and an arrow in the same drain switches into split FIRST and
+                // then moves the seam, which is what the operator meant.
+                for (int d = 0; d < seam_delta;  ++d) mgpu::gpu1::ui_split_move(+1, false);
+                for (int d = 0; d > seam_delta;  --d) mgpu::gpu1::ui_split_move(-1, false);
+                for (int d = 0; d < seam_coarse; ++d) mgpu::gpu1::ui_split_move(+1, true);
+                for (int d = 0; d > seam_coarse; --d) mgpu::gpu1::ui_split_move(-1, true);
 
                 if (run_transit)
                 {
@@ -760,6 +804,10 @@ namespace
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_VIEW);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_RC);
             mgpu::diag::info("[MGPU][P1.3g] hotkeys unregistered (transit + P6.3 intensity)");
         }
 

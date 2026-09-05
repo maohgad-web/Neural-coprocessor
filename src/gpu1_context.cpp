@@ -520,7 +520,7 @@ namespace
     // as it arrived from the game, before the model. Returns nullptr unless
     // the mode is split AND a neural output exists to put beside it - half a
     // comparison would read as the model producing nothing.
-    ID3D12Resource *stream_present_split_left(D3D12_RESOURCE_STATES &rest);
+    ID3D12Resource *stream_present_split_left(D3D12_RESOURCE_STATES &rest, float &pos);
 }
 
 bool present_frame(float r, float g, float b)
@@ -712,8 +712,19 @@ bool present_frame(float r, float g, float b)
         // either side is at its true position: this is a split, not a blend
         // and not a resample.
         D3D12_RESOURCE_STATES lrest = D3D12_RESOURCE_STATE_COPY_DEST;
-        ID3D12Resource *lsrc = stream_present_split_left(lrest);
-        const UINT halfw = (lsrc != nullptr) ? (cw / 2u) : cw;
+        float spos = 0.5f;
+        ID3D12Resource *lsrc = stream_present_split_left(lrest, spos);
+        // P7.5: the seam column, from the live position. Clamped one pixel in
+        // from each edge so that a seam pushed all the way over never produces
+        // a zero-width CopyTextureRegion, which is invalid rather than empty.
+        UINT halfw = cw;
+        if (lsrc != nullptr)
+        {
+            long sx = (long)((float)cw * spos + 0.5f);
+            if (sx < 1) sx = 1;
+            if (sx > (long)cw - 1) sx = (long)cw - 1;
+            halfw = (UINT)sx;
+        }
 
         D3D12_TEXTURE_COPY_LOCATION ps{}, pd{};
         ps.pResource = nsrc;
@@ -6509,6 +6520,14 @@ namespace
         // Touching any single slider drops back to manual, so nothing is
         // trapped - re-picking a preset re-applies it.
         int preset = 0;
+
+        // P7.5: where the split seam sits, 0.0 (all output) .. 1.0 (all input).
+        // A fixed centre seam is the wrong instrument for a face: the thing
+        // worth comparing is rarely in the middle of the frame, and asking the
+        // viewer to move the CAMERA to bring it to the seam changes the frame
+        // being compared. Moving the seam instead leaves the frame alone.
+        float split_pos = 0.5f;
+
         static constexpr float PRESET_FLOOR = 0.10f;
         static constexpr float PRESET_FULL  = 2.00f;
         int window_mode = 2;   // P7.0: 0=crop 1=match 2=fit
@@ -6674,7 +6693,7 @@ namespace
     // Same texture, same size, same format as the right half by construction:
     // tex_in and the pass outputs are all created from s.width/height/format in
     // stream_nr_create, so the two halves cannot disagree about geometry.
-    ID3D12Resource *stream_present_split_left(D3D12_RESOURCE_STATES &rest)
+    ID3D12Resource *stream_present_split_left(D3D12_RESOURCE_STATES &rest, float &pos)
     {
         stream_state &s = str();
         std::lock_guard<std::mutex> lk(s.cs);
@@ -6682,6 +6701,7 @@ namespace
         if (!s.nr_ok || s.profile) return nullptr;
         if (s.tex_in == nullptr || s.nr_final == nullptr) return nullptr;
         rest = D3D12_RESOURCE_STATE_COPY_DEST;
+        pos = s.split_pos;
         return s.tex_in;
     }
 
@@ -7019,6 +7039,18 @@ namespace
         return 2;
     }
 
+    // P7.6: Frames=0 means NO BOUND - the stream runs until the game closes.
+    //
+    // Deliberately implemented as "a bound nothing will ever reach" rather than
+    // as a stop-and-restart control. Stopping and re-arming would mean
+    // releasing the NGX features and the ping-pong textures and rebuilding them
+    // while the game is live, and that path has never executed once; it is the
+    // P1.0 teardown crash in waiting. Raising the comparison bound changes no
+    // lifecycle at all - the same single stream simply never satisfies the
+    // condition that ends it. Same behaviour for the player, none of the
+    // untested code.
+    static const unsigned long long FRAMES_UNBOUNDED = ~0ull;
+
     unsigned long long stream_read_frames()
     {
         char buf[INI_BYTES];
@@ -7026,6 +7058,7 @@ namespace
         const char *k = ini_find(buf, "Frames");
         if (k == nullptr) return 600ull;
         const long long v = atoll(k);
+        if (v == 0) return FRAMES_UNBOUNDED;
         if (v < 60) return 60ull;
         if (v > 100000) return 100000ull;
         return (unsigned long long)v;
@@ -7694,6 +7727,7 @@ void ui_read(ui_state &out)
     out.profile     = s.profile;
     out.present_mode = s.present_mode;
     out.preset       = s.preset;
+    out.split_pos    = s.split_pos;
     for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out.intensity[i] = s.intensity[i];
     out.consumed    = s.consumed;
     out.produced    = s.produced;
@@ -7798,6 +7832,43 @@ void ui_set_intensity(unsigned pass_1based, float v)
     // Silently keeping the preset label over hand-edited numbers is how a run
     // gets recorded as back-loaded when it is not.
     s.preset = 0;
+}
+
+// P7.5. Move the split seam. `dir` is -1 (left) or +1 (right); `coarse` takes
+// a tenth of the frame instead of a fortieth, for crossing it quickly.
+//
+// Deliberately a hotkey and not only a panel slider: the panel is the ReShade
+// overlay, and an overlay open across the frame is the one thing that cannot
+// be in the shot while the seam is being dragged over a face. This has to work
+// with nothing on screen but the game.
+void ui_split_move(int dir, bool coarse)
+{
+    if (dir == 0) return;
+    stream_state &s = str();
+    float now;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        s.split_pos += (float)dir * (coarse ? 0.10f : 0.025f);
+        if (s.split_pos < 0.0f) s.split_pos = 0.0f;
+        if (s.split_pos > 1.0f) s.split_pos = 1.0f;
+        now = s.split_pos;
+    }
+    char l[200];
+    snprintf(l, sizeof l,
+             "[MGPU][P7.5] split seam at %.0f%% - left of it is the INPUT, right of it is the "
+             "NEURAL OUTPUT.", (double)(now * 100.0f));
+    mgpu::diag::info(l);
+}
+
+// P7.5. Absolute, for the panel slider. 0.0 = all neural output, 1.0 = all
+// input.
+void ui_set_split_pos(float v)
+{
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    s.split_pos = v;
 }
 
 // P7.4. The present mode, LIVE. 0 nr, 1 in, 2 split.
@@ -8017,15 +8088,25 @@ void stream_request()
             snprintf(s.fault, sizeof s.fault, "none");
         }
     }
-    char l[700];
+    char l[1000];
+    // P7.6: an unbounded run says so in words rather than printing a bound of
+    // 18446744073709551615, which reads as a defect.
+    char bound[160];
+    if (s.max_frames == FRAMES_UNBOUNDED)
+        snprintf(bound, sizeof bound,
+                 "NO BOUND (Frames=0) - this run does not end and prints no summary. "
+                 "SESSIONS BEYOND A FEW MINUTES ARE UNTESTED: watch GPU load and temperature");
+    else
+        snprintf(bound, sizeof bound, "bound %llu frames", s.max_frames);
+
     snprintf(l, sizeof l,
-             "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\", "
+             "[MGPU][P4.0] stream REQUESTED - ring depth %u, %s, fault=\"%s\", "
              "neural=%s, profile=%s, present=%s, passes=%u, window=%s. "
              "Every game frame from the next one is sealed and transited until the bound is "
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
              "else.",
-             stream_state::RING, s.max_frames, s.fault,
+             stream_state::RING, bound, s.fault,
              s.neural ? "ON (P4.1 - DLSS-NR runs on every consumed frame)"
                       : "off (P4.0 transport-only control)",
              s.profile ? "ON (no on-screen output, no liveness sample - measurement run)"

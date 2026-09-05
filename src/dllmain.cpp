@@ -299,8 +299,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     if (ImGui::RadioButton("input", &pm, 1))       mgpu::gpu1::ui_set_present_mode(1);
     ImGui::SameLine();
     if (ImGui::RadioButton("split", &pm, 2))       mgpu::gpu1::ui_set_present_mode(2);
-    ImGui::TextDisabled("split = left half input, right half output, the SAME frame.");
+    ImGui::TextDisabled("split = left of the seam is input, right is output, SAME frame.");
     ImGui::TextDisabled("The neural stage and its timing are identical in all three.");
+
+    float sp = st.split_pos;
+    if (ImGui::SliderFloat("seam", &sp, 0.0f, 1.0f, "%.2f"))
+        mgpu::gpu1::ui_set_split_pos(sp);
+    ImGui::TextDisabled("CTRL+ALT+LEFT / RIGHT move the seam without opening this");
+    ImGui::TextDisabled("panel - hold SHIFT for a coarse step. Use those on camera.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Intensity shape");

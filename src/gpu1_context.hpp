@@ -257,6 +257,8 @@ struct ui_state
     int present_mode = 0;
     // P7.4: 0 = manual, 1 = front-loaded, 2 = back-loaded. See ui_set_preset.
     int preset = 0;
+    // P7.5: split seam position, 0.0 (all output) .. 1.0 (all input).
+    float split_pos = 0.5f;
     unsigned passes = 1, max_passes = 6;
     float intensity[6] = {};
     unsigned long long consumed = 0, produced = 0, dropped = 0, overrun = 0, skipped = 0;
@@ -296,6 +298,18 @@ void ui_set_present_mode(int mode);
 // is changing live on camera. Any manual slider or hotkey step returns the
 // mode to manual, so a hand-edited run is never labelled as a preset.
 void ui_set_preset(int mode);
+
+// P7.5. Move the split seam one step. dir is -1 or +1; coarse takes a tenth of
+// the frame instead of a fortieth.
+//
+// A hotkey rather than only a slider, on purpose: the panel is the ReShade
+// overlay, and an open overlay is the one thing that cannot be on screen while
+// the seam is dragged across a face for the camera. This has to work with
+// nothing visible but the game.
+void ui_split_move(int dir, bool coarse);
+
+// P7.5. Absolute seam position for the panel slider, 0.0 .. 1.0.
+void ui_set_split_pos(float v);
 
 // P6.3. BRIDGE THREAD ONLY - both of these are called from the hotkey handler
 // in the message pump, which runs on the bridge thread, and they touch state
