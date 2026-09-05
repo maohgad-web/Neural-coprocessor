@@ -6344,14 +6344,46 @@ namespace
         bool neural = true;
         bool nr_tried = false, nr_ok = false;
         NVSDK_NGX_Parameter *nr_params = nullptr;
-        NVSDK_NGX_Handle *nr_handle = nullptr;
+        // ---- P6.0: N neural passes per frame ----
+        //
+        // The architectural claim this project has argued from the start is
+        // that offloading pays once the neural work is more than one pass:
+        // transport is paid ONCE per frame whatever N is, while doing the same
+        // work locally costs GPU 0 the full per-pass time out of its own frame
+        // budget. Nothing has ever tested it, because until now there was only
+        // ever one pass.
+        //
+        // ONE FEATURE HANDLE PER PASS, not one handle evaluated N times. The
+        // feature carries temporal history (dlssnr_prev_output), so a single
+        // handle run twice in a frame would have its history be "the previous
+        // PASS" rather than "the previous FRAME". The GPU cost would be the
+        // same and the measurement would still be valid - but the picture would
+        // ghost, and an artefact of the test rig that looks exactly like a real
+        // fault is the thing this instrument exists to avoid.
+        //
+        // Passes=1 is the default and is byte-identical to the P5 behaviour:
+        // one handle, one evaluate, tex_out is the output. Nothing about the
+        // shipped path changes unless the ini asks for it.
+        static const unsigned MAX_PASSES = 4;
+        unsigned passes = 1;
+        NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
         ngx_pf_evaluate_feature nr_eval = nullptr;
         ngx_pf_release_feature nr_release = nullptr;
-        ID3D12Resource *tex_in = nullptr, *tex_out = nullptr, *nr_read = nullptr;
+        // Ping-pong. tex_in has no UAV flag - it is a copy destination and can
+        // never be a neural OUTPUT - so passes alternate between tex_out and
+        // tex_pong, both of which are UAV. `nr_final` is whichever one the last
+        // pass wrote, and it is what the window presents.
+        ID3D12Resource *tex_in = nullptr, *tex_out = nullptr, *tex_pong = nullptr,
+                       *nr_final = nullptr, *nr_read = nullptr;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT nr_fp{};   // the 64x4 liveness sample
         unsigned char nr_prev[1024] = {};
         bool nr_have_prev = false;
         unsigned long long nr_evals = 0, nr_fails = 0, nr_same = 0;
+        // P6.0: nr_evals counts PASSES now. The liveness sample is taken once
+        // per frame, so its rate needs a frame count of its own - dividing by
+        // evaluates would report a 2-pass run's identical-rate at half its
+        // true value.
+        unsigned long long nr_frames = 0;
         bool nr_first = true;
         unsigned long long resync = 0;   // seals rejected, next gap check suppressed
         bool skip_next_gap = false;
@@ -6402,9 +6434,11 @@ namespace
             rest = D3D12_RESOURCE_STATE_COPY_DEST;
             return s.tex_in;
         }
-        if (s.tex_out == nullptr) return nullptr;
+        // P6.0: the LAST pass's output, not tex_out unconditionally. With
+        // Passes=1 nr_final is tex_out and this is the P5 behaviour exactly.
+        if (s.nr_final == nullptr) return nullptr;
         rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        return s.tex_out;
+        return s.nr_final;
     }
 
     // P5.2 / DEFECT C. Declared up beside ngx_probe; defined here, where the
@@ -6504,6 +6538,22 @@ namespace
         return (k != nullptr) && (k[0] == 'i') && (k[1] == 'n');
     }
 
+    // P6.0: Passes=<n>, clamped to 1..MAX_PASSES. Out-of-range is CLAMPED AND
+    // SAID, not silently accepted: a run that quietly did one pass when the ini
+    // asked for eight would produce a perfectly clean summary describing the
+    // wrong experiment.
+    unsigned ini_read_passes()
+    {
+        char buf[1024];
+        if (!ini_slurp(buf, sizeof buf)) return 1u;
+        const char *k = ini_find(buf, "Passes");
+        if (k == nullptr) return 1u;
+        const long long v = atoll(k);
+        if (v < 1) return 1u;
+        if (v > (long long)stream_state::MAX_PASSES) return stream_state::MAX_PASSES;
+        return (unsigned)v;
+    }
+
     unsigned long long stream_read_frames()
     {
         char buf[1024];
@@ -6551,11 +6601,17 @@ namespace
     void stream_release()
     {
         stream_state &s = str();
-        // The NGX feature first: it holds references to tex_in/tex_out.
-        if (s.nr_handle != nullptr && s.nr_release != nullptr)
-            (void)s.nr_release(s.nr_handle);
-        s.nr_handle = nullptr;
+        // The NGX features first: they hold references to the textures.
+        // Released in reverse creation order, every one of them - a partial
+        // release on a failed create is how a handle leaks past the summary.
+        if (s.nr_release != nullptr)
+            for (int i = (int)stream_state::MAX_PASSES - 1; i >= 0; --i)
+                if (s.nr_handle[i] != nullptr)
+                { (void)s.nr_release(s.nr_handle[i]); s.nr_handle[i] = nullptr; }
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.nr_handle[i] = nullptr;
+        s.nr_final = nullptr;   // borrowed; released with tex_out / tex_pong
         if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
+        if (s.tex_pong != nullptr) { s.tex_pong->Release(); s.tex_pong = nullptr; }
         if (s.tex_out != nullptr) { s.tex_out->Release(); s.tex_out = nullptr; }
         if (s.tex_in  != nullptr) { s.tex_in->Release();  s.tex_in = nullptr; }
         // nr_params is NOT destroyed: it is the core's capability block and the
@@ -6673,6 +6729,12 @@ namespace
             h = make_tex(ndev, s.width, s.height, s.format,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_out);
+        // P6.0: the ping-pong partner. Created only when it will be used, so a
+        // Passes=1 run allocates exactly what P5 allocated.
+        if (SUCCEEDED(h) && s.passes > 1)
+            h = make_tex(ndev, s.width, s.height, s.format,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_pong);
         if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
         if (FAILED(h))
         {
@@ -6695,22 +6757,31 @@ namespace
         // CreateFeature records init work into the list it is handed, and that
         // work must execute before anything it touched is released - P1.0's
         // teardown crash. One list, closed, executed, waited.
+        // P6.0: ONE FEATURE PER PASS, all created into the SAME list and
+        // executed once. CreateFeature records init work into the list it is
+        // handed and that work must run before anything it touched is released
+        // (P1.0's teardown crash), so the close/execute/wait below covers every
+        // handle rather than each one separately.
         HRESULT ch = s.na->Reset();
         if (SUCCEEDED(ch)) ch = s.nl->Reset(s.na, nullptr);
         if (SUCCEEDED(ch))
         {
-            const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
-            r = p_cre(s.nl, (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
-                      s.nr_params, &s.nr_handle);
-            LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
             LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
-            snprintf(line, sizeof line,
-                     "[MGPU][P4.1] CreateFeature(Reserved18) %ux%u fmt=%d: result=0x%08X (%s) "
-                     "handle=0x%p elapsed=%.0fms",
-                     s.width, s.height, (int)s.format, (unsigned)r, ngx_result_name(r),
-                     (void *)s.nr_handle,
-                     (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
-            mgpu::diag::info(line);
+            for (unsigned i = 0; i < s.passes; ++i)
+            {
+                const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
+                r = p_cre(s.nl, (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                          s.nr_params, &s.nr_handle[i]);
+                LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.1] CreateFeature(Reserved18) pass %u/%u %ux%u fmt=%d: "
+                         "result=0x%08X (%s) handle=0x%p elapsed=%.0fms",
+                         i + 1, s.passes, s.width, s.height, (int)s.format,
+                         (unsigned)r, ngx_result_name(r), (void *)s.nr_handle[i],
+                         (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
+                mgpu::diag::info(line);
+                if (r != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
+            }
             ch = s.nl->Close();
         }
         if (SUCCEEDED(ch))
@@ -6725,12 +6796,22 @@ namespace
                 if (WaitForSingleObject(s.nev, 20000) != WAIT_OBJECT_0) ch = E_FAIL;
             }
         }
-        if (FAILED(ch) || r != NVSDK_NGX_Result_Success || s.nr_handle == nullptr)
+        bool all = (SUCCEEDED(ch) && r == NVSDK_NGX_Result_Success);
+        for (unsigned i = 0; i < s.passes && all; ++i)
+            if (s.nr_handle[i] == nullptr) all = false;
+        if (!all)
         {
-            mgpu::diag::error("[MGPU][P4.1] the neural stage did not come up - the stream "
-                              "continues TRANSPORT-ONLY and the summary says so");
+            // Partial success is a FAILURE here, deliberately. A run with three
+            // of four handles would evaluate three times and report passes=4,
+            // which is a wrong answer in the shape of a right one.
+            mgpu::diag::error("[MGPU][P4.1] the neural stage did not come up (or not every "
+                              "pass did) - the stream continues TRANSPORT-ONLY and the "
+                              "summary says so. Handles already created are released with "
+                              "the stream.");
             return false;
         }
+        // With Passes=1 this is tex_out, exactly as P5 had it.
+        s.nr_final = (s.passes % 2u == 1u) ? s.tex_out : s.tex_pong;
         return true;
     }
 }
@@ -6833,6 +6914,23 @@ void stream_request()
     s.max_frames = stream_read_frames();
     s.profile = stream_read_profile();
     s.present_in = ini_read_present_in();
+    {
+        char buf[1024];
+        const bool have = ini_slurp(buf, sizeof buf);
+        const char *k = have ? ini_find(buf, "Passes") : nullptr;
+        const long long asked = (k != nullptr) ? atoll(k) : 1;
+        s.passes = ini_read_passes();
+        if (k != nullptr && asked != (long long)s.passes)
+        {
+            char pl[400];
+            snprintf(pl, sizeof pl,
+                     "[MGPU][P6.0] mgpu.ini asks for Passes=%lld, which this build CLAMPS to %u "
+                     "(valid range 1..%u). The run below is %u passes, not %lld - said here so "
+                     "the summary is not read as the experiment that was requested.",
+                     asked, s.passes, stream_state::MAX_PASSES, s.passes, asked);
+            mgpu::diag::warn(pl);
+        }
+    }
 
     // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
     // accepted ANY string, so a name this build cannot inject - "drop" and
@@ -6865,7 +6963,7 @@ void stream_request()
     char l[700];
     snprintf(l, sizeof l,
              "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\", "
-             "neural=%s, profile=%s, present=%s. "
+             "neural=%s, profile=%s, present=%s, passes=%u. "
              "Every game frame from the next one is sealed and transited until the bound is "
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
@@ -6877,7 +6975,8 @@ void stream_request()
                        : "off",
              s.present_in ? "IN (the window shows the frame handed TO DLSS-NR, not its output - "
                             "P5.3 discriminator)"
-                          : "nr (the neural output)");
+                          : "nr (the neural output)",
+             s.passes);
     mgpu::diag::info(l);
 }
 
@@ -7213,7 +7312,7 @@ void stream_poll()
     const unsigned long long completed =
         (s.nfence != nullptr) ? (unsigned long long)s.nfence->GetCompletedValue() : 0;
 
-    char line[1000];
+    char line[1400];   // P6.0: the P2.2 and P4.1 summaries carry the pass split now
 
     if (s.consumed >= completed) ++s.idle_polls;
 
@@ -7304,51 +7403,105 @@ void stream_poll()
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
 
-                s.nr_params->Set("DLSSNR.Color", s.tex_in);
-                s.nr_params->Set("DLSSNR.Output", s.tex_out);
-                s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
-                s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
-                s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.width);
-                s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.height);
-                s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
-                s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
-                s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.width);
-                s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
-                s.nr_params->Set("DLSSNR.Intensity", 0.84f);
-                // RESET ON THE FIRST FRAME ONLY. Every probe so far set Reset=1
-                // on every evaluate, because each was an independent experiment
-                // and history between them would have contaminated the control.
-                // A stream is the opposite case: dlssnr_prev_output is temporal
-                // history and it is supposed to carry. This is the first code in
-                // the project that lets NR accumulate across frames, and if the
-                // output ever looks smeared or ghosted, this line is the first
-                // thing to try at 1.
-                s.nr_params->Set("DLSSNR.Reset", s.nr_first ? 1u : 0u);
-                s.nr_first = false;
-
-                const NVSDK_NGX_Result er =
-                    s.nr_eval(s.nl, s.nr_handle, s.nr_params, nullptr);
-                ++s.nr_evals;
-                if (er != NVSDK_NGX_Result_Success)
+                // ---- P6.0: the pass chain ----
+                //
+                // Pass 1 reads tex_in and writes tex_out. Every later pass
+                // reads what the one before it wrote and writes the other UAV
+                // texture. Transport happened ONCE, above; only this loop
+                // multiplies. That asymmetry is the entire architectural claim
+                // and this is the first code that exercises it.
+                //
+                // The synchronisation between passes is not optional: pass k+1
+                // reads the texture pass k wrote, on the same queue, and
+                // without a barrier the driver is free to overlap them. The
+                // state transition below serves as that barrier - see the note
+                // inside the loop.
+                for (unsigned pi = 0; pi < s.passes; ++pi)
                 {
-                    ++s.nr_fails;
-                    if (s.nr_fails <= 3)
+                    ID3D12Resource *src = (pi == 0)
+                                            ? s.tex_in
+                                            : ((pi % 2u == 1u) ? s.tex_out : s.tex_pong);
+                    ID3D12Resource *dst = (pi % 2u == 0u) ? s.tex_out : s.tex_pong;
+
+                    // STATE, not just a UAV barrier. Pass 1's input (tex_in) is
+                    // put in NON_PIXEL_SHADER_RESOURCE above, which is the only
+                    // state this project has ever handed NGX an input in. A
+                    // later pass reads a texture that has been sitting in
+                    // UNORDERED_ACCESS because the pass before it wrote there,
+                    // and feeding NGX an input in that state is untested here -
+                    // so it is transitioned to the same state pass 1's input
+                    // uses, and put back afterwards. The transition also IS the
+                    // write-to-read dependency between consecutive passes, so
+                    // no separate UAV barrier is needed.
+                    if (pi > 0)
+                        barrier(s.nl, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                    s.nr_params->Set("DLSSNR.Color", src);
+                    s.nr_params->Set("DLSSNR.Output", dst);
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+                    s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.width);
+                    s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.height);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+                    s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.width);
+                    s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
+                    s.nr_params->Set("DLSSNR.Intensity", 0.84f);
+                    // RESET ON THE FIRST FRAME ONLY, PER HANDLE. Every probe
+                    // before the stream set Reset=1 on every evaluate, because
+                    // each was an independent experiment and history between
+                    // them would have contaminated the control. A stream is the
+                    // opposite case: dlssnr_prev_output is temporal history and
+                    // it is supposed to carry. Each pass owns its own feature
+                    // handle precisely so that its history is the PREVIOUS
+                    // FRAME's output of that same pass, not the previous pass of
+                    // this frame - so the flag is per-frame, not per-pass. If
+                    // the output ever looks smeared or ghosted, this is the
+                    // first line to try at 1.
+                    s.nr_params->Set("DLSSNR.Reset", s.nr_first ? 1u : 0u);
+
+                    const NVSDK_NGX_Result er =
+                        s.nr_eval(s.nl, s.nr_handle[pi], s.nr_params, nullptr);
+                    ++s.nr_evals;
+                    if (er != NVSDK_NGX_Result_Success)
                     {
-                        snprintf(line, sizeof line,
-                                 "[MGPU][P4.1] EvaluateFeature f=%llu: 0x%08X (%s)",
-                                 f, (unsigned)er, ngx_result_name(er));
-                        mgpu::diag::error(line);
+                        ++s.nr_fails;
+                        if (s.nr_fails <= 3)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P4.1] EvaluateFeature f=%llu pass %u/%u: "
+                                     "0x%08X (%s)",
+                                     f, pi + 1, s.passes, (unsigned)er, ngx_result_name(er));
+                            mgpu::diag::error(line);
+                        }
                     }
+
+                    // Put it back: every UAV texture must be in
+                    // UNORDERED_ACCESS at the end of the list, because that is
+                    // the state the next frame - and stream_present_source -
+                    // both assume.
+                    if (pi > 0)
+                        barrier(s.nl, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
+                s.nr_first = false;
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
 
                 if (!s.profile)
                 {
-                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                // P6.0: sample the LAST pass's output, not tex_out. With
+                // Passes=1 nr_final IS tex_out; with an even pass count it is
+                // tex_pong, and sampling tex_out there would compare the
+                // second-to-last pass frame over frame while the window showed
+                // the last one - a liveness check watching a different image
+                // from the one on screen.
+                ID3D12Resource *const fin = s.nr_final;
+                barrier(s.nl, fin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION ss{}, sd{};
-                ss.pResource = s.tex_out;
+                ss.pResource = fin;
                 ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 ss.SubresourceIndex = 0;
                 sd.pResource = s.nr_read;
@@ -7356,7 +7509,7 @@ void stream_poll()
                 sd.PlacedFootprint = s.nr_fp;
                 D3D12_BOX box{ 0, 0, 0, 64, 4, 1 };
                 s.nl->CopyTextureRegion(&sd, 0, 0, 0, &ss, &box);
-                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                barrier(s.nl, fin, D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
                 barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -7443,6 +7596,7 @@ void stream_poll()
             D3D12_RANGE sr{0, 1024};
             if (SUCCEEDED(s.nr_read->Map(0, &sr, (void **)&sm)) && sm != nullptr)
             {
+                ++s.nr_frames;
                 if (s.nr_have_prev && memcmp(sm, s.nr_prev, 1024) == 0) ++s.nr_same;
                 memcpy(s.nr_prev, sm, 1024);
                 s.nr_have_prev = true;
@@ -7628,16 +7782,23 @@ void stream_poll()
         if (s.neural)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P4.1] neural stage: %s | evaluates=%llu failures=%llu | output "
-                     "sample identical to the previous frame %llu times (%.1f%%). ONE feature "
-                     "handle for the whole stream, DLSSNR.Reset=1 on the first frame only so "
-                     "temporal history carries. The identical-rate is NOT a verdict: a static "
-                     "scene produces identical output legitimately, so read it against what was "
-                     "on screen. A rate near 100%% with a moving scene is the signal that NR "
+                     "[MGPU][P4.1] neural stage: %s | passes=%u | evaluates=%llu (=%llu frames "
+                     "x %u passes) failures=%llu | output sample identical to the previous frame "
+                     "%llu times (%.1f%%). ONE FEATURE HANDLE PER PASS, DLSSNR.Reset=1 on the "
+                     "first frame only, so each pass's temporal history is its OWN output a "
+                     "frame ago rather than the previous pass of this frame. NOTE evaluates "
+                     "COUNTS PASSES, not frames - divide by %u before comparing it with the "
+                     "frame count above. The identical-rate is NOT a verdict: a static scene "
+                     "produces identical output legitimately, so read it against what was on "
+                     "screen. A rate near 100%% with a moving scene is the signal that NR "
                      "stopped writing.",
                      s.nr_ok ? "UP" : "NOT RUNNING (transport-only)",
-                     s.nr_evals, s.nr_fails, s.nr_same,
-                     (s.nr_evals > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_evals - 1) : 0.0);
+                     s.passes,
+                     s.nr_evals,
+                     (s.passes > 0) ? s.nr_evals / s.passes : s.nr_evals, s.passes,
+                     s.nr_fails, s.nr_same,
+                     (s.nr_frames > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_frames - 1) : 0.0,
+                     s.passes);
             mgpu::diag::info(line);
         }
 
@@ -7662,18 +7823,26 @@ void stream_poll()
             snprintf(line, sizeof line,
                      "[MGPU][P2.2] GPU TIME on GPU 1, per consumed frame, n=%llu | seal copy "
                      "mean=%.3f | unpack (cross-adapter buffer -> NR input) mean=%.3f min=%.3f "
-                     "max=%.3f | EVALUATE mean=%.3f min=%.3f max=%.3f | output sample "
-                     "mean=%.3f ms. These are GPU 1's own timestamps on GPU 1's own queue - "
-                     "execution, not wall-clock, and no cross-adapter clock is involved. The "
-                     "evaluate figure is the one to compare against the reference tool's 14.2 ms "
-                     "evaluateGPU, and it is the first time this project has had its own side of "
-                     "that comparison. STILL PERISHABLE: one rig, one link, one resolution, one "
-                     "scene.",
+                     "max=%.3f | EVALUATE(%u pass%s) mean=%.3f min=%.3f max=%.3f -> per pass "
+                     "mean=%.3f min=%.3f | output sample mean=%.3f ms. These are GPU 1's own "
+                     "timestamps on GPU 1's own queue - execution, not wall-clock, and no "
+                     "cross-adapter clock is involved. THE EVALUATE BRACKET SPANS EVERY PASS, so "
+                     "the per-pass figure is the one to compare against the reference tool's "
+                     "14.2 ms evaluateGPU and against earlier single-pass runs; the total is "
+                     "what GPU 1 actually spends. Transport is paid ONCE per frame whatever the "
+                     "pass count is - that asymmetry is the whole point of the run. STILL "
+                     "PERISHABLE: one rig, one link, one resolution, one scene.%s",
                      s.ts_n,
                      s.ts_sum[0] / n,
                      s.ts_sum[1] / n, s.ts_min[1], s.ts_max[1],
+                     s.passes, (s.passes == 1) ? "" : "es",
                      s.ts_sum[2] / n, s.ts_min[2], s.ts_max[2],
-                     s.ts_sum[3] / n);
+                     (s.ts_sum[2] / n) / (double)s.passes, s.ts_min[2] / (double)s.passes,
+                     s.ts_sum[3] / n,
+                     s.profile ? "" : " READ THE MIN, NOT THE MEAN: this run has the on-screen "
+                                      "output enabled, and the present chain's own submissions "
+                                      "share GPU 1's queue, which inflates the tail of every "
+                                      "bracket here without the model doing more work.");
             mgpu::diag::info(line);
         }
         else if (s.neural)
