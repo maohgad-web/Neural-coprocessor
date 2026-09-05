@@ -82,6 +82,9 @@ namespace
         // 1280x720 T4 fixed it at.
         HWND hwnd = nullptr;
         UINT chain_w = 0, chain_h = 0;
+        // P7.3: the backbuffer's ACTUAL format, tracked rather than assumed.
+        // See DEFECT H at present_resize. Set at creation, updated at resize.
+        DXGI_FORMAT chain_fmt = DXGI_FORMAT_UNKNOWN;
         bool borderless = false;
         bool sized_to_source = false;   // one resize per stream, not per frame
     };
@@ -458,6 +461,7 @@ bool create_present_chain(HWND hwnd)
         S.hwnd = hwnd;
         S.chain_w = width;
         S.chain_h = height;
+        S.chain_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;   // must match scd.Format above
         S.swapchain = sc3;
         S.rtv_heap = heap;
         S.backbuffer[0] = back0;
@@ -483,7 +487,11 @@ bool create_present_chain(HWND hwnd)
     }
 
     snprintf(line, sizeof line,
-             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R8G8B8A8_UNORM buffers=2 "
+             // P7.3: this said R8G8B8A8 for four milestones while the chain was
+             // created R10G10B10A2 - the string was never updated when P5.0
+             // changed scd.Format. A log line that contradicts the code is worse
+             // than no log line: it is evidence pointing the wrong way.
+             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=2 "
              "swapeffect=FLIP_DISCARD queue=DIRECT client=%ux%u CreateSwapChainForHwnd "
              "hr=0x%08X hwnd=0x%p (vsync present, non-resizable window - no ResizeBuffers at P0)",
              width, height, (unsigned)swapchain_hr, (void *)hwnd);
@@ -636,7 +644,26 @@ bool present_frame(float r, float g, float b)
     ID3D12Resource *nsrc = stream_present_source(nw, nh, nfmt, nrest);
     // The format check is not paranoia: the copy is silent about a mismatch at
     // record time and would fail at execute, taking the device with it.
-    if (nsrc != nullptr && nfmt == DXGI_FORMAT_R10G10B10A2_UNORM &&
+    //
+    // P7.3, DEFECT H's SECOND HALF - AND THE ACTUAL CAUSE OF THE BLINKING. This
+    // compared against the CONSTANT R10G10B10A2, so on a game that renders
+    // anything else the guard refused the copy every frame and the present fell
+    // through to the cycling clear colour below. That is what "colours blinking
+    // from start to finish, never the game" was: not corrupted pixels, but the
+    // no-output fallback, running for the whole session because the guard was
+    // measuring the neural output against one title's format instead of against
+    // the backbuffer it is actually copying into.
+    //
+    // The guard was RIGHT to refuse - a mismatched CopyTextureRegion would have
+    // taken the device down. It was simply asking the wrong question. The right
+    // question is whether the source matches THIS CHAIN, whatever the chain is
+    // now, and P7.3 makes the chain follow the game, so the two agree.
+    DXGI_FORMAT bbfmt = DXGI_FORMAT_UNKNOWN;
+    {
+        std::lock_guard<std::mutex> lk(S.cs);
+        bbfmt = S.chain_fmt;
+    }
+    if (nsrc != nullptr && nfmt == bbfmt && bbfmt != DXGI_FORMAT_UNKNOWN &&
         nw >= 1 && nh >= 1)
     {
         // P7.0: the CHAIN's size, not the 1280x720 T4 fixed. When the chain
@@ -715,6 +742,30 @@ bool present_frame(float r, float g, float b)
     }
     else
     {
+        // P7.3. SAY WHY THE CYCLING COLOUR IS ON SCREEN. "No neural output yet"
+        // and "there IS output but this function refused to copy it" look
+        // identical from the outside - both are the blinking clear - and the
+        // second one cost a night. Once, when output exists and was rejected.
+        if (nsrc != nullptr && nfmt != bbfmt)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                snprintf(line, sizeof line,
+                         "[MGPU][P7.3] THE CYCLING COLOUR IS A REFUSED COPY, NOT AN ABSENT FRAME. "
+                         "Neural output exists (%ux%u, DXGI format %d) but the backbuffer is "
+                         "format %d, and CopyTextureRegion does not convert - copying anyway would "
+                         "fail at execute and take the device with it. The stream, the transport "
+                         "and the neural stage are all running normally and their figures are "
+                         "valid; only the display is blocked. The P7.3 resize should have made "
+                         "these agree, so if you are reading this the chain did not get the "
+                         "source format - check for a RESIZE FAILED line above.",
+                         nw, nh, (int)nfmt, (int)bbfmt);
+                mgpu::diag::error(line);
+            }
+        }
+
         const float color[4] = { r, g, b, 1.0f };
         cl->ClearRenderTargetView(rtv, color, 0, nullptr);
 
@@ -7126,9 +7177,33 @@ namespace
 // Any failure falls back to the existing chain and says which step failed. A
 // window that is the wrong size is a cosmetic problem; a chain that has been
 // half torn down is not.
-bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
+// P7.3. DEFECT H - THE COLOURS. The bridge window showed flashing colour noise
+// and never the game, from the first frame, on Tainted Grail.
+//
+// The bridge's swapchain is created R10G10B10A2_UNORM, hardcoded at P5.0
+// because THAT game rendered R10G10B10A2 and the comment there says exactly why
+// it must match: "CopyTextureRegion requires the two formats to match exactly -
+// there is no conversion in a copy". That reasoning was right and the constant
+// was the bug. The format was pinned to one title's backbuffer and then never
+// asked again. Tainted Grail renders R8G8B8A8_UNORM - the arm line says so,
+// fmt=28 - so the copy pushed 8-bit-per-channel bytes into a 10:10:10:2
+// destination. Same 32 bits per pixel, completely different channel boundaries:
+// every pixel is reinterpreted, and reinterpreted garbage that changes with the
+// scene is precisely "colours blinking, never the game".
+//
+// It survived this long because every earlier test title happened to render
+// R10G10B10A2. The invariant "the chain matches the source" was true by
+// coincidence, and a coincidence that holds is indistinguishable from a
+// constraint that is enforced - until the coincidence stops.
+//
+// Two things follow. The chain now takes the SOURCE's format, from the seal,
+// which is the only authority on what the game actually rendered. And the
+// resize is no longer only a window-shape operation: a format mismatch has to
+// be corrected in Window=crop too, where no geometry changes at all - which is
+// why `mode == 0` no longer returns early on its own.
+bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 0=crop 1=match 2=fit
 {
-    if (mode == 0 || src_w == 0 || src_h == 0) return false;
+    if (src_w == 0 || src_h == 0) return false;
 
     auto &S = st();
     HWND hwnd = nullptr;
@@ -7139,16 +7214,42 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
     ID3D12Fence *fence = nullptr;
     HANDLE ev = nullptr;
     UINT64 fv = 0;
+    UINT cur_w = 0, cur_h = 0;
+    DXGI_FORMAT cur_fmt = DXGI_FORMAT_UNKNOWN;
     {
         std::lock_guard<std::mutex> lk(S.cs);
         if (S.sized_to_source) return false;   // one per stream
         hwnd = S.hwnd; sc = S.swapchain; dev = S.device; queue = S.queue;
         heap = S.rtv_heap; fence = S.fence; ev = S.fence_event; fv = S.fence_value;
+        cur_w = S.chain_w; cur_h = S.chain_h; cur_fmt = S.chain_fmt;
         if (hwnd == nullptr || sc == nullptr || dev == nullptr) return false;
         S.sized_to_source = true;   // set before the work: one attempt, not a retry loop
     }
 
     char l[900];
+
+    // The format the chain must end up in. UNKNOWN from the caller means the
+    // seal did not carry one, in which case leave the chain as it is rather
+    // than resize it to nothing.
+    const DXGI_FORMAT want_fmt = (src_fmt != DXGI_FORMAT_UNKNOWN) ? src_fmt : cur_fmt;
+    const bool fmt_wrong = (want_fmt != cur_fmt);
+
+    // In crop there is no geometry to change, so this runs ONLY to correct the
+    // format - and if the format is already right there is nothing to do at all.
+    if (mode == 0 && !fmt_wrong) return false;
+
+    if (fmt_wrong)
+    {
+        snprintf(l, sizeof l,
+                 "[MGPU][P7.3] BACKBUFFER FORMAT MISMATCH CORRECTED: the present chain was created "
+                 "DXGI format %d and this game renders %d. CopyTextureRegion does not convert, so "
+                 "every pixel copied so far was reinterpreted across different channel boundaries - "
+                 "that is the colour noise on the bridge window, and it is a display fault only: "
+                 "the neural stage and the transport were unaffected and their figures stand. "
+                 "Resizing the chain to %d now.",
+                 (int)cur_fmt, (int)want_fmt, (int)want_fmt);
+        mgpu::diag::warn(l);
+    }
 
     // The monitor this window is on, so a source larger than the panel does not
     // produce a window that cannot be seen.
@@ -7188,7 +7289,15 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
     // window equals the buffers and nothing scales at all.
     UINT buf_w = src_w, buf_h = src_h;
     UINT win_w, win_h;
-    if (mode == 2) { win_w = mon_w; win_h = mon_h; }
+    if (mode == 0)
+    {
+        // Format-only correction. The P5 window keeps its size, its border and
+        // its position; nothing here is a shape change and the crop maths
+        // downstream must keep seeing the size it already has.
+        win_w = cur_w; win_h = cur_h;
+        buf_w = cur_w; buf_h = cur_h;
+    }
+    else if (mode == 2) { win_w = mon_w; win_h = mon_h; }
     else
     {
         win_w = (src_w < mon_w) ? src_w : mon_w;
@@ -7200,7 +7309,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
     // the monitor's origin; `match` may be smaller than the panel, so centre it
     // there rather than pinning it to a corner.
     int win_x = mon_x, win_y = mon_y;
-    if (mode != 2)
+    if (mode == 1)
     {
         if (win_w < mon_w) win_x = mon_x + (int)((mon_w - win_w) / 2);
         if (win_h < mon_h) win_y = mon_y + (int)((mon_h - win_h) / 2);
@@ -7242,16 +7351,21 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
     // Borderless, then move. WS_POPUP with no caption and no thick frame; the
     // window still belongs to the bridge thread, which is the thread running
     // this, so SetWindowLongPtr and SetWindowPos are both legal here.
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    style &= ~(WS_OVERLAPPEDWINDOW);
-    style |= WS_POPUP;
-    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
-    SetWindowPos(hwnd, nullptr, win_x, win_y, (int)win_w, (int)win_h,
-                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    // Client rect is now exactly win_w x win_h: WS_POPUP has no non-client area.
+    // mode 0 touches neither the style nor the rectangle: it is here only to
+    // put the backbuffers in the right format.
+    if (mode != 0)
+    {
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        style &= ~(WS_OVERLAPPEDWINDOW);
+        style |= WS_POPUP;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        SetWindowPos(hwnd, nullptr, win_x, win_y, (int)win_w, (int)win_h,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        // Client rect is now exactly win_w x win_h: WS_POPUP has no non-client area.
+    }
 
-    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h,
-                                         DXGI_FORMAT_R10G10B10A2_UNORM, 0);
+    // want_fmt, not a constant. This is DEFECT H's actual repair.
+    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, 0);
     bool ok = SUCCEEDED(rb);
 
     // Re-acquire the backbuffers and rebuild the two RTVs.
@@ -7272,7 +7386,8 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
             S.backbuffer[1] = b1;
             S.chain_w = buf_w;
             S.chain_h = buf_h;
-            S.borderless = true;
+            S.chain_fmt = want_fmt;
+            if (mode != 0) S.borderless = true;
         }
         else
         {
@@ -7299,10 +7414,12 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
     }
 
     snprintf(l, sizeof l,
-             "[MGPU][P7.1] window resized: mode=%s source=%ux%u -> window %ux%u at (%d,%d), "
-             "swapchain %ux%u, borderless, monitor %ux%u at (%d,%d)%s. %s",
-             (mode == 2) ? "fit" : "match", src_w, src_h, win_w, win_h, win_x, win_y,
-             buf_w, buf_h, mon_w, mon_h, mon_x, mon_y,
+             "[MGPU][P7.3] present chain resized: mode=%s source=%ux%u fmt=%d -> window %ux%u at "
+             "(%d,%d), swapchain %ux%u fmt=%d, monitor %ux%u at (%d,%d)%s. %s",
+             (mode == 0) ? "crop (format only - window untouched)"
+                         : ((mode == 2) ? "fit" : "match"),
+             src_w, src_h, (int)src_fmt, win_w, win_h, win_x, win_y,
+             buf_w, buf_h, (int)want_fmt, mon_w, mon_h, mon_x, mon_y,
              mon_ok ? "" : " (GetMonitorInfo FAILED - origin assumed 0,0, so the window may be on "
                            "the wrong panel)",
              (mode == 2 && (buf_w != win_w || buf_h != win_h))
@@ -8039,8 +8156,12 @@ void stream_poll()
         // P7.0. Here and not at arm: the source dimensions come from the seal,
         // so this is the earliest point they are known to be real. Not in
         // profile mode - that run has no on-screen output to size.
-        if (!s.profile && s.window_mode != 0)
-            (void)present_resize(s.width, s.height, s.window_mode);
+        // P7.3: no longer gated on window_mode. A format mismatch has to be
+        // corrected in crop too, where the window does not change at all - and
+        // present_resize itself decides there is nothing to do when the mode is
+        // crop AND the format already matches.
+        if (!s.profile)
+            (void)present_resize(s.width, s.height, s.window_mode, s.format);
     }
 
     while (s.consumed < completed)
