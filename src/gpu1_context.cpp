@@ -76,6 +76,14 @@ namespace
         UINT64 fence_value = 0;
         bool present_failed_logged = false;
         bool neural_shown = false;   // P5.0: one-shot "the window is live" log
+        // P7.0: the chain is resizable now. `hwnd` is kept because a resize has
+        // to move the window as well as the buffers, and `chain_w/h` because
+        // present_frame's crop maths needs the CURRENT size rather than the
+        // 1280x720 T4 fixed it at.
+        HWND hwnd = nullptr;
+        UINT chain_w = 0, chain_h = 0;
+        bool borderless = false;
+        bool sized_to_source = false;   // one resize per stream, not per frame
     };
 
     state &st()
@@ -447,6 +455,9 @@ bool create_present_chain(HWND hwnd)
     {
         std::lock_guard<std::mutex> lk(S.cs);
         S.queue = queue;
+        S.hwnd = hwnd;
+        S.chain_w = width;
+        S.chain_h = height;
         S.swapchain = sc3;
         S.rtv_heap = heap;
         S.backbuffer[0] = back0;
@@ -628,8 +639,17 @@ bool present_frame(float r, float g, float b)
     if (nsrc != nullptr && nfmt == DXGI_FORMAT_R10G10B10A2_UNORM &&
         nw >= 1 && nh >= 1)
     {
-        const UINT cw = (nw < 1280u) ? nw : 1280u;
-        const UINT ch = (nh < 720u)  ? nh : 720u;
+        // P7.0: the CHAIN's size, not the 1280x720 T4 fixed. When the chain
+        // has been resized to the source these are equal and the "crop" is the
+        // whole frame - which is the point: still one CopyTextureRegion, still
+        // no resampling anywhere in our code.
+        UINT bw = 1280u, bh = 720u;
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            if (S.chain_w != 0 && S.chain_h != 0) { bw = S.chain_w; bh = S.chain_h; }
+        }
+        const UINT cw = (nw < bw) ? nw : bw;
+        const UINT ch = (nh < bh) ? nh : bh;
         const UINT left = (nw - cw) / 2u;
         const UINT top  = (nh - ch) / 2u;
 
@@ -677,9 +697,9 @@ bool present_frame(float r, float g, float b)
         if (say)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P5.0] the bridge window is now showing the %s - a "
-                     "%ux%u 1:1 crop from the centre of the %ux%u frame, no scaling and no "
-                     "resampling. The cycling colour returns when the stream ends.",
+                     "[MGPU][P5.0] the bridge window is now showing the %s - %s of the %ux%u "
+                     "frame at %ux%u, one CopyTextureRegion, no resampling in this add-on. The "
+                     "cycling colour returns when the stream ends.",
                      (nrest == D3D12_RESOURCE_STATE_COPY_DEST)
                          ? "NEURAL INPUT (mgpu.ini Present=in) - the transited game frame as it "
                            "was handed to DLSS-NR, BEFORE the neural stage. NR still runs and is "
@@ -687,7 +707,9 @@ bool present_frame(float r, float g, float b)
                            "fault is on our side of the handover and NR is innocent"
                          : "NEURAL OUTPUT - every pixel on screen is a pixel DLSS-NR produced on "
                            "the second adapter",
-                     cw, ch, nw, nh);
+                     (cw == nw && ch == nh) ? "THE WHOLE"
+                                            : "a 1:1 centre crop",
+                     nw, nh, cw, ch);
             mgpu::diag::info(line);
         }
     }
@@ -6336,6 +6358,7 @@ namespace
         // still measured, so a Present=in run and a Present=nr run are
         // otherwise the same run.
         bool present_in = false;
+        int window_mode = 2;   // P7.0: 0=crop 1=match 2=fit
 
         // ---- P4.1: the persistent neural stage ----
         // Opt-OUT (mgpu.ini Neural=0), because running without it is now the
@@ -6691,6 +6714,20 @@ namespace
         return n;
     }
 
+    // P7.0: Window= crop | match | fit. Default fit - the window is the product
+    // now, and a 1280x720 letterbox out of a 2048x1152 frame is not it. crop
+    // restores the P5 behaviour exactly.
+    int ini_read_window_mode()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 2;
+        const char *k = ini_find(buf, "Window");
+        if (k == nullptr) return 2;
+        if (k[0] == 'c') return 0;
+        if (k[0] == 'm') return 1;
+        return 2;
+    }
+
     unsigned long long stream_read_frames()
     {
         char buf[INI_BYTES];
@@ -6969,6 +7006,176 @@ namespace
 // str() gave it internal linkage and worker.cpp failed to link against it.
 // The file-static helpers it calls are reachable from here because this is
 // the same translation unit.
+// ---- P7.0: size the bridge window to the game's frame ----
+//
+// T4 fixed the window at 1280x720 and T5 created the swapchain non-resizable,
+// deliberately - "no ResizeBuffers at P0". That was right while the window's job
+// was to prove the loop was alive. It is wrong now that the window is the
+// product: a 1280x720 letterbox out of a 2048x1152 frame throws away three
+// quarters of what the neural stage produced, and it is not what anyone would
+// record a video of.
+//
+// Called ONCE per stream, from the bridge thread, on the first frame whose
+// source dimensions are known - which is why it cannot happen at T4: the game's
+// backbuffer size is not known until a seal has carried it across.
+//
+// Window= in mgpu.ini picks the shape:
+//   crop  the P5 behaviour, unchanged. 1280x720, bordered, centre crop.
+//   match the window and the swapchain both become the SOURCE size, borderless.
+//         One CopyTextureRegion, 1:1, whole frame, nothing resampled anywhere.
+//         Clamped to the monitor if the source is larger.
+//   fit   borderless at the MONITOR's size with the swapchain still at source
+//         size, so DXGI scales on presentation. Fills the screen; the scaling is
+//         the compositor's, not ours, and the banner says so rather than
+//         claiming a 1:1 crop it no longer is.
+//
+// Any failure falls back to the existing chain and says which step failed. A
+// window that is the wrong size is a cosmetic problem; a chain that has been
+// half torn down is not.
+bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
+{
+    if (mode == 0 || src_w == 0 || src_h == 0) return false;
+
+    auto &S = st();
+    HWND hwnd = nullptr;
+    IDXGISwapChain3 *sc = nullptr;
+    ID3D12Device *dev = nullptr;
+    ID3D12CommandQueue *queue = nullptr;
+    ID3D12DescriptorHeap *heap = nullptr;
+    ID3D12Fence *fence = nullptr;
+    HANDLE ev = nullptr;
+    UINT64 fv = 0;
+    {
+        std::lock_guard<std::mutex> lk(S.cs);
+        if (S.sized_to_source) return false;   // one per stream
+        hwnd = S.hwnd; sc = S.swapchain; dev = S.device; queue = S.queue;
+        heap = S.rtv_heap; fence = S.fence; ev = S.fence_event; fv = S.fence_value;
+        if (hwnd == nullptr || sc == nullptr || dev == nullptr) return false;
+        S.sized_to_source = true;   // set before the work: one attempt, not a retry loop
+    }
+
+    char l[700];
+
+    // The monitor this window is on, so a source larger than the panel does not
+    // produce a window that cannot be seen.
+    UINT mon_w = src_w, mon_h = src_h;
+    {
+        HMONITOR mh = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        if (mh != nullptr && GetMonitorInfoW(mh, &mi) != FALSE)
+        {
+            mon_w = (UINT)(mi.rcMonitor.right - mi.rcMonitor.left);
+            mon_h = (UINT)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+        }
+    }
+
+    // Buffers stay at the SOURCE size in both modes - that is what keeps the
+    // copy 1:1. In `fit` the window is bigger and DXGI stretches; in `match` the
+    // window equals the buffers and nothing scales at all.
+    UINT buf_w = src_w, buf_h = src_h;
+    UINT win_w, win_h;
+    if (mode == 2) { win_w = mon_w; win_h = mon_h; }
+    else
+    {
+        win_w = (src_w < mon_w) ? src_w : mon_w;
+        win_h = (src_h < mon_h) ? src_h : mon_h;
+        buf_w = win_w; buf_h = win_h;   // match: buffers follow the window
+    }
+
+    // GPU idle first. ResizeBuffers requires every backbuffer reference
+    // released, and releasing a resource the GPU is still reading is the P1.0
+    // teardown crash in a different costume.
+    if (fence != nullptr && queue != nullptr && ev != nullptr)
+    {
+        ++fv;
+        if (SUCCEEDED(queue->Signal(fence, fv)))
+        {
+            fence->SetEventOnCompletion(fv, ev);
+            WaitForSingleObject(ev, 2000);
+        }
+        std::lock_guard<std::mutex> lk(S.cs);
+        S.fence_value = fv;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(S.cs);
+        for (int i = 0; i < 2; ++i)
+            if (S.backbuffer[i] != nullptr) { S.backbuffer[i]->Release(); S.backbuffer[i] = nullptr; }
+    }
+
+    // Borderless, then move. WS_POPUP with no caption and no thick frame; the
+    // window still belongs to the bridge thread, which is the thread running
+    // this, so SetWindowLongPtr and SetWindowPos are both legal here.
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    style &= ~(WS_OVERLAPPEDWINDOW);
+    style |= WS_POPUP;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+    SetWindowPos(hwnd, nullptr, 0, 0, (int)win_w, (int)win_h,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    // Client rect is now exactly win_w x win_h: WS_POPUP has no non-client area.
+
+    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h,
+                                         DXGI_FORMAT_R10G10B10A2_UNORM, 0);
+    bool ok = SUCCEEDED(rb);
+
+    // Re-acquire the backbuffers and rebuild the two RTVs.
+    if (ok)
+    {
+        ID3D12Resource *b0 = nullptr, *b1 = nullptr;
+        HRESULT h0 = sc->GetBuffer(0, IID_PPV_ARGS(&b0));
+        HRESULT h1 = SUCCEEDED(h0) ? sc->GetBuffer(1, IID_PPV_ARGS(&b1)) : h0;
+        if (SUCCEEDED(h1) && heap != nullptr)
+        {
+            const UINT rs = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            D3D12_CPU_DESCRIPTOR_HANDLE d0 = heap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_CPU_DESCRIPTOR_HANDLE d1 = d0; d1.ptr += rs;
+            dev->CreateRenderTargetView(b0, nullptr, d0);
+            dev->CreateRenderTargetView(b1, nullptr, d1);
+            std::lock_guard<std::mutex> lk(S.cs);
+            S.backbuffer[0] = b0;
+            S.backbuffer[1] = b1;
+            S.chain_w = buf_w;
+            S.chain_h = buf_h;
+            S.borderless = true;
+        }
+        else
+        {
+            if (b0 != nullptr) b0->Release();
+            if (b1 != nullptr) b1->Release();
+            ok = false;
+        }
+    }
+
+    if (!ok)
+    {
+        // The chain has no backbuffers now. present_frame will fail on the next
+        // call and log its own one-shot line; say here WHY, because "Present
+        // failed" on its own would send the next person looking in the wrong
+        // place entirely.
+        snprintf(l, sizeof l,
+                 "[MGPU][P7.0] RESIZE FAILED - ResizeBuffers hr=0x%08X for %ux%u. The present "
+                 "chain has been left without backbuffers and the window will stop presenting; "
+                 "the game and the neural stage are UNAFFECTED, this is the bridge's own display "
+                 "path only. Set Window=crop in mgpu.ini to get the P5 1280x720 window back.",
+                 (unsigned)rb, buf_w, buf_h);
+        mgpu::diag::error(l);
+        return false;
+    }
+
+    snprintf(l, sizeof l,
+             "[MGPU][P7.0] window resized: mode=%s source=%ux%u -> window %ux%u, swapchain "
+             "%ux%u, borderless, monitor %ux%u. %s",
+             (mode == 2) ? "fit" : "match", src_w, src_h, win_w, win_h, buf_w, buf_h,
+             mon_w, mon_h,
+             (mode == 2 && (buf_w != win_w || buf_h != win_h))
+               ? "DXGI SCALES on presentation - the copy into the backbuffer is still 1:1 and "
+                 "nothing in this add-on resamples, but what reaches the panel has been "
+                 "stretched by the compositor. Say so in any capture."
+               : "Window and swapchain are the same size, so nothing scales anywhere.");
+    mgpu::diag::info(l);
+    return true;
+}
+
 // P5.1. THE PRESENT GATE - the pipeline cleanup, and it is two fixes in one.
 //
 // The bridge's present loop ran at the display's refresh - 210 fps - and
@@ -7218,6 +7425,7 @@ void stream_request()
     s.max_frames = stream_read_frames();
     s.profile = stream_read_profile();
     s.present_in = ini_read_present_in();
+    s.window_mode = ini_read_window_mode();
     {
         char buf[INI_BYTES];
         const bool have = ini_slurp(buf, sizeof buf);
@@ -7300,7 +7508,7 @@ void stream_request()
     char l[700];
     snprintf(l, sizeof l,
              "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\", "
-             "neural=%s, profile=%s, present=%s, passes=%u. "
+             "neural=%s, profile=%s, present=%s, passes=%u, window=%s. "
              "Every game frame from the next one is sealed and transited until the bound is "
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
@@ -7313,7 +7521,10 @@ void stream_request()
              s.present_in ? "IN (the window shows the frame handed TO DLSS-NR, not its output - "
                             "P5.3 discriminator)"
                           : "nr (the neural output)",
-             s.passes);
+             s.passes,
+             (s.window_mode == 0) ? "crop (1280x720, the P5 behaviour)"
+                                  : ((s.window_mode == 1) ? "match (borderless at the source size)"
+                                                          : "fit (borderless full screen)"));
     mgpu::diag::info(l);
 }
 
@@ -7686,6 +7897,12 @@ void stream_poll()
             ndev = st().device;
         }
         s.nr_ok = (ndev != nullptr) && stream_nr_create(s, ndev);
+
+        // P7.0. Here and not at arm: the source dimensions come from the seal,
+        // so this is the earliest point they are known to be real. Not in
+        // profile mode - that run has no on-screen output to size.
+        if (!s.profile && s.window_mode != 0)
+            (void)present_resize(s.width, s.height, s.window_mode);
     }
 
     while (s.consumed < completed)
