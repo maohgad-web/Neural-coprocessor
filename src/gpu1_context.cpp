@@ -698,6 +698,17 @@ bool present_frame(float r, float g, float b)
         nb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         cl->ResourceBarrier(1, &nb);
 
+        // P7.4. SPLIT. The left half is the INPUT, the right half is the
+        // OUTPUT, and they are the SAME FRAME - not two captures aligned after
+        // the fact, which is the thing that cannot be done in a game at all.
+        // Both textures are the same size and format by construction, so the
+        // seam falls on the same column of the same picture and every pixel
+        // either side is at its true position: this is a split, not a blend
+        // and not a resample.
+        D3D12_RESOURCE_STATES lrest = D3D12_RESOURCE_STATE_COPY_DEST;
+        ID3D12Resource *lsrc = stream_present_split_left(lrest);
+        const UINT halfw = (lsrc != nullptr) ? (cw / 2u) : cw;
+
         D3D12_TEXTURE_COPY_LOCATION ps{}, pd{};
         ps.pResource = nsrc;
         ps.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -705,16 +716,67 @@ bool present_frame(float r, float g, float b)
         pd.pResource = backbuffer[index];
         pd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         pd.SubresourceIndex = 0;
-        D3D12_BOX pbox{ left, top, 0, left + cw, top + ch, 1 };
-        cl->CopyTextureRegion(&pd, 0, 0, 0, &ps, &pbox);
+        // Right half in split, whole frame otherwise. The destination x
+        // matches the source x, so nothing shifts sideways when the mode
+        // changes - the seam appears, the picture does not move.
+        D3D12_BOX pbox{ left + halfw, top, 0, left + cw, top + ch, 1 };
+        if (lsrc == nullptr) pbox.left = left;
+        cl->CopyTextureRegion(&pd, (lsrc != nullptr) ? halfw : 0u, 0, 0, &ps, &pbox);
 
         nb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         nb.Transition.StateAfter = nrest;
         cl->ResourceBarrier(1, &nb);
 
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        cl->ResourceBarrier(1, &barrier);
+        if (lsrc != nullptr)
+        {
+            D3D12_RESOURCE_BARRIER lb{};
+            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            lb.Transition.pResource = lsrc;
+            lb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            lb.Transition.StateBefore = lrest;
+            lb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cl->ResourceBarrier(1, &lb);
+
+            D3D12_TEXTURE_COPY_LOCATION ls{};
+            ls.pResource = lsrc;
+            ls.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            ls.SubresourceIndex = 0;
+            D3D12_BOX lbox{ left, top, 0, left + halfw, top + ch, 1 };
+            cl->CopyTextureRegion(&pd, 0, 0, 0, &ls, &lbox);
+
+            lb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            lb.Transition.StateAfter = lrest;
+            cl->ResourceBarrier(1, &lb);
+        }
+
+        if (lsrc != nullptr)
+        {
+            // The seam, drawn last. Without it a viewer has to guess where the
+            // boundary is, and on a frame where the two halves happen to look
+            // similar they will guess wrong and conclude the split is not
+            // working. Back to RENDER_TARGET for one 3px clear, then PRESENT.
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            cl->ResourceBarrier(1, &barrier);
+
+            const float seam[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            D3D12_RECT sr{};
+            sr.left   = (LONG)((halfw >= 2u) ? (halfw - 2u) : 0u);
+            sr.top    = 0;
+            sr.right  = (LONG)(halfw + 1u);
+            sr.bottom = (LONG)ch;
+            cl->ClearRenderTargetView(rtv, seam, 1, &sr);
+
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            cl->ResourceBarrier(1, &barrier);
+        }
+        else
+        {
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            cl->ResourceBarrier(1, &barrier);
+        }
 
         bool say = false;
         {
@@ -727,7 +789,12 @@ bool present_frame(float r, float g, float b)
                      "[MGPU][P5.0] the bridge window is now showing the %s - %s of the %ux%u "
                      "frame at %ux%u, one CopyTextureRegion, no resampling in this add-on. The "
                      "cycling colour returns when the stream ends.",
-                     (nrest == D3D12_RESOURCE_STATE_COPY_DEST)
+                     (lsrc != nullptr)
+                         ? "SPLIT (Present=split) - LEFT half is the frame handed TO DLSS-NR, "
+                           "RIGHT half is what DLSS-NR produced, and BOTH ARE THE SAME FRAME. "
+                           "Same instant, same camera, same lighting, one white seam between "
+                           "them. Any difference across that seam is the model and nothing else"
+                     : (nrest == D3D12_RESOURCE_STATE_COPY_DEST)
                          ? "NEURAL INPUT (mgpu.ini Present=in) - the transited game frame as it "
                            "was handed to DLSS-NR, BEFORE the neural stage. NR still runs and is "
                            "still timed; only what is on screen changed. If THIS looks wrong, the "
@@ -6408,7 +6475,36 @@ namespace
         // the NR output. Display only - the neural stage still runs and is
         // still measured, so a Present=in run and a Present=nr run are
         // otherwise the same run.
-        bool present_in = false;
+        // P7.4: present_mode replaces the present_in bool. 0 = the neural
+        // output, 1 = the frame handed TO the model, 2 = SPLIT - the left half
+        // of the input beside the right half of the output, THE SAME FRAME,
+        // in one backbuffer.
+        //
+        // Split exists because the quality comparison was impossible without
+        // it. Two runs cannot be aligned: no game replays a frame, and an
+        // exterior with a sky changes underneath you, so a difference between
+        // two captures is never cleanly attributable to the setting that
+        // changed. Splitting one frame removes the question entirely - both
+        // halves are the same instant, the same camera, the same weather.
+        //
+        // It is also the only honest way to film this. Cutting between two
+        // recordings proves nothing to a sceptical viewer; a live seam does.
+        int present_mode = 0;
+
+        // P7.4: the intensity SHAPE, held as a mode rather than written once.
+        // 0 = manual, 1 = front-loaded (pass 1 at FULL, every other pass at
+        // FLOOR), 2 = back-loaded (last pass at FULL, every other at FLOOR).
+        //
+        // A preset that only wrote numbers would silently stop describing the
+        // experiment the moment the pass count moved: set "max on the last
+        // pass" at 4 passes, go to 5, and the max is now on the second to last
+        // one while the panel still says back-loaded. Since the demo changes
+        // the pass count live, on camera, the shape has to FOLLOW the count.
+        // Touching any single slider drops back to manual, so nothing is
+        // trapped - re-picking a preset re-applies it.
+        int preset = 0;
+        static constexpr float PRESET_FLOOR = 0.10f;
+        static constexpr float PRESET_FULL  = 2.00f;
         int window_mode = 2;   // P7.0: 0=crop 1=match 2=fit
 
         // ---- P4.1: the persistent neural stage ----
@@ -6438,7 +6534,13 @@ namespace
         // Passes=1 is the default and is byte-identical to the P5 behaviour:
         // one handle, one evaluate, tex_out is the output. Nothing about the
         // shipped path changes unless the ini asks for it.
-        static const unsigned MAX_PASSES = 4;
+        // P7.4: 6, up from 4. The demo climbs the pass count on camera and 4 was
+    // not enough steps to make the shape of the curve visible; 10 was
+    // considered and rejected because latency scales with passes and a bridge
+    // window crawling at 200 ms would read as a fault on video rather than as
+    // the honest cost it is. Arm time is ~150 ms per handle, so six is about a
+    // second of stall at arm and nothing after.
+    static const unsigned MAX_PASSES = 6;
         unsigned passes = 1;
         NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
         ngx_pf_evaluate_feature nr_eval = nullptr;
@@ -6472,7 +6574,7 @@ namespace
         // absent, every pass uses Intensity. A strong first pass with gentle
         // later ones is the configuration that observation suggests, and it
         // could not be expressed before.
-        float intensity[MAX_PASSES] = { 0.84f, 0.84f, 0.84f, 0.84f };
+        float intensity[MAX_PASSES] = { 0.84f, 0.84f, 0.84f, 0.84f, 0.84f, 0.84f };
         bool intensity_set[MAX_PASSES] = {};   // was it named per pass in the ini?
         // P6.3: 0 = every pass, 1..MAX_PASSES = that pass alone. Bridge thread
         // only - the hotkey is delivered to the bridge thread's message queue
@@ -6542,7 +6644,7 @@ namespace
         // produced wrong colours" from "we handed the neural stage a wrong
         // frame and it faithfully denoised it", and no amount of looking at
         // the output alone can tell those apart.
-        if (s.present_in)
+        if (s.present_mode == 1)
         {
             if (s.tex_in == nullptr) return nullptr;
             rest = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -6553,6 +6655,28 @@ namespace
         if (s.nr_final == nullptr) return nullptr;
         rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         return s.nr_final;
+    }
+
+    // P7.4. THE LEFT HALF OF A SPLIT PRESENT.
+    //
+    // Returns tex_in - the frame as it arrived from the game, before the model
+    // - but ONLY in split mode, and only when a neural output also exists to
+    // put beside it. Half a comparison is worse than none: a viewer looking at
+    // the input on the left and the cycling clear colour on the right would
+    // read it as the model producing nothing.
+    //
+    // Same texture, same size, same format as the right half by construction:
+    // tex_in and the pass outputs are all created from s.width/height/format in
+    // stream_nr_create, so the two halves cannot disagree about geometry.
+    ID3D12Resource *stream_present_split_left(D3D12_RESOURCE_STATES &rest)
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (s.present_mode != 2) return nullptr;
+        if (!s.nr_ok || s.profile) return nullptr;
+        if (s.tex_in == nullptr || s.nr_final == nullptr) return nullptr;
+        rest = D3D12_RESOURCE_STATE_COPY_DEST;
+        return s.tex_in;
     }
 
     // P5.2 / DEFECT C. Declared up beside ngx_probe; defined here, where the
@@ -6776,12 +6900,28 @@ namespace
 
     // P5.3: Present=in | nr. Default nr - the output, which is what every run
     // so far has shown.
-    bool ini_read_present_in()
+    // P7.4: nr | in | split. 's' is unambiguous against the other two.
+    int ini_read_present_mode()
     {
         char buf[INI_BYTES];
-        if (!ini_slurp(buf, sizeof buf)) return false;
+        if (!ini_slurp(buf, sizeof buf)) return 0;
         const char *k = ini_find(buf, "Present");
-        return (k != nullptr) && (k[0] == 'i') && (k[1] == 'n');
+        if (k == nullptr) return 0;
+        if (k[0] == 'i' && k[1] == 'n') return 1;
+        if (k[0] == 's') return 2;
+        return 0;
+    }
+
+    // P7.4: Preset= manual | front | back. The shape, not four numbers.
+    int ini_read_preset()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0;
+        const char *k = ini_find(buf, "Preset");
+        if (k == nullptr) return 0;
+        if (k[0] == 'f') return 1;
+        if (k[0] == 'b') return 2;
+        return 0;
     }
 
     // P6.0: Passes=<n>, clamped to 1..MAX_PASSES. Out-of-range is CLAMPED AND
@@ -7546,13 +7686,65 @@ void ui_read(ui_state &out)
     out.passes      = s.passes;
     out.max_passes  = stream_state::MAX_PASSES;
     out.profile     = s.profile;
-    out.present_in  = s.present_in;
+    out.present_mode = s.present_mode;
+    out.preset       = s.preset;
     for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out.intensity[i] = s.intensity[i];
     out.consumed    = s.consumed;
     out.produced    = s.produced;
     out.dropped     = s.dropped;
     out.overrun     = s.overrun;
     out.skipped     = s.nr_skipped;
+}
+
+// P7.4. Re-apply the intensity SHAPE for the current pass count. Caller holds
+// s.cs. Manual does nothing at all - that is the whole point of manual.
+//
+// front: pass 1 at PRESET_FULL, every other pass at PRESET_FLOOR.
+// back:  pass s.passes at PRESET_FULL, every other pass at PRESET_FLOOR.
+//
+// "Every other pass" means every pass in the ARRAY, not just the active ones,
+// so a pass that is currently inactive is already at the floor when the count
+// grows to include it. Without that, raising the count would briefly show a
+// pass at whatever it held from an earlier configuration.
+static void preset_apply_locked(stream_state &s)
+{
+    if (s.preset == 0) return;
+    for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+        s.intensity[i] = stream_state::PRESET_FLOOR;
+    const unsigned hot = (s.preset == 1) ? 0u
+                                         : ((s.passes >= 1 ? s.passes : 1u) - 1u);
+    s.intensity[hot] = stream_state::PRESET_FULL;
+    ++s.intensity_edits;
+}
+
+// P7.4. Pick the shape. 0 manual, 1 front-loaded, 2 back-loaded. Applied now
+// and re-applied on every pass-count change until something drops it back to
+// manual, which is what makes the delta between front and back a single
+// variable even while the count is moving on camera.
+void ui_set_preset(int mode)
+{
+    if (mode < 0 || mode > 2) return;
+    stream_state &s = str();
+    unsigned n = 1;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (s.preset == mode && mode == 0) return;
+        s.preset = mode;
+        preset_apply_locked(s);
+        n = s.passes;
+    }
+    char l[420];
+    snprintf(l, sizeof l,
+             "[MGPU][P7.4] intensity preset = %s, %u pass%s. %s The shape FOLLOWS the pass "
+             "count: change the count and the peak moves with it, so front and back stay "
+             "comparable as the count climbs. Moving any single slider returns to manual.",
+             (mode == 0) ? "MANUAL" : ((mode == 1) ? "FRONT-LOADED" : "BACK-LOADED"),
+             n, (n == 1) ? "" : "es",
+             (mode == 0) ? "Per-pass values are whatever they were; nothing is rewritten."
+                         : ((mode == 1)
+                                ? "Pass 1 at 2.00, every other pass at 0.10."
+                                : "The LAST pass at 2.00, every other pass at 0.10."));
+    mgpu::diag::info(l);
 }
 
 void ui_set_passes(unsigned n)
@@ -7570,6 +7762,12 @@ void ui_set_passes(unsigned n)
         // nothing is created or destroyed here. nr_final is recomputed on the
         // next consumed frame.
         ++s.intensity_edits;
+        // P7.4: and the shape follows. Absolute per-pass values already
+        // survived a count change - they were never reset - but surviving is
+        // exactly what breaks a preset: "max on the last pass" set at 4 becomes
+        // "max on the second to last" at 5 while the panel still claims
+        // back-loaded. preset_apply_locked moves the peak instead.
+        preset_apply_locked(s);
     }
     char l[300];
     snprintf(l, sizeof l,
@@ -7590,6 +7788,39 @@ void ui_set_intensity(unsigned pass_1based, float v)
     else if (pass_1based <= stream_state::MAX_PASSES)
         s.intensity[pass_1based - 1] = v;
     ++s.intensity_edits;
+    // P7.4: touching a value by hand means the shape is no longer a preset.
+    // Silently keeping the preset label over hand-edited numbers is how a run
+    // gets recorded as back-loaded when it is not.
+    s.preset = 0;
+}
+
+// P7.4. The present mode, LIVE. 0 nr, 1 in, 2 split.
+//
+// This used to be read once from mgpu.ini at arm, which is precisely why the
+// input and the output could never be compared: one run showed one of them,
+// and no two runs of a game contain the same frame. Live, one keypress puts
+// both on screen at once.
+void ui_set_present_mode(int mode)
+{
+    if (mode < 0 || mode > 2) return;
+    stream_state &s = str();
+    int was;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        was = s.present_mode;
+        if (was == mode) return;
+        s.present_mode = mode;
+    }
+    static const char *const nm[3] = { "nr (neural output)",
+                                       "in (the frame handed TO the model)",
+                                       "split (left input | right output, SAME frame)" };
+    char l[360];
+    snprintf(l, sizeof l,
+             "[MGPU][P7.4] present mode %s -> %s, live from the next present. Nothing is armed, "
+             "torn down or re-timed: the neural stage runs identically in all three and only the "
+             "copy into the bridge backbuffer changes.",
+             nm[was], nm[mode]);
+    mgpu::diag::info(l);
 }
 
 void ui_set_neural(bool on)
@@ -7646,6 +7877,7 @@ void intensity_step(int dir)
         if (v < LO) v = LO;
         if (v > HI) v = HI;
         s.intensity[i] = v;
+        s.preset = 0;   // P7.4: a hand-driven step is a manual edit like any other
     }
     ++s.intensity_edits;
 
@@ -7679,7 +7911,8 @@ void stream_request()
     s.neural = stream_read_neural();
     s.max_frames = stream_read_frames();
     s.profile = stream_read_profile();
-    s.present_in = ini_read_present_in();
+    s.present_mode = ini_read_present_mode();
+    s.preset = ini_read_preset();
     s.window_mode = ini_read_window_mode();
     {
         char buf[INI_BYTES];
@@ -7704,6 +7937,24 @@ void stream_request()
     {
         const unsigned named = ini_read_intensity(s.intensity, s.intensity_set, s.passes);
         s.set_n = ini_read_sets(s.set_key, s.set_f, s.set_u, s.set_is_float);
+        // P7.4. A Preset= in the ini OVERRIDES the per-pass numbers, and says
+        // so below rather than leaving two sources of truth to be reconciled
+        // by whoever reads the log later. Applied after Passes so the peak
+        // lands on the right pass.
+        if (s.preset != 0)
+        {
+            preset_apply_locked(s);
+            char pr[420];
+            snprintf(pr, sizeof pr,
+                     "[MGPU][P7.4] Preset=%s OVERRIDES every Intensity/IntensityN in the ini for "
+                     "this run: %s Remove the Preset line to use the per-pass numbers instead. "
+                     "The panel can change the shape live and any manual slider returns to manual.",
+                     (s.preset == 1) ? "front" : "back",
+                     (s.preset == 1)
+                         ? "pass 1 at 2.00, every other pass at 0.10."
+                         : "the LAST active pass at 2.00, every other pass at 0.10.");
+            mgpu::diag::warn(pr);
+        }
 
         char kl[900];
         int w = snprintf(kl, sizeof kl, "[MGPU][P6.2] knobs | intensity");
@@ -7773,9 +8024,12 @@ void stream_request()
                       : "off (P4.0 transport-only control)",
              s.profile ? "ON (no on-screen output, no liveness sample - measurement run)"
                        : "off",
-             s.present_in ? "IN (the window shows the frame handed TO DLSS-NR, not its output - "
-                            "P5.3 discriminator)"
-                          : "nr (the neural output)",
+             (s.present_mode == 1)
+                 ? "IN (the window shows the frame handed TO DLSS-NR, not its output - "
+                   "P5.3 discriminator)"
+                 : ((s.present_mode == 2)
+                       ? "SPLIT (left half input, right half output, SAME frame)"
+                       : "nr (the neural output)"),
              s.passes,
              (s.window_mode == 0) ? "crop (1280x720, the P5 behaviour)"
                                   : ((s.window_mode == 1) ? "match (borderless at the source size)"

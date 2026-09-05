@@ -53,6 +53,11 @@
 #define MGPU_HOTKEY_INT_TARGET 0x4D48   // CTRL+ALT+F8  - cycle which pass
 #define MGPU_HOTKEY_INT_DOWN   0x4D49   // CTRL+ALT+F9  - one step down
 #define MGPU_HOTKEY_INT_UP     0x4D4A   // CTRL+ALT+F11 - one step up
+// P7.4: CTRL+ALT+F7 cycles the view - output, input, split. On the hotkey and
+// not only in the panel because the panel is the ReShade overlay, and opening
+// the overlay to change the view puts the overlay in the shot. The comparison
+// has to be filmable without the instrument on screen.
+#define MGPU_HOTKEY_VIEW       0x4D4B   // CTRL+ALT+F7  - cycle present mode
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -379,6 +384,17 @@ namespace
                                                 MOD_CONTROL | MOD_ALT, VK_F9) != FALSE;
                             const bool k_u = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_UP,
                                                 MOD_CONTROL | MOD_ALT, VK_F11) != FALSE;
+                            const bool k_v = RegisterHotKey(nullptr, MGPU_HOTKEY_VIEW,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7) != FALSE;
+                            char vk[300];
+                            snprintf(vk, sizeof vk,
+                                     "[MGPU][P7.4] view hotkey: CTRL+ALT+F7 cycles output -> input "
+                                     "-> split = %s. Split shows the frame handed TO the model on "
+                                     "the left and what it produced on the right, THE SAME FRAME, "
+                                     "so the two halves cannot disagree about time, camera or "
+                                     "lighting. The neural stage is unchanged in all three.",
+                                     k_v ? "OK" : "FAILED");
+                            mgpu::diag::info(vk);
                             char ik[420];
                             snprintf(ik, sizeof ik,
                                      "[MGPU][P6.3] intensity hotkeys: CTRL+ALT+F8 cycle target "
@@ -506,6 +522,7 @@ namespace
                 // stalling anything that broadcasts to top-level windows.
                 int int_delta = 0;
                 unsigned int_cycles = 0;
+                unsigned view_cycles = 0;
                 while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
                 {
                     if (m.message == WM_QUIT)
@@ -516,6 +533,8 @@ namespace
                     { --int_delta; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_UP)
                     { ++int_delta; continue; }
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
+                    { ++view_cycles; continue; }
                     // P1.3g. WM_HOTKEY is thread-posted, not window-posted, so
                     // it arrives here with hwnd == nullptr and never reaches a
                     // window procedure. Flag it and run the probe AFTER the
@@ -538,6 +557,19 @@ namespace
                     mgpu::gpu1::intensity_cycle_target();
                 for (int d = 0; d < int_delta; ++d)  mgpu::gpu1::intensity_step(+1);
                 for (int d = 0; d > int_delta; --d)  mgpu::gpu1::intensity_step(-1);
+
+                // P7.4. The view cycles output -> input -> split -> output.
+                // Read the current mode rather than tracking one here: the
+                // panel can change it too, and two owners of one value is how
+                // a control starts lying about what it is showing.
+                if (view_cycles != 0)
+                {
+                    mgpu::gpu1::ui_state vs;
+                    mgpu::gpu1::ui_read(vs);
+                    int mode = vs.present_mode;
+                    for (unsigned c = 0; c < view_cycles; ++c) mode = (mode + 1) % 3;
+                    mgpu::gpu1::ui_set_present_mode(mode);
+                }
 
                 if (run_transit)
                 {
@@ -727,6 +759,7 @@ namespace
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_TARGET);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_VIEW);
             mgpu::diag::info("[MGPU][P1.3g] hotkeys unregistered (transit + P6.3 intensity)");
         }
 

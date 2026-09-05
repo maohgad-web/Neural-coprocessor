@@ -292,6 +292,30 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     ImGui::TextUnformatted(note);
 
     ImGui::Separator();
+    ImGui::TextUnformatted("View");
+    int pm = st.present_mode;
+    if (ImGui::RadioButton("output", &pm, 0))      mgpu::gpu1::ui_set_present_mode(0);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("input", &pm, 1))       mgpu::gpu1::ui_set_present_mode(1);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("split", &pm, 2))       mgpu::gpu1::ui_set_present_mode(2);
+    ImGui::TextDisabled("split = left half input, right half output, the SAME frame.");
+    ImGui::TextDisabled("The neural stage and its timing are identical in all three.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Intensity shape");
+    int pr = st.preset;
+    if (ImGui::RadioButton("manual", &pr, 0))      mgpu::gpu1::ui_set_preset(0);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("front-loaded", &pr, 1)) mgpu::gpu1::ui_set_preset(1);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("back-loaded", &pr, 2))  mgpu::gpu1::ui_set_preset(2);
+    ImGui::TextDisabled("front = pass 1 at 2.00, the rest at 0.10.");
+    ImGui::TextDisabled("back  = the LAST pass at 2.00, the rest at 0.10.");
+    ImGui::TextDisabled("The peak FOLLOWS the pass count, so front and back stay");
+    ImGui::TextDisabled("comparable while the count changes. Moving a slider = manual.");
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Intensity (0.00 - 2.00)");
 
     float all = st.intensity[0];

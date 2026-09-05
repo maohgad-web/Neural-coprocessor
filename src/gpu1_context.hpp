@@ -251,9 +251,14 @@ bool probes_enabled();
 struct ui_state
 {
     bool armed = false, summarised = false, neural = false, nr_ok = false;
-    bool profile = false, present_in = false;
-    unsigned passes = 1, max_passes = 4;
-    float intensity[4] = {};
+    bool profile = false;
+    // P7.4: 0 = neural output, 1 = the frame handed TO the model, 2 = split
+    // (left half input, right half output, the same frame).
+    int present_mode = 0;
+    // P7.4: 0 = manual, 1 = front-loaded, 2 = back-loaded. See ui_set_preset.
+    int preset = 0;
+    unsigned passes = 1, max_passes = 6;
+    float intensity[6] = {};
     unsigned long long consumed = 0, produced = 0, dropped = 0, overrun = 0, skipped = 0;
 };
 void ui_read(ui_state &out);
@@ -269,6 +274,28 @@ void ui_set_intensity(unsigned pass_1based, float v);
 // Turn the neural stage off without tearing it down - the handles stay alive so
 // it can come back without a 400 ms CreateFeature stall.
 void ui_set_neural(bool on);
+
+// P7.4. The present mode, live: 0 neural output, 1 the frame handed TO the
+// model, 2 SPLIT - both halves of the SAME frame side by side, input left,
+// output right, with a white seam between them.
+//
+// Split is the only way to compare input against output in a game: two runs
+// never contain the same frame, and an exterior changes underneath you, so a
+// difference between two captures can never be attributed cleanly. It changes
+// nothing about the neural stage or its timing - only the copy into the
+// bridge's backbuffer.
+void ui_set_present_mode(int mode);
+
+// P7.4. The intensity SHAPE, held as a mode rather than written once:
+//   0 manual  - per-pass values as they are, nothing rewritten
+//   1 front   - pass 1 at 2.00, every other pass at 0.10
+//   2 back    - the LAST active pass at 2.00, every other pass at 0.10
+//
+// The shape FOLLOWS the pass count. Raising the count moves the peak with it,
+// which is what keeps front and back a single clean variable while the count
+// is changing live on camera. Any manual slider or hotkey step returns the
+// mode to manual, so a hand-edited run is never labelled as a preset.
+void ui_set_preset(int mode);
 
 // P6.3. BRIDGE THREAD ONLY - both of these are called from the hotkey handler
 // in the message pump, which runs on the bridge thread, and they touch state
