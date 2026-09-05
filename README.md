@@ -52,6 +52,32 @@ All of this is measured on the worst plausible configuration for the idea: the
 second GPU is on a **chipset-fed PCIe 3.0 x2 slot**. That is the point, not a
 caveat — the architecture wins where it should struggle most.
 
+### What was measured, precisely
+
+**Both arms reach DLSS Neural Rendering by injection through ReShade.** Neither
+is a game's native DLSS 5 integration. The local arm is RenoDX under ReShade; the
+offload arm is this bridge, also under ReShade. That is the comparison: the same
+injection route, the same game, the same scene, with the location of the neural
+work as the only variable.
+
+**OptiScaler — the other common route to the same feature — was not tested**, and
+nothing here describes its performance.
+
+**These numbers do not predict what NVIDIA's own implementation does.** An
+injected neural stage sees the frame at a different point than an engine-native
+one, does not share the engine's motion vectors or depth, and cannot make the
+scheduling decisions a native integration can. **If you are reading this some
+time after September 2026, treat every absolute figure as historical**: driver
+versions, the DLSS-NR model shipped in them, and the games themselves all move,
+and any of those changes the numbers without changing anything in this
+repository.
+
+What is *not* expected to be historical is the shape — that neural work on the
+render device competes with the render work, and moving it off a device that is
+saturated returns the capacity upscaling was supposed to free. That is an
+architectural claim, and it is the one worth checking against your own machine
+rather than taking from this table.
+
 ---
 
 ## What it actually does

@@ -162,9 +162,18 @@ explains how to identify the right pack — LumeniteFX dates each shader
 independently and publishes no single pack version number, so there is no
 release string to pin here.
 
-`assets/gpu1.ini` in this repository names the LumeniteFX technique
-`Lumenite_QuantMotion` as a configuration string. That is a reference to
-an externally installed asset, not a copy of it or a derivative of it.
+~~`assets/gpu1.ini` in this repository names the LumeniteFX technique
+`Lumenite_QuantMotion` as a configuration string.~~ **No longer true as of
+2026-09-05, and the reason matters.** The shipped `assets/gpu1.ini` is now empty
+of techniques, and `build.yml` **fails the build** if it names any — that preset
+had been copied out of a working game folder and shipped a motion-flow debug view
+over the neural output on every fresh install.
+
+So this repository contains **no reference to LumeniteFX at all** in anything it
+ships. The technique name appears only in `VENDOR_LOCK.md` and the milestone
+record, describing the configuration under which P0 was verified. Even then it
+was a reference to an externally installed asset rather than a copy of it or a
+derivative of it.
 
 Nothing in this repository is a fork of LumeniteFX or of any other
 third-party repository.
