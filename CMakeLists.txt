@@ -25,6 +25,11 @@ add_library(mgpu_bridge SHARED
     src/gpu1_context.cpp
 )
 
+target_include_directories(mgpu_bridge PRIVATE
+    "ext/reshade/include"
+    "ext/reshade/deps/imgui"
+)
+
 set_target_properties(mgpu_bridge PROPERTIES
     PREFIX ""
     SUFFIX ".addon64"
