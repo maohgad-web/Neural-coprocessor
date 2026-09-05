@@ -6578,10 +6578,104 @@ namespace
     // Two changes, and the second one matters more than the first: the buffer
     // is now 8 KB, and a file that does not fit is REPORTED BY NAME rather
     // than quietly clipped.
+    // P7.2. DEFECT G. mgpu.ini was opened as a BARE RELATIVE PATH, so it
+    // resolved against the process's CURRENT WORKING DIRECTORY - which is not
+    // the add-on's folder, is not something the add-on controls, and is not
+    // even stable per game. It happened to be the game folder for every title
+    // tested up to now, which is exactly why this survived: the bug and the
+    // working case are indistinguishable until the CWD moves.
+    //
+    // When it does move, fopen returns null, ini_slurp returns false, and EVERY
+    // reader falls back to its default while the log reports those defaults as
+    // though they had been read. That is section 00's failure again in its
+    // purest form - a confident, correctly-formatted, wrong answer - and it is
+    // worse here than defect D was, because defect D lost one key and this
+    // loses the whole file at once. Frames=600, Passes=1, Window=fit,
+    // Neural=ON, Profile=off is the signature: all defaults, simultaneously.
+    //
+    // The add-on's own directory is the right anchor. mgpu.ini ships beside the
+    // .addon64 and the .addon64's path is knowable from inside it - ask the
+    // loader where this code is, take the directory, put mgpu.ini in it. The
+    // CWD is kept as a SECOND attempt so an existing rig that relies on it does
+    // not change behaviour, and the log says which one answered.
+    const wchar_t *ini_path()
+    {
+        static wchar_t path[1024];
+        static bool done = false;
+        if (done) return path;
+        done = true;
+        path[0] = L'\0';
+
+        HMODULE h = nullptr;
+        // FROM_ADDRESS with our own code as the address: this is the module
+        // that contains this function, whatever it was named or renamed to on
+        // disk. UNCHANGED_REFCOUNT so we are not pinning ourselves loaded.
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&ini_path), &h) != FALSE && h != nullptr)
+        {
+            wchar_t mod[1024];
+            const DWORD got = GetModuleFileNameW(h, mod, 1024);
+            if (got > 0 && got < 1024)
+            {
+                size_t cut = 0;
+                for (size_t i = 0; mod[i] != L'\0'; ++i)
+                    if (mod[i] == L'\\' || mod[i] == L'/') cut = i + 1;
+                if (cut > 0 && cut + 10 < 1024)
+                {
+                    for (size_t i = 0; i < cut; ++i) path[i] = mod[i];
+                    const wchar_t *nm = L"mgpu.ini";
+                    size_t j = cut;
+                    for (size_t i = 0; nm[i] != L'\0'; ++i) path[j++] = nm[i];
+                    path[j] = L'\0';
+                }
+            }
+        }
+        return path;   // empty means "could not work it out - use the CWD"
+    }
+
     bool ini_slurp(char *buf, size_t n)
     {
         buf[0] = '\0';
-        FILE *f = fopen("mgpu.ini", "rb");
+        FILE *f = nullptr;
+        bool beside = false;
+        const wchar_t *wp = ini_path();
+        if (wp[0] != L'\0') { f = _wfopen(wp, L"rb"); beside = (f != nullptr); }
+        if (f == nullptr) f = fopen("mgpu.ini", "rb");   // legacy CWD fallback
+
+        // Say once, out loud, WHICH file is in force - or that none is. Every
+        // value on the arm line downstream of this is either the file's or a
+        // default, and until now there was no way to tell those apart.
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                char pl[900];
+                if (f == nullptr)
+                    snprintf(pl, sizeof pl,
+                             "[MGPU][P7.2] NO mgpu.ini FOUND - not beside the add-on (\"%ls\") and "
+                             "not in the working directory. EVERY KEY IS AT ITS DEFAULT: 600 "
+                             "frames, Passes=1, Window=fit, Neural=ON, Profile=off. The arm line "
+                             "below will report those defaults and will look exactly like a file "
+                             "that asked for them. Put mgpu.ini beside the .addon64.",
+                             (wp[0] != L'\0') ? wp : L"<path unknown>");
+                else if (beside)
+                    snprintf(pl, sizeof pl,
+                             "[MGPU][P7.2] mgpu.ini read from beside the add-on: \"%ls\". This is "
+                             "the file whose values appear on the arm line.", wp);
+                else
+                    snprintf(pl, sizeof pl,
+                             "[MGPU][P7.2] mgpu.ini read from the WORKING DIRECTORY, not from "
+                             "beside the add-on (nothing at \"%ls\"). It works, but the CWD is the "
+                             "game's to change and a launcher that changes it silently reverts "
+                             "every key to its default. Move mgpu.ini next to the .addon64.",
+                             (wp[0] != L'\0') ? wp : L"<path unknown>");
+                if (f == nullptr) mgpu::diag::error(pl);
+                else              mgpu::diag::info(pl);
+            }
+        }
+
         if (f == nullptr) return false;
         const size_t got = fread(buf, 1, n - 1, f);
         // Is there anything left? One byte past what we took is enough to know.
