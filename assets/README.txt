@@ -7,6 +7,16 @@ work runs on a second one that is not rendering the game.
 This is research code. Read it before you run it - see ACKNOWLEDGEMENTS.md in
 the repository, which is not a formality.
 
+THIS IS AN INJECTED PATH, NOT NVIDIA'S. DLSS Neural Rendering is reached here by
+injecting through ReShade, not by a game's own DLSS 5 integration. An injected
+neural stage sees the frame at a different point than an engine-native one, gets
+no engine motion vectors or depth, and makes none of the scheduling decisions a
+native integration can. Performance and image quality may differ from NVIDIA's
+official implementation in either direction, and the measurements published with
+this project were taken on one machine in September 2026 - driver versions, the
+DLSS-NR model inside them, and games all move. Treat any absolute number you read
+about this project as historical and check your own.
+
 
 WHAT YOU NEED FIRST
 -------------------
@@ -40,6 +50,15 @@ ReShade DLL (usually dxgi.dll):
     mgpu.ini                         its settings
     gpu1.ini                         preset for the bridge's own window
     ReShade2.ini                     config for the bridge's own runtime
+
+The download also contains this README and LICENSE. Those two are for you, not
+for the game folder, and copying them there does nothing either way.
+
+gpu1.ini ships EMPTY on purpose - no techniques, no sort order. It is the preset
+ReShade assigns to the bridge's own window, so anything enabled in it is drawn
+on top of the neural output. A stale copy of this file once carried a motion-flow
+debug view and cost a night of wrong diagnoses; CI now fails the build if it
+ships with anything enabled.
 
 DO NOT RENAME THE ADD-ON. The filename must contain the literal substring
 "nvngx.dll". The DLSS-NR snippet resolves the module owning its caller's return
@@ -165,10 +184,9 @@ ReShade then writes a second image alongside the clean one.
 KNOWN LIMITATIONS
 -----------------
 
-Stability has only been tested for the durations recorded in the measurements -
-sessions of minutes, not hours. One development session ended with the game
-rendering black on both displays after several minutes; the bridge logged no
-fault and the cause was not isolated. Sustained-session stability is untested.
+Sustained-session stability is untested - see "RUNNING WITHOUT A FRAME BOUND"
+above, which is where that warning belongs because Frames=0 is what makes it
+reachable.
 
 The bridge window's own frame rate falls as the pass count rises. The game's
 does not. That is the architecture working, not a fault.
