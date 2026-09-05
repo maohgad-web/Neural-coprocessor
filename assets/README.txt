@@ -132,8 +132,9 @@ everything. If a log line and this README disagree, believe the log.
 RUNNING WITHOUT A FRAME BOUND
 -----------------------------
 
-By default the stream stops after Frames= frames and prints a summary. Set
-Frames=0 and it runs until the game closes.
+THIS BUILD SHIPS WITH Frames=0 - the stream runs until the game closes and
+prints no summary. Set Frames to a number (60..100000) if you want a bounded
+run that ends with a summary, which is what the measurement runs used.
 
 This is implemented as a bound that is never reached, NOT as a stop-and-restart
 control: no neural feature and no texture is ever torn down and rebuilt while
