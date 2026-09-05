@@ -50,9 +50,22 @@
 // Without them the add-on compiles exactly as before and the P6.3 hotkeys are
 // the control; the startup log says which of the two you got, so a missing
 // panel is never a mystery.
+//
+// P7.1: TWO THINGS THE HEADER DEMANDS AND WILL NOT INFER.
+//   1. ImTextureID must be 8 bytes. reshade_overlay.hpp has a static_assert on
+//      exactly that, because ReShade passes a resource_view through it. ImGui's
+//      default is a void*, which IS 8 bytes on x64 - the assert would pass - but
+//      ReShade itself is compiled with ImTextureID=ImU64 and a type that merely
+//      happens to be the same width is not the same type in the structs either
+//      side of the table. Define it, the way ReShade's own build does.
+//   2. The version must be EXACTLY 19250 (ImGui 1.92.5). reshade_overlay.hpp
+//      #errors on anything else - the function table is a version-numbered
+//      struct of raw pointers, so a near-miss is a silent ABI mismatch and the
+//      header refuses rather than letting it happen. Vendor that exact tag.
 #if defined(__has_include)
 #  if __has_include(<imgui.h>)
 #    define MGPU_HAVE_IMGUI 1
+#    define ImTextureID ImU64
 #    include <imgui.h>
 #  endif
 #endif
@@ -463,11 +476,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             "CTRL+ALT+F8/F9/F11 hotkeys still work and drive the same values.");
 #else
         reshade::log::message(reshade::log::level::warning,
-            "[MGPU][P6.4] NO OVERLAY PANEL IN THIS BUILD - imgui.h was not on the include path "
+            "[MGPU][P7.1] NO OVERLAY PANEL IN THIS BUILD - imgui.h was not on the include path "
             "when this compiled, and reshade.hpp only wires up the ImGui function table when "
             "IMGUI_VERSION_NUM is defined ahead of it. Nothing else is affected: use the "
-            "CTRL+ALT+F8 / F9 / F11 hotkeys, which drive exactly the same values. Add the "
-            "ReShade deps' imgui headers to the include path to get the panel.");
+            "CTRL+ALT+F8 / F9 / F11 hotkeys, which drive exactly the same values. To get the "
+            "panel, put ImGui 1.92.5's imgui.h and imconfig.h (tag 3912b3d, the commit ReShade "
+            "18deaa52 pins at deps/imgui) somewhere on the include path. A target_include_"
+            "directories line pointing at a directory that does not exist is silently ignored "
+            "by CMake and __has_include then just says no, which is how this warning survives "
+            "an edit to CMakeLists that looked correct.");
 #endif
         break;
 

@@ -7054,11 +7054,22 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
         S.sized_to_source = true;   // set before the work: one attempt, not a retry loop
     }
 
-    char l[700];
+    char l[900];
 
     // The monitor this window is on, so a source larger than the panel does not
     // produce a window that cannot be seen.
+    // P7.1. THE ORIGIN IS PART OF THE ANSWER. P7.0 read this rectangle for its
+    // SIZE and then positioned the window at (0,0), which is the origin of the
+    // VIRTUAL DESKTOP, not of this monitor - so on a two-card, two-monitor rig
+    // the borderless window jumped onto whichever panel Windows calls primary,
+    // which on this rig is the one the GAME is on. The bridge window landing on
+    // the game's monitor is not a cosmetic annoyance: it puts GPU 1's output on
+    // GPU 0's panel, which is the exact cross-adapter present the topology is
+    // supposed to avoid, and it hides the thing being measured behind the thing
+    // being measured. Keep the whole rect and move the window to mon_x,mon_y.
     UINT mon_w = src_w, mon_h = src_h;
+    int  mon_x = 0, mon_y = 0;
+    bool mon_ok = false;
     {
         HMONITOR mh = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{}; mi.cbSize = sizeof mi;
@@ -7066,8 +7077,17 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
         {
             mon_w = (UINT)(mi.rcMonitor.right - mi.rcMonitor.left);
             mon_h = (UINT)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+            mon_x = (int)mi.rcMonitor.left;
+            mon_y = (int)mi.rcMonitor.top;
+            mon_ok = true;
         }
     }
+    // MonitorFromWindow answers for the window's CURRENT rectangle, which is the
+    // 1280x720 P5 window wherever it was created. That is the monitor the user
+    // has been watching the bridge on, so it is the right target - but it is an
+    // inference from the window's position, not a statement about which adapter
+    // drives that panel. If they ever disagree the log line below is what says
+    // so, because it now prints the origin it moved to.
 
     // Buffers stay at the SOURCE size in both modes - that is what keeps the
     // copy 1:1. In `fit` the window is bigger and DXGI stretches; in `match` the
@@ -7081,6 +7101,28 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
         win_h = (src_h < mon_h) ? src_h : mon_h;
         buf_w = win_w; buf_h = win_h;   // match: buffers follow the window
     }
+
+    // The window's top-left on THIS monitor. `fit` fills it, so the origin is
+    // the monitor's origin; `match` may be smaller than the panel, so centre it
+    // there rather than pinning it to a corner.
+    int win_x = mon_x, win_y = mon_y;
+    if (mode != 2)
+    {
+        if (win_w < mon_w) win_x = mon_x + (int)((mon_w - win_w) / 2);
+        if (win_h < mon_h) win_y = mon_y + (int)((mon_h - win_h) / 2);
+    }
+
+    // P7.1. SAY THIS BEFORE IT HAPPENS. The drain below stops the consumer for
+    // about a second while the producer keeps writing, so the seal ring wraps
+    // and the next few frames come back DROPPED / REORDERED / STALE. Every P7.0
+    // fit run shows that burst and it is not a transport fault - it is this
+    // function holding the consumer still. Reading it as a bridge defect is the
+    // instrument-failure pattern again, so the log names the cause in advance
+    // and the recovery to gap=1 on the following frames is the proof.
+    mgpu::diag::info("[MGPU][P7.1] resizing the present window - draining GPU 1. The producer is "
+                     "NOT paused, so expect one burst of DROPPED / REORDERED / STALE seals across "
+                     "the next few frames. That is this resize, not the transport; frames after it "
+                     "return to gap=1 OK.");
 
     // GPU idle first. ResizeBuffers requires every backbuffer reference
     // released, and releasing a resource the GPU is still reading is the P1.0
@@ -7110,7 +7152,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
     style &= ~(WS_OVERLAPPEDWINDOW);
     style |= WS_POPUP;
     SetWindowLongPtrW(hwnd, GWL_STYLE, style);
-    SetWindowPos(hwnd, nullptr, 0, 0, (int)win_w, (int)win_h,
+    SetWindowPos(hwnd, nullptr, win_x, win_y, (int)win_w, (int)win_h,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     // Client rect is now exactly win_w x win_h: WS_POPUP has no non-client area.
 
@@ -7153,7 +7195,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
         // failed" on its own would send the next person looking in the wrong
         // place entirely.
         snprintf(l, sizeof l,
-                 "[MGPU][P7.0] RESIZE FAILED - ResizeBuffers hr=0x%08X for %ux%u. The present "
+                 "[MGPU][P7.1] RESIZE FAILED - ResizeBuffers hr=0x%08X for %ux%u. The present "
                  "chain has been left without backbuffers and the window will stop presenting; "
                  "the game and the neural stage are UNAFFECTED, this is the bridge's own display "
                  "path only. Set Window=crop in mgpu.ini to get the P5 1280x720 window back.",
@@ -7163,10 +7205,12 @@ bool present_resize(UINT src_w, UINT src_h, int mode)   // 0=crop 1=match 2=fit
     }
 
     snprintf(l, sizeof l,
-             "[MGPU][P7.0] window resized: mode=%s source=%ux%u -> window %ux%u, swapchain "
-             "%ux%u, borderless, monitor %ux%u. %s",
-             (mode == 2) ? "fit" : "match", src_w, src_h, win_w, win_h, buf_w, buf_h,
-             mon_w, mon_h,
+             "[MGPU][P7.1] window resized: mode=%s source=%ux%u -> window %ux%u at (%d,%d), "
+             "swapchain %ux%u, borderless, monitor %ux%u at (%d,%d)%s. %s",
+             (mode == 2) ? "fit" : "match", src_w, src_h, win_w, win_h, win_x, win_y,
+             buf_w, buf_h, mon_w, mon_h, mon_x, mon_y,
+             mon_ok ? "" : " (GetMonitorInfo FAILED - origin assumed 0,0, so the window may be on "
+                           "the wrong panel)",
              (mode == 2 && (buf_w != win_w || buf_h != win_h))
                ? "DXGI SCALES on presentation - the copy into the backbuffer is still 1:1 and "
                  "nothing in this add-on resamples, but what reaches the panel has been "
