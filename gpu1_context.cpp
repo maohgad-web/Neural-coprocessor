@@ -76,6 +76,17 @@ namespace
         UINT64 fence_value = 0;
         bool present_failed_logged = false;
         bool neural_shown = false;   // P5.0: one-shot "the window is live" log
+        // P7.0: the chain is resizable now. `hwnd` is kept because a resize has
+        // to move the window as well as the buffers, and `chain_w/h` because
+        // present_frame's crop maths needs the CURRENT size rather than the
+        // 1280x720 T4 fixed it at.
+        HWND hwnd = nullptr;
+        UINT chain_w = 0, chain_h = 0;
+        // P7.3: the backbuffer's ACTUAL format, tracked rather than assumed.
+        // See DEFECT H at present_resize. Set at creation, updated at resize.
+        DXGI_FORMAT chain_fmt = DXGI_FORMAT_UNKNOWN;
+        bool borderless = false;
+        bool sized_to_source = false;   // one resize per stream, not per frame
     };
 
     state &st()
@@ -447,6 +458,10 @@ bool create_present_chain(HWND hwnd)
     {
         std::lock_guard<std::mutex> lk(S.cs);
         S.queue = queue;
+        S.hwnd = hwnd;
+        S.chain_w = width;
+        S.chain_h = height;
+        S.chain_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;   // must match scd.Format above
         S.swapchain = sc3;
         S.rtv_heap = heap;
         S.backbuffer[0] = back0;
@@ -472,7 +487,11 @@ bool create_present_chain(HWND hwnd)
     }
 
     snprintf(line, sizeof line,
-             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R8G8B8A8_UNORM buffers=2 "
+             // P7.3: this said R8G8B8A8 for four milestones while the chain was
+             // created R10G10B10A2 - the string was never updated when P5.0
+             // changed scd.Format. A log line that contradicts the code is worse
+             // than no log line: it is evidence pointing the wrong way.
+             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=2 "
              "swapeffect=FLIP_DISCARD queue=DIRECT client=%ux%u CreateSwapChainForHwnd "
              "hr=0x%08X hwnd=0x%p (vsync present, non-resizable window - no ResizeBuffers at P0)",
              width, height, (unsigned)swapchain_hr, (void *)hwnd);
@@ -494,7 +513,8 @@ namespace
     // when one is live, or nullptr. Takes the stream's own lock briefly and
     // never while holding this file's - stream_poll nests them the other way
     // round, and the two orders together would be a cycle.
-    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt);
+    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt,
+                                          D3D12_RESOURCE_STATES &rest);
 }
 
 bool present_frame(float r, float g, float b)
@@ -529,7 +549,8 @@ bool present_frame(float r, float g, float b)
         fence_value = S.fence_value;
     }
 
-    char line[320];
+    char line[800];   // P5.3 widened: the Present=in banner is longer than 320 and a
+                      // truncated banner is a wrong label on a whole run
 
     // One-shot first-failure log (brief T5: "log the first Present
     // failure and stop presenting; do not log every frame's failure").
@@ -619,14 +640,43 @@ bool present_frame(float r, float g, float b)
     // colour. That fallback is also the signal that the stream has ended.
     UINT nw = 0, nh = 0;
     DXGI_FORMAT nfmt = DXGI_FORMAT_UNKNOWN;
-    ID3D12Resource *nsrc = stream_present_source(nw, nh, nfmt);
+    D3D12_RESOURCE_STATES nrest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12Resource *nsrc = stream_present_source(nw, nh, nfmt, nrest);
     // The format check is not paranoia: the copy is silent about a mismatch at
     // record time and would fail at execute, taking the device with it.
-    if (nsrc != nullptr && nfmt == DXGI_FORMAT_R10G10B10A2_UNORM &&
+    //
+    // P7.3, DEFECT H's SECOND HALF - AND THE ACTUAL CAUSE OF THE BLINKING. This
+    // compared against the CONSTANT R10G10B10A2, so on a game that renders
+    // anything else the guard refused the copy every frame and the present fell
+    // through to the cycling clear colour below. That is what "colours blinking
+    // from start to finish, never the game" was: not corrupted pixels, but the
+    // no-output fallback, running for the whole session because the guard was
+    // measuring the neural output against one title's format instead of against
+    // the backbuffer it is actually copying into.
+    //
+    // The guard was RIGHT to refuse - a mismatched CopyTextureRegion would have
+    // taken the device down. It was simply asking the wrong question. The right
+    // question is whether the source matches THIS CHAIN, whatever the chain is
+    // now, and P7.3 makes the chain follow the game, so the two agree.
+    DXGI_FORMAT bbfmt = DXGI_FORMAT_UNKNOWN;
+    {
+        std::lock_guard<std::mutex> lk(S.cs);
+        bbfmt = S.chain_fmt;
+    }
+    if (nsrc != nullptr && nfmt == bbfmt && bbfmt != DXGI_FORMAT_UNKNOWN &&
         nw >= 1 && nh >= 1)
     {
-        const UINT cw = (nw < 1280u) ? nw : 1280u;
-        const UINT ch = (nh < 720u)  ? nh : 720u;
+        // P7.0: the CHAIN's size, not the 1280x720 T4 fixed. When the chain
+        // has been resized to the source these are equal and the "crop" is the
+        // whole frame - which is the point: still one CopyTextureRegion, still
+        // no resampling anywhere in our code.
+        UINT bw = 1280u, bh = 720u;
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            if (S.chain_w != 0 && S.chain_h != 0) { bw = S.chain_w; bh = S.chain_h; }
+        }
+        const UINT cw = (nw < bw) ? nw : bw;
+        const UINT ch = (nh < bh) ? nh : bh;
         const UINT left = (nw - cw) / 2u;
         const UINT top  = (nh - ch) / 2u;
 
@@ -644,7 +694,7 @@ bool present_frame(float r, float g, float b)
         nb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         nb.Transition.pResource = nsrc;
         nb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        nb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        nb.Transition.StateBefore = nrest;
         nb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         cl->ResourceBarrier(1, &nb);
 
@@ -659,7 +709,7 @@ bool present_frame(float r, float g, float b)
         cl->CopyTextureRegion(&pd, 0, 0, 0, &ps, &pbox);
 
         nb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        nb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        nb.Transition.StateAfter = nrest;
         cl->ResourceBarrier(1, &nb);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -674,16 +724,48 @@ bool present_frame(float r, float g, float b)
         if (say)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P5.0] the bridge window is now showing the NEURAL OUTPUT - a "
-                     "%ux%u 1:1 crop from the centre of the %ux%u frame, no scaling and no "
-                     "resampling. Every pixel on screen is a pixel DLSS-NR produced on the "
-                     "second adapter. The cycling colour returns when the stream ends.",
-                     cw, ch, nw, nh);
+                     "[MGPU][P5.0] the bridge window is now showing the %s - %s of the %ux%u "
+                     "frame at %ux%u, one CopyTextureRegion, no resampling in this add-on. The "
+                     "cycling colour returns when the stream ends.",
+                     (nrest == D3D12_RESOURCE_STATE_COPY_DEST)
+                         ? "NEURAL INPUT (mgpu.ini Present=in) - the transited game frame as it "
+                           "was handed to DLSS-NR, BEFORE the neural stage. NR still runs and is "
+                           "still timed; only what is on screen changed. If THIS looks wrong, the "
+                           "fault is on our side of the handover and NR is innocent"
+                         : "NEURAL OUTPUT - every pixel on screen is a pixel DLSS-NR produced on "
+                           "the second adapter",
+                     (cw == nw && ch == nh) ? "THE WHOLE"
+                                            : "a 1:1 centre crop",
+                     nw, nh, cw, ch);
             mgpu::diag::info(line);
         }
     }
     else
     {
+        // P7.3. SAY WHY THE CYCLING COLOUR IS ON SCREEN. "No neural output yet"
+        // and "there IS output but this function refused to copy it" look
+        // identical from the outside - both are the blinking clear - and the
+        // second one cost a night. Once, when output exists and was rejected.
+        if (nsrc != nullptr && nfmt != bbfmt)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                snprintf(line, sizeof line,
+                         "[MGPU][P7.3] THE CYCLING COLOUR IS A REFUSED COPY, NOT AN ABSENT FRAME. "
+                         "Neural output exists (%ux%u, DXGI format %d) but the backbuffer is "
+                         "format %d, and CopyTextureRegion does not convert - copying anyway would "
+                         "fail at execute and take the device with it. The stream, the transport "
+                         "and the neural stage are all running normally and their figures are "
+                         "valid; only the display is blocked. The P7.3 resize should have made "
+                         "these agree, so if you are reading this the chain did not get the "
+                         "source format - check for a RESIZE FAILED line above.",
+                         nw, nh, (int)nfmt, (int)bbfmt);
+                mgpu::diag::error(line);
+            }
+        }
+
         const float color[4] = { r, g, b, 1.0f };
         cl->ClearRenderTargetView(rtv, color, 0, nullptr);
 
@@ -1257,6 +1339,31 @@ namespace
     // command objects inline rather than borrowing transit_side, so nothing
     // else has to move.
     HRESULT transit_make_device(LUID want, ID3D12Device **out);
+
+    // P5.2. DEFECT C, found on the rig 2026-09-05. The one-shot probe chain
+    // and the P4.1 persistent neural stage BOTH take their parameter block
+    // from NVSDK_NGX_D3D12_GetCapabilityParameters, and that call does not
+    // hand out a fresh block per caller - it hands out the core's capability
+    // block. stream_release has said so in a comment since P4.1 ("nr_params
+    // is NOT destroyed: it is the core's capability block") and acted on it.
+    // The probe's teardown did not: it called DestroyParameters
+    // unconditionally, which destroyed the block the LIVE stream still held
+    // and still wrote DLSSNR.Color / DLSSNR.Output into every frame.
+    //
+    // The symptom was a neural image with the colours wrong and NOTHING else
+    // out of place - every seal counter zero, gap=1 throughout. That is the
+    // section 00 failure shape exactly: the transport was healthy and the
+    // instrument had no way to say the consumer was broken.
+    //
+    // Latent, not new. In the P5.0 run the probe chain finished (P3.1 at
+    // :280) before the stream's NR came up (P5.0 at :735) and the destroy
+    // landed on a block nobody else held. P5.1 moved stream_poll() ahead of
+    // present_frame() in the worker loop, which reversed that order and put
+    // the destroy in the middle of a live stream.
+    //
+    // Returns true when the stream's neural stage holds the block. Takes the
+    // stream's own lock; defined with the stream further down.
+    bool stream_nr_live();
 }
 
 bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
@@ -1675,15 +1782,36 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         }
         if (params != nullptr)
         {
-            // The capability map is driver-allocated and the header states
-            // it must be freed this way - never with delete or free.
-            mgpu::diag::info("[MGPU][P1.0c] teardown: DestroyParameters ...");
-            const NVSDK_NGX_Result r = p_destroy(params);
-            snprintf(line, sizeof line,
-                     "[MGPU][P1.0c] teardown: DestroyParameters result=0x%08X (%s)",
-                     (unsigned)r, ngx_result_name(r));
-            mgpu::diag::info(line);
-            params = nullptr;
+            // P5.2 / DEFECT C. GetCapabilityParameters returns the CORE's
+            // block, not a per-caller one, so destroying it here destroys it
+            // for every other holder in the process. When the P4.1 stream is
+            // live it is such a holder, and this call is what turned its
+            // output into wrong colours while leaving every transport counter
+            // clean. The block is deliberately never freed in that case - the
+            // NGX session is already kept open for the process lifetime for
+            // the same reason (see the teardown note above), so this leaks
+            // nothing that was not already held on purpose.
+            if (stream_nr_live())
+            {
+                mgpu::diag::warn("[MGPU][P1.0c] teardown: DestroyParameters SKIPPED - the P4.1 "
+                                 "stream holds the same capability block (GetCapabilityParameters "
+                                 "returns the core's block, not a per-caller one). Destroying it "
+                                 "here would pull the parameter map out from under a running "
+                                 "neural stage. See P1_INSTRUMENT defect C.");
+                params = nullptr;
+            }
+            else
+            {
+                // The capability map is driver-allocated and the header states
+                // it must be freed this way - never with delete or free.
+                mgpu::diag::info("[MGPU][P1.0c] teardown: DestroyParameters ...");
+                const NVSDK_NGX_Result r = p_destroy(params);
+                snprintf(line, sizeof line,
+                         "[MGPU][P1.0c] teardown: DestroyParameters result=0x%08X (%s)",
+                         (unsigned)r, ngx_result_name(r));
+                mgpu::diag::info(line);
+                params = nullptr;
+            }
         }
 
         // ---- 2b. the P1.1 local resources ----
@@ -6276,6 +6404,12 @@ namespace
         // measurement run that silently stops checking identity is how a
         // corrupted stream gets recorded as a fast one.
         bool profile = false;
+        // P5.3: Present=in shows the NR INPUT in the bridge window instead of
+        // the NR output. Display only - the neural stage still runs and is
+        // still measured, so a Present=in run and a Present=nr run are
+        // otherwise the same run.
+        bool present_in = false;
+        int window_mode = 2;   // P7.0: 0=crop 1=match 2=fit
 
         // ---- P4.1: the persistent neural stage ----
         // Opt-OUT (mgpu.ini Neural=0), because running without it is now the
@@ -6284,14 +6418,86 @@ namespace
         bool neural = true;
         bool nr_tried = false, nr_ok = false;
         NVSDK_NGX_Parameter *nr_params = nullptr;
-        NVSDK_NGX_Handle *nr_handle = nullptr;
+        // ---- P6.0: N neural passes per frame ----
+        //
+        // The architectural claim this project has argued from the start is
+        // that offloading pays once the neural work is more than one pass:
+        // transport is paid ONCE per frame whatever N is, while doing the same
+        // work locally costs GPU 0 the full per-pass time out of its own frame
+        // budget. Nothing has ever tested it, because until now there was only
+        // ever one pass.
+        //
+        // ONE FEATURE HANDLE PER PASS, not one handle evaluated N times. The
+        // feature carries temporal history (dlssnr_prev_output), so a single
+        // handle run twice in a frame would have its history be "the previous
+        // PASS" rather than "the previous FRAME". The GPU cost would be the
+        // same and the measurement would still be valid - but the picture would
+        // ghost, and an artefact of the test rig that looks exactly like a real
+        // fault is the thing this instrument exists to avoid.
+        //
+        // Passes=1 is the default and is byte-identical to the P5 behaviour:
+        // one handle, one evaluate, tex_out is the output. Nothing about the
+        // shipped path changes unless the ini asks for it.
+        static const unsigned MAX_PASSES = 4;
+        unsigned passes = 1;
+        NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
         ngx_pf_evaluate_feature nr_eval = nullptr;
         ngx_pf_release_feature nr_release = nullptr;
-        ID3D12Resource *tex_in = nullptr, *tex_out = nullptr, *nr_read = nullptr;
+        // Ping-pong. tex_in has no UAV flag - it is a copy destination and can
+        // never be a neural OUTPUT - so passes alternate between tex_out and
+        // tex_pong, both of which are UAV. `nr_final` is whichever one the last
+        // pass wrote, and it is what the window presents.
+        ID3D12Resource *tex_in = nullptr, *tex_out = nullptr, *tex_pong = nullptr,
+                       *nr_final = nullptr, *nr_read = nullptr;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT nr_fp{};   // the 64x4 liveness sample
         unsigned char nr_prev[1024] = {};
         bool nr_have_prev = false;
         unsigned long long nr_evals = 0, nr_fails = 0, nr_same = 0;
+        // P6.0: nr_evals counts PASSES now. The liveness sample is taken once
+        // per frame, so its rate needs a frame count of its own - dividing by
+        // evaluates would report a 2-pass run's identical-rate at half its
+        // true value.
+        unsigned long long nr_frames = 0;
+
+        // ---- P6.2: the knobs ----
+        //
+        // Until now exactly one quality parameter was set, hardcoded:
+        // DLSSNR.Intensity = 0.84. No model, no encoding, no white point. The
+        // reference addon's own panel exposes several we never touch, and the
+        // observation that drove this - four passes fixed ghosting, noise and
+        // blur but washed the colour out - is a cumulative effect that a
+        // per-pass strength is the natural lever against.
+        //
+        // intensity[] is per pass. IntensityN in the ini overrides pass N;
+        // absent, every pass uses Intensity. A strong first pass with gentle
+        // later ones is the configuration that observation suggests, and it
+        // could not be expressed before.
+        float intensity[MAX_PASSES] = { 0.84f, 0.84f, 0.84f, 0.84f };
+        bool intensity_set[MAX_PASSES] = {};   // was it named per pass in the ini?
+        // P6.3: 0 = every pass, 1..MAX_PASSES = that pass alone. Bridge thread
+        // only - the hotkey is delivered to the bridge thread's message queue
+        // and stream_poll reads intensity[] on that same thread, which is why
+        // this needs no synchronisation of its own.
+        unsigned intensity_target = 0;
+        unsigned long long intensity_edits = 0;
+        // P6.4: frames whose seal was checked but whose neural work was
+        // deliberately skipped because a newer frame was already waiting.
+        unsigned long long nr_skipped = 0;
+
+        // GENERIC KEYS. Every other parameter is reachable without this file
+        // knowing its name: Set.<key>=<value> in the ini is applied verbatim
+        // before every evaluate. That is deliberate - guessing NGX key names
+        // from memory is a mistake this project has already paid for, and this
+        // way the names come from whoever actually knows them rather than from
+        // me. A value containing '.' is sent as a float, otherwise as an
+        // unsigned int, and the arm line says which so a mistyped value is
+        // visible rather than silently coerced.
+        static const unsigned MAX_SETS = 12;
+        char set_key[MAX_SETS][96] = {};
+        float set_f[MAX_SETS] = {};
+        unsigned set_u[MAX_SETS] = {};
+        bool set_is_float[MAX_SETS] = {};
+        unsigned set_n = 0;
         bool nr_first = true;
         unsigned long long resync = 0;   // seals rejected, next gap check suppressed
         bool skip_next_gap = false;
@@ -6314,13 +6520,51 @@ namespace
     // note in stream_poll - this becomes a lifetime bug and must be revisited
     // with it.
 
-    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt)
+    // P5.3. `rest` is the state the returned texture sits in between frames,
+    // which the caller must barrier away from and back to. It is an OUT
+    // PARAMETER rather than a constant because the two things this can now
+    // return rest in different states - tex_out in UNORDERED_ACCESS (NR writes
+    // it), tex_in in COPY_DEST (we copy into it) - and a present path that
+    // assumed one of them would silently record an invalid transition on the
+    // other. The debug layer would catch it; a release build would not.
+    ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt,
+                                          D3D12_RESOURCE_STATES &rest)
     {
         stream_state &s = str();
         std::lock_guard<std::mutex> lk(s.cs);
-        if (!s.nr_ok || s.tex_out == nullptr || s.profile) return nullptr;
+        if (!s.nr_ok || s.profile) return nullptr;
         w = s.width; h = s.height; fmt = s.format;
-        return s.tex_out;
+
+        // P5.3, the discriminator. Present=in shows the frame we HANDED to
+        // DLSS-NR instead of the frame it produced - same adapter, same
+        // texture format, same crop, same present path, one resource
+        // different. It is the only thing that separates "the neural stage
+        // produced wrong colours" from "we handed the neural stage a wrong
+        // frame and it faithfully denoised it", and no amount of looking at
+        // the output alone can tell those apart.
+        if (s.present_in)
+        {
+            if (s.tex_in == nullptr) return nullptr;
+            rest = D3D12_RESOURCE_STATE_COPY_DEST;
+            return s.tex_in;
+        }
+        // P6.0: the LAST pass's output, not tex_out unconditionally. With
+        // Passes=1 nr_final is tex_out and this is the P5 behaviour exactly.
+        if (s.nr_final == nullptr) return nullptr;
+        rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        return s.nr_final;
+    }
+
+    // P5.2 / DEFECT C. Declared up beside ngx_probe; defined here, where the
+    // stream state it reads already is. True only while the persistent neural
+    // stage actually holds the capability block - `nr_ok` alone is not the
+    // test, because the block is taken before the feature is created and must
+    // be protected from that moment on.
+    bool stream_nr_live()
+    {
+        stream_state &s = str();
+        std::lock_guard<std::mutex> lk(s.cs);
+        return s.nr_params != nullptr;
     }
 
     // Read Fault= out of mgpu.ini beside the add-on. Deliberately tiny and
@@ -6331,17 +6575,311 @@ namespace
     // output was a log line and is too short to look at anything. Clamped at
     // both ends: below 60 there is nothing to measure, and the bound exists to
     // stop a misbehaving build costing the whole session.
+    // ---- P5.2: the ini reader, fixed ----
+    //
+    // Every reader below used strstr on the whole file. strstr does not know
+    // what a comment is, so a line reading "; Set Neural to 0 for the control"
+    // would have been found BEFORE the real Neural= key and silently disabled
+    // the neural stage - a config file whose own documentation changes its
+    // meaning. That was caught by reading a draft ini rather than by any
+    // check, which is the same class of miss as section 00a.
+    //
+    // ini_find returns a pointer just past "<key>=" for the first occurrence
+    // that starts a line (leading spaces and tabs allowed) and is not preceded
+    // on that line by ';' or '#'. Returns nullptr when there is no such line.
+    const char *ini_find(const char *buf, const char *key)
+    {
+        const size_t klen = strlen(key);
+        const char *p = buf;
+        while (*p != '\0')
+        {
+            // p is at the start of a line. Skip leading blanks.
+            const char *q = p;
+            while (*q == ' ' || *q == '\t') ++q;
+            if (*q != ';' && *q != '#' &&
+                strncmp(q, key, klen) == 0 && q[klen] == '=')
+                return q + klen + 1;
+            // advance to the next line
+            while (*p != '\0' && *p != '\n') ++p;
+            if (*p == '\n') ++p;
+        }
+        return nullptr;
+    }
+
+    // Reads the file once into `buf`. False when there is nothing to read -
+    // callers then keep their default, because a missing or unreadable
+    // mgpu.ini must never be a reason a run does not happen.
+    // The ini is read whole into a stack buffer. 8 KB is far more than any
+    // sane config, and anything beyond it is now reported rather than dropped.
+    static const size_t INI_BYTES = 8192;
+
+    // DEFECT D, found on the rig 2026-09-05 and fixed here. This read 1023
+    // bytes into a 1024-byte buffer AND SAID NOTHING when the file was longer.
+    // The shipped mgpu.ini - whose comments I wrote - is 1419 bytes, and
+    // Passes= sits at byte 1410. Frames (82), Neural (145), Profile (395),
+    // Probes (625) and Present (896) all fall inside 1023 and worked; Passes
+    // fell outside and read as ABSENT, so two rig launches ran Passes=1 while
+    // the ini said 4 and every log line agreed with itself.
+    //
+    // The size was the trigger. The DEFECT is that truncation was silent: a
+    // key past the cutoff is indistinguishable from a key that was never
+    // written, and "absent" is a legitimate value here, so the wrong answer
+    // was perfectly well-formed. Section 00 again.
+    //
+    // Two changes, and the second one matters more than the first: the buffer
+    // is now 8 KB, and a file that does not fit is REPORTED BY NAME rather
+    // than quietly clipped.
+    // P7.2. DEFECT G. mgpu.ini was opened as a BARE RELATIVE PATH, so it
+    // resolved against the process's CURRENT WORKING DIRECTORY - which is not
+    // the add-on's folder, is not something the add-on controls, and is not
+    // even stable per game. It happened to be the game folder for every title
+    // tested up to now, which is exactly why this survived: the bug and the
+    // working case are indistinguishable until the CWD moves.
+    //
+    // When it does move, fopen returns null, ini_slurp returns false, and EVERY
+    // reader falls back to its default while the log reports those defaults as
+    // though they had been read. That is section 00's failure again in its
+    // purest form - a confident, correctly-formatted, wrong answer - and it is
+    // worse here than defect D was, because defect D lost one key and this
+    // loses the whole file at once. Frames=600, Passes=1, Window=fit,
+    // Neural=ON, Profile=off is the signature: all defaults, simultaneously.
+    //
+    // The add-on's own directory is the right anchor. mgpu.ini ships beside the
+    // .addon64 and the .addon64's path is knowable from inside it - ask the
+    // loader where this code is, take the directory, put mgpu.ini in it. The
+    // CWD is kept as a SECOND attempt so an existing rig that relies on it does
+    // not change behaviour, and the log says which one answered.
+    const wchar_t *ini_path()
+    {
+        static wchar_t path[1024];
+        static bool done = false;
+        if (done) return path;
+        done = true;
+        path[0] = L'\0';
+
+        HMODULE h = nullptr;
+        // FROM_ADDRESS with our own code as the address: this is the module
+        // that contains this function, whatever it was named or renamed to on
+        // disk. UNCHANGED_REFCOUNT so we are not pinning ourselves loaded.
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&ini_path), &h) != FALSE && h != nullptr)
+        {
+            wchar_t mod[1024];
+            const DWORD got = GetModuleFileNameW(h, mod, 1024);
+            if (got > 0 && got < 1024)
+            {
+                size_t cut = 0;
+                for (size_t i = 0; mod[i] != L'\0'; ++i)
+                    if (mod[i] == L'\\' || mod[i] == L'/') cut = i + 1;
+                if (cut > 0 && cut + 10 < 1024)
+                {
+                    for (size_t i = 0; i < cut; ++i) path[i] = mod[i];
+                    const wchar_t *nm = L"mgpu.ini";
+                    size_t j = cut;
+                    for (size_t i = 0; nm[i] != L'\0'; ++i) path[j++] = nm[i];
+                    path[j] = L'\0';
+                }
+            }
+        }
+        return path;   // empty means "could not work it out - use the CWD"
+    }
+
+    bool ini_slurp(char *buf, size_t n)
+    {
+        buf[0] = '\0';
+        FILE *f = nullptr;
+        bool beside = false;
+        const wchar_t *wp = ini_path();
+        if (wp[0] != L'\0') { f = _wfopen(wp, L"rb"); beside = (f != nullptr); }
+        if (f == nullptr) f = fopen("mgpu.ini", "rb");   // legacy CWD fallback
+
+        // Say once, out loud, WHICH file is in force - or that none is. Every
+        // value on the arm line downstream of this is either the file's or a
+        // default, and until now there was no way to tell those apart.
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                char pl[900];
+                if (f == nullptr)
+                    snprintf(pl, sizeof pl,
+                             "[MGPU][P7.2] NO mgpu.ini FOUND - not beside the add-on (\"%ls\") and "
+                             "not in the working directory. EVERY KEY IS AT ITS DEFAULT: 600 "
+                             "frames, Passes=1, Window=fit, Neural=ON, Profile=off. The arm line "
+                             "below will report those defaults and will look exactly like a file "
+                             "that asked for them. Put mgpu.ini beside the .addon64.",
+                             (wp[0] != L'\0') ? wp : L"<path unknown>");
+                else if (beside)
+                    snprintf(pl, sizeof pl,
+                             "[MGPU][P7.2] mgpu.ini read from beside the add-on: \"%ls\". This is "
+                             "the file whose values appear on the arm line.", wp);
+                else
+                    snprintf(pl, sizeof pl,
+                             "[MGPU][P7.2] mgpu.ini read from the WORKING DIRECTORY, not from "
+                             "beside the add-on (nothing at \"%ls\"). It works, but the CWD is the "
+                             "game's to change and a launcher that changes it silently reverts "
+                             "every key to its default. Move mgpu.ini next to the .addon64.",
+                             (wp[0] != L'\0') ? wp : L"<path unknown>");
+                if (f == nullptr) mgpu::diag::error(pl);
+                else              mgpu::diag::info(pl);
+            }
+        }
+
+        if (f == nullptr) return false;
+        const size_t got = fread(buf, 1, n - 1, f);
+        // Is there anything left? One byte past what we took is enough to know.
+        const bool truncated = (fgetc(f) != EOF);
+        fclose(f);
+        buf[got] = '\0';
+        if (truncated)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                char tl[400];
+                snprintf(tl, sizeof tl,
+                         "[MGPU][P6.1] mgpu.ini is LARGER than this build reads (%zu bytes taken, "
+                         "more follow). EVERY KEY PAST THAT POINT READS AS ABSENT AND ITS DEFAULT "
+                         "IS USED SILENTLY. Shorten the file or move the keys you care about to "
+                         "the top; the values reported on the arm line are what actually took "
+                         "effect.", got);
+                mgpu::diag::error(tl);
+            }
+        }
+        return got != 0;
+    }
+
+    // P5.2. DEFECT C's second half. The one-shot probe chain (P1.3 transit,
+    // P1.5 capture, and the P3.x ngx_probe it leads into) and the P4.1
+    // persistent stream both armed from the SAME hotkey press, so every
+    // stream run also ran a second, independent NGX consumer against the same
+    // shared parameter block - setting DLSSNR.Color, DLSSNR.Output and the
+    // subrect keys for its own textures in between the stream's frames.
+    // Skipping the destroy (above) stops the block being pulled away, but two
+    // writers on one block is not a thing to leave running under a
+    // measurement.
+    //
+    // So the probes are now OPT-IN and default OFF: the hotkey arms the
+    // stream alone unless mgpu.ini says Probes=1. The probes are answered
+    // questions - P1.3, P1.5, P3.0-P3.2 are all closed - and re-running them
+    // under a live stream can only cost.
+    bool ini_read_probes()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, "Probes");
+        return (k != nullptr) && (*k == '1');
+    }
+
+    // P5.3: Present=in | nr. Default nr - the output, which is what every run
+    // so far has shown.
+    bool ini_read_present_in()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, "Present");
+        return (k != nullptr) && (k[0] == 'i') && (k[1] == 'n');
+    }
+
+    // P6.0: Passes=<n>, clamped to 1..MAX_PASSES. Out-of-range is CLAMPED AND
+    // SAID, not silently accepted: a run that quietly did one pass when the ini
+    // asked for eight would produce a perfectly clean summary describing the
+    // wrong experiment.
+    unsigned ini_read_passes()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 1u;
+        const char *k = ini_find(buf, "Passes");
+        if (k == nullptr) return 1u;
+        const long long v = atoll(k);
+        if (v < 1) return 1u;
+        if (v > (long long)stream_state::MAX_PASSES) return stream_state::MAX_PASSES;
+        return (unsigned)v;
+    }
+
+    // P6.2. Reads Intensity and Intensity1..IntensityN. Returns the count of
+    // per-pass overrides found, for the log.
+    unsigned ini_read_intensity(float *out, bool *named, unsigned n_passes)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0;
+        float base = 0.84f;
+        const char *k = ini_find(buf, "Intensity");
+        if (k != nullptr) base = (float)atof(k);
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out[i] = base;
+
+        unsigned named_n = 0;
+        for (unsigned i = 0; i < n_passes && i < stream_state::MAX_PASSES; ++i)
+        {
+            char key[32];
+            snprintf(key, sizeof key, "Intensity%u", i + 1);
+            const char *p2 = ini_find(buf, key);
+            if (p2 != nullptr) { out[i] = (float)atof(p2); named[i] = true; ++named_n; }
+        }
+        return named_n;
+    }
+
+    // P6.2. Set.<key>=<value>, up to MAX_SETS of them. Scans line by line
+    // rather than by key name, because the whole point is not to know the names.
+    unsigned ini_read_sets(char (*keys)[96], float *fv, unsigned *uv, bool *isf)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0;
+        unsigned n = 0;
+        const char *p2 = buf;
+        while (*p2 != '\0' && n < stream_state::MAX_SETS)
+        {
+            const char *q = p2;
+            while (*q == ' ' || *q == '\t') ++q;
+            if (*q != ';' && *q != '#' && strncmp(q, "Set.", 4) == 0)
+            {
+                const char *ks = q + 4;
+                const char *eq = ks;
+                while (*eq != '\0' && *eq != '=' && *eq != '\r' && *eq != '\n') ++eq;
+                if (*eq == '=' && eq > ks && (size_t)(eq - ks) < 95)
+                {
+                    memcpy(keys[n], ks, (size_t)(eq - ks));
+                    keys[n][eq - ks] = '\0';
+                    const char *vs = eq + 1;
+                    bool dot = false;
+                    for (const char *c = vs; *c != '\0' && *c != '\r' && *c != '\n'; ++c)
+                        if (*c == '.') { dot = true; break; }
+                    isf[n] = dot;
+                    if (dot) fv[n] = (float)atof(vs);
+                    else     uv[n] = (unsigned)strtoul(vs, nullptr, 10);
+                    ++n;
+                }
+            }
+            while (*p2 != '\0' && *p2 != '\n') ++p2;
+            if (*p2 == '\n') ++p2;
+        }
+        return n;
+    }
+
+    // P7.0: Window= crop | match | fit. Default fit - the window is the product
+    // now, and a 1280x720 letterbox out of a 2048x1152 frame is not it. crop
+    // restores the P5 behaviour exactly.
+    int ini_read_window_mode()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 2;
+        const char *k = ini_find(buf, "Window");
+        if (k == nullptr) return 2;
+        if (k[0] == 'c') return 0;
+        if (k[0] == 'm') return 1;
+        return 2;
+    }
+
     unsigned long long stream_read_frames()
     {
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return 600ull;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return 600ull;
-        const char *k = strstr(buf, "Frames=");
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 600ull;
+        const char *k = ini_find(buf, "Frames");
         if (k == nullptr) return 600ull;
-        const long long v = atoll(k + 7);
+        const long long v = atoll(k);
         if (v < 60) return 60ull;
         if (v > 100000) return 100000ull;
         return (unsigned long long)v;
@@ -6350,41 +6888,28 @@ namespace
     // P5.1: Profile=1 strips display and liveness sampling for measurement runs.
     bool stream_read_profile()
     {
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return false;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return false;
-        const char *k = strstr(buf, "Profile=");
-        return (k != nullptr) && (k[8] == '1');
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, "Profile");
+        return (k != nullptr) && (*k == '1');
     }
 
     // Returns false when the file explicitly says Neural=0.
     bool stream_read_neural()
     {
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return true;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return true;
-        const char *k = strstr(buf, "Neural=");
-        return (k == nullptr) || (k[7] != '0');
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return true;
+        const char *k = ini_find(buf, "Neural");
+        return (k == nullptr) || (*k != '0');
     }
 
     void stream_read_fault(char *out, size_t n)
     {
         snprintf(out, n, "none");
-        FILE *f = fopen("mgpu.ini", "rb");
-        if (f == nullptr) return;
-        char buf[512] = {};
-        const size_t got = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        if (got == 0) return;
-        const char *k = strstr(buf, "Fault=");
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return;
+        const char *k = ini_find(buf, "Fault");
         if (k == nullptr) return;
-        k += 6;
         size_t i = 0;
         while (i + 1 < n && k[i] != '\0' && k[i] != '\r' && k[i] != '\n' && k[i] != ' ')
         { out[i] = k[i]; ++i; }
@@ -6395,11 +6920,17 @@ namespace
     void stream_release()
     {
         stream_state &s = str();
-        // The NGX feature first: it holds references to tex_in/tex_out.
-        if (s.nr_handle != nullptr && s.nr_release != nullptr)
-            (void)s.nr_release(s.nr_handle);
-        s.nr_handle = nullptr;
+        // The NGX features first: they hold references to the textures.
+        // Released in reverse creation order, every one of them - a partial
+        // release on a failed create is how a handle leaks past the summary.
+        if (s.nr_release != nullptr)
+            for (int i = (int)stream_state::MAX_PASSES - 1; i >= 0; --i)
+                if (s.nr_handle[i] != nullptr)
+                { (void)s.nr_release(s.nr_handle[i]); s.nr_handle[i] = nullptr; }
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.nr_handle[i] = nullptr;
+        s.nr_final = nullptr;   // borrowed; released with tex_out / tex_pong
         if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
+        if (s.tex_pong != nullptr) { s.tex_pong->Release(); s.tex_pong = nullptr; }
         if (s.tex_out != nullptr) { s.tex_out->Release(); s.tex_out = nullptr; }
         if (s.tex_in  != nullptr) { s.tex_in->Release();  s.tex_in = nullptr; }
         // nr_params is NOT destroyed: it is the core's capability block and the
@@ -6517,6 +7048,14 @@ namespace
             h = make_tex(ndev, s.width, s.height, s.format,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_out);
+        // P6.4: always created now. The pass count is changeable at runtime, so
+        // "will it be used" is no longer knowable at arm time, and allocating it
+        // lazily would mean a CreateFeature-sized stall the first time someone
+        // moved the slider.
+        if (SUCCEEDED(h))
+            h = make_tex(ndev, s.width, s.height, s.format,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_pong);
         if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
         if (FAILED(h))
         {
@@ -6539,22 +7078,39 @@ namespace
         // CreateFeature records init work into the list it is handed, and that
         // work must execute before anything it touched is released - P1.0's
         // teardown crash. One list, closed, executed, waited.
+        // P6.0: ONE FEATURE PER PASS, all created into the SAME list and
+        // executed once. CreateFeature records init work into the list it is
+        // handed and that work must run before anything it touched is released
+        // (P1.0's teardown crash), so the close/execute/wait below covers every
+        // handle rather than each one separately.
         HRESULT ch = s.na->Reset();
         if (SUCCEEDED(ch)) ch = s.nl->Reset(s.na, nullptr);
         if (SUCCEEDED(ch))
         {
-            const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
-            r = p_cre(s.nl, (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
-                      s.nr_params, &s.nr_handle);
-            LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
             LARGE_INTEGER fq{}; QueryPerformanceFrequency(&fq);
-            snprintf(line, sizeof line,
-                     "[MGPU][P4.1] CreateFeature(Reserved18) %ux%u fmt=%d: result=0x%08X (%s) "
-                     "handle=0x%p elapsed=%.0fms",
-                     s.width, s.height, (int)s.format, (unsigned)r, ngx_result_name(r),
-                     (void *)s.nr_handle,
-                     (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
-            mgpu::diag::info(line);
+            // P6.4: MAX_PASSES handles, not `passes` of them. The pass count is
+            // now changeable while the stream runs, and CreateFeature takes
+            // 200-450 ms - doing that mid-stream would stall the consumer for
+            // twenty frames and show up as a fault that was really a UI click.
+            // Paying for all four up front costs about a second of arm time and
+            // three extra sets of history buffers; the weight heap is shared
+            // (the snippet log says "Released network resources after FINAL
+            // feature release", so it is refcounted, not duplicated).
+            for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+            {
+                const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
+                r = p_cre(s.nl, (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                          s.nr_params, &s.nr_handle[i]);
+                LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
+                snprintf(line, sizeof line,
+                         "[MGPU][P4.1] CreateFeature(Reserved18) handle %u/%u %ux%u fmt=%d: "
+                         "result=0x%08X (%s) handle=0x%p elapsed=%.0fms",
+                         i + 1, stream_state::MAX_PASSES, s.width, s.height, (int)s.format,
+                         (unsigned)r, ngx_result_name(r), (void *)s.nr_handle[i],
+                         (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
+                mgpu::diag::info(line);
+                if (r != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
+            }
             ch = s.nl->Close();
         }
         if (SUCCEEDED(ch))
@@ -6569,12 +7125,23 @@ namespace
                 if (WaitForSingleObject(s.nev, 20000) != WAIT_OBJECT_0) ch = E_FAIL;
             }
         }
-        if (FAILED(ch) || r != NVSDK_NGX_Result_Success || s.nr_handle == nullptr)
+        bool all = (SUCCEEDED(ch) && r == NVSDK_NGX_Result_Success);
+        for (unsigned i = 0; i < stream_state::MAX_PASSES && all; ++i)
+            if (s.nr_handle[i] == nullptr) all = false;
+        if (!all)
         {
-            mgpu::diag::error("[MGPU][P4.1] the neural stage did not come up - the stream "
-                              "continues TRANSPORT-ONLY and the summary says so");
+            // Partial success is a FAILURE here, deliberately. A run with three
+            // of four handles would evaluate three times and report passes=4,
+            // which is a wrong answer in the shape of a right one.
+            mgpu::diag::error("[MGPU][P4.1] the neural stage did not come up (or not every "
+                              "pass did) - the stream continues TRANSPORT-ONLY and the "
+                              "summary says so. Handles already created are released with "
+                              "the stream.");
             return false;
         }
+        // Recomputed after every consume as well, because `passes` can change
+        // under us now. With Passes=1 this is tex_out, exactly as P5 had it.
+        s.nr_final = (s.passes % 2u == 1u) ? s.tex_out : s.tex_pong;
         return true;
     }
 }
@@ -6584,6 +7151,286 @@ namespace
 // str() gave it internal linkage and worker.cpp failed to link against it.
 // The file-static helpers it calls are reachable from here because this is
 // the same translation unit.
+// ---- P7.0: size the bridge window to the game's frame ----
+//
+// T4 fixed the window at 1280x720 and T5 created the swapchain non-resizable,
+// deliberately - "no ResizeBuffers at P0". That was right while the window's job
+// was to prove the loop was alive. It is wrong now that the window is the
+// product: a 1280x720 letterbox out of a 2048x1152 frame throws away three
+// quarters of what the neural stage produced, and it is not what anyone would
+// record a video of.
+//
+// Called ONCE per stream, from the bridge thread, on the first frame whose
+// source dimensions are known - which is why it cannot happen at T4: the game's
+// backbuffer size is not known until a seal has carried it across.
+//
+// Window= in mgpu.ini picks the shape:
+//   crop  the P5 behaviour, unchanged. 1280x720, bordered, centre crop.
+//   match the window and the swapchain both become the SOURCE size, borderless.
+//         One CopyTextureRegion, 1:1, whole frame, nothing resampled anywhere.
+//         Clamped to the monitor if the source is larger.
+//   fit   borderless at the MONITOR's size with the swapchain still at source
+//         size, so DXGI scales on presentation. Fills the screen; the scaling is
+//         the compositor's, not ours, and the banner says so rather than
+//         claiming a 1:1 crop it no longer is.
+//
+// Any failure falls back to the existing chain and says which step failed. A
+// window that is the wrong size is a cosmetic problem; a chain that has been
+// half torn down is not.
+// P7.3. DEFECT H - THE COLOURS. The bridge window showed flashing colour noise
+// and never the game, from the first frame, on Tainted Grail.
+//
+// The bridge's swapchain is created R10G10B10A2_UNORM, hardcoded at P5.0
+// because THAT game rendered R10G10B10A2 and the comment there says exactly why
+// it must match: "CopyTextureRegion requires the two formats to match exactly -
+// there is no conversion in a copy". That reasoning was right and the constant
+// was the bug. The format was pinned to one title's backbuffer and then never
+// asked again. Tainted Grail renders R8G8B8A8_UNORM - the arm line says so,
+// fmt=28 - so the copy pushed 8-bit-per-channel bytes into a 10:10:10:2
+// destination. Same 32 bits per pixel, completely different channel boundaries:
+// every pixel is reinterpreted, and reinterpreted garbage that changes with the
+// scene is precisely "colours blinking, never the game".
+//
+// It survived this long because every earlier test title happened to render
+// R10G10B10A2. The invariant "the chain matches the source" was true by
+// coincidence, and a coincidence that holds is indistinguishable from a
+// constraint that is enforced - until the coincidence stops.
+//
+// Two things follow. The chain now takes the SOURCE's format, from the seal,
+// which is the only authority on what the game actually rendered. And the
+// resize is no longer only a window-shape operation: a format mismatch has to
+// be corrected in Window=crop too, where no geometry changes at all - which is
+// why `mode == 0` no longer returns early on its own.
+bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 0=crop 1=match 2=fit
+{
+    if (src_w == 0 || src_h == 0) return false;
+
+    auto &S = st();
+    HWND hwnd = nullptr;
+    IDXGISwapChain3 *sc = nullptr;
+    ID3D12Device *dev = nullptr;
+    ID3D12CommandQueue *queue = nullptr;
+    ID3D12DescriptorHeap *heap = nullptr;
+    ID3D12Fence *fence = nullptr;
+    HANDLE ev = nullptr;
+    UINT64 fv = 0;
+    UINT cur_w = 0, cur_h = 0;
+    DXGI_FORMAT cur_fmt = DXGI_FORMAT_UNKNOWN;
+    {
+        std::lock_guard<std::mutex> lk(S.cs);
+        if (S.sized_to_source) return false;   // one per stream
+        hwnd = S.hwnd; sc = S.swapchain; dev = S.device; queue = S.queue;
+        heap = S.rtv_heap; fence = S.fence; ev = S.fence_event; fv = S.fence_value;
+        cur_w = S.chain_w; cur_h = S.chain_h; cur_fmt = S.chain_fmt;
+        if (hwnd == nullptr || sc == nullptr || dev == nullptr) return false;
+        S.sized_to_source = true;   // set before the work: one attempt, not a retry loop
+    }
+
+    char l[900];
+
+    // The format the chain must end up in. UNKNOWN from the caller means the
+    // seal did not carry one, in which case leave the chain as it is rather
+    // than resize it to nothing.
+    const DXGI_FORMAT want_fmt = (src_fmt != DXGI_FORMAT_UNKNOWN) ? src_fmt : cur_fmt;
+    const bool fmt_wrong = (want_fmt != cur_fmt);
+
+    // In crop there is no geometry to change, so this runs ONLY to correct the
+    // format - and if the format is already right there is nothing to do at all.
+    if (mode == 0 && !fmt_wrong) return false;
+
+    if (fmt_wrong)
+    {
+        snprintf(l, sizeof l,
+                 "[MGPU][P7.3] BACKBUFFER FORMAT MISMATCH CORRECTED: the present chain was created "
+                 "DXGI format %d and this game renders %d. CopyTextureRegion does not convert, so "
+                 "every pixel copied so far was reinterpreted across different channel boundaries - "
+                 "that is the colour noise on the bridge window, and it is a display fault only: "
+                 "the neural stage and the transport were unaffected and their figures stand. "
+                 "Resizing the chain to %d now.",
+                 (int)cur_fmt, (int)want_fmt, (int)want_fmt);
+        mgpu::diag::warn(l);
+    }
+
+    // The monitor this window is on, so a source larger than the panel does not
+    // produce a window that cannot be seen.
+    // P7.1. THE ORIGIN IS PART OF THE ANSWER. P7.0 read this rectangle for its
+    // SIZE and then positioned the window at (0,0), which is the origin of the
+    // VIRTUAL DESKTOP, not of this monitor - so on a two-card, two-monitor rig
+    // the borderless window jumped onto whichever panel Windows calls primary,
+    // which on this rig is the one the GAME is on. The bridge window landing on
+    // the game's monitor is not a cosmetic annoyance: it puts GPU 1's output on
+    // GPU 0's panel, which is the exact cross-adapter present the topology is
+    // supposed to avoid, and it hides the thing being measured behind the thing
+    // being measured. Keep the whole rect and move the window to mon_x,mon_y.
+    UINT mon_w = src_w, mon_h = src_h;
+    int  mon_x = 0, mon_y = 0;
+    bool mon_ok = false;
+    {
+        HMONITOR mh = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        if (mh != nullptr && GetMonitorInfoW(mh, &mi) != FALSE)
+        {
+            mon_w = (UINT)(mi.rcMonitor.right - mi.rcMonitor.left);
+            mon_h = (UINT)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+            mon_x = (int)mi.rcMonitor.left;
+            mon_y = (int)mi.rcMonitor.top;
+            mon_ok = true;
+        }
+    }
+    // MonitorFromWindow answers for the window's CURRENT rectangle, which is the
+    // 1280x720 P5 window wherever it was created. That is the monitor the user
+    // has been watching the bridge on, so it is the right target - but it is an
+    // inference from the window's position, not a statement about which adapter
+    // drives that panel. If they ever disagree the log line below is what says
+    // so, because it now prints the origin it moved to.
+
+    // Buffers stay at the SOURCE size in both modes - that is what keeps the
+    // copy 1:1. In `fit` the window is bigger and DXGI stretches; in `match` the
+    // window equals the buffers and nothing scales at all.
+    UINT buf_w = src_w, buf_h = src_h;
+    UINT win_w, win_h;
+    if (mode == 0)
+    {
+        // Format-only correction. The P5 window keeps its size, its border and
+        // its position; nothing here is a shape change and the crop maths
+        // downstream must keep seeing the size it already has.
+        win_w = cur_w; win_h = cur_h;
+        buf_w = cur_w; buf_h = cur_h;
+    }
+    else if (mode == 2) { win_w = mon_w; win_h = mon_h; }
+    else
+    {
+        win_w = (src_w < mon_w) ? src_w : mon_w;
+        win_h = (src_h < mon_h) ? src_h : mon_h;
+        buf_w = win_w; buf_h = win_h;   // match: buffers follow the window
+    }
+
+    // The window's top-left on THIS monitor. `fit` fills it, so the origin is
+    // the monitor's origin; `match` may be smaller than the panel, so centre it
+    // there rather than pinning it to a corner.
+    int win_x = mon_x, win_y = mon_y;
+    if (mode == 1)
+    {
+        if (win_w < mon_w) win_x = mon_x + (int)((mon_w - win_w) / 2);
+        if (win_h < mon_h) win_y = mon_y + (int)((mon_h - win_h) / 2);
+    }
+
+    // P7.1. SAY THIS BEFORE IT HAPPENS. The drain below stops the consumer for
+    // about a second while the producer keeps writing, so the seal ring wraps
+    // and the next few frames come back DROPPED / REORDERED / STALE. Every P7.0
+    // fit run shows that burst and it is not a transport fault - it is this
+    // function holding the consumer still. Reading it as a bridge defect is the
+    // instrument-failure pattern again, so the log names the cause in advance
+    // and the recovery to gap=1 on the following frames is the proof.
+    mgpu::diag::info("[MGPU][P7.1] resizing the present window - draining GPU 1. The producer is "
+                     "NOT paused, so expect one burst of DROPPED / REORDERED / STALE seals across "
+                     "the next few frames. That is this resize, not the transport; frames after it "
+                     "return to gap=1 OK.");
+
+    // GPU idle first. ResizeBuffers requires every backbuffer reference
+    // released, and releasing a resource the GPU is still reading is the P1.0
+    // teardown crash in a different costume.
+    if (fence != nullptr && queue != nullptr && ev != nullptr)
+    {
+        ++fv;
+        if (SUCCEEDED(queue->Signal(fence, fv)))
+        {
+            fence->SetEventOnCompletion(fv, ev);
+            WaitForSingleObject(ev, 2000);
+        }
+        std::lock_guard<std::mutex> lk(S.cs);
+        S.fence_value = fv;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(S.cs);
+        for (int i = 0; i < 2; ++i)
+            if (S.backbuffer[i] != nullptr) { S.backbuffer[i]->Release(); S.backbuffer[i] = nullptr; }
+    }
+
+    // Borderless, then move. WS_POPUP with no caption and no thick frame; the
+    // window still belongs to the bridge thread, which is the thread running
+    // this, so SetWindowLongPtr and SetWindowPos are both legal here.
+    // mode 0 touches neither the style nor the rectangle: it is here only to
+    // put the backbuffers in the right format.
+    if (mode != 0)
+    {
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        style &= ~(WS_OVERLAPPEDWINDOW);
+        style |= WS_POPUP;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        SetWindowPos(hwnd, nullptr, win_x, win_y, (int)win_w, (int)win_h,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        // Client rect is now exactly win_w x win_h: WS_POPUP has no non-client area.
+    }
+
+    // want_fmt, not a constant. This is DEFECT H's actual repair.
+    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, 0);
+    bool ok = SUCCEEDED(rb);
+
+    // Re-acquire the backbuffers and rebuild the two RTVs.
+    if (ok)
+    {
+        ID3D12Resource *b0 = nullptr, *b1 = nullptr;
+        HRESULT h0 = sc->GetBuffer(0, IID_PPV_ARGS(&b0));
+        HRESULT h1 = SUCCEEDED(h0) ? sc->GetBuffer(1, IID_PPV_ARGS(&b1)) : h0;
+        if (SUCCEEDED(h1) && heap != nullptr)
+        {
+            const UINT rs = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            D3D12_CPU_DESCRIPTOR_HANDLE d0 = heap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_CPU_DESCRIPTOR_HANDLE d1 = d0; d1.ptr += rs;
+            dev->CreateRenderTargetView(b0, nullptr, d0);
+            dev->CreateRenderTargetView(b1, nullptr, d1);
+            std::lock_guard<std::mutex> lk(S.cs);
+            S.backbuffer[0] = b0;
+            S.backbuffer[1] = b1;
+            S.chain_w = buf_w;
+            S.chain_h = buf_h;
+            S.chain_fmt = want_fmt;
+            if (mode != 0) S.borderless = true;
+        }
+        else
+        {
+            if (b0 != nullptr) b0->Release();
+            if (b1 != nullptr) b1->Release();
+            ok = false;
+        }
+    }
+
+    if (!ok)
+    {
+        // The chain has no backbuffers now. present_frame will fail on the next
+        // call and log its own one-shot line; say here WHY, because "Present
+        // failed" on its own would send the next person looking in the wrong
+        // place entirely.
+        snprintf(l, sizeof l,
+                 "[MGPU][P7.1] RESIZE FAILED - ResizeBuffers hr=0x%08X for %ux%u. The present "
+                 "chain has been left without backbuffers and the window will stop presenting; "
+                 "the game and the neural stage are UNAFFECTED, this is the bridge's own display "
+                 "path only. Set Window=crop in mgpu.ini to get the P5 1280x720 window back.",
+                 (unsigned)rb, buf_w, buf_h);
+        mgpu::diag::error(l);
+        return false;
+    }
+
+    snprintf(l, sizeof l,
+             "[MGPU][P7.3] present chain resized: mode=%s source=%ux%u fmt=%d -> window %ux%u at "
+             "(%d,%d), swapchain %ux%u fmt=%d, monitor %ux%u at (%d,%d)%s. %s",
+             (mode == 0) ? "crop (format only - window untouched)"
+                         : ((mode == 2) ? "fit" : "match"),
+             src_w, src_h, (int)src_fmt, win_w, win_h, win_x, win_y,
+             buf_w, buf_h, (int)want_fmt, mon_w, mon_h, mon_x, mon_y,
+             mon_ok ? "" : " (GetMonitorInfo FAILED - origin assumed 0,0, so the window may be on "
+                           "the wrong panel)",
+             (mode == 2 && (buf_w != win_w || buf_h != win_h))
+               ? "DXGI SCALES on presentation - the copy into the backbuffer is still 1:1 and "
+                 "nothing in this add-on resamples, but what reaches the panel has been "
+                 "stretched by the compositor. Say so in any capture."
+               : "Window and swapchain are the same size, so nothing scales anywhere.");
+    mgpu::diag::info(l);
+    return true;
+}
+
 // P5.1. THE PRESENT GATE - the pipeline cleanup, and it is two fixes in one.
 //
 // The bridge's present loop ran at the display's refresh - 210 fps - and
@@ -6655,6 +7502,167 @@ bool stream_present_gate(unsigned long timeout_ms)
     return false;
 }
 
+bool probes_enabled()
+{
+    return ini_read_probes();
+}
+
+// ---- P6.3: intensity on the hotkeys ----
+//
+// Until now Intensity was read from mgpu.ini once, at arm time. Finding the
+// right value therefore cost one game launch per value, with the scene reset
+// each time and the comparison spread across runs - the same cross-run problem
+// that has confounded half the measurements in this project.
+//
+// This works for one specific reason: P1.2 established that NGX parameters are
+// LIVE PER EVALUATE (intensity 0.00 vs 1.60 changed 98.03% of pixels while the
+// same-value control was byte-identical), and the pass loop sets them fresh
+// every frame. So a value changed between frames takes effect on the very next
+// one, with no rebuild, no re-arm and no relaunch.
+//
+// Bridge thread only, by construction: RegisterHotKey delivers WM_HOTKEY to the
+// thread that registered it, which is the bridge thread, which is also the only
+// thread that reads intensity[]. Nothing here needs a lock.
+
+// ---- P6.4: the accessors the overlay panel drives ----
+//
+// BRIDGE THREAD ONLY is NOT true of these - the ReShade overlay callback runs
+// on whichever thread presents the runtime it belongs to. So unlike the hotkey
+// helpers above, these take the stream's lock. They are deliberately tiny and
+// never block on anything: a UI callback that can stall is a UI callback that
+// can stall a present.
+//
+// gpu1_context still names no ReShade and no ImGui type. The panel lives in
+// dllmain.cpp, where those headers already are, and talks to the stream through
+// plain scalars - the same rule that has kept this file portable since T3.
+void ui_read(ui_state &out)
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    out.armed       = s.armed;
+    out.summarised  = s.summarised;
+    out.neural      = s.neural;
+    out.nr_ok       = s.nr_ok;
+    out.passes      = s.passes;
+    out.max_passes  = stream_state::MAX_PASSES;
+    out.profile     = s.profile;
+    out.present_in  = s.present_in;
+    for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out.intensity[i] = s.intensity[i];
+    out.consumed    = s.consumed;
+    out.produced    = s.produced;
+    out.dropped     = s.dropped;
+    out.overrun     = s.overrun;
+    out.skipped     = s.nr_skipped;
+}
+
+void ui_set_passes(unsigned n)
+{
+    if (n < 1) n = 1;
+    if (n > stream_state::MAX_PASSES) n = stream_state::MAX_PASSES;
+    stream_state &s = str();
+    unsigned was;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        was = s.passes;
+        if (was == n) return;
+        s.passes = n;
+        // Every handle exists from arm time, so this is a count change and
+        // nothing is created or destroyed here. nr_final is recomputed on the
+        // next consumed frame.
+        ++s.intensity_edits;
+    }
+    char l[300];
+    snprintf(l, sizeof l,
+             "[MGPU][P6.4] passes %u -> %u, live from the next frame. Handles for all %u were "
+             "created at arm, so nothing is built or torn down here.",
+             was, n, stream_state::MAX_PASSES);
+    mgpu::diag::info(l);
+}
+
+void ui_set_intensity(unsigned pass_1based, float v)
+{
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (pass_1based == 0)
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.intensity[i] = v;
+    else if (pass_1based <= stream_state::MAX_PASSES)
+        s.intensity[pass_1based - 1] = v;
+    ++s.intensity_edits;
+}
+
+void ui_set_neural(bool on)
+{
+    stream_state &s = str();
+    bool was;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        was = s.neural;
+        if (was == on) return;
+        // nr_ok is NOT cleared: the feature handles stay alive so this can be
+        // switched back without a 400 ms stall. The consume loop tests `neural`.
+        s.neural = on;
+        ++s.intensity_edits;
+    }
+    char l[260];
+    snprintf(l, sizeof l, "[MGPU][P6.4] neural stage %s (handles kept alive either way)",
+             on ? "ON" : "OFF - transport only, the window shows the last neural frame");
+    mgpu::diag::info(l);
+}
+
+// Cycle which pass the steps act on: all -> 1 -> 2 -> ... -> passes -> all.
+void intensity_cycle_target()
+{
+    stream_state &s = str();
+    const unsigned n = (s.passes >= 1 && s.passes <= stream_state::MAX_PASSES) ? s.passes : 1u;
+    s.intensity_target = (s.intensity_target >= n) ? 0u : s.intensity_target + 1u;
+
+    char l[400];
+    int w = snprintf(l, sizeof l, "[MGPU][P6.3] intensity target -> ");
+    if (s.intensity_target == 0) w += snprintf(l + w, sizeof l - (size_t)w, "ALL passes");
+    else                         w += snprintf(l + w, sizeof l - (size_t)w, "pass %u only",
+                                               s.intensity_target);
+    w += snprintf(l + w, sizeof l - (size_t)w, " | now:");
+    for (unsigned i = 0; i < n && (size_t)w < sizeof l; ++i)
+        w += snprintf(l + w, sizeof l - (size_t)w, " p%u=%.2f", i + 1, s.intensity[i]);
+    mgpu::diag::info(l);
+}
+
+// One step up or down. STEP and the clamp are deliberate: 1.60 was exercised in
+// P1.2 and worked, so the ceiling is above 1.0 and is not a guess about what
+// the model accepts - it is a bound on how far one keypress can take you.
+void intensity_step(int dir)
+{
+    stream_state &s = str();
+    const unsigned n = (s.passes >= 1 && s.passes <= stream_state::MAX_PASSES) ? s.passes : 1u;
+    const float STEP = 0.05f;
+    const float LO = 0.0f, HI = 2.0f;
+
+    for (unsigned i = 0; i < n; ++i)
+    {
+        if (s.intensity_target != 0 && s.intensity_target != i + 1) continue;
+        float v = s.intensity[i] + STEP * (float)dir;
+        if (v < LO) v = LO;
+        if (v > HI) v = HI;
+        s.intensity[i] = v;
+    }
+    ++s.intensity_edits;
+
+    char l[400];
+    int w = snprintf(l, sizeof l, "[MGPU][P6.3] intensity %s (%s) ->",
+                     (dir > 0) ? "UP  " : "DOWN",
+                     (s.intensity_target == 0) ? "all passes" : "one pass");
+    for (unsigned i = 0; i < n && (size_t)w < sizeof l; ++i)
+        w += snprintf(l + w, sizeof l - (size_t)w, " p%u=%.2f%s", i + 1, s.intensity[i],
+                      (s.intensity_target == i + 1) ? "<" : "");
+    if ((size_t)w < sizeof l)
+        snprintf(l + w, sizeof l - (size_t)w,
+                 "%s", s.armed ? " (live from the next frame)"
+                               : " (stream not armed yet - this is the starting value)");
+    mgpu::diag::info(l);
+}
+
 void stream_request()
 {
     stream_state &s = str();
@@ -6671,6 +7679,58 @@ void stream_request()
     s.neural = stream_read_neural();
     s.max_frames = stream_read_frames();
     s.profile = stream_read_profile();
+    s.present_in = ini_read_present_in();
+    s.window_mode = ini_read_window_mode();
+    {
+        char buf[INI_BYTES];
+        const bool have = ini_slurp(buf, sizeof buf);
+        const char *k = have ? ini_find(buf, "Passes") : nullptr;
+        const long long asked = (k != nullptr) ? atoll(k) : 1;
+        s.passes = ini_read_passes();
+        if (k != nullptr && asked != (long long)s.passes)
+        {
+            char pl[400];
+            snprintf(pl, sizeof pl,
+                     "[MGPU][P6.0] mgpu.ini asks for Passes=%lld, which this build CLAMPS to %u "
+                     "(valid range 1..%u). The run below is %u passes, not %lld - said here so "
+                     "the summary is not read as the experiment that was requested.",
+                     asked, s.passes, stream_state::MAX_PASSES, s.passes, asked);
+            mgpu::diag::warn(pl);
+        }
+    }
+
+    // P6.2. Read after `passes`, because the per-pass overrides only make
+    // sense once we know how many passes there are.
+    {
+        const unsigned named = ini_read_intensity(s.intensity, s.intensity_set, s.passes);
+        s.set_n = ini_read_sets(s.set_key, s.set_f, s.set_u, s.set_is_float);
+
+        char kl[900];
+        int w = snprintf(kl, sizeof kl, "[MGPU][P6.2] knobs | intensity");
+        for (unsigned i = 0; i < s.passes && w > 0 && (size_t)w < sizeof kl; ++i)
+            w += snprintf(kl + w, sizeof kl - (size_t)w, " p%u=%.3f%s",
+                          i + 1, s.intensity[i], s.intensity_set[i] ? "*" : "");
+        if (w > 0 && (size_t)w < sizeof kl)
+            w += snprintf(kl + w, sizeof kl - (size_t)w,
+                          " (%u per-pass override%s, * marks them)", named,
+                          (named == 1) ? "" : "s");
+        for (unsigned i = 0; i < s.set_n && w > 0 && (size_t)w < sizeof kl; ++i)
+        {
+            if (s.set_is_float[i])
+                w += snprintf(kl + w, sizeof kl - (size_t)w, " | %s=%.4f(f)",
+                              s.set_key[i], s.set_f[i]);
+            else
+                w += snprintf(kl + w, sizeof kl - (size_t)w, " | %s=%u(u)",
+                              s.set_key[i], s.set_u[i]);
+        }
+        if (w > 0 && (size_t)w < sizeof kl)
+            snprintf(kl + w, sizeof kl - (size_t)w,
+                     ". Set.* keys are passed to NGX VERBATIM and this add-on does not "
+                     "know whether the snippet reads them - a key listed here was SENT, "
+                     "not necessarily HONOURED. Intensity is the only one proven live "
+                     "(P1.2: 0.00 vs 1.60 changed 98.03%% of pixels).");
+        mgpu::diag::info(kl);
+    }
 
     // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
     // accepted ANY string, so a name this build cannot inject - "drop" and
@@ -6700,10 +7760,10 @@ void stream_request()
             snprintf(s.fault, sizeof s.fault, "none");
         }
     }
-    char l[500];
+    char l[700];
     snprintf(l, sizeof l,
              "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\", "
-             "neural=%s, profile=%s. "
+             "neural=%s, profile=%s, present=%s, passes=%u, window=%s. "
              "Every game frame from the next one is sealed and transited until the bound is "
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
@@ -6712,7 +7772,14 @@ void stream_request()
              s.neural ? "ON (P4.1 - DLSS-NR runs on every consumed frame)"
                       : "off (P4.0 transport-only control)",
              s.profile ? "ON (no on-screen output, no liveness sample - measurement run)"
-                       : "off");
+                       : "off",
+             s.present_in ? "IN (the window shows the frame handed TO DLSS-NR, not its output - "
+                            "P5.3 discriminator)"
+                          : "nr (the neural output)",
+             s.passes,
+             (s.window_mode == 0) ? "crop (1280x720, the P5 behaviour)"
+                                  : ((s.window_mode == 1) ? "match (borderless at the source size)"
+                                                          : "fit (borderless full screen)"));
     mgpu::diag::info(l);
 }
 
@@ -7020,7 +8087,27 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 void stream_poll()
 {
     stream_state &s = str();
-    std::lock_guard<std::mutex> lk(s.cs);
+    // DEFECT E, found on the rig 2026-09-05 by running Passes=2 and watching the
+    // GAME slow down from ~60 to ~49.8 fps.
+    //
+    // This was a lock_guard held for the whole function - INCLUDING the fence
+    // wait below, which blocks until GPU 1 has finished the unpack, every
+    // evaluate and the sample. stream_on_finish_effects takes this same mutex
+    // on the GAME'S RENDER THREAD every frame. So the game's render thread was
+    // waiting on GPU 1's neural work, once per frame.
+    //
+    // The header has warned about exactly this since P4.0 - "holding it across
+    // a wait is the one hazard in this add-on that can reach the application" -
+    // and P5.1 applied that discipline to stream_present_gate. stream_poll was
+    // never checked against it.
+    //
+    // It was invisible at one pass because GPU 1's ~8 ms fitted inside the
+    // frame interval. Two passes is ~16 ms against ~17 ms, and the game fell
+    // over the edge. THE ARCHITECTURE'S CLAIM - that neural work is free to the
+    // game - was true of the design and false of this build.
+    //
+    // unique_lock, not lock_guard, so the wait can happen with it released.
+    std::unique_lock<std::mutex> lk(s.cs);
     if (!s.armed || s.summarised) return;
 
     // WHY THIS IS STILL CALLED FROM THE PRESENT LOOP, AND WHY THAT IS WRONG.
@@ -7048,7 +8135,7 @@ void stream_poll()
     const unsigned long long completed =
         (s.nfence != nullptr) ? (unsigned long long)s.nfence->GetCompletedValue() : 0;
 
-    char line[1000];
+    char line[1400];   // P6.0: the P2.2 and P4.1 summaries carry the pass split now
 
     if (s.consumed >= completed) ++s.idle_polls;
 
@@ -7065,6 +8152,16 @@ void stream_poll()
             ndev = st().device;
         }
         s.nr_ok = (ndev != nullptr) && stream_nr_create(s, ndev);
+
+        // P7.0. Here and not at arm: the source dimensions come from the seal,
+        // so this is the earliest point they are known to be real. Not in
+        // profile mode - that run has no on-screen output to size.
+        // P7.3: no longer gated on window_mode. A format mismatch has to be
+        // corrected in crop too, where the window does not change at all - and
+        // present_resize itself decides there is nothing to do when the mode is
+        // crop AND the format already matches.
+        if (!s.profile)
+            (void)present_resize(s.width, s.height, s.window_mode, s.format);
     }
 
     while (s.consumed < completed)
@@ -7106,6 +8203,30 @@ void stream_poll()
 
         const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
 
+        // ---- P6.4: DO NOT RUN NR ON A FRAME THAT IS ALREADY STALE ----
+        //
+        // stream_poll consumes EVERY arrived frame before it returns, and the
+        // loop presents once afterwards. When the consumer is behind, that
+        // meant evaluating six frames and showing the last one. The Passes=2
+        // run on 2026-09-05 did exactly that: 2651 frames of neural work, 451
+        // presents - 83% of it computed and discarded, which is what turned
+        // "17.5 ms of work against a 16.9 ms budget" into a 9 fps window.
+        //
+        // The seal is still read for every frame, because identity and ordering
+        // are the point of the instrument and cost microseconds. Only the
+        // EVALUATES are skipped, and only for frames a newer one has already
+        // superseded. Those are counted separately from `dropped`: a frame we
+        // chose not to denoise because it was already old is not the same event
+        // as a frame the transport lost, and conflating them would report our
+        // own scheduling as a fault.
+        //
+        // DECLARED HERE, at the frame's scope, NOT inside the command-list
+        // block below: the timestamp read and the liveness sample both test it
+        // and both live after that block closes.
+        const bool newest = (f >= completed);
+        const bool run_nr = s.nr_ok && newest && s.neural;
+        if (!newest) ++s.nr_skipped;
+
         HRESULT h = s.na->Reset();
         if (SUCCEEDED(h)) h = s.nl->Reset(s.na, nullptr);
         if (SUCCEEDED(h))
@@ -7123,7 +8244,7 @@ void stream_poll()
             // small sample of the output. One list, one submission, one wait per
             // consumed frame - which is also why the consumer's pace with the
             // stage attached is directly comparable to its pace without it.
-            if (s.nr_ok)
+            if (run_nr)
             {
                 D3D12_TEXTURE_COPY_LOCATION us{}, ud{};
                 us.pResource = s.nxfer;
@@ -7139,51 +8260,118 @@ void stream_poll()
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
 
-                s.nr_params->Set("DLSSNR.Color", s.tex_in);
-                s.nr_params->Set("DLSSNR.Output", s.tex_out);
-                s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
-                s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
-                s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.width);
-                s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.height);
-                s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
-                s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
-                s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.width);
-                s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
-                s.nr_params->Set("DLSSNR.Intensity", 0.84f);
-                // RESET ON THE FIRST FRAME ONLY. Every probe so far set Reset=1
-                // on every evaluate, because each was an independent experiment
-                // and history between them would have contaminated the control.
-                // A stream is the opposite case: dlssnr_prev_output is temporal
-                // history and it is supposed to carry. This is the first code in
-                // the project that lets NR accumulate across frames, and if the
-                // output ever looks smeared or ghosted, this line is the first
-                // thing to try at 1.
-                s.nr_params->Set("DLSSNR.Reset", s.nr_first ? 1u : 0u);
-                s.nr_first = false;
-
-                const NVSDK_NGX_Result er =
-                    s.nr_eval(s.nl, s.nr_handle, s.nr_params, nullptr);
-                ++s.nr_evals;
-                if (er != NVSDK_NGX_Result_Success)
+                // ---- P6.0: the pass chain ----
+                //
+                // Pass 1 reads tex_in and writes tex_out. Every later pass
+                // reads what the one before it wrote and writes the other UAV
+                // texture. Transport happened ONCE, above; only this loop
+                // multiplies. That asymmetry is the entire architectural claim
+                // and this is the first code that exercises it.
+                //
+                // The synchronisation between passes is not optional: pass k+1
+                // reads the texture pass k wrote, on the same queue, and
+                // without a barrier the driver is free to overlap them. The
+                // state transition below serves as that barrier - see the note
+                // inside the loop.
+                for (unsigned pi = 0; pi < s.passes; ++pi)
                 {
-                    ++s.nr_fails;
-                    if (s.nr_fails <= 3)
+                    ID3D12Resource *src = (pi == 0)
+                                            ? s.tex_in
+                                            : ((pi % 2u == 1u) ? s.tex_out : s.tex_pong);
+                    ID3D12Resource *dst = (pi % 2u == 0u) ? s.tex_out : s.tex_pong;
+
+                    // STATE, not just a UAV barrier. Pass 1's input (tex_in) is
+                    // put in NON_PIXEL_SHADER_RESOURCE above, which is the only
+                    // state this project has ever handed NGX an input in. A
+                    // later pass reads a texture that has been sitting in
+                    // UNORDERED_ACCESS because the pass before it wrote there,
+                    // and feeding NGX an input in that state is untested here -
+                    // so it is transitioned to the same state pass 1's input
+                    // uses, and put back afterwards. The transition also IS the
+                    // write-to-read dependency between consecutive passes, so
+                    // no separate UAV barrier is needed.
+                    if (pi > 0)
+                        barrier(s.nl, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                    s.nr_params->Set("DLSSNR.Color", src);
+                    s.nr_params->Set("DLSSNR.Output", dst);
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+                    s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.width);
+                    s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.height);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+                    s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.width);
+                    s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
+                    // P6.2: per pass, not one hardcoded value for all of them.
+                    s.nr_params->Set("DLSSNR.Intensity", s.intensity[pi]);
+                    // P6.2: whatever the ini named, verbatim, before every
+                    // evaluate. Applied AFTER Intensity so a Set.DLSSNR.Intensity
+                    // line deliberately wins - that is the escape hatch if the
+                    // per-pass path ever needs to be bypassed.
+                    for (unsigned si = 0; si < s.set_n; ++si)
                     {
-                        snprintf(line, sizeof line,
-                                 "[MGPU][P4.1] EvaluateFeature f=%llu: 0x%08X (%s)",
-                                 f, (unsigned)er, ngx_result_name(er));
-                        mgpu::diag::error(line);
+                        if (s.set_is_float[si]) s.nr_params->Set(s.set_key[si], s.set_f[si]);
+                        else                    s.nr_params->Set(s.set_key[si], s.set_u[si]);
                     }
+                    // RESET ON THE FIRST FRAME ONLY, PER HANDLE. Every probe
+                    // before the stream set Reset=1 on every evaluate, because
+                    // each was an independent experiment and history between
+                    // them would have contaminated the control. A stream is the
+                    // opposite case: dlssnr_prev_output is temporal history and
+                    // it is supposed to carry. Each pass owns its own feature
+                    // handle precisely so that its history is the PREVIOUS
+                    // FRAME's output of that same pass, not the previous pass of
+                    // this frame - so the flag is per-frame, not per-pass. If
+                    // the output ever looks smeared or ghosted, this is the
+                    // first line to try at 1.
+                    s.nr_params->Set("DLSSNR.Reset", s.nr_first ? 1u : 0u);
+
+                    const NVSDK_NGX_Result er =
+                        s.nr_eval(s.nl, s.nr_handle[pi], s.nr_params, nullptr);
+                    ++s.nr_evals;
+                    if (er != NVSDK_NGX_Result_Success)
+                    {
+                        ++s.nr_fails;
+                        if (s.nr_fails <= 3)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P4.1] EvaluateFeature f=%llu pass %u/%u: "
+                                     "0x%08X (%s)",
+                                     f, pi + 1, s.passes, (unsigned)er, ngx_result_name(er));
+                            mgpu::diag::error(line);
+                        }
+                    }
+
+                    // Put it back: every UAV texture must be in
+                    // UNORDERED_ACCESS at the end of the list, because that is
+                    // the state the next frame - and stream_present_source -
+                    // both assume.
+                    if (pi > 0)
+                        barrier(s.nl, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
+                s.nr_first = false;
+                // P6.4: `passes` can change between frames now, so the final
+                // texture is recomputed here rather than fixed at arm time.
+                s.nr_final = (s.passes % 2u == 1u) ? s.tex_out : s.tex_pong;
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
 
                 if (!s.profile)
                 {
-                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                // P6.0: sample the LAST pass's output, not tex_out. With
+                // Passes=1 nr_final IS tex_out; with an even pass count it is
+                // tex_pong, and sampling tex_out there would compare the
+                // second-to-last pass frame over frame while the window showed
+                // the last one - a liveness check watching a different image
+                // from the one on screen.
+                ID3D12Resource *const fin = s.nr_final;
+                barrier(s.nl, fin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_TEXTURE_COPY_LOCATION ss{}, sd{};
-                ss.pResource = s.tex_out;
+                ss.pResource = fin;
                 ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 ss.SubresourceIndex = 0;
                 sd.pResource = s.nr_read;
@@ -7191,7 +8379,7 @@ void stream_poll()
                 sd.PlacedFootprint = s.nr_fp;
                 D3D12_BOX box{ 0, 0, 0, 64, 4, 1 };
                 s.nl->CopyTextureRegion(&sd, 0, 0, 0, &ss, &box);
-                barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                barrier(s.nl, fin, D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
                 barrier(s.nl, s.tex_in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -7203,7 +8391,7 @@ void stream_poll()
             // Resolve after every mark is written, never before: the resolve
             // reads the heap on the GPU timeline and a mark recorded after it
             // would not be in the buffer we map.
-            if (s.ts_ok && s.nr_ok)
+            if (s.ts_ok && run_nr)
                 s.nl->ResolveQueryData(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
                                        stream_state::TS_MARKS, s.tsread, 0);
 
@@ -7218,7 +8406,23 @@ void stream_poll()
             if (SUCCEEDED(h))
             {
                 s.nf->SetEventOnCompletion(s.nf_value, s.nev);
-                if (WaitForSingleObject(s.nev, 5000) != WAIT_OBJECT_0) h = E_FAIL;
+                // DEFECT E. THE ONLY BLOCKING CALL IN THIS FUNCTION, AND IT
+                // RUNS WITH THE MUTEX RELEASED. What the game thread does while
+                // we are here is exactly what it should be free to do: record
+                // its copies, signal its own fence, advance `produced`. None of
+                // that touches the bridge-side objects this loop is using
+                // (s.nl, s.nq, s.nev are bridge thread only), and the seal for
+                // this frame was copied into s.nseal by the GPU before the wait
+                // can clear - so nothing read after re-acquiring is stale.
+                //
+                // If the producer laps us while we are unlocked, that is the
+                // overrun condition and the check at the top of the next
+                // iteration names it. Being lapped is a fact about our speed;
+                // blocking the game to avoid it never was.
+                lk.unlock();
+                const DWORD wr = WaitForSingleObject(s.nev, 5000);
+                lk.lock();
+                if (wr != WAIT_OBJECT_0) h = E_FAIL;
             }
         }
         if (FAILED(h)) { s.consumed = f; continue; }
@@ -7241,7 +8445,11 @@ void stream_poll()
         // P2.2a: the per-stage GPU times for this frame. Read only when the
         // neural stage is up, because with it off marks 2..4 are never written
         // and the deltas would be garbage rather than zero.
-        if (s.ts_ok && s.nr_ok)
+        // P6.4: only when the evaluates actually happened. On a skipped frame
+        // marks 2..4 are never written and the deltas would be whatever the
+        // previous resolve left behind - a stale number that looks exactly like
+        // a real one.
+        if (s.ts_ok && run_nr)
         {
             const UINT64 *tv = nullptr;
             D3D12_RANGE tr{0, (SIZE_T)(stream_state::TS_MARKS * 8)};
@@ -7272,12 +8480,13 @@ void stream_poll()
         // identical-rate means is ambiguous by construction and the summary
         // says so: a static scene produces identical NR output legitimately.
         // It is a rate to be read alongside the scene, not a verdict.
-        if (s.nr_ok && !s.profile)
+        if (run_nr && !s.profile)
         {
             unsigned char *sm = nullptr;
             D3D12_RANGE sr{0, 1024};
             if (SUCCEEDED(s.nr_read->Map(0, &sr, (void **)&sm)) && sm != nullptr)
             {
+                ++s.nr_frames;
                 if (s.nr_have_prev && memcmp(sm, s.nr_prev, 1024) == 0) ++s.nr_same;
                 memcpy(s.nr_prev, sm, 1024);
                 s.nr_have_prev = true;
@@ -7463,16 +8672,48 @@ void stream_poll()
         if (s.neural)
         {
             snprintf(line, sizeof line,
-                     "[MGPU][P4.1] neural stage: %s | evaluates=%llu failures=%llu | output "
-                     "sample identical to the previous frame %llu times (%.1f%%). ONE feature "
-                     "handle for the whole stream, DLSSNR.Reset=1 on the first frame only so "
-                     "temporal history carries. The identical-rate is NOT a verdict: a static "
-                     "scene produces identical output legitimately, so read it against what was "
-                     "on screen. A rate near 100%% with a moving scene is the signal that NR "
+                     "[MGPU][P4.1] neural stage: %s | passes=%u | evaluates=%llu (=%llu frames "
+                     "x %u passes) failures=%llu | output sample identical to the previous frame "
+                     "%llu times (%.1f%%) | %llu frames had their NEURAL WORK SKIPPED because a "
+                     "newer frame was already waiting - those are not drops, their seals were "
+                     "checked and they are counted here so the evaluate count and the frame "
+                     "count are not expected to agree. ONE FEATURE HANDLE PER PASS, DLSSNR.Reset=1 on the "
+                     "first frame only, so each pass's temporal history is its OWN output a "
+                     "frame ago rather than the previous pass of this frame. NOTE evaluates "
+                     "COUNTS PASSES, not frames - divide by %u before comparing it with the "
+                     "frame count above. The identical-rate is NOT a verdict: a static scene "
+                     "produces identical output legitimately, so read it against what was on "
+                     "screen. A rate near 100%% with a moving scene is the signal that NR "
                      "stopped writing.",
                      s.nr_ok ? "UP" : "NOT RUNNING (transport-only)",
-                     s.nr_evals, s.nr_fails, s.nr_same,
-                     (s.nr_evals > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_evals - 1) : 0.0);
+                     s.passes,
+                     s.nr_evals,
+                     (s.passes > 0) ? s.nr_evals / s.passes : s.nr_evals, s.passes,
+                     s.nr_fails, s.nr_same,
+                     (s.nr_frames > 1) ? 100.0 * (double)s.nr_same / (double)(s.nr_frames - 1) : 0.0,
+                     s.nr_skipped,
+                     s.passes);
+            mgpu::diag::info(line);
+        }
+
+        if (s.neural)
+        {
+            int w = snprintf(line, sizeof line,
+                             "[MGPU][P6.3] intensity AT THE END of this run:");
+            for (unsigned i = 0; i < s.passes && (size_t)w < sizeof line; ++i)
+                w += snprintf(line + w, sizeof line - (size_t)w, " p%u=%.2f",
+                              i + 1, s.intensity[i]);
+            if ((size_t)w < sizeof line)
+                snprintf(line + w, sizeof line - (size_t)w,
+                         " | %llu hotkey edit%s during the run. %s",
+                         s.intensity_edits, (s.intensity_edits == 1) ? "" : "s",
+                         (s.intensity_edits != 0)
+                           ? "THE VALUE CHANGED WHILE THIS RAN, so the frames in this summary "
+                             "were NOT all produced at the same strength - the timings and the "
+                             "identical-rate above cover a moving target and must not be quoted "
+                             "as a figure for any one value."
+                           : "Unchanged from the ini for the whole run, so the summary above "
+                             "describes a single configuration.");
             mgpu::diag::info(line);
         }
 
@@ -7497,18 +8738,26 @@ void stream_poll()
             snprintf(line, sizeof line,
                      "[MGPU][P2.2] GPU TIME on GPU 1, per consumed frame, n=%llu | seal copy "
                      "mean=%.3f | unpack (cross-adapter buffer -> NR input) mean=%.3f min=%.3f "
-                     "max=%.3f | EVALUATE mean=%.3f min=%.3f max=%.3f | output sample "
-                     "mean=%.3f ms. These are GPU 1's own timestamps on GPU 1's own queue - "
-                     "execution, not wall-clock, and no cross-adapter clock is involved. The "
-                     "evaluate figure is the one to compare against the reference tool's 14.2 ms "
-                     "evaluateGPU, and it is the first time this project has had its own side of "
-                     "that comparison. STILL PERISHABLE: one rig, one link, one resolution, one "
-                     "scene.",
+                     "max=%.3f | EVALUATE(%u pass%s) mean=%.3f min=%.3f max=%.3f -> per pass "
+                     "mean=%.3f min=%.3f | output sample mean=%.3f ms. These are GPU 1's own "
+                     "timestamps on GPU 1's own queue - execution, not wall-clock, and no "
+                     "cross-adapter clock is involved. THE EVALUATE BRACKET SPANS EVERY PASS, so "
+                     "the per-pass figure is the one to compare against the reference tool's "
+                     "14.2 ms evaluateGPU and against earlier single-pass runs; the total is "
+                     "what GPU 1 actually spends. Transport is paid ONCE per frame whatever the "
+                     "pass count is - that asymmetry is the whole point of the run. STILL "
+                     "PERISHABLE: one rig, one link, one resolution, one scene.%s",
                      s.ts_n,
                      s.ts_sum[0] / n,
                      s.ts_sum[1] / n, s.ts_min[1], s.ts_max[1],
+                     s.passes, (s.passes == 1) ? "" : "es",
                      s.ts_sum[2] / n, s.ts_min[2], s.ts_max[2],
-                     s.ts_sum[3] / n);
+                     (s.ts_sum[2] / n) / (double)s.passes, s.ts_min[2] / (double)s.passes,
+                     s.ts_sum[3] / n,
+                     s.profile ? "" : " READ THE MIN, NOT THE MEAN: this run has the on-screen "
+                                      "output enabled, and the present chain's own submissions "
+                                      "share GPU 1's queue, which inflates the tail of every "
+                                      "bracket here without the model doing more work.");
             mgpu::diag::info(line);
         }
         else if (s.neural)
