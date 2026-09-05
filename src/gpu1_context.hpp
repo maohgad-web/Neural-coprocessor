@@ -220,6 +220,23 @@ void capture_poll();
 // deliberately not attached: if both landed in one commit, a failure would not
 // say which half.
 
+// P5.2. Any thread. True only when mgpu.ini says Probes=1.
+//
+// DEFECT C: the one-shot probe chain (P1.3 transit, P1.5 capture and the P3.x
+// ngx_probe it leads into) and the P4.1 stream both armed from the same hotkey,
+// which put TWO independent NGX consumers on ONE shared parameter block -
+// GetCapabilityParameters returns the core's block, not a per-caller one. The
+// probe's teardown then destroyed it under the running stream. The visible
+// symptom was a neural image with the colours wrong while every transport
+// counter stayed clean, which is precisely the failure shape the seal cannot
+// see: the bytes arrived, the consumer was broken.
+//
+// The destroy is now suppressed while the stream holds the block, and the
+// probes themselves are opt-in and default OFF - they are answered questions,
+// and re-running them under a live stream can only cost. Set Probes=1 in
+// mgpu.ini to run the old chain again, with the stream deliberately not armed.
+bool probes_enabled();
+
 // Bridge thread. Arms the stream; inert until called, one stream per process.
 // Reads Fault= from mgpu.ini beside the add-on - absent means no fault, so the
 // shipped default is a clean run and a missing file is never an error.
@@ -235,4 +252,21 @@ void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
 // arrived, checks each seal, and prints the summary once the producer has
 // stopped and drained.
 void stream_poll();
+
+// P5.1. Bridge thread, called immediately before present_frame. Returns true
+// when the bridge should put a frame on screen.
+//
+// While the stream is running with an on-screen output, that is once per NEW
+// neural frame rather than once per vsync - which removes three quarters of the
+// full-frame backbuffer copies and three quarters of the DWM cross-adapter
+// copies of the bridge window, both of which were competing with the payload
+// for the same link. When there is nothing new it blocks on the shared fence
+// (outside the stream's lock) for up to `timeout_ms`, so the consumer wakes on
+// a frame landing rather than on a vblank, and its cadence stops depending on
+// which display GPU 1 is attached to.
+//
+// Returns true unconditionally when the stream is idle or in profile mode, so
+// the cycling clear colour - T5's liveness proof - keeps running as it always
+// has.
+bool stream_present_gate(unsigned long timeout_ms);
 }

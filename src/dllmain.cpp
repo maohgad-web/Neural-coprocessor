@@ -36,6 +36,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <cstdio>     // P1.6: snprintf. This file had no formatted logging before.
 #include <reshade.hpp>
 
 #include "adapter.hpp"
@@ -107,6 +108,105 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     mgpu::adapter::on_swapchain(swapchain, resize);
 }
 
+// ---- P1.6: what is actually painted on each runtime ----
+//
+// INCIDENT 6, and the cheapest one to have prevented. The bridge window showed
+// the neural output with the colours destroyed - psychedelic banding over
+// black - and three separate code hypotheses were formed and shipped against
+// it. None was the cause. gpu1.ini, the preset ReShade assigns to the BRIDGE
+// runtime, still carried "Techniques=Lumenite_QuantMotion@lumenite_QuantMotion.fx"
+// with "DEBUG_FLOW=1" from an earlier debugging session. A motion-flow debug
+// view was being drawn on top of every neural frame, and nothing in any log
+// said so.
+//
+// The instrument could not see the one thing that was wrong, because the run
+// CONFIGURATION - which preset each runtime loaded, and which techniques it
+// enabled - was never recorded anywhere. A bisect run under a contaminated
+// preset returns a confident, correctly-formatted, wrong answer, which is the
+// section 00 failure shape exactly.
+//
+// So both runtimes now state, once each, the preset they loaded and every
+// technique enabled in it. After this, "something was painted over the output"
+// is a line in the log rather than a hypothesis about our code.
+//
+// The technique list is not read on the first event: at that point effects may
+// still be compiling and an empty list would be recorded as "nothing enabled",
+// which is the same wrong answer in a different costume. The read is retried
+// until the runtime enumerates at least one technique, and if it never does,
+// THAT is said explicitly instead.
+namespace
+{
+    struct preset_probe
+    {
+        bool done = false;
+        unsigned attempts = 0;
+        char names[900] = {};
+        size_t used = 0;
+        unsigned enabled = 0;
+        unsigned total = 0;
+    };
+
+    void technique_cb(reshade::api::effect_runtime *rt,
+                      reshade::api::effect_technique tech, void *user)
+    {
+        preset_probe *p = static_cast<preset_probe *>(user);
+        ++p->total;
+        if (!rt->get_technique_state(tech)) return;
+        ++p->enabled;
+
+        char tn[128] = {}; size_t tns = sizeof tn - 1;
+        rt->get_technique_name(tech, tn, &tns);
+        char en[128] = {}; size_t ens = sizeof en - 1;
+        rt->get_technique_effect_name(tech, en, &ens);
+
+        const int wrote = snprintf(p->names + p->used, sizeof p->names - p->used,
+                                   "%s%s@%s", (p->used != 0) ? ", " : "", tn, en);
+        if (wrote > 0 && (size_t)wrote < sizeof p->names - p->used)
+            p->used += (size_t)wrote;
+    }
+
+    // `tag` is "GAME" or "BRIDGE". Two independent probes, because the two
+    // runtimes load different presets and either one can change what is on
+    // screen.
+    void log_preset_once(reshade::api::effect_runtime *runtime, const char *tag,
+                         preset_probe &p)
+    {
+        if (p.done) return;
+        ++p.attempts;
+
+        p.used = 0; p.enabled = 0; p.total = 0; p.names[0] = '\0';
+        runtime->enumerate_techniques(nullptr, technique_cb, &p);
+
+        // Still compiling: say nothing yet rather than record an empty list as
+        // a fact. 900 events is roughly fifteen seconds at 60 fps, comfortably
+        // past shader compilation on this rig.
+        if (p.total == 0 && p.attempts < 900) return;
+        p.done = true;
+
+        char preset[512] = {}; size_t ps = sizeof preset - 1;
+        runtime->get_current_preset_path(preset, &ps);
+
+        char line[1600];
+        if (p.total == 0)
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.6] %s runtime preset=\"%s\" - NO TECHNIQUES ENUMERATED after %u "
+                     "frames. Either the preset is empty or its effects failed to compile. "
+                     "Nothing is being drawn on this runtime.",
+                     tag, preset, p.attempts);
+        else
+            snprintf(line, sizeof line,
+                     "[MGPU][P1.6] %s runtime preset=\"%s\" | %u of %u techniques ENABLED%s%s. "
+                     "This line exists because a stale gpu1.ini once drew a motion-flow debug "
+                     "view over the neural output and three code hypotheses were spent on it. "
+                     "If anything unexpected is listed here, what is on screen is not what this "
+                     "add-on produced.",
+                     tag, preset, p.enabled, p.total,
+                     (p.enabled != 0) ? ": " : "",
+                     (p.enabled != 0) ? p.names : "");
+        mgpu::diag::info(line);
+    }
+}
+
 // P1.5: the only event this add-on subscribes to that is raised on the GAME's
 // render thread with the GAME's command list open. Everything it does is
 // one-shot and self-disarming; after a single frame is captured it never
@@ -126,6 +226,30 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
 
     reshade::api::device *dev = runtime->get_device();
     if (dev == nullptr) return;
+
+    // P1.6. Which runtime is this? The same LUID comparison on_destroy_device
+    // already makes. Log-only and one-shot per side; nothing below changes
+    // behaviour, and the adapter filtering that actually gates the capture and
+    // stream paths still happens inside gpu1_context where the game's LUID
+    // lives. Placed here rather than at stream arm on purpose: the preset is
+    // painting frames from the moment the runtime exists, which is long before
+    // anything is armed, so the record has to start there too.
+    {
+        static preset_probe game_probe, bridge_probe;
+        mgpu::adapter::selection_result sel;
+        mgpu::adapter::get_selection(sel);
+        if (sel.game_luid_known && dev->get_api() == reshade::api::device_api::d3d12)
+        {
+            if (auto *dev12 = reinterpret_cast<ID3D12Device *>(dev->get_native()))
+            {
+                const LUID luid = dev12->GetAdapterLuid();
+                const bool is_game = (luid.LowPart == sel.game_luid.LowPart &&
+                                      luid.HighPart == sel.game_luid.HighPart);
+                log_preset_once(runtime, is_game ? "GAME" : "BRIDGE",
+                                is_game ? game_probe : bridge_probe);
+            }
+        }
+    }
 
     // The resource behind the view, not the view: the copy source has to be
     // the texture. Adapter filtering happens inside gpu1_context, which is
