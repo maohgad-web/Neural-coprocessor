@@ -5898,6 +5898,9 @@ namespace
         // so the shipped default is a clean run and a missing file is never an
         // error.
         char fault[32] = "none";
+        bool fault_unimpl = false;   // a name was given that this build cannot inject
+        unsigned long long resync = 0;   // seals rejected, next gap check suppressed
+        bool skip_next_gap = false;
     };
 
     stream_state &str()
@@ -5966,6 +5969,35 @@ void stream_request()
     if (s.requested) return;
     s.requested = true;
     stream_read_fault(s.fault, sizeof s.fault);
+
+    // DEFECT A, found on the rig 2026-09-04 and fixed here. stream_read_fault
+    // accepted ANY string, so a name this build cannot inject - "drop" and
+    // "stale" were both tried - silently injected nothing, the run came back
+    // with every counter zero, and the fault-injected warning then declared
+    // that "the checker did not trip and the instrument is not yet
+    // trustworthy". That is a FALSE ACCUSATION AGAINST A WORKING CHECKER,
+    // produced by the instrument's own permissiveness. An unknown name is now
+    // refused loudly, by name, with the implemented set listed.
+    {
+        static const char *KNOWN[] = { "none", "pitch", "alias", "magic", "drop", "stale" };
+        bool ok = false;
+        for (unsigned i = 0; i < sizeof KNOWN / sizeof KNOWN[0]; ++i)
+            if (strcmp(s.fault, KNOWN[i]) == 0) { ok = true; break; }
+        if (!ok)
+        {
+            char e[500];
+            snprintf(e, sizeof e,
+                     "[MGPU][P4.0] mgpu.ini requests Fault=\"%s\", which this build CANNOT "
+                     "inject. Implemented: pitch, alias, magic, drop, stale. Running clean "
+                     "instead - and the summary will say so, because a run that injects nothing "
+                     "and reports all-zero counters would otherwise read as a checker that "
+                     "failed to trip. NOT implemented: tear, which needs the barcode shader to "
+                     "have anything to check against.", s.fault);
+            mgpu::diag::error(e);
+            s.fault_unimpl = true;
+            snprintf(s.fault, sizeof s.fault, "none");
+        }
+    }
     char l[500];
     snprintf(l, sizeof l,
              "[MGPU][P4.0] stream REQUESTED - ring depth %u, bound %llu frames, fault=\"%s\". "
@@ -6174,6 +6206,20 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     }
 
     const unsigned long long fi = s.produced + 1;
+
+    // FAULT "drop": burn frame index 40 without writing anything for it. The
+    // fence still advances, so the consumer is told frame 40 landed and finds
+    // whatever the slot held three frames ago. Expected diagnosis: REORDERED at
+    // f=40 (the slot holds an older index), then DROPPED gap=2 at f=41.
+    // Deliberately models a PRODUCER drop - a frame the game rendered that
+    // never made it into the ring - which is a different failure from the
+    // consumer falling behind, and is counted separately for that reason.
+    if (strcmp(s.fault, "drop") == 0 && fi == 40)
+    {
+        s.produced = fi;
+        return;
+    }
+
     const unsigned slot = (unsigned)((fi - 1) % stream_state::RING);
     const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
 
@@ -6274,7 +6320,16 @@ void stream_poll()
             continue;
         }
 
-        const unsigned slot = (unsigned)((f - 1) % stream_state::RING);
+        unsigned slot = (unsigned)((f - 1) % stream_state::RING);
+
+        // FAULT "stale": read the PREVIOUS slot once, at f=40. This is a
+        // consumer-side injection on purpose - it models the ring's indexing
+        // being wrong rather than the transport being wrong, and those have
+        // different fixes. Expected diagnosis: RING ALIAS (the seal's own
+        // slot_index will not match the slot we read) plus REORDERED.
+        if (strcmp(s.fault, "stale") == 0 && f == 40)
+            slot = (slot + stream_state::RING - 1) % stream_state::RING;
+
         const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
 
         HRESULT h = s.na->Reset();
@@ -6322,6 +6377,16 @@ void stream_poll()
                      "arrived at this offset, or the two ends disagree about the layout.",
                      f, slot, got.magic, got.seal_version);
             mgpu::diag::error(line);
+            // DEFECT B, found on the rig 2026-09-04. A rejected seal never
+            // reaches the frame_index bookkeeping below, so `last_seen` stays
+            // where it was and the NEXT frame computes gap=2 and reports a
+            // DROPPED that did not happen. The magic run showed exactly that:
+            // one injected corruption, two counters, and a producer blamed for
+            // a fault entirely on the consumer's side. One rejected seal is
+            // one failure; the following frame resynchronises silently and is
+            // counted here so the suppression is visible rather than implied.
+            ++s.resync;
+            s.skip_next_gap = true;
         }
         else
         {
@@ -6375,7 +6440,12 @@ void stream_poll()
             else
             {
                 const unsigned long long gap = got.frame_index - s.last_seen;
-                if (s.last_seen != 0 && gap != 1)
+                if (s.skip_next_gap)
+                {
+                    // Resynchronising after a rejected seal - see DEFECT B.
+                    s.skip_next_gap = false;
+                }
+                else if (s.last_seen != 0 && gap != 1)
                 {
                     ++s.dropped;
                     snprintf(line, sizeof line,
@@ -6424,9 +6494,12 @@ void stream_poll()
         snprintf(line, sizeof line,
                  "[MGPU][SEAL] summary: produced=%llu consumed=%llu new=%llu dropped=%llu "
                  "reordered=%llu overrun=%llu bad_magic=%llu contract=%llu alias=%llu "
-                 "fault=\"%s\" seal_version=%u",
+                 "resync=%llu fault=\"%s\"%s seal_version=%u",
                  s.produced, s.consumed, s.lat_n, s.dropped, s.reordered,
-                 s.overrun, s.bad_magic, s.contract, s.alias, s.fault, SEAL_VERSION);
+                 s.overrun, s.bad_magic, s.contract, s.alias, s.resync, s.fault,
+                 s.fault_unimpl ? " (an UNIMPLEMENTED fault was requested - see the error above; "
+                                  "this ran clean and proves nothing about the checker)" : "",
+                 SEAL_VERSION);
         mgpu::diag::info(line);
         {
             // The rate ratio, out of quantities this consumer can observe, plus
