@@ -31,6 +31,19 @@ WHAT YOU NEED FIRST
 2. A second NVIDIA GPU in the machine, with a current driver. DLSS-NR comes
    from your driver installation.
 
+   GEFORCE RTX 50-SERIES. NVIDIA documents DLSS Neural Rendering as a
+   50-series feature - it is not available on 40-series or older cards, and
+   this add-on cannot change that. It drives the NGX libraries already in your
+   driver and cannot enable something the driver will not run. THIS ADD-ON
+   DOES NOT CHECK YOUR HARDWARE: on an older card expect it to load, log
+   normally, and produce nothing.
+
+   It is the SECOND card that runs the neural stage, so that is the one the
+   requirement applies to - but a mixed pair has never been tested, and the
+   cross-adapter shared-heap workaround this depends on is itself specific to
+   the 50-series. Two RTX 5060 Ti 16 GB is the only configuration this has
+   been run on.
+
    You do NOT need a shader pack. Ticking effect packages in the ReShade
    installer is optional - this add-on needs add-on support and nothing else,
    and it was tested with no effects installed at all.
