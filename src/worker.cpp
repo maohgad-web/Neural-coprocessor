@@ -175,6 +175,36 @@ namespace
     // Everything here can only withhold a placement, never produce a wrong one:
     // any failure leaves the origin at CW_USEDEFAULT, which is exactly the old
     // behaviour, and says so in the log.
+    // The desktop's own monitor list, used when the adapter will not name its
+    // outputs. EnumDisplayMonitors reports what the desktop actually spans,
+    // which is independent of how DXGI attributes outputs to adapters.
+    struct desktop_monitors
+    {
+        RECT rect[8]{};
+        bool primary[8]{};
+        UINT count = 0;
+    };
+
+    BOOL CALLBACK monitor_enum_cb(HMONITOR mh, HDC, LPRECT, LPARAM lp)
+    {
+        desktop_monitors *d = reinterpret_cast<desktop_monitors *>(lp);
+        if (d->count >= 8) return FALSE;
+        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        if (GetMonitorInfoW(mh, &mi) != FALSE)
+        {
+            d->rect[d->count]    = mi.rcMonitor;
+            d->primary[d->count] = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            ++d->count;
+        }
+        return TRUE;
+    }
+
+    void enumerate_desktop_monitors(desktop_monitors &out)
+    {
+        EnumDisplayMonitors(nullptr, nullptr, monitor_enum_cb,
+                            reinterpret_cast<LPARAM>(&out));
+    }
+
     struct bridge_placement
     {
         bool known = false;
@@ -225,16 +255,76 @@ namespace
 
         if (n_attached == 0)
         {
-            // Headless second card. It works - earlier milestones ran this way
-            // - but it is the slower configuration by a wide margin, and it is
-            // worth saying so at the moment it is detected rather than leaving
-            // someone to wonder why their figures are low.
+            // DXGI SAYS THIS ADAPTER DRIVES NOTHING. Believe it about the
+            // adapter; do not believe it about the machine.
+            //
+            // Measured on the development rig: a second card with a monitor
+            // physically attached and lit reported outputs=0 through
+            // EnumOutputs, while the render adapter reported outputs=2. DXGI
+            // attributes outputs to the adapter that owns the desktop
+            // composition for them, which on a multi-GPU desktop is not
+            // reliably the card the cable is in. So the adapter path is the
+            // preferred answer and NOT the only one - when it comes back
+            // empty, fall through to the desktop's own monitor list.
+            //
+            // The fallback deliberately does NOT try to work out which card
+            // owns which panel, because that is the question DXGI just failed
+            // to answer. It uses the only thing that is reliably true: the
+            // bridge window should not open on the display the game is using.
+            // On a two-monitor rig that is one candidate, which is the whole
+            // problem people actually have.
+            desktop_monitors mons;
+            enumerate_desktop_monitors(mons);
+
+            if (mons.count == 0)
+            {
+                snprintf(out.detail, sizeof out.detail,
+                         "the bridge adapter reports no attached output (%u reported) and no "
+                         "desktop monitor could be enumerated either - window placed by Windows",
+                         out.outputs_total);
+                return;
+            }
+
+            UINT pick = 0;
+            const char *how = nullptr;
+            if (want >= 0 && (UINT)want < mons.count)
+            {
+                pick = (UINT)want;
+                how = "Monitor= from mgpu.ini, indexing DESKTOP monitors (the adapter reported "
+                      "none of its own)";
+            }
+            else
+            {
+                // First non-primary monitor. The game is on the primary one on
+                // essentially every rig this will meet, and "not where the game
+                // is" is the requirement - not "which card owns it".
+                bool found = false;
+                for (UINT i = 0; i < mons.count; ++i)
+                    if (!mons.primary[i]) { pick = i; found = true; break; }
+                if (!found)
+                {
+                    snprintf(out.detail, sizeof out.detail,
+                             "the bridge adapter reports no attached output and this desktop has "
+                             "only one monitor - running HEADLESS or single-screen. This works, "
+                             "but a monitor on the second card was worth +33%% throughput and "
+                             "roughly half the latency on the rig this was measured on. Window "
+                             "placed by Windows");
+                    return;
+                }
+                how = "auto, from the DESKTOP monitor list because the bridge adapter reported "
+                      "no outputs of its own: the first non-primary monitor";
+            }
+
+            out.known = true;
+            out.x = (int)mons.rect[pick].left;
+            out.y = (int)mons.rect[pick].top;
             snprintf(out.detail, sizeof out.detail,
-                     "the bridge adapter drives NO attached display (%u output(s) reported, 0 "
-                     "attached) - running HEADLESS. This works, but moving a monitor cable onto "
-                     "the second card was worth +33%% throughput and roughly half the latency on "
-                     "the rig this was measured on. Window placed by Windows",
-                     out.outputs_total);
+                     "%s - monitor %u of %u, rect (%d,%d)-(%d,%d). CHECK THIS ONE: it is placed "
+                     "away from the primary display, not proven to be on the second card, because "
+                     "DXGI would not say. Set Monitor=<n> if it picked wrong",
+                     how, pick, mons.count,
+                     (int)mons.rect[pick].left, (int)mons.rect[pick].top,
+                     (int)mons.rect[pick].right, (int)mons.rect[pick].bottom);
             return;
         }
 
