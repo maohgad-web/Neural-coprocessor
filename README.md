@@ -234,8 +234,15 @@ For screen recording, prefer display or Windows-Graphics-Capture sources over
 "game capture", which adds a third `Present` hook to a process that already has
 two.
 
-**D3D11 games do nothing.** No game adapter is identified, the bridge stands
-down, and the log says so. Some Unity titles can be forced with `-force-d3d12`.
+**D3D12 only. D3D11 and Vulkan titles do nothing.** The add-on loads, finds no
+D3D12 render device, stands down, and says so in the log and in its window
+title. Some Unity titles can be forced with `-force-d3d12`.
+
+This is a limit of *this bridge*, not of the feature — NVIDIA's own DLSS-NR
+programming guide is written against Vulkan, and the snippet ships a fuller
+Vulkan surface than a D3D12 one. Everything here hooks ReShade's D3D12 path and
+creates a D3D12 device on the second adapter, so Vulkan would be a separate
+implementation rather than a flag.
 
 **Image quality is not assessed anywhere in this repository.** That is a
 separate question needing exposure-normalised comparison, and nothing here is a
