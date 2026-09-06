@@ -6667,6 +6667,36 @@ namespace
         // over-long list is a compile error, which is the intended behaviour:
         // it forces this line to be revisited whenever the bound moves.
         float intensity[MAX_PASSES] = { 0.84f, 0.84f };
+
+        // ---- P7.9: the tuning parameters, from the DLSS-NR programming guide ----
+        //
+        // Names and types are READ FROM THE GUIDE's parameter reference, not
+        // inferred: LocalToneStrength, LocalStructureStrength,
+        // SkinStructureStrength and Style are floats (Set overload slot 1);
+        // UseAutoMask is unsigned int 0/1 (slot 3). Choosing the wrong overload
+        // writes a value the snippet never reads back, silently - which is the
+        // same failure shape as the subrect keys.
+        //
+        // The guide describes LocalToneStrength as driving local contrast and
+        // reading as ambient-occlusion-like shading. Until now this add-on set
+        // exactly one quality parameter - Intensity - and left every one of
+        // these at whatever the feature defaults to, while the reference
+        // implementation this project measures against sets them all. That is a
+        // recorded, unmatchable difference between the two arms in RESULTS.md,
+        // and it is the first thing to reach for on a title whose output looks
+        // wrong at strength.
+        //
+        // DEFAULT OFF. tuning_on is false unless the ini or the panel turns it
+        // on, and while it is false NOTHING here is set - the evaluate path is
+        // byte-identical to every published measurement. A knob that changes a
+        // published number the moment it is compiled in is not a knob, it is a
+        // silent regression.
+        bool  tuning_on = false;
+        float tone_strength      = 1.0f;
+        float structure_strength = 1.0f;
+        float skin_strength      = 1.0f;
+        float style              = 0.0f;
+        bool  auto_mask          = false;
         bool intensity_set[MAX_PASSES] = {};   // was it named per pass in the ini?
         // P6.3: 0 = every pass, 1..MAX_PASSES = that pass alone. Bridge thread
         // only - the hotkey is delivered to the bridge thread's message queue
@@ -7018,6 +7048,26 @@ namespace
     //                             written.
     //   output changed but wrong in a NEW way -> the decode happened and the
     //                             missing encode is now visible. Also progress.
+    // P7.9. Tuning=1 enables the guide's quality parameters; absent or 0 leaves
+    // every one of them unset, which is what every published figure was measured
+    // under. Tone/Structure/Skin/Style are floats, AutoMask is 0/1.
+    float ini_read_float(const char *key, float dflt)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return dflt;
+        const char *k = ini_find(buf, key);
+        if (k == nullptr) return dflt;
+        return (float)atof(k);
+    }
+
+    bool ini_read_flag(const char *key)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, key);
+        return (k != nullptr) && (*k == '1');
+    }
+
     bool ini_read_srgb_input()
     {
         char buf[INI_BYTES];
@@ -7357,6 +7407,25 @@ namespace
         // still the game's, unconverted; only the way the hardware is told to
         // interpret them changes, and only for formats that have an sRGB
         // variant at all.
+        // P7.9: read once at arm; the panel drives them live afterwards.
+        s.tuning_on          = ini_read_flag("Tuning");
+        s.tone_strength      = ini_read_float("ToneStrength",      1.0f);
+        s.structure_strength = ini_read_float("StructureStrength", 1.0f);
+        s.skin_strength      = ini_read_float("SkinStrength",      1.0f);
+        s.style              = ini_read_float("Style",             0.0f);
+        s.auto_mask          = ini_read_flag("AutoMask");
+        if (s.tuning_on)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P7.9] TUNING ON - tone=%.2f structure=%.2f skin=%.2f style=%.2f "
+                     "automask=%u are set on every evaluate. Default is OFF and every published "
+                     "figure was measured with these UNSET, so a run with this line present is not "
+                     "comparable to one without it.",
+                     s.tone_strength, s.structure_strength, s.skin_strength, s.style,
+                     s.auto_mask ? 1u : 0u);
+            mgpu::diag::warn(line);
+        }
+
         const DXGI_FORMAT nrfmt = nr_linear_format(s.format);
 
         // P7.8b. tex_in only; the UAV textures have no choice. See
@@ -7905,6 +7974,13 @@ void ui_read(ui_state &out)
     static_assert(sizeof(ui_state::intensity) / sizeof(float) >= stream_state::MAX_PASSES,
                   "ui_state::intensity is smaller than MAX_PASSES - update gpu1_context.hpp");
 
+    out.tuning_on          = s.tuning_on;
+    out.tone_strength      = s.tone_strength;
+    out.structure_strength = s.structure_strength;
+    out.skin_strength      = s.skin_strength;
+    out.style              = s.style;
+    out.auto_mask          = s.auto_mask;
+
     out.passes      = s.passes;
     out.max_passes  = stream_state::MAX_PASSES;
     out.profile     = s.profile;
@@ -7998,6 +8074,39 @@ void ui_set_passes(unsigned n)
              "created at arm, so nothing is built or torn down here.",
              was, n, stream_state::MAX_PASSES);
     mgpu::diag::info(l);
+}
+
+// P7.9. Live, from the panel. Values are clamped only where the guide gives a
+// range; the strengths are not documented with one, so they are passed as typed
+// and the log records what was in force.
+void ui_set_tuning(bool on)
+{
+    std::lock_guard<std::mutex> g(stream_mtx());
+    stream_state &s = S();
+    s.tuning_on = on;
+    char l[300];
+    snprintf(l, sizeof l,
+             "[MGPU][P7.9] tuning %s - tone=%.2f structure=%.2f skin=%.2f style=%.2f automask=%u. "
+             "With this ON the run is a TUNING run and its figures are not comparable to the "
+             "published ones, which were all taken with these unset.",
+             on ? "ON" : "OFF", s.tone_strength, s.structure_strength, s.skin_strength,
+             s.style, s.auto_mask ? 1u : 0u);
+    mgpu::diag::info(l);
+}
+
+void ui_set_tuning_value(int which, float v)
+{
+    std::lock_guard<std::mutex> g(stream_mtx());
+    stream_state &s = S();
+    switch (which)
+    {
+    case 0: s.tone_strength      = v; break;
+    case 1: s.structure_strength = v; break;
+    case 2: s.skin_strength      = v; break;
+    case 3: s.style              = v; break;
+    case 4: s.auto_mask = (v != 0.0f); break;
+    default: return;
+    }
 }
 
 void ui_set_intensity(unsigned pass_1based, float v)
@@ -8830,6 +8939,17 @@ void stream_poll()
                     s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.height);
                     // P6.2: per pass, not one hardcoded value for all of them.
                     s.nr_params->Set("DLSSNR.Intensity", s.intensity[pi]);
+                    // P7.9. Only when explicitly enabled - see stream_state.
+                    // Set BEFORE the generic Set.<key> loop so an ini line still
+                    // overrides a slider, keeping the escape hatch on top.
+                    if (s.tuning_on)
+                    {
+                        s.nr_params->Set("DLSSNR.LocalToneStrength",      s.tone_strength);
+                        s.nr_params->Set("DLSSNR.LocalStructureStrength", s.structure_strength);
+                        s.nr_params->Set("DLSSNR.SkinStructureStrength",  s.skin_strength);
+                        s.nr_params->Set("DLSSNR.Style",                  s.style);
+                        s.nr_params->Set("DLSSNR.UseAutoMask", s.auto_mask ? 1u : 0u);
+                    }
                     // P6.2: whatever the ini named, verbatim, before every
                     // evaluate. Applied AFTER Intensity so a Set.DLSSNR.Intensity
                     // line deliberately wins - that is the escape hatch if the
