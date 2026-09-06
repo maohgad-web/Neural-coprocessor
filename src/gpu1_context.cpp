@@ -6991,6 +6991,41 @@ namespace
         return (k != nullptr) && (*k == '1');
     }
 
+    // P7.8b: EXPERIMENT, not a setting. Default 0 = the shipped behaviour.
+    //
+    // Cyberpunk 2077 (_SRGB backbuffer) returns a washed frame from the model
+    // while the frame handed TO it is correct - established by same-frame split,
+    // so transport and presentation are both exonerated and the model is doing
+    // colour maths on gamma-encoded values.
+    //
+    // The free fix, IF it works, is to let the hardware linearise on read: an
+    // SRV typed _SRGB decodes during the texture fetch at no ALU cost. That only
+    // helps if NGX builds its SRV from the resource's own format rather than
+    // overriding it, and NOTHING ESTABLISHES THAT. This key exists to find out
+    // in one launch instead of one build.
+    //
+    // SrgbInput=1 creates tex_in (and its copy footprint) in the game's actual
+    // format, which on such a title is _SRGB. tex_out and tex_pong stay UNORM
+    // regardless - they are UAVs and D3D12 does not permit typed UAVs on _SRGB.
+    //
+    // Reading the result: run Present=split on an _SRGB title.
+    //   both halves match      -> NGX honours the format, the decode is free,
+    //                             and the remaining work is the encode on the
+    //                             way out (an _SRGB RTV blit, also free).
+    //   output still washed    -> NGX overrides the view format; the free path
+    //                             does not exist and a real conversion pass is
+    //                             required. That is worth knowing before one is
+    //                             written.
+    //   output changed but wrong in a NEW way -> the decode happened and the
+    //                             missing encode is now visible. Also progress.
+    bool ini_read_srgb_input()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, "SrgbInput");
+        return (k != nullptr) && (*k == '1');
+    }
+
     // P5.3: Present=in | nr. Default nr - the output, which is what every run
     // so far has shown.
     // P7.4: nr | in | split. 's' is unambiguous against the other two.
@@ -7323,6 +7358,25 @@ namespace
         // interpret them changes, and only for formats that have an sRGB
         // variant at all.
         const DXGI_FORMAT nrfmt = nr_linear_format(s.format);
+
+        // P7.8b. tex_in only; the UAV textures have no choice. See
+        // ini_read_srgb_input for what each outcome means.
+        const bool srgb_in = ini_read_srgb_input();
+        const DXGI_FORMAT infmt = srgb_in ? s.format : nrfmt;
+        if (srgb_in)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P7.8b] EXPERIMENT: SrgbInput=1. tex_in is created DXGI %d (the game's "
+                     "own format) instead of %d, so that if NGX builds its SRV from the resource "
+                     "format the hardware linearises on read at no cost. tex_out/tex_pong stay %d - "
+                     "they are UAVs and D3D12 has no typed UAV on _SRGB. Compare both halves in "
+                     "Present=split: matching halves mean the free decode works and only the encode "
+                     "on the way out is left; still washed means NGX overrides the view format and a "
+                     "real conversion pass is required. THIS IS NOT A SHIPPING SETTING.",
+                     (int)s.format, (int)nrfmt, (int)nrfmt);
+            mgpu::diag::warn(line);
+        }
+
         if (nrfmt != s.format)
         {
             snprintf(line, sizeof line,
@@ -7336,7 +7390,7 @@ namespace
             mgpu::diag::info(line);
         }
 
-        HRESULT h = make_tex(ndev, s.width, s.height, nrfmt,
+        HRESULT h = make_tex(ndev, s.width, s.height, infmt,
                              D3D12_RESOURCE_FLAG_NONE,
                              D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_in);
         if (SUCCEEDED(h))
@@ -7365,8 +7419,11 @@ namespace
         // mean.
         s.nr_fp.Offset = 0;
         // P7.8: the footprint describes the layout of the bytes in the shared
-        // heap for the copy INTO tex_in, so it must name tex_in's format.
-        s.nr_fp.Footprint.Format = nr_linear_format(s.format);
+        // heap for the copy INTO tex_in, so it must name tex_in's format - which
+        // P7.8b can change. Both formats are the same typeless family and the
+        // same bytes per pixel, so the copy itself is unaffected either way.
+        s.nr_fp.Footprint.Format = ini_read_srgb_input() ? s.format
+                                                         : nr_linear_format(s.format);
         s.nr_fp.Footprint.Width = 64;
         s.nr_fp.Footprint.Height = 4;
         s.nr_fp.Footprint.Depth = 1;
