@@ -194,6 +194,18 @@ does not. That is the architecture working, not a fault.
 Interacting with the bridge window takes keyboard focus away from the game. A
 controller sidesteps this entirely.
 
+EXTERNAL FPS OVERLAYS FLICKER, AND IT IS NOT YOUR SETUP. This add-on puts a
+second swapchain inside the game's process. RivaTuner / MSI Afterburner assume
+one swapchain per process and flip between the two present streams; the NVIDIA
+overlay does not recognise the bridge window at all. Use ReShade's own counter -
+there are two ReShade runtimes here, so each draws its own FPS for its own
+window, and the game's rate and the bridge's rate are different numbers by
+design. Set ShowFPS=1 under [OVERLAY] in ReShade.ini AND in ReShade2.ini.
+
+For screen recording, use a display capture or a Windows Graphics Capture window
+source rather than "game capture", which adds a third Present hook to a process
+that already has two.
+
 
 No warranty. See LICENSE. Not affiliated with, endorsed by, or supported by
 NVIDIA.
