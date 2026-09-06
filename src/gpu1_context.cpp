@@ -1193,6 +1193,47 @@ namespace
                                             state, nullptr, IID_PPV_ARGS(out));
     }
 
+
+    // P7.8: THE NEURAL TEXTURES MUST NOT BE _SRGB, AND THE PRESENT CHAIN MUST.
+    //
+    // Cyberpunk 2077 renders to DXGI 28, R8G8B8A8_UNORM_SRGB. The Blood of
+    // Dawnwalker renders to 24, R10G10B10A2_UNORM, which has no sRGB sibling -
+    // so until a second title was tested this path had never seen an _SRGB
+    // format at all, and the code below passed the game's format straight into
+    // every texture it creates.
+    //
+    // Two things are wrong with that, and only the first is certain:
+    //
+    //   1. tex_out and tex_pong are created ALLOW_UNORDERED_ACCESS. D3D12 does
+    //      not support typed UAVs on _SRGB formats. That is an invalid
+    //      combination whatever it appeared to do on this driver, and the debug
+    //      layer would have said so - see section 09 for why this project
+    //      cannot run it.
+    //   2. An _SRGB view linearises on read and encodes on write. Anywhere the
+    //      bytes are meant to pass through untouched, that is one conversion
+    //      too many, and one extra linearisation looks exactly like the washed
+    //      output observed on Cyberpunk with Present=in - which is BEFORE the
+    //      model, so the neural stage cannot be the cause.
+    //
+    // The fix is to carry the bytes as UNORM through the whole pipeline and let
+    // only the swapchain be _SRGB, because the game's own swapchain is _SRGB
+    // and the compositor treats both the same way. Copies between an _SRGB
+    // texture and its UNORM sibling are legal - they are the same typeless
+    // family - so nothing else has to change.
+    //
+    // Formats without an sRGB variant are returned unchanged, so the Dawnwalker
+    // path is byte-identical to what it was.
+    DXGI_FORMAT nr_linear_format(DXGI_FORMAT f)
+    {
+        switch (f)
+        {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
+        default:                              return f;
+        }
+    }
+
     // A buffer on an UPLOAD or READBACK heap. Buffers must be created in
     // GENERIC_READ (upload) or COPY_DEST (readback); anything else is a
     // debug-layer error.
@@ -6559,13 +6600,36 @@ namespace
         // Passes=1 is the default and is byte-identical to the P5 behaviour:
         // one handle, one evaluate, tex_out is the output. Nothing about the
         // shipped path changes unless the ini asks for it.
-        // P7.4: 6, up from 4. The demo climbs the pass count on camera and 4 was
-    // not enough steps to make the shape of the curve visible; 10 was
-    // considered and rejected because latency scales with passes and a bridge
-    // window crawling at 200 ms would read as a fault on video rather than as
-    // the honest cost it is. Arm time is ~150 ms per handle, so six is about a
-    // second of stall at arm and nothing after.
-    static const unsigned MAX_PASSES = 6;
+        // P7.7: 2, DOWN from 6, and this is a POWER decision rather than a
+    // performance one.
+    //
+    // Measured on the development rig at 1080p, with a ~16.7 ms frame period:
+    //
+    //   1 pass    8.3 ms of GPU 1 work per frame  ~50% duty   ~49 W
+    //   2 passes  17.5 ms - about the whole frame  ~100% duty  ~145 W
+    //   3 passes  26.0 ms - OVER the frame period  saturated   ~180 W = the cap
+    //
+    // Two passes fill the card. Three exceed the frame period, so the card
+    // clamps at its power limit and every further pass is served on throttled
+    // clocks - 3, 4, 5 and 6 all drew an identical ~180 W, which is the limiter
+    // and not a coincidence. Past two, a pass buys latency rather than picture.
+    //
+    // The reason it is enforced in code rather than documented is the failure
+    // mode at the other end of the range. This add-on ships with Frames=0, so a
+    // run is unbounded: it holds the second GPU at whatever load it reaches for
+    // as long as the game is open, in a window the user has very likely
+    // minimised. On a larger card at a higher resolution those watt figures
+    // scale with the hardware, not with the numbers above. Sustained maximum
+    // board power is the condition under which a marginally seated power
+    // connector fails, and "they can set it back down in the ini" is not a
+    // safety argument for a setting whose cost is invisible until something
+    // melts.
+    //
+    // The ghosting experiment that motivated six passes is NOT settled by any
+    // of this - it was never run, because no ghosting scene was ever captured.
+    // If it is run later, raise this constant in a local build. It does not
+    // ship raised.
+    static const unsigned MAX_PASSES = 2;
         unsigned passes = 1;
         NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
         ngx_pf_evaluate_feature nr_eval = nullptr;
@@ -6599,7 +6663,10 @@ namespace
         // absent, every pass uses Intensity. A strong first pass with gentle
         // later ones is the configuration that observation suggests, and it
         // could not be expressed before.
-        float intensity[MAX_PASSES] = { 0.84f, 0.84f, 0.84f, 0.84f, 0.84f, 0.84f };
+        // One initialiser per pass. This list is sized by MAX_PASSES and an
+        // over-long list is a compile error, which is the intended behaviour:
+        // it forces this line to be revisited whenever the bound moves.
+        float intensity[MAX_PASSES] = { 0.84f, 0.84f };
         bool intensity_set[MAX_PASSES] = {};   // was it named per pass in the ini?
         // P6.3: 0 = every pass, 1..MAX_PASSES = that pass alone. Bridge thread
         // only - the hotkey is delivered to the bridge thread's message queue
@@ -6954,6 +7021,12 @@ namespace
     // SAID, not silently accepted: a run that quietly did one pass when the ini
     // asked for eight would produce a perfectly clean summary describing the
     // wrong experiment.
+    //
+    // P7.7 makes the saying real. The clamp existed and this comment claimed it
+    // spoke, but nothing printed the value that was asked for - so a file
+    // reading Passes=6 produced a run identical in every log line to one reading
+    // Passes=2, and the only way to know which you had was to open the ini. Now
+    // the requested value is named, with the reason for the bound.
     unsigned ini_read_passes()
     {
         char buf[INI_BYTES];
@@ -6961,8 +7034,32 @@ namespace
         const char *k = ini_find(buf, "Passes");
         if (k == nullptr) return 1u;
         const long long v = atoll(k);
-        if (v < 1) return 1u;
-        if (v > (long long)stream_state::MAX_PASSES) return stream_state::MAX_PASSES;
+        if (v < 1)
+        {
+            if (v != 0)
+            {
+                char l[220];
+                snprintf(l, sizeof l,
+                         "[MGPU][P7.7] mgpu.ini asked for Passes=%lld - RAISED to 1. "
+                         "The minimum is one pass.", v);
+                mgpu::diag::warn(l);
+            }
+            return 1u;
+        }
+        if (v > (long long)stream_state::MAX_PASSES)
+        {
+            char l[420];
+            snprintf(l, sizeof l,
+                     "[MGPU][P7.7] mgpu.ini asked for Passes=%lld - CLAMPED to %u, the build "
+                     "maximum. Three or more passes exceed the frame period on the hardware "
+                     "this was measured on, so the second GPU clamps at its power limit and "
+                     "each further pass is served on throttled clocks - it buys latency, not "
+                     "picture. The bound is a power decision and is enforced here, not in the "
+                     "settings file.",
+                     v, stream_state::MAX_PASSES);
+            mgpu::diag::warn(l);
+            return stream_state::MAX_PASSES;
+        }
         return (unsigned)v;
     }
 
@@ -7220,11 +7317,30 @@ namespace
         // NATIVE FORMAT, no conversion. P3.1 established DLSS-NR consumes the
         // game's R10G10B10A2 buffer as rendered, so the stream hands it over
         // untouched and no per-frame conversion pass exists in this pipeline.
-        HRESULT h = make_tex(ndev, s.width, s.height, s.format,
+        //
+        // P7.8: native, but never _SRGB - see nr_linear_format. The bytes are
+        // still the game's, unconverted; only the way the hardware is told to
+        // interpret them changes, and only for formats that have an sRGB
+        // variant at all.
+        const DXGI_FORMAT nrfmt = nr_linear_format(s.format);
+        if (nrfmt != s.format)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P7.8] this game renders to an _SRGB backbuffer (DXGI %d). The neural "
+                     "textures are created as DXGI %d - the same bytes, without the hardware sRGB "
+                     "conversion on every read and write. The present chain stays at %d, matching "
+                     "the game's own swapchain, so the compositor treats both identically. Without "
+                     "this the output is washed by one extra linearisation, and tex_out would be a "
+                     "typed UAV on an _SRGB format, which D3D12 does not support.",
+                     (int)s.format, (int)nrfmt, (int)s.format);
+            mgpu::diag::info(line);
+        }
+
+        HRESULT h = make_tex(ndev, s.width, s.height, nrfmt,
                              D3D12_RESOURCE_FLAG_NONE,
                              D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_in);
         if (SUCCEEDED(h))
-            h = make_tex(ndev, s.width, s.height, s.format,
+            h = make_tex(ndev, s.width, s.height, nrfmt,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_out);
         // P6.4: always created now. The pass count is changeable at runtime, so
@@ -7232,7 +7348,7 @@ namespace
         // lazily would mean a CreateFeature-sized stall the first time someone
         // moved the slider.
         if (SUCCEEDED(h))
-            h = make_tex(ndev, s.width, s.height, s.format,
+            h = make_tex(ndev, s.width, s.height, nrfmt,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_pong);
         if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
@@ -7248,7 +7364,9 @@ namespace
         // summary text for exactly what a high identical-rate does and does not
         // mean.
         s.nr_fp.Offset = 0;
-        s.nr_fp.Footprint.Format = s.format;
+        // P7.8: the footprint describes the layout of the bytes in the shared
+        // heap for the copy INTO tex_in, so it must name tex_in's format.
+        s.nr_fp.Footprint.Format = nr_linear_format(s.format);
         s.nr_fp.Footprint.Width = 64;
         s.nr_fp.Footprint.Height = 4;
         s.nr_fp.Footprint.Depth = 1;
@@ -7722,6 +7840,14 @@ void ui_read(ui_state &out)
     out.summarised  = s.summarised;
     out.neural      = s.neural;
     out.nr_ok       = s.nr_ok;
+    // The header cannot see MAX_PASSES (it is private to this file), so
+    // ui_state::intensity carries a second copy of the bound. A duplicated
+    // constant that only one side updates is how the hardcoded R10G10B10A2 in
+    // ResizeBuffers survived a format change; this makes the drift a compile
+    // error instead of a truncated copy at runtime.
+    static_assert(sizeof(ui_state::intensity) / sizeof(float) >= stream_state::MAX_PASSES,
+                  "ui_state::intensity is smaller than MAX_PASSES - update gpu1_context.hpp");
+
     out.passes      = s.passes;
     out.max_passes  = stream_state::MAX_PASSES;
     out.profile     = s.profile;
