@@ -8114,6 +8114,11 @@ void ui_set_tuning_value(int which, float v)
     case 4: s.auto_mask = (v != 0.0f); break;
     default: return;
     }
+    // First touch enables the group. The panel shows these controls whether or
+    // not tuning is on, because they are the first thing to reach for when the
+    // image looks wrong - but nothing is SET until someone moves one, so a run
+    // nobody touched is still identical to every published measurement.
+    s.tuning_on = true;
     ++s.intensity_edits;
 }
 

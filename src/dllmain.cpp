@@ -282,37 +282,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ImGui::RadioButton(lab, &passes, (int)i))
             mgpu::gpu1::ui_set_passes(i);
     }
-    // Formatted with snprintf and handed over finished. ImGui's Text family is
-    // varargs, and this add-on cannot test-compile against the ImGui the repo
-    // will actually use - a finished string cannot be mis-forwarded.
-    char note[160];
-    snprintf(note, sizeof note,
-             "All %u handles were created at arm, so this costs nothing to change.",
-             st.max_passes);
-    ImGui::TextUnformatted(note);
-
-    // P7.7: THE POWER WARNING LIVES HERE, not only in mgpu.ini.
-    //
-    // This control is the reason the ini exists to be ignored: it is live, it
-    // needs no relaunch and no file editing, so the person who changes the pass
-    // count is precisely the person who never reads the settings file. A warning
-    // that only appears in a file nobody opens is not a warning.
-    //
-    // Always drawn, never a hover tooltip - someone clicking straight from x1 to
-    // x2 never hovers anything.
+    // ONE line, and it goes red when the setting it warns about is active.
+    // The panel used to carry six lines of explanation here; a warning nobody
+    // finishes reading is not a warning. The full reasoning is in mgpu.ini.
     if (passes >= 2)
-        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.30f, 1.0f),
-                           "x2 puts the SECOND GPU under sustained heavy load.");
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                           "x2 costs the game nothing but pushes the second GPU to its "
+                           "power limit. Use at your own discretion - x1 recommended.");
     else
-        ImGui::TextDisabled("x1 leaves the second GPU roughly half idle - the lowest load.");
-    ImGui::TextDisabled("Measured at 1080p on the development rig: x1 ~49 W, x2 ~145 W.");
-    ImGui::TextDisabled("Your card and resolution scale those numbers - they are not yours.");
-    ImGui::TextDisabled("With Frames=0 the load lasts as long as the game is open, in a");
-    ImGui::TextDisabled("window you may have minimised. Do not leave it unattended, and");
-    ImGui::TextDisabled("check a high-power card's connector is fully seated first.");
-    ImGui::TextDisabled("The maximum is 2 and is enforced in code: three or more exceed the");
-    ImGui::TextDisabled("frame period, so the card clamps at its power limit and further");
-    ImGui::TextDisabled("passes buy latency rather than picture.");
+        ImGui::TextDisabled("x1 leaves the second GPU about half idle.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("View");
@@ -332,57 +310,43 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("panel - hold SHIFT for a coarse step. Use those on camera.");
 
     ImGui::Separator();
-    bool tune = st.tuning_on;
-    if (ImGui::Checkbox("Tuning parameters", &tune))
-        mgpu::gpu1::ui_set_tuning(tune);
-    ImGui::TextDisabled("OFF by default, and every published figure was measured");
-    ImGui::TextDisabled("with these UNSET. Switching this on makes the run a tuning");
-    ImGui::TextDisabled("run - the log says so, and its numbers are not comparable.");
-
-    if (st.tuning_on)
+    ImGui::TextUnformatted("Model tuning");
+    if (!st.tuning_on)
+        ImGui::TextDisabled("Not applied - move any control below to enable.");
+    else
     {
-        // Names and types from the DLSS-NR programming guide's parameter
-        // reference. LocalToneStrength is the one to move first on an image
-        // that looks blown out or washed at strength - the guide describes it
-        // as driving local contrast, reading as ambient-occlusion-like shading.
-        float tone = st.tone_strength;
-        if (ImGui::SliderFloat("tone strength", &tone, 0.0f, 2.0f, "%.3f"))
-            mgpu::gpu1::ui_set_tuning_value(0, tone);
-        float structure = st.structure_strength;
-        if (ImGui::SliderFloat("structure strength", &structure, 0.0f, 2.0f, "%.3f"))
-            mgpu::gpu1::ui_set_tuning_value(1, structure);
-        float skin = st.skin_strength;
-        if (ImGui::SliderFloat("skin structure", &skin, 0.0f, 2.0f, "%.3f"))
-            mgpu::gpu1::ui_set_tuning_value(2, skin);
-        // DLSSNR.Style is a float in the guide but appears to be a small
-        // enumeration: the reference implementation records Style=2 for what its
-        // own panel calls "Model C", so A/B/C reads as 0/1/2. A continuous
-        // slider would make that hard to hit exactly and hard to report, so it
-        // is a three-way here - and it stays a float on the wire, because the
-        // guide says slot 1 and the wrong overload fails silently.
-        //
-        // NOT the preset. DLSSNR.Hint.Render.Preset is a separate parameter with
-        // its own per-feature table, and this DLL build enumerates exactly one
-        // config, so there is nothing to select there.
-        int style_i = (int)(st.style + 0.5f);
-        ImGui::TextUnformatted("Style");
-        if (ImGui::RadioButton("A", &style_i, 0)) mgpu::gpu1::ui_set_tuning_value(3, 0.0f);
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Applied - this is a tuning run.");
         ImGui::SameLine();
-        if (ImGui::RadioButton("B", &style_i, 1)) mgpu::gpu1::ui_set_tuning_value(3, 1.0f);
-        ImGui::SameLine();
-        if (ImGui::RadioButton("C", &style_i, 2)) mgpu::gpu1::ui_set_tuning_value(3, 2.0f);
-        ImGui::TextDisabled("The reference arm this project measures against runs");
-        ImGui::TextDisabled("Style 2 (its panel calls that Model C). This arm has");
-        ImGui::TextDisabled("never set Style at all - another unmatched parameter.");
-        bool mask = st.auto_mask;
-        if (ImGui::Checkbox("auto mask", &mask))
-            mgpu::gpu1::ui_set_tuning_value(4, mask ? 1.0f : 0.0f);
-        ImGui::TextDisabled("tone/structure/skin/style are floats; auto mask is a");
-        ImGui::TextDisabled("0/1 uint - a different Set overload, and the wrong one");
-        ImGui::TextDisabled("writes a value the snippet never reads, silently.");
-        ImGui::TextDisabled("The reference implementation runs roughly 1.14 tone,");
-        ImGui::TextDisabled("1.09 structure, 1.03 skin, auto mask on, intensity 0.84.");
+        if (ImGui::SmallButton("reset")) mgpu::gpu1::ui_set_tuning(false);
     }
+
+    // Visible by default rather than behind a checkbox: these are the controls
+    // the reference implementation sets and this one did not, so they are the
+    // first thing to reach for when the image looks wrong. Touching any of them
+    // enables the whole group - see ui_set_tuning_value.
+    int style_i = (int)(st.style + 0.5f);
+    ImGui::TextUnformatted("Style");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("A", &style_i, 0)) mgpu::gpu1::ui_set_tuning_value(3, 0.0f);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("B", &style_i, 1)) mgpu::gpu1::ui_set_tuning_value(3, 1.0f);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("C", &style_i, 2)) mgpu::gpu1::ui_set_tuning_value(3, 2.0f);
+
+    float tone = st.tone_strength;
+    if (ImGui::SliderFloat("tone", &tone, 0.0f, 2.0f, "%.2f"))
+        mgpu::gpu1::ui_set_tuning_value(0, tone);
+    float structure = st.structure_strength;
+    if (ImGui::SliderFloat("structure", &structure, 0.0f, 2.0f, "%.2f"))
+        mgpu::gpu1::ui_set_tuning_value(1, structure);
+    float skin = st.skin_strength;
+    if (ImGui::SliderFloat("skin", &skin, 0.0f, 2.0f, "%.2f"))
+        mgpu::gpu1::ui_set_tuning_value(2, skin);
+    bool mask = st.auto_mask;
+    if (ImGui::Checkbox("auto mask", &mask))
+        mgpu::gpu1::ui_set_tuning_value(4, mask ? 1.0f : 0.0f);
+    ImGui::TextDisabled("Reference values: style C, tone 1.14, structure 1.09,");
+    ImGui::TextDisabled("skin 1.03, auto mask on, intensity 0.84.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Intensity shape");
