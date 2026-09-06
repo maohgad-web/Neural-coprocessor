@@ -259,8 +259,18 @@ struct ui_state
     int preset = 0;
     // P7.5: split seam position, 0.0 (all output) .. 1.0 (all input).
     float split_pos = 0.5f;
-    unsigned passes = 1, max_passes = 6;
-    float intensity[6] = {};
+    // P7.7: 2, down from 6. gpu1_context.cpp owns the real bound (MAX_PASSES)
+    // and the reasoning; this is the copy the panel reads. A static_assert in
+    // ui_read() fails the build if the two ever disagree, because this header
+    // cannot see the constant and a silently smaller array would truncate the
+    // copy rather than error.
+    unsigned passes = 1, max_passes = 2;
+    float intensity[2] = {};
+    // P7.9: the guide's tuning parameters. tuning_on false = none of them are
+    // set, which is what every published measurement ran under.
+    bool  tuning_on = false, auto_mask = false;
+    float tone_strength = 1.0f, structure_strength = 1.0f, skin_strength = 1.0f,
+          style = 0.0f;
     unsigned long long consumed = 0, produced = 0, dropped = 0, overrun = 0, skipped = 0;
 };
 void ui_read(ui_state &out);
@@ -272,6 +282,28 @@ void ui_set_passes(unsigned n);
 
 // pass_1based == 0 sets every pass; otherwise that one. Clamped 0.0..2.0.
 void ui_set_intensity(unsigned pass_1based, float v);
+
+// P7.9. The DLSS-NR tuning parameters, names and types taken from the feature's
+// programming guide rather than guessed:
+//
+//   DLSSNR.LocalToneStrength       float  - local contrast, reads as AO-like shading
+//   DLSSNR.LocalStructureStrength  float  - detail synthesis
+//   DLSSNR.SkinStructureStrength   float
+//   DLSSNR.Style                   float
+//   DLSSNR.UseAutoMask             uint   - 0/1, a different Set overload
+//
+// Until P7.9 this add-on set only DLSSNR.Intensity and left all of these at the
+// feature's defaults, while the reference implementation measured against in
+// RESULTS.md sets them. That is a recorded unmatchable difference between the
+// two arms and the first thing to reach for when output looks wrong at strength.
+//
+// DEFAULT OFF, and that matters: with tuning_on false nothing here is set and
+// the evaluate path is identical to every published run. Turning it on makes the
+// run a tuning run, and the log says so.
+void ui_set_tuning(bool on);
+
+// which: 0 tone, 1 structure, 2 skin, 3 style, 4 auto-mask (0.0/1.0).
+void ui_set_tuning_value(int which, float v);
 
 // Turn the neural stage off without tearing it down - the handles stay alive so
 // it can come back without a 400 ms CreateFeature stall.

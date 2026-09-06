@@ -291,6 +291,29 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
              st.max_passes);
     ImGui::TextUnformatted(note);
 
+    // P7.7: THE POWER WARNING LIVES HERE, not only in mgpu.ini.
+    //
+    // This control is the reason the ini exists to be ignored: it is live, it
+    // needs no relaunch and no file editing, so the person who changes the pass
+    // count is precisely the person who never reads the settings file. A warning
+    // that only appears in a file nobody opens is not a warning.
+    //
+    // Always drawn, never a hover tooltip - someone clicking straight from x1 to
+    // x2 never hovers anything.
+    if (passes >= 2)
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.30f, 1.0f),
+                           "x2 puts the SECOND GPU under sustained heavy load.");
+    else
+        ImGui::TextDisabled("x1 leaves the second GPU roughly half idle - the lowest load.");
+    ImGui::TextDisabled("Measured at 1080p on the development rig: x1 ~49 W, x2 ~145 W.");
+    ImGui::TextDisabled("Your card and resolution scale those numbers - they are not yours.");
+    ImGui::TextDisabled("With Frames=0 the load lasts as long as the game is open, in a");
+    ImGui::TextDisabled("window you may have minimised. Do not leave it unattended, and");
+    ImGui::TextDisabled("check a high-power card's connector is fully seated first.");
+    ImGui::TextDisabled("The maximum is 2 and is enforced in code: three or more exceed the");
+    ImGui::TextDisabled("frame period, so the card clamps at its power limit and further");
+    ImGui::TextDisabled("passes buy latency rather than picture.");
+
     ImGui::Separator();
     ImGui::TextUnformatted("View");
     int pm = st.present_mode;
@@ -309,6 +332,59 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("panel - hold SHIFT for a coarse step. Use those on camera.");
 
     ImGui::Separator();
+    bool tune = st.tuning_on;
+    if (ImGui::Checkbox("Tuning parameters", &tune))
+        mgpu::gpu1::ui_set_tuning(tune);
+    ImGui::TextDisabled("OFF by default, and every published figure was measured");
+    ImGui::TextDisabled("with these UNSET. Switching this on makes the run a tuning");
+    ImGui::TextDisabled("run - the log says so, and its numbers are not comparable.");
+
+    if (st.tuning_on)
+    {
+        // Names and types from the DLSS-NR programming guide's parameter
+        // reference. LocalToneStrength is the one to move first on an image
+        // that looks blown out or washed at strength - the guide describes it
+        // as driving local contrast, reading as ambient-occlusion-like shading.
+        float tone = st.tone_strength;
+        if (ImGui::SliderFloat("tone strength", &tone, 0.0f, 2.0f, "%.3f"))
+            mgpu::gpu1::ui_set_tuning_value(0, tone);
+        float structure = st.structure_strength;
+        if (ImGui::SliderFloat("structure strength", &structure, 0.0f, 2.0f, "%.3f"))
+            mgpu::gpu1::ui_set_tuning_value(1, structure);
+        float skin = st.skin_strength;
+        if (ImGui::SliderFloat("skin structure", &skin, 0.0f, 2.0f, "%.3f"))
+            mgpu::gpu1::ui_set_tuning_value(2, skin);
+        // DLSSNR.Style is a float in the guide but appears to be a small
+        // enumeration: the reference implementation records Style=2 for what its
+        // own panel calls "Model C", so A/B/C reads as 0/1/2. A continuous
+        // slider would make that hard to hit exactly and hard to report, so it
+        // is a three-way here - and it stays a float on the wire, because the
+        // guide says slot 1 and the wrong overload fails silently.
+        //
+        // NOT the preset. DLSSNR.Hint.Render.Preset is a separate parameter with
+        // its own per-feature table, and this DLL build enumerates exactly one
+        // config, so there is nothing to select there.
+        int style_i = (int)(st.style + 0.5f);
+        ImGui::TextUnformatted("Style");
+        if (ImGui::RadioButton("A", &style_i, 0)) mgpu::gpu1::ui_set_tuning_value(3, 0.0f);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("B", &style_i, 1)) mgpu::gpu1::ui_set_tuning_value(3, 1.0f);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("C", &style_i, 2)) mgpu::gpu1::ui_set_tuning_value(3, 2.0f);
+        ImGui::TextDisabled("The reference arm this project measures against runs");
+        ImGui::TextDisabled("Style 2 (its panel calls that Model C). This arm has");
+        ImGui::TextDisabled("never set Style at all - another unmatched parameter.");
+        bool mask = st.auto_mask;
+        if (ImGui::Checkbox("auto mask", &mask))
+            mgpu::gpu1::ui_set_tuning_value(4, mask ? 1.0f : 0.0f);
+        ImGui::TextDisabled("tone/structure/skin/style are floats; auto mask is a");
+        ImGui::TextDisabled("0/1 uint - a different Set overload, and the wrong one");
+        ImGui::TextDisabled("writes a value the snippet never reads, silently.");
+        ImGui::TextDisabled("The reference implementation runs roughly 1.14 tone,");
+        ImGui::TextDisabled("1.09 structure, 1.03 skin, auto mask on, intensity 0.84.");
+    }
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Intensity shape");
     int pr = st.preset;
     if (ImGui::RadioButton("manual", &pr, 0))      mgpu::gpu1::ui_set_preset(0);
@@ -316,10 +392,10 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     if (ImGui::RadioButton("front-loaded", &pr, 1)) mgpu::gpu1::ui_set_preset(1);
     ImGui::SameLine();
     if (ImGui::RadioButton("back-loaded", &pr, 2))  mgpu::gpu1::ui_set_preset(2);
-    ImGui::TextDisabled("front = pass 1 at 2.00, the rest at 0.10.");
-    ImGui::TextDisabled("back  = the LAST pass at 2.00, the rest at 0.10.");
-    ImGui::TextDisabled("The peak FOLLOWS the pass count, so front and back stay");
-    ImGui::TextDisabled("comparable while the count changes. Moving a slider = manual.");
+    ImGui::TextDisabled("front = pass 1 at 2.00, the other at 0.10.");
+    ImGui::TextDisabled("back  = the LAST active pass at 2.00, the other at 0.10.");
+    ImGui::TextDisabled("At x1 all three are identical - there is only one pass to shape.");
+    ImGui::TextDisabled("Moving a slider by hand returns this to manual.");
 
     ImGui::Separator();
     ImGui::TextUnformatted("Intensity (0.00 - 2.00)");
