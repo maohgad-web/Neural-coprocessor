@@ -191,9 +191,14 @@ ReShade then writes a second image alongside the clean one.
 KNOWN LIMITATIONS
 -----------------
 
-Sustained-session stability is untested - see "RUNNING WITHOUT A FRAME BOUND"
-above, which is where that warning belongs because Frames=0 is what makes it
-reachable.
+THE ONE BAD FAILURE THIS PROJECT SAW IS EXPLAINED, AND IT WAS THE PASS COUNT.
+One development session ended with the game rendering black on both displays
+after several minutes, with no fault in any log. It was a SIX-pass run held for
+several minutes, which holds the second GPU at its power limit indefinitely.
+This build allows at most two passes and the bound is enforced in code, so that
+condition is no longer reachable from the settings file. Stability at one and
+two passes is still only tested in sessions of minutes, not hours - watch GPU
+load and temperature, especially with Frames=0.
 
 The bridge window's own frame rate falls as the pass count rises. The game's
 does not. That is the architecture working, not a fault.
