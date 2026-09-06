@@ -5,10 +5,18 @@ renders.** Not SLI — nothing is split mid-frame. Neural rendering is a *termin
 stage: it takes a finished frame and returns a finished frame, so it can be
 picked up and executed somewhere else entirely.
 
-The add-on that does it is called **MGPU Bridge**, and every log line it writes
-is prefixed `[MGPU]`.
+**This is a ReShade add-on.** It is called **MGPU Bridge**, it is a `.addon64`
+file that ReShade loads into a D3D12 game, and every log line it writes is
+prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a
+replacement for anything — it needs an **add-on-enabled** ReShade build to load
+at all. There is no game modification of any kind: the add-on reads each
+finished frame and does its work elsewhere.
 
 This is research code with published measurements. It is not a product.
+
+**See it running:** [The Blood of Dawnwalker, 1920 × 1080](https://youtu.be/yoEsuZyltFc)
+— the game on one card, the neural output in its own window on the other, both
+live in a single take.
 
 | | |
 |---|---|
@@ -55,9 +63,13 @@ it off restores it.**
 The render GPU also runs 21 °C cooler, because the load sits across two coolers
 instead of stacked on one.
 
-All of it measured on the worst plausible configuration for the idea: the second
-GPU is on a **chipset-fed PCIe 3.0 x2 slot**. That is the point rather than a
-caveat — the architecture wins where it should struggle most.
+All of it measured on the worst plausible configuration for the idea. The game
+renders on a card in a **chipset-fed PCIe 3.0 x2 slot**, and the second GPU sits
+on the CPU-fed slot — so every frame leaves the render card over that x2 chipset
+link on its way to the neural stage. It is the narrowest path in the machine and
+the whole payload crosses it. That is the point rather than a caveat — the
+architecture wins where it should struggle most. Slot topology, verified against
+the board specification, is in [RESULTS.md](RESULTS.md) §3.
 
 ### What this needs
 
@@ -93,7 +105,8 @@ your own machine rather than taking from this table.
 
 ## What it actually does
 
-The bridge is a ReShade add-on. On a D3D12 game it:
+MGPU Bridge is a ReShade add-on — a `.addon64` that ReShade loads into the game
+process. On a D3D12 game it:
 
 1. identifies the adapter the game renders on, from the swapchain
 2. creates its own D3D12 device on a *different* adapter
@@ -177,6 +190,27 @@ across two captures is confounded by everything that changed in between. The
 seam moves on hotkeys precisely so it can be dragged across a face with nothing
 on screen but the game.
 
+The panel in the overlay carries the same controls plus the model's own tuning
+parameters — **Style A/B/C, tone, structure, skin, auto mask**. Those are off
+until you touch one; the defaults are the feature's own, which is what every
+figure above was measured under. Touching any of them marks the run as a tuning
+run in the log.
+
+**If the picture looks washed out or flat, take `tone` down.** On the machine
+this was built on, `0.00` fixed it. That is one rig and one pair of titles, so
+treat it as the first thing to try rather than the setting you should be on.
+
+Two settings in `mgpu.ini` are worth knowing before the first launch:
+
+| | |
+|---|---|
+| `Monitor=auto` | which of the **second card's own** outputs the window opens on |
+| `AutoArm=0` | `1` arms the stream by itself once the game has settled |
+
+`AutoArm` is off by default because every published measurement was armed by
+hand, in gameplay, at a moment that was chosen. Turn it on if you just want to
+see the thing work without learning a hotkey.
+
 ---
 
 ## Limitations
@@ -202,23 +236,31 @@ not.** That is the architecture working, not a fault.
 **Interacting with the bridge window takes keyboard focus from the game.** A
 controller sidesteps it entirely.
 
-**The bridge window opens on the game's display and has to be moved once per
-launch.** Known defect, not a configuration mistake. The window is created before
-the sizing code runs, and that code fits the window to *the monitor it is already
-on* — so it sizes correctly to the wrong display. Drag it to the second monitor;
-`Window=fit` then does the right thing. The proper fix is to derive the target
-monitor from the bridge adapter's own DXGI output rather than from the window's
-current position, which is also the placement that keeps scan-out on the card
-that did the neural work.
+**Do not change resolution, DLSS mode or graphics presets while the stream is
+armed.** The stream is armed once, against the game's swapchain exactly as it
+stands at that instant — source size, format and row pitch are all fixed then.
+Anything that makes the game rebuild its swapchain leaves the bridge consuming
+against an arrangement that no longer exists. On the development machine that
+produced a session-long run of dropped and reordered frames beginning one second
+after the change, and the session could freeze. Set the game up first, then arm;
+to change something afterwards, disarm, change it, and arm again. The seal
+reports it when it happens, so the log will say plainly whether this is what you
+hit.
 
-**A washed neural output on Cyberpunk 2077, cause NOT established.** The frame
-handed to the model is correct and the frame it returns is washed — established
-by same-frame split, so transport and presentation are both exonerated. The only
-recorded difference between the two titles is **bit depth**: Dawnwalker renders
-`fmt=24` `R10G10B10A2_UNORM` (10 bits per channel), Cyberpunk `fmt=28`
-`R8G8B8A8_UNORM` (8 bits). **Both are plain UNORM — there is no sRGB involved,
-and an earlier diagnosis that said there was is retracted.** Not fixed, not
-explained, and no mechanism is asserted.
+**Frame generation is untested.** It was enabled once and that session ended
+badly, but on a machine that was also failing on ordinary settings changes — so
+nothing is established either way. It is not recommended and it has not been
+characterised.
+
+**Colour handling is not implemented, and on one of the two titles tested the
+output comes back washed.** The frame handed to the model is correct and the
+frame it returns is washed, established by same-frame split, so transport and
+presentation are both exonerated. The cause is not established. **Taking `tone`
+down in the panel fixed it on the development rig — `0.00` there — and yours may
+differ.** The only recorded difference between the two titles is bit depth, 8
+versus 10 bits per channel; both formats are plain UNORM, there is no sRGB
+anywhere in this pipeline, and an earlier diagnosis that said there was is
+retracted.
 
 **External overlays that hook `Present` misbehave, and the reason is
 structural.** This add-on creates a second swapchain inside the game's process,
