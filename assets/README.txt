@@ -31,7 +31,14 @@ WHAT YOU NEED FIRST
 2. A second NVIDIA GPU in the machine, with a current driver. DLSS-NR comes
    from your driver installation.
 
-3. A DirectX 12 game. D3D11 titles do nothing - no game adapter is identified,
+3. TWO MONITORS - ONE ON EACH CARD. This is a requirement, not a nicety. The
+   neural output is displayed by the card that produced it, so nothing has to
+   travel back across the link. With both monitors on the render card, the same
+   build measured 33% lower throughput and roughly double the latency on the
+   development machine. A headless second card works and is slower, and there is
+   nothing to look at.
+
+4. A DirectX 12 game. D3D11 titles do nothing - no game adapter is identified,
    so the bridge stands down and says so in the log. Some Unity titles can be
    forced with -force-d3d12.
 
@@ -193,6 +200,12 @@ does not. That is the architecture working, not a fault.
 
 Interacting with the bridge window takes keyboard focus away from the game. A
 controller sidesteps this entirely.
+
+THE BRIDGE WINDOW OPENS ON THE GAME'S DISPLAY. You have to drag it to the second
+monitor once per launch. This is a known defect, not something you configured
+wrong: the window is created before the sizing code runs, and that code fits the
+window to whichever monitor it is already on - so it sizes correctly to the wrong
+display. Move it and Window=fit behaves as documented.
 
 EXTERNAL FPS OVERLAYS FLICKER, AND IT IS NOT YOUR SETUP. This add-on puts a
 second swapchain inside the game's process. RivaTuner / MSI Afterburner assume
