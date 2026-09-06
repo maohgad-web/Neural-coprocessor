@@ -106,27 +106,65 @@ both cards on CPU lanes at PCIe 5.0 x8 shows what the same code does when the
 link is not the constraint. Slot topology, verified against the board
 specifications, is in [RESULTS.md](RESULTS.md) §3.
 
-### What this needs
-
-**GeForce RTX 50-series cards.** DLSS Neural Rendering is documented by NVIDIA
-as a 50-series feature; it is not available on 40-series or older hardware, and
-nothing this add-on does changes that it drives the NGX libraries in your own
-driver installation and cannot enable a feature the driver will not run. Every
-figure here was taken on two RTX 5060 Ti 16 GB. **The add-on does not check your
-hardware**, so on an older card expect it to load, log, and produce nothing.
-
-Strictly it is the **second** GPU that runs the neural stage, so that is the card
-NVIDIA's requirement applies to but a mixed pair was never tested, and the
-cross-adapter shared-heap workaround this depends on is itself a 50-series one.
-Two 50-series cards is the only configuration that has been run.
-
-**Two GPUs and two monitors one monitor on each card.** This is a requirement,
-not a nicety, and it is the first thing to get right. The neural output is
-displayed by the card that produced it, so nothing has to travel back across the
-link. Earlier milestones ran the second GPU headless and it works, but moving the
-cable onto the second card was worth **+33% throughput and roughly half the
-latency** on this machine one variable, five minutes apart. Run it headless and
-you get a slower version of this with nothing to look at.
+HAT YOU NEED FIRST
+-------------------
+ 
+1. ReShade 6.8.0 or newer, installed WITH ADD-ON SUPPORT.
+ 
+   This is the single most common reason nothing happens. The effects-only
+   build of ReShade never loads .addon64 files at all, and it does not say so -
+   no error, no log line, because the add-on was never loaded to write one. If
+   the log has no "Registered add-on \"MGPU Bridge\"" line, this is why.
+ 
+2. A second NVIDIA GPU in the machine, with a current driver. DLSS-NR comes
+   from your driver installation.
+ 
+   GEFORCE RTX 50-SERIES. NVIDIA documents DLSS Neural Rendering as a
+   50-series feature - it is not available on 40-series or older cards, and
+   this add-on cannot change that. It drives the NGX libraries already in your
+   driver and cannot enable something the driver will not run. THIS ADD-ON
+   DOES NOT CHECK YOUR HARDWARE: on an older card expect it to load, log
+   normally, and produce nothing.
+ 
+   It is the SECOND card that runs the neural stage, so that is the one the
+   requirement applies to - but a mixed pair has never been tested, and the
+   cross-adapter shared-heap workaround this depends on is itself specific to
+   the 50-series. Two RTX 5060 Ti 16 GB is the only configuration this has
+   been run on.
+ 
+   You do NOT need a shader pack. Ticking effect packages in the ReShade
+   installer is optional - this add-on needs add-on support and nothing else,
+   and it was tested with no effects installed at all.
+ 
+   YOU DO NOT NEED ANY OTHER ADD-ON. This one reaches DLSS Neural Rendering on
+   its own: it creates its own D3D12 device on the second GPU and drives the
+   NGX libraries in your driver directly. Nothing else has to be present.
+ 
+   DO NOT RUN A SECOND NEURAL PATH ALONGSIDE IT. Untested, and this project has
+   already seen two independent NGX consumers sharing one parameter block
+   produce a visibly wrong image while every transport counter stayed clean.
+   One neural path at a time.
+ 
+3. TWO MONITORS - ONE ON EACH CARD. This is a requirement, not a nicety. The
+   neural output is displayed by the card that produced it, so nothing has to
+   travel back across the link. With both monitors on the render card, the same
+   build measured 33% lower throughput and roughly double the latency on the
+   development machine. A headless second card works and is slower, and there is
+   nothing to look at.
+ 
+4. A DIRECTX 12 GAME. D3D11 AND VULKAN TITLES DO NOTHING - the add-on loads,
+   finds no D3D12 render device, stands down, and says so in the log and in
+   the ReShade overlay panel. There is no bridge window on those titles: no
+   D3D12 device means no window at all, which is why the message is in the
+   panel. Some Unity titles can be forced with -force-d3d12.
+ 
+   This is a limit of this add-on, not of DLSS Neural Rendering itself, which
+   NVIDIA documents against Vulkan. Everything here is built on ReShade's
+   D3D12 path.
+ 
+NOTHING FROM NVIDIA IS INCLUDED HERE. _nvngx.dll, nvngx_dlssnr.dll and the
+DLSS-NR weights come from your own driver install. Do not add them to this
+folder to make it work for somebody else.
 
 ### What was measured
 
