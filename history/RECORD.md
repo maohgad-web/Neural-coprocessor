@@ -1170,9 +1170,86 @@ artifact is six files.
 ## What P7 did not settle
 
 - Fault injection, still (see above).
-- **Stability beyond about five and a half minutes.** One session ended with the
-  game rendering black on both displays, with no fault in any log and no cause
-  isolated. `Frames=0` makes this reachable by anyone who runs it, which is why
-  it is stated in `../README.md` under limitations rather than left in a record.
+- ~~**Stability beyond about five and a half minutes.** One session ended with
+  the game rendering black on both displays, with no fault in any log and no
+  cause isolated.~~ **CLOSED 2026-09-06 — see P7.7 below.**
 - **Image quality.** Nothing in this project assesses how the output looks, and
   `Present=split` is a way to look at it, not a measurement of it.
+
+---
+
+# P7.7 — the pass ceiling, and the black screen · CLOSED 2026-09-06
+
+The last unexplained observation in the project, closed by a measurement that was
+almost not taken.
+
+## What was measured
+
+Board power had never been recorded. The only power figure anywhere was `180 W
+enforced` in the machine table, which is a limit setting rather than a
+measurement, and the field had been lost once already to a malformed
+`nvidia-smi` argument. It was taken because the first objection anyone would
+raise to the whole result is *"you added a second 180 W GPU and got more
+frames"*, and the repository had no answer.
+
+At 1080p, against a ~16.7 ms frame period:
+
+| passes | GPU 1 work/frame | duty cycle | GPU 1 power | GPU 1 util |
+|---|---|---|---|---|
+| 1 | 8.3 ms | ~50% | ~49 W | 51–55% |
+| 2 | 17.5 ms | ~100% | ~145 W | 67–72% |
+| 3+ | 26.0 ms | over budget | ~174–180 W (**capped**) | 74–90% |
+
+Three, four, five and six all draw the same ~180 W. That is the power limiter,
+not a coincidence, and it is why the pass count could not be read off the power
+trace alone.
+
+**Duty cycle explains all three plateaus.** At one pass the second GPU is
+roughly half idle — skip-to-newest means it evaluates only non-superseded frames,
+so it finishes and waits. Two passes fill the frame. Three exceed it.
+
+## The black screen
+
+`P5_P6_RECORD` §05 and every document downstream of it carried an unexplained
+session: the game rendering black on both displays after several minutes, no
+fault in any log, no device removal. It was briefly attributed to the title's
+engine, and that guess was withdrawn once it was noticed that it rested on a
+single title.
+
+**It was a six-pass run held for several minutes** — the second GPU pinned at its
+power limit for the duration. The exact mechanism (thermal, a driver reset under
+sustained limit, or both) is not established and does not need to be: the
+condition is, and it is no longer reachable.
+
+Two things about how this sat unresolved are worth more than the fix.
+
+**It was filed as out of scope.** `RESULTS.md` said the cause was "not
+investigated further, deliberately: it is out of scope for the architecture
+claim." That was true and beside the point — it was the only observed failure
+that could damage a user's hardware. **Scope is a judgement about what a result
+depends on, not a licence to leave the one dangerous observation unexamined.**
+
+**The measurement that explained it was nearly skipped**, on the grounds that
+board power was not load-bearing for the frame-rate claim. It was not
+load-bearing. It closed the project's last open fault anyway.
+
+## The decision
+
+`MAX_PASSES` drops from 6 to **2**, enforced in `gpu1_context.cpp`. A larger
+value in `mgpu.ini` is clamped and the log now names the value that was asked
+for — the clamp existed before and its comment claimed it spoke, but nothing
+printed the requested value, so `Passes=6` and `Passes=2` produced identical
+logs.
+
+Two is the highest setting that uses the card fully without saturating it. Past
+two a pass buys latency rather than picture, and the shipped configuration is
+unbounded (`Frames=0`), so the load lasts as long as the game is open in a window
+the user has probably minimised.
+
+The panel carries the warning as well as the ini, because the panel is live and
+needs no file editing — the person who changes the pass count is exactly the
+person who never opens the settings file.
+
+**The multi-pass ghosting hypothesis is not settled by any of this.** It was
+never tested; no ghosting scene was ever captured. Testing it later means raising
+the constant in a local build. It does not ship raised.
