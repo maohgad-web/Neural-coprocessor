@@ -19,64 +19,69 @@ This is research code with published measurements. It is not a product.
 
 ## The result
 
-Measured on one machine, one game, both arms rendering on the same card so that
-the only variable is where the neural work runs. Full method, caveats and the
-machine description are in [RESULTS.md](RESULTS.md).
+Measured on one machine, one game, with the game rendering on the same card in
+both runs — so the only variable is which GPU does the neural work. Method and
+caveats in [RESULTS.md](RESULTS.md).
 
 At 1920 × 1080, across the DLSS range:
 
-| DLSS mode | neural local | neural offloaded |
+| DLSS mode | NR on the render GPU | NR on the second GPU |
 |---|---|---|
 | DLAA | 43–44 | 48 |
 | Quality | 44–45 | 58 |
 | Performance | 47–48 | 69 |
 | Ultra Performance | 56–57 | 79 |
 
-The frame rates are not the interesting part. This is:
+The frame rates are not the finding. The **slope** is — what you gain by going
+from DLAA down to Ultra Performance:
 
-- neural **local** gains **+30%** across that whole range
-- neural **offloaded** gains **+65%**
+- neural work on the render GPU: **+30%**
+- neural work on the second GPU: **+65%**
 
-When neural post-processing runs on the render device it saturates that device,
-so lowering the render resolution frees capacity the neural stage immediately
-consumes. Upscaling stops paying. Move the neural work to a second device and
-the render GPU is genuinely freed, so DLSS behaves the way it is supposed to.
+Neural post-processing saturates whatever device it runs on. On the render GPU,
+lowering the render resolution frees capacity the neural stage immediately
+consumes, so upscaling stops paying for itself. Move it to a second GPU and the
+render GPU is genuinely freed.
 
-**Neural post-processing on the render device largely defeats upscaling.
-Moving it off restores it.**
+**Neural post-processing on the render device largely defeats upscaling. Moving
+it off restores it.**
 
-The render GPU also runs 21 °C cooler, because the load is spread across two
-coolers instead of stacked on one.
+The render GPU also runs 21 °C cooler, because the load sits across two coolers
+instead of stacked on one.
 
-All of this is measured on the worst plausible configuration for the idea: the
-second GPU is on a **chipset-fed PCIe 3.0 x2 slot**. That is the point, not a
+All of it measured on the worst plausible configuration for the idea: the second
+GPU is on a **chipset-fed PCIe 3.0 x2 slot**. That is the point rather than a
 caveat — the architecture wins where it should struggle most.
 
-### What was measured, precisely
+### What this needs
 
-**Both arms reach DLSS Neural Rendering by injection through ReShade.** Neither
-is a game's native DLSS 5 integration. The local arm is RenoDX under ReShade; the
-offload arm is this bridge, also under ReShade. That is the comparison: the same
-injection route, the same game, the same scene, with the location of the neural
-work as the only variable.
+**Two GPUs and two monitors — one monitor on each card.** This is a requirement,
+not a nicety, and it is the first thing to get right. The neural output is
+displayed by the card that produced it, so nothing has to travel back across the
+link. Earlier milestones ran the second GPU headless and it works, but moving the
+cable onto the second card was worth **+33% throughput and roughly half the
+latency** on this machine — one variable, five minutes apart. Run it headless and
+you get a slower version of this with nothing to look at.
 
-**OptiScaler — the other common route to the same feature — was not tested**, and
-nothing here describes its performance.
+### What was measured
 
-**These numbers do not predict what NVIDIA's own implementation does.** An
-injected neural stage sees the frame at a different point than an engine-native
-one, does not share the engine's motion vectors or depth, and cannot make the
-scheduling decisions a native integration can. **If you are reading this some
-time after September 2026, treat every absolute figure as historical**: driver
-versions, the DLSS-NR model shipped in them, and the games themselves all move,
-and any of those changes the numbers without changing anything in this
-repository.
+**Everything here was measured through ReShade**, both runs. The render-GPU arm
+is RenoDX; the second-GPU arm is this bridge. Same route into DLSS-NR, same game,
+same scene.
 
-What is *not* expected to be historical is the shape — that neural work on the
-render device competes with the render work, and moving it off a device that is
-saturated returns the capacity upscaling was supposed to free. That is an
-architectural claim, and it is the one worth checking against your own machine
-rather than taking from this table.
+That is not a game's native DLSS 5 integration, and it is not **OptiScaler**,
+which was not tested and is not described by any figure here.
+
+**These numbers are not a prediction of what NVIDIA's own implementation does**,
+and they are dated. If you are reading this well after September 2026, treat
+every absolute figure as historical — driver versions, the DLSS-NR model inside
+them, and the games themselves all move, and any of those changes the numbers
+without anything in this repository changing.
+
+The **shape** is what is expected to survive: neural work competes with render
+work on the device it runs on, and moving it off a saturated device returns the
+capacity upscaling was supposed to free. That is the claim worth checking against
+your own machine rather than taking from this table.
 
 ---
 
@@ -176,6 +181,15 @@ not.** That is the architecture working, not a fault.
 
 **Interacting with the bridge window takes keyboard focus from the game.** A
 controller sidesteps it entirely.
+
+**The bridge window opens on the game's display and has to be moved once per
+launch.** Known defect, not a configuration mistake. The window is created before
+the sizing code runs, and that code fits the window to *the monitor it is already
+on* — so it sizes correctly to the wrong display. Drag it to the second monitor;
+`Window=fit` then does the right thing. The proper fix is to derive the target
+monitor from the bridge adapter's own DXGI output rather than from the window's
+current position, which is also the placement that keeps scan-out on the card
+that did the neural work.
 
 **External overlays that hook `Present` misbehave, and the reason is
 structural.** This add-on creates a second swapchain inside the game's process,
