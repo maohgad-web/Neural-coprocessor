@@ -8081,23 +8081,30 @@ void ui_set_passes(unsigned n)
 // and the log records what was in force.
 void ui_set_tuning(bool on)
 {
-    std::lock_guard<std::mutex> g(stream_mtx());
-    stream_state &s = S();
-    s.tuning_on = on;
-    char l[300];
+    stream_state &s = str();
+    float tone, structure, skin, style;
+    bool mask;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        s.tuning_on = on;
+        ++s.intensity_edits;   // a tuning change makes this a tuning run, and
+                               // the summary already reports that count.
+        tone = s.tone_strength; structure = s.structure_strength;
+        skin = s.skin_strength; style = s.style; mask = s.auto_mask;
+    }
+    char l[420];
     snprintf(l, sizeof l,
              "[MGPU][P7.9] tuning %s - tone=%.2f structure=%.2f skin=%.2f style=%.2f automask=%u. "
              "With this ON the run is a TUNING run and its figures are not comparable to the "
              "published ones, which were all taken with these unset.",
-             on ? "ON" : "OFF", s.tone_strength, s.structure_strength, s.skin_strength,
-             s.style, s.auto_mask ? 1u : 0u);
+             on ? "ON" : "OFF", tone, structure, skin, style, mask ? 1u : 0u);
     mgpu::diag::info(l);
 }
 
 void ui_set_tuning_value(int which, float v)
 {
-    std::lock_guard<std::mutex> g(stream_mtx());
-    stream_state &s = S();
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
     switch (which)
     {
     case 0: s.tone_strength      = v; break;
@@ -8107,6 +8114,7 @@ void ui_set_tuning_value(int which, float v)
     case 4: s.auto_mask = (v != 0.0f); break;
     default: return;
     }
+    ++s.intensity_edits;
 }
 
 void ui_set_intensity(unsigned pass_1based, float v)
