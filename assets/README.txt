@@ -31,6 +31,10 @@ WHAT YOU NEED FIRST
 2. A second NVIDIA GPU in the machine, with a current driver. DLSS-NR comes
    from your driver installation.
 
+   You do NOT need a shader pack. Ticking effect packages in the ReShade
+   installer is optional - this add-on needs add-on support and nothing else,
+   and it was tested with no effects installed at all.
+
 3. TWO MONITORS - ONE ON EACH CARD. This is a requirement, not a nicety. The
    neural output is displayed by the card that produced it, so nothing has to
    travel back across the link. With both monitors on the render card, the same
@@ -38,9 +42,14 @@ WHAT YOU NEED FIRST
    development machine. A headless second card works and is slower, and there is
    nothing to look at.
 
-4. A DirectX 12 game. D3D11 titles do nothing - no game adapter is identified,
-   so the bridge stands down and says so in the log. Some Unity titles can be
-   forced with -force-d3d12.
+4. A DIRECTX 12 GAME. D3D11 AND VULKAN TITLES DO NOTHING - the add-on loads,
+   finds no D3D12 render device, stands down, and says so in the log and in
+   the bridge window's title bar. Some Unity titles can be forced with
+   -force-d3d12.
+
+   This is a limit of this add-on, not of DLSS Neural Rendering itself, which
+   NVIDIA documents against Vulkan. Everything here is built on ReShade's
+   D3D12 path.
 
 NOTHING FROM NVIDIA IS INCLUDED HERE. _nvngx.dll, nvngx_dlssnr.dll and the
 DLSS-NR weights come from your own driver install. Do not add them to this
@@ -191,14 +200,16 @@ ReShade then writes a second image alongside the clean one.
 KNOWN LIMITATIONS
 -----------------
 
-THE ONE BAD FAILURE THIS PROJECT SAW IS EXPLAINED, AND IT WAS THE PASS COUNT.
-One development session ended with the game rendering black on both displays
-after several minutes, with no fault in any log. It was a SIX-pass run held for
-several minutes, which holds the second GPU at its power limit indefinitely.
-This build allows at most two passes and the bound is enforced in code, so that
-condition is no longer reachable from the settings file. Stability at one and
-two passes is still only tested in sessions of minutes, not hours - watch GPU
-load and temperature, especially with Frames=0.
+THE ONE BAD FAILURE THIS PROJECT SAW WAS AT SIX PASSES. One development
+session ended with the game rendering black on both displays after several
+minutes, on a six-pass run. The exact mechanism was never isolated - a later
+twenty-minute run at TWO passes sat at 174W of a 180W limit and was completely
+stable, so simply being at the power limit is not the explanation. This build
+allows at most two passes and the bound is enforced in code, so the condition
+that produced it is not reachable from the settings file.
+
+LONGEST CLEAN RUN: 20 minutes, Cyberpunk 2077 at 1440p, two passes. Beyond that
+is untested - watch GPU load and temperature, especially with Frames=0.
 
 The bridge window's own frame rate falls as the pass count rises. The game's
 does not. That is the architecture working, not a fault.
