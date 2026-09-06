@@ -73,6 +73,18 @@ the board specification, is in [RESULTS.md](RESULTS.md) §3.
 
 ### What this needs
 
+**GeForce RTX 50-series cards.** DLSS Neural Rendering is documented by NVIDIA
+as a 50-series feature; it is not available on 40-series or older hardware, and
+nothing this add-on does changes that — it drives the NGX libraries in your own
+driver installation and cannot enable a feature the driver will not run. Every
+figure here was taken on two RTX 5060 Ti 16 GB. **The add-on does not check your
+hardware**, so on an older card expect it to load, log, and produce nothing.
+
+Strictly it is the **second** GPU that runs the neural stage, so that is the card
+NVIDIA's requirement applies to — but a mixed pair was never tested, and the
+cross-adapter shared-heap workaround this depends on is itself a 50-series one.
+Two 50-series cards is the only configuration that has been run.
+
 **Two GPUs and two monitors — one monitor on each card.** This is a requirement,
 not a nicety, and it is the first thing to get right. The neural output is
 displayed by the card that produced it, so nothing has to travel back across the
