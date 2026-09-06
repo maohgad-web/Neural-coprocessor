@@ -3,8 +3,10 @@
 All figures 2026-09-05, one machine, one game. Read the limitations section
 before quoting anything here.
 
-Items marked **CONFIRM** are gaps in the record that need filling from the run
-logs before publication. They are marked rather than guessed.
+Every figure below is measured. An earlier draft carried **CONFIRM** markers on
+values that were still owed from the run logs; all of them were filled, and none
+remain. If you find one, it is an editing error and the value under it should not
+be trusted.
 
 ---
 
@@ -60,9 +62,9 @@ resident scene. Figures below are taken stationary for that reason.
 - **Game**: The Blood of Dawnwalker (D3D12)
 - **Scene**: the game's opening area — the forest at the start of *All Good
   Things* ("Find Lunka in the forest", 166 m marker). Stationary, same spot and
-  same camera heading for every arm. `docs/scene.png` is that scene as the game
+  same camera heading for every arm. `docs/scenes/Scene.png` is that scene as the game
   renders it, with no neural stage — the reference for where every figure below
-  was taken. `docs/split.png` is the same scene in the bridge's split view: left
+  was taken. `docs/scenes/Split.png` is the same scene in the bridge's split view: left
   of the seam is the frame handed to the model, right of it is what the model
   produced, and both halves are the same frame.
 - **Vsync**: off. Checked explicitly after the 1080p Quality figure looked like
@@ -78,7 +80,19 @@ resident scene. Figures below are taken stationary for that reason.
 
 ### Parameter matching between the arms
 
-The local arm is RenoDX; the offload arm is this bridge. Matched:
+The local arm is RenoDX **under ReShade**; the offload arm is this bridge.
+
+**Which local path was measured matters, and only one of them was.** DLSS-NR can
+be reached on the render device by more than one route, and they are not
+interchangeable for a performance measurement — they differ in where they insert
+into the frame and in how much of the frame they touch. Everything in this
+document was measured through the **ReShade add-on path**. **OptiScaler, the
+other route in common use, was not measured at all**, and no figure here should
+be read as describing it. If someone reproduces this against OptiScaler and gets
+a different local arm, that is a different measurement rather than a
+contradiction of this one — and it is a measurement worth having.
+
+Matched:
 
 | | RenoDX | bridge |
 |---|---|---|
@@ -237,10 +251,13 @@ architecture claim.
 separate question requiring exposure-normalised comparison and is deliberately
 excluded. Nothing in this document is a claim about how the output looks.
 
-**The comparison is against one implementation** of local neural rendering, at
-matched intensity and pass count, with two parameters that could not be matched
-(masking, hook point). It is not a general claim about all possible local
-implementations.
+**The comparison is against one implementation, reached by one route.** The local
+arm is RenoDX under ReShade, at matched intensity and pass count, with two
+parameters that could not be matched (masking, hook point). **OptiScaler — the
+other way to reach DLSS-NR on the render device — was not tested**, and its
+performance is not asserted here in either direction. This is not a general claim
+about all possible local implementations, and the +30% / +65% shape is a
+statement about the arms actually measured.
 
 **Resizable BAR** is enabled in BIOS and left at default in the NVIDIA control
 panel for both cards on this machine. It is a BIOS setting and does **not**

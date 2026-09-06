@@ -190,7 +190,9 @@ claim about how the output looks.
 
 Genuinely, not as a formality. This creates a second D3D12 device, allocates
 cross-adapter shared heaps, and drives vendor libraries on your own hardware.
-It has been exercised on two machines with a handful of games.
+It has been exercised on **one machine**, with three titles — and only one of
+those produced the measurements. A second machine exists and nothing has been run
+on it yet.
 
 See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for how it was built — including
 which parts were written by AI, and the specific occasions where the AI was

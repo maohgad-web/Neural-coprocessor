@@ -76,9 +76,25 @@ than formal:
   a game's own renderer.
 - **[Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR)** —
   studied as an alternative foundation and as a reference for the DLSS-NR
-  feature and parameter space.
-- **RenoDX** — the local-GPU neural rendering path used as the comparison arm
-  throughout. Every offload figure in this work is measured against it.
+  feature and parameter space. **It is not the local arm in any measurement
+  here** — see below.
+- **[clshortfuse/renodx](https://github.com/clshortfuse/renodx)** — the local-GPU
+  neural rendering path used as the comparison arm throughout. Every offload
+  figure in this work is measured against it.
+
+**On which local path was measured.** DLSS-NR can be reached on the render device
+by more than one route, and the comparison arm in `RESULTS.md` is specifically
+**RenoDX under ReShade**. **OptiScaler was not measured**, and nothing in this
+repository characterises its performance. That distinction is stated because
+naming a project as a comparison arm is a claim about that project, and the
+narrower the claim the fairer it is: what was measured is one route on one
+machine, not "local neural rendering" as a category.
+
+It should also be said plainly that using an existing local implementation as a
+comparison arm is not a criticism of it. This project set out to build its own
+path — its own optical flow, its own transport — rather than to improve on
+anyone's; a comparison arm is a reference point, and a well-made one is what
+makes the offload figure mean anything.
 - **LumeniteFX** — the shader suite used in the earlier pipeline stages.
 - **[ocornut/Dear ImGui](https://github.com/ocornut/imgui)** — the overlay
   panel. Fetched at configure time; no ImGui source is vendored here.
@@ -95,9 +111,12 @@ Thank you to all of them. Mistakes in this repository are ours, not theirs.
 
 This is research code. It creates a second D3D12 device, allocates
 cross-adapter shared heaps, loads NVIDIA's NGX libraries from your driver
-installation, and runs a neural feature on a second GPU. It has been exercised
-on exactly two machines, with a small number of games, for sessions measured in
-minutes rather than hours.
+installation, and runs a neural feature on a second GPU. It has been exercised on
+**exactly one machine** — the rig described in `VENDOR_LOCK.md` — with three
+titles, only one of which produced the published measurements, for sessions
+measured in minutes rather than hours. A second rig is documented there because
+it changes how the first one's numbers must be read; **nothing has been run on
+it.**
 
 You are encouraged — genuinely, not as a formality — to read the source before
 running it, and to check that what it does matches what this documentation
@@ -124,7 +143,7 @@ liability terms; this section is context, not a substitute for it.
 
 Running this changes how a game's frames are processed and drives an
 undocumented path through vendor libraries on your own hardware. It may crash,
-produce incorrect output, or behave in ways not observed on the two machines it
+produce incorrect output, or behave in ways not observed on the single machine it
 was developed on. Stability beyond the durations recorded in the measurements
 has not been tested. You run it at your own risk, and the authors accept no
 responsibility for any damage, data loss, or consequences arising from its use
