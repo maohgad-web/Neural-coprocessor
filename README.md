@@ -40,7 +40,7 @@ each. The measured runs were separate and unrecorded.
 
 ## The result
 
-One game, at 1920 × 1080, across the whole DLSS range. **Three arms**, so the
+One game, at 1920 × 1080, across the whole DLSS range on dual 5060 ti 16GB's. **Three arms**, so the
 neural stage can be priced rather than only compared against itself: the game
 with no neural rendering at all, the neural stage on the render GPU, and the
 neural stage on the second GPU. Method and caveats in [RESULTS.md](RESULTS.md).
