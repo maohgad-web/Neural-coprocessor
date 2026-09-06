@@ -1,7 +1,12 @@
-# MGPU Bridge
+# Neural Coprocessor
 
-Cross-adapter DLSS Neural Rendering. The game renders on one GPU; the neural
-post-processing runs on a second GPU that is not rendering the game.
+**A second GPU running a game's neural post-processing, while the first one
+renders.** Not SLI — nothing is split mid-frame. Neural rendering is a *terminal*
+stage: it takes a finished frame and returns a finished frame, so it can be
+picked up and executed somewhere else entirely.
+
+The add-on that does it is called **MGPU Bridge**, and every log line it writes
+is prefixed `[MGPU]`.
 
 This is research code with published measurements. It is not a product.
 
@@ -20,8 +25,9 @@ This is research code with published measurements. It is not a product.
 ## The result
 
 Measured on one machine, one game, with the game rendering on the same card in
-both runs — so the only variable is which GPU does the neural work. Method and
-caveats in [RESULTS.md](RESULTS.md).
+both runs — so the only variable is which GPU does the neural work. A second
+title was run for compatibility, stability and power, but **not** for a
+frame-rate comparison. Method and caveats in [RESULTS.md](RESULTS.md).
 
 At 1920 × 1080, across the DLSS range:
 
@@ -118,6 +124,10 @@ download — but two things decide whether it works at all:
 loads `.addon64` files and says nothing about it. No error, no log line, because
 the add-on was never loaded to write one.
 
+**No shader pack is needed.** Tested directly: no effect packages, no techniques
+enabled, both titles fine. An earlier version of this documentation claimed
+otherwise and was wrong.
+
 **Do not rename the add-on.** Its filename must contain the literal substring
 `nvngx.dll`. The DLSS-NR snippet resolves the module owning its caller's return
 address, takes that module's file path, and requires it to contain that
@@ -171,18 +181,20 @@ on screen but the game.
 
 ## Limitations
 
-**The black-screen session is explained, and it was the pass count.** The longest
-clean run recorded is about five and a half minutes, and one session ended with
-the game rendering black on both displays with no fault in any log. That was
-~~never isolated~~ **isolated on 2026-09-06: it was a six-pass run, sustained for
-several minutes.** Nothing in this add-on's own code was involved, and the game
-was not, either — an earlier guess that it might be engine-specific was wrong and
-is withdrawn. Six passes hold the second GPU at its power limit indefinitely, and
-that is the state the session ended in. **The build now allows a maximum of two
-passes, which is the condition this failure was never observed under.**
+**The black-screen session — what is established and what is not.** It was a
+**six-pass** run held for several minutes. That is the condition, and it is
+solid. The *mechanism* is not: a later twenty-minute Cyberpunk 2077 run at two
+passes sat at **167–174 W of a 180 W limit** and was completely stable, so
+"pinned at the power limit" is survivable and cannot by itself be the
+explanation. Six passes differ from two by more than the ceiling — per-frame GPU
+time, live handle count, sustained thermals — and which of those mattered was
+never isolated. **The build now allows at most two passes, a condition under
+which the failure has never been seen and which has now been held for twenty
+minutes.**
 
-Long-run stability at one and two passes is still untested beyond minutes rather
-than hours. Watch GPU load and temperature, especially with `Frames=0`.
+**Longest clean run: twenty minutes**, Cyberpunk 2077 at 1440p, two passes,
+stable throughout. Beyond that is untested. Watch GPU load and temperature,
+especially with `Frames=0`.
 
 **The bridge window's frame rate falls as the pass count rises. The game's does
 not.** That is the architecture working, not a fault.
@@ -198,6 +210,15 @@ on* — so it sizes correctly to the wrong display. Drag it to the second monito
 monitor from the bridge adapter's own DXGI output rather than from the window's
 current position, which is also the placement that keeps scan-out on the card
 that did the neural work.
+
+**A washed neural output on Cyberpunk 2077, cause NOT established.** The frame
+handed to the model is correct and the frame it returns is washed — established
+by same-frame split, so transport and presentation are both exonerated. The only
+recorded difference between the two titles is **bit depth**: Dawnwalker renders
+`fmt=24` `R10G10B10A2_UNORM` (10 bits per channel), Cyberpunk `fmt=28`
+`R8G8B8A8_UNORM` (8 bits). **Both are plain UNORM — there is no sRGB involved,
+and an earlier diagnosis that said there was is retracted.** Not fixed, not
+explained, and no mechanism is asserted.
 
 **External overlays that hook `Present` misbehave, and the reason is
 structural.** This add-on creates a second swapchain inside the game's process,
