@@ -94,7 +94,7 @@ The bridge is a ReShade add-on. On a D3D12 game it:
 3. copies each finished frame across a cross-adapter shared heap, with a
    64-byte seal per ring slot so every frame's identity and ordering can be
    checked rather than assumed
-4. runs DLSS Neural Rendering on the second adapter, up to six times per frame
+4. runs DLSS Neural Rendering on the second adapter, once or twice per frame
 5. presents the result in its own window on the second adapter
 
 The game's own rendering is never touched. The bridge reads the finished frame
@@ -171,10 +171,18 @@ on screen but the game.
 
 ## Limitations
 
-**Stability beyond a few minutes is untested.** The longest clean run recorded
-is about five and a half minutes. One session ended with the game rendering
-black on both displays; the bridge logged no fault and the cause was never
-isolated. Watch GPU load and temperature, especially with `Frames=0`.
+**The black-screen session is explained, and it was the pass count.** The longest
+clean run recorded is about five and a half minutes, and one session ended with
+the game rendering black on both displays with no fault in any log. That was
+~~never isolated~~ **isolated on 2026-09-06: it was a six-pass run, sustained for
+several minutes.** Nothing in this add-on's own code was involved, and the game
+was not, either — an earlier guess that it might be engine-specific was wrong and
+is withdrawn. Six passes hold the second GPU at its power limit indefinitely, and
+that is the state the session ended in. **The build now allows a maximum of two
+passes, which is the condition this failure was never observed under.**
+
+Long-run stability at one and two passes is still untested beyond minutes rather
+than hours. Watch GPU load and temperature, especially with `Frames=0`.
 
 **The bridge window's frame rate falls as the pass count rises. The game's does
 not.** That is the architecture working, not a fault.

@@ -238,12 +238,27 @@ DLSS mode. On this rig, at these resolutions, the link is not the limit.
 
 **Stability is untested beyond the durations recorded here** — sessions of
 minutes, not hours. The longest clean run was 16,775 frames (~5.5 minutes) with
-the transport reporting no gaps throughout. One session ended with the game
-rendering black on both displays after several minutes; the bridge logged no
-fault and no device removal, and the cause was not isolated. Candidates
-included a power limit in force at the time, ReBAR configuration, and the game
-engine. Not investigated further, deliberately: it is out of scope for the
-architecture claim.
+the transport reporting no gaps throughout.
+
+~~One session ended with the game rendering black on both displays after several
+minutes; the bridge logged no fault and no device removal, and the cause was not
+isolated. Candidates included a power limit in force at the time, ReBAR
+configuration, and the game engine.~~ **ISOLATED 2026-09-06.** That session was a
+**six-pass** run held for several minutes. Of the three candidates listed, the
+power one was right and the other two were not — ReBAR was not involved, and the
+guess that it might be engine-specific was wrong and is withdrawn. Six passes
+exceed the frame period, so the second GPU sits clamped at its power limit
+indefinitely, and that is the state the session ended in. **The shipped build now
+allows at most two passes**, which is a condition this failure has never been
+observed under.
+
+Worth recording as method rather than only as a fix: the entry above said the
+cause was "not investigated further, deliberately — out of scope for the
+architecture claim." It was in scope. It was the only observed failure that could
+damage a user's hardware, and it went unexplained for two days because it was
+filed as a curiosity rather than as the one open safety question. **Scope is a
+judgement about what a result depends on, not a reason to leave the only
+dangerous observation unexamined.**
 
 **One game, one scene, one machine.** Rig B figures are pending.
 

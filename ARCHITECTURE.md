@@ -246,14 +246,56 @@ handles cost N sets of history buffers and one set of weights.
 
 ### Passes
 
-`Passes=N` runs DLSS-NR N times per frame, one feature handle each, ping-ponging
-between two output textures. All handles are created at arm — about 150 ms each
-— so changing the count live costs nothing.
+`Passes=N` runs DLSS-NR N times per frame, one feature handle each,
+ping-ponging between two output textures. All handles are created at arm —
+179–220 ms each, one-time rather than per-resolution — so changing the count live
+costs nothing.
+
+**One handle per pass, not one handle evaluated twice.** The feature carries
+temporal history, so a single handle run twice in a frame would have its history
+be "the previous pass" rather than "the previous frame". The GPU cost would be
+identical and the measurement still valid, but the picture would ghost — an
+artefact of the test rig that looks exactly like a real fault.
 
 **Latency scales with passes; the game's frame rate does not.** The bridge
 window's own output rate falls as the count climbs. That is the architecture
-working, not a fault, and it is the one thing about the demo that reliably reads
-as a bug to someone who has not been told.
+working, and it is the one thing about the demo that reliably reads as a bug to
+someone who has not been told.
+
+#### The maximum is two, and it is a power decision
+
+Measured on the development rig at 1080p, against a ~16.7 ms frame period:
+
+| passes | GPU 1 work per frame | duty cycle | GPU 1 power |
+|---|---|---|---|
+| 1 | 8.3 ms | ~50% | ~49 W |
+| 2 | 17.5 ms | ~100% | ~145 W |
+| 3 | 26.0 ms | over budget | ~180 W — the card's limit |
+
+Two passes fill the card. Three exceed the frame period, so the card clamps at
+its power limit and further passes are served on throttled clocks — three, four,
+five and six all drew an identical ~180 W, which is the limiter rather than a
+coincidence. **Past two, a pass buys latency rather than picture.**
+
+That alone would be an argument for a documented recommendation. What makes it a
+hard bound in code is the other end: this add-on ships with `Frames=0`, so a run
+is unbounded. It holds the second GPU at whatever load it reaches for as long as
+the game is open, in a window the user has very likely minimised — and on a
+larger card at a higher resolution those watt figures scale with the hardware,
+not with the numbers above. Sustained maximum board power is the condition under
+which a marginally seated power connector fails.
+
+**The failure was observed, not hypothesised.** One development session ended
+with the game rendering black on both displays after several minutes, with no
+fault in any log. It went unexplained for two days and was briefly blamed on the
+title's engine. It was a six-pass run. `MAX_PASSES` is 2, enforced in
+`gpu1_context.cpp`; a larger value in `mgpu.ini` is clamped and the log names the
+value that was asked for.
+
+The multi-pass ghosting hypothesis that motivated six passes is **not settled by
+any of this** — it was never tested, because no ghosting scene was ever captured.
+Testing it later means raising the constant in a local build. It does not ship
+raised.
 
 `DLSSNR.Reset` is set on the **first frame only**. Every probe before the stream
 existed set it on every evaluate, because each was an independent experiment and

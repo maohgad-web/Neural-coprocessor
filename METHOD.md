@@ -287,7 +287,11 @@ Stated so it is not mistaken for complete.
   have.
 - **Photon-to-photon latency.** Timings here are submit-to-consume.
 - **Long-run stability.** The longest clean run recorded is about five and a half
-  minutes.
+  minutes, at one and two passes. The one session that ended badly was later
+  explained — see `RESULTS.md` — and is the origin of a rule this document did
+  not have: **the observation that could hurt someone is never the one to defer.**
+  It was filed as out of scope for two days on the grounds that the architecture
+  claim did not depend on it, which was true and beside the point.
 - **Generality across hardware.** Every number was taken on the machines
   described in `RESULTS.md`. The architectural claims should transfer; the
   figures are not asserted to.
