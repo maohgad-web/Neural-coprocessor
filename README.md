@@ -14,9 +14,17 @@ finished frame and does its work elsewhere.
 
 This is research code with published measurements. It is not a product.
 
-**See it running:** [The Blood of Dawnwalker, 1920 × 1080](https://youtu.be/yoEsuZyltFc)
-— the game on one card, the neural output in its own window on the other, both
-live in a single take.
+**See it running** — the game on one card, the neural output in its own window on
+the other, both live in a single take:
+
+- [The Blood of Dawnwalker](https://youtu.be/yoEsuZyltFc) — the title every
+  measurement in [RESULTS.md](RESULTS.md) was taken on
+- [Cyberpunk 2077](https://youtu.be/XWv5jw90yHc) — gameplay, played normally.
+  **No figure in this repository comes from Cyberpunk**; it was run for
+  compatibility, stability and power draw only.
+
+Both are demonstrations, not benchmarks — screen-recording overhead is present in
+each. The measured runs were separate and unrecorded.
 
 | | |
 |---|---|
