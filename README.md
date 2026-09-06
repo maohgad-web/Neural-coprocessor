@@ -1,7 +1,7 @@
 # Neural Coprocessor
 
 **A second GPU running a game's neural post-processing, while the first one
-renders.** Not SLI — nothing is split mid-frame. Neural rendering is a *terminal*
+renders.** Not SLI nothing is split mid-frame. Neural rendering is a *terminal*
 stage: it takes a finished frame and returns a finished frame, so it can be
 picked up and executed somewhere else entirely.
 
@@ -41,7 +41,7 @@ each. The measured runs were separate and unrecorded.
 ## The result
 
 Measured on one machine, one game, with the game rendering on the same card in
-both runs — so the only variable is which GPU does the neural work. A second
+both runs so the only variable is which GPU does the neural work. A second
 title was run for compatibility, stability and power, but **not** for a
 frame-rate comparison. Method and caveats in [RESULTS.md](RESULTS.md).
 
@@ -73,7 +73,7 @@ instead of stacked on one.
 
 All of it measured on the worst plausible configuration for the idea. The game
 renders on a card in a **chipset-fed PCIe 3.0 x2 slot**, and the second GPU sits
-on the CPU-fed slot — so every frame leaves the render card over that x2 chipset
+on the CPU-fed slot so every frame leaves the render card over that x2 chipset
 link on its way to the neural stage. It is the narrowest path in the machine and
 the whole payload crosses it. That is the point rather than a caveat — the
 architecture wins where it should struggle most. Slot topology, verified against
@@ -89,7 +89,7 @@ figure here was taken on two RTX 5060 Ti 16 GB. **The add-on does not check your
 hardware**, so on an older card expect it to load, log, and produce nothing.
 
 Strictly it is the **second** GPU that runs the neural stage, so that is the card
-NVIDIA's requirement applies to — but a mixed pair was never tested, and the
+NVIDIA's requirement applies to but a mixed pair was never tested, and the
 cross-adapter shared-heap workaround this depends on is itself a 50-series one.
 Two 50-series cards is the only configuration that has been run.
 
@@ -139,7 +139,7 @@ process. On a D3D12 game it:
 The game's own rendering is never touched. The bridge reads the finished frame
 and does its work elsewhere.
 
-[ARCHITECTURE.md](ARCHITECTURE.md) has the mechanism: adapter selection, the
+(ARCHITECTURE.md) has the mechanism: adapter selection, the
 shared heap and the seal, the NGX core/snippet split and the result-code ladder,
 and the present path.
 
@@ -250,9 +250,6 @@ minutes.**
 stable throughout. Beyond that is untested. Watch GPU load and temperature,
 especially with `Frames=0`.
 
-**The bridge window's frame rate falls as the pass count rises. The game's does
-not.** That is the architecture working, not a fault.
-
 **Interacting with the bridge window takes keyboard focus from the game.** A
 controller sidesteps it entirely.
 
@@ -273,10 +270,7 @@ nothing is established either way. It is not recommended and it has not been
 characterised.
 
 **Colour handling is not implemented, and on one of the two titles tested the
-output comes back washed.** The frame handed to the model is correct and the
-frame it returns is washed, established by same-frame split, so transport and
-presentation are both exonerated. The cause is not established. **Taking `tone`
-down in the panel fixed it on the development rig — `0.00` there — and yours may
+output comes back washed.** **Taking `tone` down in the panel fixed it on the development rig — `0.00` there — and yours may
 differ.** The only recorded difference between the two titles is bit depth, 8
 versus 10 bits per channel; both formats are plain UNORM, there is no sRGB
 anywhere in this pipeline, and an earlier diagnosis that said there was is
