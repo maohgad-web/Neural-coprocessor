@@ -44,8 +44,9 @@ WHAT YOU NEED FIRST
 
 4. A DIRECTX 12 GAME. D3D11 AND VULKAN TITLES DO NOTHING - the add-on loads,
    finds no D3D12 render device, stands down, and says so in the log and in
-   the bridge window's title bar. Some Unity titles can be forced with
-   -force-d3d12.
+   the ReShade overlay panel. There is no bridge window on those titles: no
+   D3D12 device means no window at all, which is why the message is in the
+   panel. Some Unity titles can be forced with -force-d3d12.
 
    This is a limit of this add-on, not of DLSS Neural Rendering itself, which
    NVIDIA documents against Vulkan. Everything here is built on ReShade's
@@ -217,11 +218,30 @@ does not. That is the architecture working, not a fault.
 Interacting with the bridge window takes keyboard focus away from the game. A
 controller sidesteps this entirely.
 
-THE BRIDGE WINDOW OPENS ON THE GAME'S DISPLAY. You have to drag it to the second
-monitor once per launch. This is a known defect, not something you configured
-wrong: the window is created before the sizing code runs, and that code fits the
-window to whichever monitor it is already on - so it sizes correctly to the wrong
-display. Move it and Window=fit behaves as documented.
+DO NOT CHANGE RESOLUTION, DLSS MODE OR GRAPHICS PRESETS WHILE THE STREAM IS
+ARMED. The stream is armed once, against the game's swapchain exactly as it
+stands at that instant - source size, format and row pitch are fixed then.
+Anything that makes the game rebuild its swapchain leaves the bridge consuming
+against an arrangement that no longer exists. On the development machine this
+produced a run of dropped and reordered frames beginning a second after the
+change, and the session could freeze. Set the game up first, then let it arm. To
+change something afterwards, close the game and relaunch.
+
+FRAME GENERATION IS UNTESTED. It was enabled once and that session ended badly,
+on a machine that was also failing on ordinary settings changes, so nothing is
+established either way. It is not recommended and it has not been characterised.
+
+WASHED OR FLAT COLOUR? Open the panel (Home over the bridge window) and take the
+"tone" slider down - 0.00 fixed it on the development rig, and yours may differ.
+Colour handling is not implemented in this add-on and on one of the two titles
+tested the output comes back washed; the cause is not established.
+
+THE BRIDGE WINDOW SHOULD OPEN ON THE SECOND MONITOR BY ITSELF. If it opens on
+the game's display instead, set Monitor=<n> in mgpu.ini and check the
+[MGPU][P7.10] line in ReShade.log - it names which monitor it chose and how.
+Earlier builds always opened on the game's display and had to be dragged once
+per launch; that is fixed, and a build that still does it is telling you the
+placement fell back, which the log will say.
 
 EXTERNAL FPS OVERLAYS FLICKER, AND IT IS NOT YOUR SETUP. This add-on puts a
 second swapchain inside the game's process. RivaTuner / MSI Afterburner assume
