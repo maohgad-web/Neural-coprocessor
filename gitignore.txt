@@ -1,0 +1,36 @@
+# CI-fetched ReShade and NGX headers — created at build time by
+# .github/workflows/build.yml from crosire/reshade and NVIDIA/DLSS at the pinned
+# SHAs recorded in VENDOR_LOCK.md. Never committed, never redistributed.
+ext/
+
+# CMake build output
+build/
+
+# CI download scratch (codeload tarball). The fetch step keeps downloads in
+# the workspace rather than /tmp: MSYS path translation on Windows runners
+# makes /tmp unreliable for curl/tar arguments.
+_dl/
+
+# CI staging directory for the release artifact. Assembled by build.yml's
+# "Stage deploy set" step from assets/ and the built add-on; the artifact is the
+# product, the directory is not.
+_deploy/
+
+# Run output. These are produced beside the game's dxgi.dll and get copied in
+# here while a run is being read. Working copies must never be committed —
+# ReShade.log carries the machine's filesystem paths.
+*.log
+ReShade.log
+nvngx*.log
+
+# Exception: logs published as evidence alongside a result or a video. A run
+# whose log can be read is a run someone can check instead of trusting, which is
+# the whole point of publishing it. Put them under docs/runs/ deliberately, one
+# directory per take, after reading them — see the note in that directory.
+!docs/runs/*.log
+
+# Local editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
