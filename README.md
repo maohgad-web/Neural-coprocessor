@@ -1,7 +1,7 @@
 # Neural Coprocessor
 
 **A second GPU running a game's neural post-processing, while the first one
-renders.** Not SLI nothing is split mid-frame. Neural rendering is a *terminal*
+renders.** Not SLI — nothing is split mid-frame. Neural rendering is a *terminal*
 stage: it takes a finished frame and returns a finished frame, so it can be
 picked up and executed somewhere else entirely.
 
@@ -40,44 +40,71 @@ each. The measured runs were separate and unrecorded.
 
 ## The result
 
-Measured on one machine, one game, with the game rendering on the same card in
-both runs so the only variable is which GPU does the neural work. A second
-title was run for compatibility, stability and power, but **not** for a
-frame-rate comparison. Method and caveats in [RESULTS.md](RESULTS.md).
+One game, at 1920 × 1080, across the whole DLSS range. **Three arms**, so the
+neural stage can be priced rather than only compared against itself: the game
+with no neural rendering at all, the neural stage on the render GPU, and the
+neural stage on the second GPU. Method and caveats in [RESULTS.md](RESULTS.md).
 
-At 1920 × 1080, across the DLSS range:
+| DLSS mode | no neural rendering | neural on the **render** GPU | neural on the **second** GPU |
+|---|---|---|---|
+| DLAA | 67–70 | 44 | 67–70 |
+| Quality | 98–99 | 54–55 | 91 |
+| Performance | 127–131 | 59 | 106–107 |
+| Ultra Performance | 172 | 69–71 | 157 |
 
-| DLSS mode | NR on the render GPU | NR on the second GPU |
+The first column is the ceiling — what the machine does when nothing neural is
+running. Against it, this is what the neural stage **costs the game**:
+
+| DLSS mode | on the render GPU | on the second GPU |
 |---|---|---|
-| DLAA | 43–44 | 48 |
-| Quality | 44–45 | 58 |
-| Performance | 47–48 | 69 |
-| Ultra Performance | 56–57 | 79 |
+| DLAA | −36% | **0%** |
+| Quality | −45% | −8% |
+| Performance | −54% | −17% |
+| Ultra Performance | −59% | −9% |
 
 The frame rates are not the finding. The **slope** is — what you gain by going
-from DLAA down to Ultra Performance:
+from DLAA down to Ultra Performance, and how much of the available gain each arm
+keeps:
 
-- neural work on the render GPU: **+30%**
-- neural work on the second GPU: **+65%**
+| | gain, DLAA → Ultra Performance | share of the ceiling's gain |
+|---|---|---|
+| no neural rendering | +151% | — |
+| neural on the second GPU | **+129%** | **86%** |
+| neural on the render GPU | +59% | 39% |
 
-Neural post-processing saturates whatever device it runs on. On the render GPU,
-lowering the render resolution frees capacity the neural stage immediately
-consumes, so upscaling stops paying for itself. Move it to a second GPU and the
-render GPU is genuinely freed.
+Neural post-processing saturates whatever device it runs on, and it always runs
+at *output* resolution — so its cost barely falls as you drop the DLSS mode while
+the render work collapses. On the render GPU it therefore eats a larger and
+larger share of every frame, and upscaling stops paying for itself: about a third
+of what the machine actually had to give. Move it to a second GPU and you keep
+**86%** of it.
+
+**At DLAA the offloaded neural stage costs the game nothing measurable** — the
+setting where the render GPU has no spare capacity to hand over.
+
+The same shape was measured earlier on a second machine with a far worse link —
+smaller numbers, same conclusion. That table, and every condition both sets of
+figures were taken under, is in [RESULTS.md](RESULTS.md).
 
 **Neural post-processing on the render device largely defeats upscaling. Moving
 it off restores it.**
 
-The render GPU also runs 21 °C cooler, because the load sits across two coolers
-instead of stacked on one.
+**The render GPU also runs cooler.** On the first machine it was 21 °C cooler
+with the neural stage moved off, load spread across two coolers instead of
+stacked on one. On the second machine the neural stage costs the render card
+about 10 °C when it runs there. Both are within-rig deltas, taken minutes apart
+on one card; the two machines have different cooling and their absolute
+temperatures are not comparable.
 
-All of it measured on the worst plausible configuration for the idea. The game
-renders on a card in a **chipset-fed PCIe 3.0 x2 slot**, and the second GPU sits
-on the CPU-fed slot so every frame leaves the render card over that x2 chipset
-link on its way to the neural stage. It is the narrowest path in the machine and
-the whole payload crosses it. That is the point rather than a caveat — the
-architecture wins where it should struggle most. Slot topology, verified against
-the board specification, is in [RESULTS.md](RESULTS.md) §3.
+**And the first machine was the worst plausible configuration for the idea.**
+The game rendered on a card in a **chipset-fed PCIe 3.0 x2 slot**, with the
+second GPU on the CPU-fed slot — so every frame left the render card over that
+x2 chipset link on its way to the neural stage. Narrowest path in the machine,
+and the whole payload crossed it. That is the point rather than a caveat: the
+architecture won where it should have struggled most, and the second machine —
+both cards on CPU lanes at PCIe 5.0 x8 — shows what the same code does when the
+link is not the constraint. Slot topology, verified against the board
+specifications, is in [RESULTS.md](RESULTS.md) §3.
 
 ### What this needs
 
@@ -89,7 +116,7 @@ figure here was taken on two RTX 5060 Ti 16 GB. **The add-on does not check your
 hardware**, so on an older card expect it to load, log, and produce nothing.
 
 Strictly it is the **second** GPU that runs the neural stage, so that is the card
-NVIDIA's requirement applies to but a mixed pair was never tested, and the
+NVIDIA's requirement applies to — but a mixed pair was never tested, and the
 cross-adapter shared-heap workaround this depends on is itself a 50-series one.
 Two 50-series cards is the only configuration that has been run.
 
@@ -139,7 +166,7 @@ process. On a D3D12 game it:
 The game's own rendering is never touched. The bridge reads the finished frame
 and does its work elsewhere.
 
-(ARCHITECTURE.md) has the mechanism: adapter selection, the
+[ARCHITECTURE.md](ARCHITECTURE.md) has the mechanism: adapter selection, the
 shared heap and the seal, the NGX core/snippet split and the result-code ladder,
 and the present path.
 
@@ -250,6 +277,9 @@ minutes.**
 stable throughout. Beyond that is untested. Watch GPU load and temperature,
 especially with `Frames=0`.
 
+**The bridge window's frame rate falls as the pass count rises. The game's does
+not.** That is the architecture working, not a fault.
+
 **Interacting with the bridge window takes keyboard focus from the game.** A
 controller sidesteps it entirely.
 
@@ -270,7 +300,10 @@ nothing is established either way. It is not recommended and it has not been
 characterised.
 
 **Colour handling is not implemented, and on one of the two titles tested the
-output comes back washed.** **Taking `tone` down in the panel fixed it on the development rig — `0.00` there — and yours may
+output comes back washed.** The frame handed to the model is correct and the
+frame it returns is washed, established by same-frame split, so transport and
+presentation are both exonerated. The cause is not established. **Taking `tone`
+down in the panel fixed it on the development rig — `0.00` there — and yours may
 differ.** The only recorded difference between the two titles is bit depth, 8
 versus 10 bits per channel; both formats are plain UNORM, there is no sRGB
 anywhere in this pipeline, and an earlier diagnosis that said there was is
@@ -310,9 +343,9 @@ claim about how the output looks.
 
 Genuinely, not as a formality. This creates a second D3D12 device, allocates
 cross-adapter shared heaps, and drives vendor libraries on your own hardware.
-It has been exercised on **one machine**, with three titles — and only one of
-those produced the measurements. A second machine exists and nothing has been run
-on it yet.
+It has been exercised on **two machines**, with three titles — and only one of
+those titles produced the frame-rate measurements. Sessions are measured in
+minutes, not hours.
 
 See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for how it was built — including
 which parts were written by AI, and the specific occasions where the AI was
