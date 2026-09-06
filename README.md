@@ -177,6 +177,20 @@ not.** That is the architecture working, not a fault.
 **Interacting with the bridge window takes keyboard focus from the game.** A
 controller sidesteps it entirely.
 
+**External overlays that hook `Present` misbehave, and the reason is
+structural.** This add-on creates a second swapchain inside the game's process,
+and tools like RivaTuner / MSI Afterburner assume one swapchain per process — the
+counter flickers between the two present streams. The NVIDIA overlay does not
+recognise the bridge window at all. Use **ReShade's own FPS display** instead:
+there are two ReShade runtimes in the process, so each draws its own counter for
+its own swapchain, which is what you want anyway — the game's rate and the
+bridge's rate are different numbers and the difference is the point. Set
+`ShowFPS=1` under `[OVERLAY]` in both `ReShade.ini` and `ReShade2.ini`.
+
+For screen recording, prefer display or Windows-Graphics-Capture sources over
+"game capture", which adds a third `Present` hook to a process that already has
+two.
+
 **D3D11 games do nothing.** No game adapter is identified, the bridge stands
 down, and the log says so. Some Unity titles can be forced with `-force-d3d12`.
 
