@@ -1,29 +1,29 @@
 # Neural Coprocessor
 
 **A second GPU running a game's neural post-processing, while the first one
-renders.** Not SLI — nothing is split mid-frame. Neural rendering is a *terminal*
+renders.** Not SLI nothing is split mid-frame. Neural rendering is a *terminal*
 stage: it takes a finished frame and returns a finished frame, so it can be
 picked up and executed somewhere else entirely.
 
 **This is a ReShade add-on.** It is called **MGPU Bridge**, it is a `.addon64`
 file that ReShade loads into a D3D12 game, and every log line it writes is
 prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a
-replacement for anything — it needs an **add-on-enabled** ReShade build to load
+replacement for anything it needs an **add-on-enabled** ReShade build to load
 at all. There is no game modification of any kind: the add-on reads each
 finished frame and does its work elsewhere.
 
 This is research code with published measurements. It is not a product.
 
-**See it running** — the game on one card, the neural output in its own window on
+**See it running** the game on one card, the neural output in its own window on
 the other, both live in a single take:
 
-- [The Blood of Dawnwalker](https://youtu.be/yoEsuZyltFc) — the title every
+- [The Blood of Dawnwalker](https://youtu.be/yoEsuZyltFc) the title every
   measurement in [RESULTS.md](RESULTS.md) was taken on
-- [Cyberpunk 2077](https://youtu.be/XWv5jw90yHc) — gameplay, played normally.
+- [Cyberpunk 2077](https://youtu.be/XWv5jw90yHc) gameplay, played normally.
   **No figure in this repository comes from Cyberpunk**; it was run for
   compatibility, stability and power draw only.
 
-Both are demonstrations, not benchmarks — screen-recording overhead is present in
+Both are demonstrations, not benchmarks screen-recording overhead is present in
 each. The measured runs were separate and unrecorded.
 
 | | |
@@ -52,7 +52,7 @@ neural stage on the second GPU. Method and caveats in [RESULTS.md](RESULTS.md).
 | Performance | 127–131 | 59 | 106–107 |
 | Ultra Performance | 172 | 69–71 | 157 |
 
-The first column is the ceiling — what the machine does when nothing neural is
+The first column is the ceiling what the machine does when nothing neural is
 running. Against it, this is what the neural stage **costs the game**:
 
 | DLSS mode | on the render GPU | on the second GPU |
@@ -62,7 +62,7 @@ running. Against it, this is what the neural stage **costs the game**:
 | Performance | −54% | −17% |
 | Ultra Performance | −59% | −9% |
 
-The frame rates are not the finding. The **slope** is — what you gain by going
+The frame rates are not the finding. The **slope** is what you gain by going
 from DLAA down to Ultra Performance, and how much of the available gain each arm
 keeps:
 
@@ -73,16 +73,16 @@ keeps:
 | neural on the render GPU | +59% | 39% |
 
 Neural post-processing saturates whatever device it runs on, and it always runs
-at *output* resolution — so its cost barely falls as you drop the DLSS mode while
+at *output* resolution so its cost barely falls as you drop the DLSS mode while
 the render work collapses. On the render GPU it therefore eats a larger and
 larger share of every frame, and upscaling stops paying for itself: about a third
 of what the machine actually had to give. Move it to a second GPU and you keep
 **86%** of it.
 
-**At DLAA the offloaded neural stage costs the game nothing measurable** — the
+**At DLAA the offloaded neural stage costs the game nothing measurable** the
 setting where the render GPU has no spare capacity to hand over.
 
-The same shape was measured earlier on a second machine with a far worse link —
+The same shape was measured earlier on a second machine with a far worse link
 smaller numbers, same conclusion. That table, and every condition both sets of
 figures were taken under, is in [RESULTS.md](RESULTS.md).
 
@@ -98,11 +98,11 @@ temperatures are not comparable.
 
 **And the first machine was the worst plausible configuration for the idea.**
 The game rendered on a card in a **chipset-fed PCIe 3.0 x2 slot**, with the
-second GPU on the CPU-fed slot — so every frame left the render card over that
+second GPU on the CPU-fed slot so every frame left the render card over that
 x2 chipset link on its way to the neural stage. Narrowest path in the machine,
 and the whole payload crossed it. That is the point rather than a caveat: the
-architecture won where it should have struggled most, and the second machine —
-both cards on CPU lanes at PCIe 5.0 x8 — shows what the same code does when the
+architecture won where it should have struggled most, and the second machine
+both cards on CPU lanes at PCIe 5.0 x8 shows what the same code does when the
 link is not the constraint. Slot topology, verified against the board
 specifications, is in [RESULTS.md](RESULTS.md) §3.
 
@@ -110,22 +110,22 @@ specifications, is in [RESULTS.md](RESULTS.md) §3.
 
 **GeForce RTX 50-series cards.** DLSS Neural Rendering is documented by NVIDIA
 as a 50-series feature; it is not available on 40-series or older hardware, and
-nothing this add-on does changes that — it drives the NGX libraries in your own
+nothing this add-on does changes that it drives the NGX libraries in your own
 driver installation and cannot enable a feature the driver will not run. Every
 figure here was taken on two RTX 5060 Ti 16 GB. **The add-on does not check your
 hardware**, so on an older card expect it to load, log, and produce nothing.
 
 Strictly it is the **second** GPU that runs the neural stage, so that is the card
-NVIDIA's requirement applies to — but a mixed pair was never tested, and the
+NVIDIA's requirement applies to but a mixed pair was never tested, and the
 cross-adapter shared-heap workaround this depends on is itself a 50-series one.
 Two 50-series cards is the only configuration that has been run.
 
-**Two GPUs and two monitors — one monitor on each card.** This is a requirement,
+**Two GPUs and two monitors one monitor on each card.** This is a requirement,
 not a nicety, and it is the first thing to get right. The neural output is
 displayed by the card that produced it, so nothing has to travel back across the
 link. Earlier milestones ran the second GPU headless and it works, but moving the
 cable onto the second card was worth **+33% throughput and roughly half the
-latency** on this machine — one variable, five minutes apart. Run it headless and
+latency** on this machine one variable, five minutes apart. Run it headless and
 you get a slower version of this with nothing to look at.
 
 ### What was measured
@@ -139,7 +139,7 @@ which was not tested and is not described by any figure here.
 
 **These numbers are not a prediction of what NVIDIA's own implementation does**,
 and they are dated. If you are reading this well after September 2026, treat
-every absolute figure as historical — driver versions, the DLSS-NR model inside
+every absolute figure as historical driver versions, the DLSS-NR model inside
 them, and the games themselves all move, and any of those changes the numbers
 without anything in this repository changing.
 
@@ -152,7 +152,7 @@ your own machine rather than taking from this table.
 
 ## What it actually does
 
-MGPU Bridge is a ReShade add-on — a `.addon64` that ReShade loads into the game
+MGPU Bridge is a ReShade add-on a `.addon64` that ReShade loads into the game
 process. On a D3D12 game it:
 
 1. identifies the adapter the game renders on, from the swapchain
@@ -178,7 +178,7 @@ NVIDIA is redistributed here.
 ## Install
 
 See [assets/README.txt](assets/README.txt), which is also the `README.txt` in the
-download — but two things decide whether it works at all:
+download but two things decide whether it works at all:
 
 **ReShade must be installed with add-on support.** The effects-only build never
 loads `.addon64` files and says nothing about it. No error, no log line, because
@@ -193,26 +193,6 @@ otherwise and was wrong.
 address, takes that module's file path, and requires it to contain that
 substring. Rename the file and the bridge loads, logs normally, and produces
 nothing.
-
----
-
-## Reading the log
-
-The instrumentation is deliberately loud, because this project repeatedly found
-that a confident, correctly-formatted, wrong answer is harder to catch than an
-obvious failure. Four lines answer most questions:
-
-| line | what it settles |
-|---|---|
-| `Registered add-on "MGPU Bridge"` | ReShade has add-on support and found the file |
-| `[MGPU][P1.6] ... N of 14 techniques ENABLED` | what is being drawn on top of what you are looking at, per runtime |
-| `[MGPU][P7.2] mgpu.ini read from ...` | which settings file actually took effect |
-| `[MGPU][P4.0] stream REQUESTED - ...` | every setting in force, in one line |
-
-If a log line and this README disagree, believe the log and open an issue.
-
-The instrumentation is loud on purpose, and the reasoning behind that — along
-with the rest of the working rules — is in [METHOD.md](METHOD.md).
 
 ---
 
@@ -262,23 +242,9 @@ see the thing work without learning a hotkey.
 
 ## Limitations
 
-**The black-screen session — what is established and what is not.** It was a
-**six-pass** run held for several minutes. That is the condition, and it is
-solid. The *mechanism* is not: a later twenty-minute Cyberpunk 2077 run at two
-passes sat at **167–174 W of a 180 W limit** and was completely stable, so
-"pinned at the power limit" is survivable and cannot by itself be the
-explanation. Six passes differ from two by more than the ceiling — per-frame GPU
-time, live handle count, sustained thermals — and which of those mattered was
-never isolated. **The build now allows at most two passes, a condition under
-which the failure has never been seen and which has now been held for twenty
-minutes.**
-
 **Longest clean run: twenty minutes**, Cyberpunk 2077 at 1440p, two passes,
 stable throughout. Beyond that is untested. Watch GPU load and temperature,
 especially with `Frames=0`.
-
-**The bridge window's frame rate falls as the pass count rises. The game's does
-not.** That is the architecture working, not a fault.
 
 **Interacting with the bridge window takes keyboard focus from the game.** A
 controller sidesteps it entirely.
@@ -287,12 +253,7 @@ controller sidesteps it entirely.
 armed.** The stream is armed once, against the game's swapchain exactly as it
 stands at that instant — source size, format and row pitch are all fixed then.
 Anything that makes the game rebuild its swapchain leaves the bridge consuming
-against an arrangement that no longer exists. On the development machine that
-produced a session-long run of dropped and reordered frames beginning one second
-after the change, and the session could freeze. Set the game up first, then arm;
-to change something afterwards, disarm, change it, and arm again. The seal
-reports it when it happens, so the log will say plainly whether this is what you
-hit.
+against an arrangement that no longer exists.
 
 **Frame generation is untested.** It was enabled once and that session ended
 badly, but on a machine that was also failing on ordinary settings changes — so
@@ -300,14 +261,10 @@ nothing is established either way. It is not recommended and it has not been
 characterised.
 
 **Colour handling is not implemented, and on one of the two titles tested the
-output comes back washed.** The frame handed to the model is correct and the
-frame it returns is washed, established by same-frame split, so transport and
-presentation are both exonerated. The cause is not established. **Taking `tone`
-down in the panel fixed it on the development rig — `0.00` there — and yours may
+output comes back washed.**  **Taking `tone down in the panel fixed it on the development rig — `0.00` there — and yours may
 differ.** The only recorded difference between the two titles is bit depth, 8
 versus 10 bits per channel; both formats are plain UNORM, there is no sRGB
-anywhere in this pipeline, and an earlier diagnosis that said there was is
-retracted.
+anywhere in this pipeline. 
 
 **External overlays that hook `Present` misbehave, and the reason is
 structural.** This add-on creates a second swapchain inside the game's process,
@@ -327,9 +284,7 @@ two.
 D3D12 render device, stands down, and says so in the log and in its window
 title. Some Unity titles can be forced with `-force-d3d12`.
 
-This is a limit of *this bridge*, not of the feature — NVIDIA's own DLSS-NR
-programming guide is written against Vulkan, and the snippet ships a fuller
-Vulkan surface than a D3D12 one. Everything here hooks ReShade's D3D12 path and
+This is a limit of *this bridge*, not of the feature. Everything here hooks ReShade's D3D12 path and
 creates a D3D12 device on the second adapter, so Vulkan would be a separate
 implementation rather than a flag.
 
