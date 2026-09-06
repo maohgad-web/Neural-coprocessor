@@ -93,6 +93,23 @@ namespace
         LUID provisional_luid{};
         bool decided = false;               // selected or terminally refused
         selection_result result;
+        // P7.10. When the last swapchain event arrived, and how many of them
+        // named a device that was not d3d12.
+        //
+        // The first exists for AutoArm. The stream is armed once against the
+        // game's swapchain as it stands at that instant - source size, format,
+        // row pitch and the shared heap are all fixed then - and a game that
+        // rebuilds its swapchain afterwards leaves the consumer bound to an
+        // arrangement that no longer exists. A rig log caught exactly that: a
+        // ResizeBuffers on the game's chain, and a second later a continuous run
+        // of DROPPED and REORDERED seals. Anything that arms by itself has to
+        // wait for this to go quiet first.
+        //
+        // The second is how the panel can tell a D3D11 or Vulkan title from a
+        // D3D12 one that simply has not reached its swapchain yet. Without it
+        // the only honest thing the UI can say is "waiting", forever.
+        std::atomic<unsigned long long> last_sc_ms{0};
+        std::atomic<unsigned> non_d3d12_sc{0};
     };
 
     state &st()
@@ -499,6 +516,11 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
     ensure_init();
     if (swapchain == nullptr)
         return;
+    // P7.10. Stamped for EVERY swapchain event, before any filtering and
+    // including the resize path that returns early below. The value AutoArm
+    // needs is "when did the presentation setup last change", and a resize is
+    // exactly such a change even though it establishes no new game LUID.
+    st().last_sc_ms.store(GetTickCount64(), std::memory_order_relaxed);
     ::reshade::api::device *dev = swapchain->get_device();
     ID3D12Device *dev12 = nullptr;
     if (dev != nullptr &&
@@ -507,8 +529,19 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
         dev12 = reinterpret_cast<ID3D12Device *>(dev->get_native());
     if (dev12 == nullptr)
     {
-        mgpu::diag::warn("[MGPU][T2] init_swapchain: the swapchain's device is not d3d12 - this "
-                         "event establishes no game luid");
+        // P7.10. Counted, not just warned. A D3D11 or Vulkan title reaches this
+        // line on every swapchain it creates and never reaches any other, so the
+        // count is the difference between "this API is not supported" and "the
+        // game has not got there yet" - and the panel has no other way to tell
+        // those apart. Said in the log the first time only; the counter carries
+        // the rest.
+        const unsigned n = st().non_d3d12_sc.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1)
+            mgpu::diag::warn("[MGPU][T2] init_swapchain: the swapchain's device is not d3d12 - this "
+                             "event establishes no game luid. If every swapchain in this process "
+                             "looks like this, the title is D3D11 or Vulkan and this add-on does "
+                             "nothing on it: it hooks ReShade's D3D12 path and creates a D3D12 "
+                             "device on the second adapter. Some Unity titles accept -force-d3d12.");
         return;
     }
     // The device that owns the swapchain is the device
@@ -595,6 +628,25 @@ void get_selection(selection_result &out)
     auto &S = st();
     std::lock_guard<std::mutex> lk(S.cs);
     out = S.result;
+}
+
+// P7.10. Both are atomics read without the lock deliberately: they are called
+// from the bridge thread's present loop and from an overlay callback, neither
+// of which may block behind a selection that is mid-decision.
+unsigned long long ms_since_last_swapchain_event()
+{
+    ensure_init();
+    const unsigned long long t = st().last_sc_ms.load(std::memory_order_relaxed);
+    if (t == 0)
+        return 0;   // no swapchain event yet - "not quiet", which is the safe answer
+    const unsigned long long now = GetTickCount64();
+    return (now > t) ? (now - t) : 0;
+}
+
+unsigned non_d3d12_swapchain_events()
+{
+    ensure_init();
+    return st().non_d3d12_sc.load(std::memory_order_relaxed);
 }
 
 void log_device_luid(const char *event, ::reshade::api::device *device)

@@ -29,6 +29,11 @@
 // removed).
 #include <windows.h>
 #include <process.h>
+// P7.10: IDXGIAdapter1::EnumOutputs and DXGI_OUTPUT_DESC, to ask the BRIDGE
+// adapter which panels it drives instead of asking Windows where it happened to
+// put our window. dxgi1_4.h is what adapter.cpp already includes, so the two
+// files agree on the DXGI surface level.
+#include <dxgi1_4.h>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -147,6 +152,156 @@ namespace
         default:
             return DefWindowProcW(hWnd, msg, wParam, lParam);
         }
+    }
+
+    // ---- P7.10: where the window is born ----
+    //
+    // THE DEFECT. The window was created at CW_USEDEFAULT and the P7.3 fit code
+    // then called MonitorFromWindow to learn which panel it had landed on. That
+    // is an inference from where Windows happened to place it, and Windows
+    // places it on the primary display - which on the rig this was built on is
+    // the GAME's panel. So the window sized itself correctly to the wrong
+    // monitor, every launch, and had to be dragged across by hand. It is not
+    // cosmetic: presenting GPU 1's output on GPU 0's panel is the cross-adapter
+    // present the whole topology exists to avoid, and it puts the thing being
+    // measured behind the thing being measured.
+    //
+    // THE FIX. The bridge adapter knows which outputs it drives. Ask it. That
+    // is a statement about the hardware rather than a guess about window
+    // placement, and it is the same adapter pointer T2 selected and T3 created
+    // the device on, so the window cannot end up on a different card than the
+    // neural work by construction.
+    //
+    // Everything here can only withhold a placement, never produce a wrong one:
+    // any failure leaves the origin at CW_USEDEFAULT, which is exactly the old
+    // behaviour, and says so in the log.
+    struct bridge_placement
+    {
+        bool known = false;
+        int  x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+        UINT outputs_total = 0;      // outputs the adapter reports
+        UINT outputs_attached = 0;   // of those, attached to the desktop
+        char detail[320] = {};
+    };
+
+    void pick_bridge_placement(const mgpu::adapter::selection_result &sel,
+                               bridge_placement &out)
+    {
+        const int want = mgpu::gpu1::monitor_index();   // -1 = auto
+
+        IDXGIAdapter1 *ad1 = static_cast<IDXGIAdapter1 *>(sel.selected_adapter);
+        if (ad1 == nullptr)
+        {
+            snprintf(out.detail, sizeof out.detail,
+                     "no adapter reference - window placed by Windows (CW_USEDEFAULT)");
+            return;
+        }
+
+        // Collect the adapter's outputs that are actually attached to the
+        // desktop. An output that exists but is not attached has no desktop
+        // rectangle to place a window in, so it is counted and skipped.
+        RECT rects[8]{};
+        char names[8][40]{};
+        UINT n_attached = 0;
+
+        for (UINT i = 0; i < 32; ++i)
+        {
+            IDXGIOutput *o = nullptr;
+            if (FAILED(ad1->EnumOutputs(i, &o)) || o == nullptr)
+                break;   // DXGI_ERROR_NOT_FOUND: this adapter has no more
+            ++out.outputs_total;
+            DXGI_OUTPUT_DESC d{};
+            if (SUCCEEDED(o->GetDesc(&d)) && d.AttachedToDesktop && n_attached < 8)
+            {
+                rects[n_attached] = d.DesktopCoordinates;
+                WideCharToMultiByte(CP_UTF8, 0, d.DeviceName, -1,
+                                    names[n_attached], 39, nullptr, nullptr);
+                names[n_attached][39] = '\0';
+                ++n_attached;
+            }
+            o->Release();
+        }
+        out.outputs_attached = n_attached;
+
+        if (n_attached == 0)
+        {
+            // Headless second card. It works - earlier milestones ran this way
+            // - but it is the slower configuration by a wide margin, and it is
+            // worth saying so at the moment it is detected rather than leaving
+            // someone to wonder why their figures are low.
+            snprintf(out.detail, sizeof out.detail,
+                     "the bridge adapter drives NO attached display (%u output(s) reported, 0 "
+                     "attached) - running HEADLESS. This works, but moving a monitor cable onto "
+                     "the second card was worth +33%% throughput and roughly half the latency on "
+                     "the rig this was measured on. Window placed by Windows",
+                     out.outputs_total);
+            return;
+        }
+
+        UINT pick = 0;
+        const char *how = "auto: the bridge adapter's first attached output";
+        if (want >= 0)
+        {
+            if ((UINT)want < n_attached)
+            {
+                pick = (UINT)want;
+                how = "Monitor= from mgpu.ini";
+            }
+            else
+            {
+                // Refuse the index, do not silently substitute a different
+                // panel: a setting that quietly does something else is worse
+                // than one that fails loudly.
+                how = "Monitor= in mgpu.ini names an output this adapter does not have - "
+                      "falling back to its first attached output";
+            }
+        }
+
+        out.known = true;
+        out.x = (int)rects[pick].left;
+        out.y = (int)rects[pick].top;
+        snprintf(out.detail, sizeof out.detail,
+                 "%s: output %u of %u attached (%u reported) \"%s\" desktop rect "
+                 "(%d,%d)-(%d,%d) - the window is created ON THE CARD THAT DID THE NEURAL WORK, "
+                 "so nothing crosses back over the link to be displayed",
+                 how, pick, n_attached, out.outputs_total, names[pick],
+                 (int)rects[pick].left, (int)rects[pick].top,
+                 (int)rects[pick].right, (int)rects[pick].bottom);
+    }
+
+    // ---- P7.10: the title bar as the status line ----
+    //
+    // The window is the only surface a user sees without opening an overlay or
+    // reading a log, and it spent every milestone up to here saying the same
+    // eight characters whatever the bridge was doing. Now it answers the two
+    // questions people actually ask of it - is it armed, and is the neural
+    // stage running - plus the one thing that is a hard limit rather than a
+    // setting.
+    void set_window_title(HWND hwnd, unsigned long long frame)
+    {
+        if (hwnd == nullptr) return;
+
+        mgpu::gpu1::ui_state st;
+        mgpu::gpu1::ui_read(st);
+
+        char t[220];
+        if (!st.armed)
+            snprintf(t, sizeof t,
+                     "MGPU Bridge (GPU 1) - NOT ARMED - press CTRL+ALT+F10 in gameplay "
+                     "| D3D12 only");
+        else if (st.summarised)
+            snprintf(t, sizeof t,
+                     "MGPU Bridge (GPU 1) - finished, ran to its bound | D3D12 only");
+        else
+            snprintf(t, sizeof t,
+                     "MGPU Bridge (GPU 1) - armed | x%u | neural %s | %llu frames | D3D12 only",
+                     st.passes, st.neural ? (st.nr_ok ? "ON" : "requested") : "off",
+                     (unsigned long long)st.consumed);
+
+        wchar_t w[220];
+        if (MultiByteToWideChar(CP_UTF8, 0, t, -1, w, 220) != 0)
+            SetWindowTextW(hwnd, w);
+        (void)frame;
     }
 
     unsigned __stdcall bridge_main(void *arg)
@@ -307,6 +462,23 @@ namespace
                 const int width = rc.right - rc.left;
                 const int height = rc.bottom - rc.top;
 
+                // P7.10: the origin comes from the BRIDGE ADAPTER's own output,
+                // not from wherever Windows would have put the window. It is
+                // computed before CreateWindowExW rather than corrected after,
+                // because the P7.3 fit code reads the window's monitor - move
+                // the window later and the size has already been decided
+                // against the wrong panel.
+                bridge_placement place;
+                pick_bridge_placement(sel, place);
+                // Its own buffer: the enclosing `line` is 320 bytes and this
+                // message is longer. A truncated log line is a wrong answer
+                // that looks like a right one - the same reason the P1.3g
+                // hotkey message has a buffer of its own.
+                char pline[420];
+                snprintf(pline, sizeof pline, "[MGPU][P7.10] window placement - %s", place.detail);
+                if (place.known) mgpu::diag::info(pline);
+                else             mgpu::diag::warn(pline);
+
                 // T5 (section 09): no WS_VISIBLE. A window created visible
                 // takes foreground activation from the game the moment it
                 // appears, and the game's borderless-fullscreen presentation
@@ -315,9 +487,9 @@ namespace
                 hwnd = CreateWindowExW(
                     0,
                     class_name_w,
-                    L"MGPU Bridge (GPU 1)",
+                    L"MGPU Bridge (GPU 1) - starting | D3D12 only",
                     wnd_style,
-                    CW_USEDEFAULT, CW_USEDEFAULT,
+                    place.x, place.y,
                     width, height,
                     nullptr, nullptr,
                     mgpu::module_handle(),
@@ -361,6 +533,12 @@ namespace
                     // of this code logged that as an error on every single
                     // launch. There is nothing to check.
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+                    // P7.10: say what it is doing straight away. The present
+                    // loop refreshes this every half second, but if the present
+                    // chain fails to create, this is the only title the window
+                    // will ever have - and "starting" forever is a lie.
+                    set_window_title(hwnd, 0);
 
                     // P1.3g. A GLOBAL hotkey, deliberately - not a key handled by
                     // the bridge window. A window-scoped key would force the
@@ -514,6 +692,33 @@ namespace
         // exactly as it was.
         bool removed_logged = false;
         unsigned long long frame = 0;   // T5: completed presents
+
+        // P7.10: AutoArm. Off unless mgpu.ini says otherwise, so every
+        // published measurement's conditions are the shipped default and a
+        // measurement run still arms by hand, in gameplay, where the operator
+        // chose it.
+        //
+        // Two conditions, not one. The frame count gives the game time to get
+        // past shader compilation and its own startup swapchain churn; the
+        // swapchain-quiet check is the one that matters, because the stream is
+        // armed ONCE against the game's swapchain as it stands at that instant.
+        // A rig log shows what happens when that is violated: a ResizeBuffers on
+        // the game's chain, and a second later a continuous run of DROPPED and
+        // REORDERED seals for the rest of the session.
+        const unsigned autoarm_at = mgpu::gpu1::autoarm_frames();
+        const unsigned long long AUTOARM_QUIET_MS = 3000;
+        bool autoarm_done = (autoarm_at == 0);
+        bool autoarm_waiting_logged = false;
+        if (autoarm_at != 0)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][P7.10] AutoArm is ON: the stream will arm itself after %u presented "
+                     "frames AND %llu ms with no swapchain event. For a MEASUREMENT leave it off "
+                     "and arm by hand in gameplay - that is what every published figure ran under.",
+                     autoarm_at, (unsigned long long)AUTOARM_QUIET_MS);
+            mgpu::diag::info(line);
+        }
+
         for (;;)
         {
             if (have_chain)
@@ -710,6 +915,59 @@ namespace
                              "[MGPU][T5] present loop alive: frame %llu thread id 0x%X",
                              (unsigned long long)frame, (unsigned)tid);
                     mgpu::diag::info(line);
+                }
+
+                // P7.10: the title as a status line. Every 30 frames (~0.5 s)
+                // and once at frame 1, so the window says what it is doing
+                // before anyone opens an overlay. SetWindowTextW on the thread
+                // that owns the window, which is this one.
+                if (frame == 1 || frame % 30 == 0)
+                    set_window_title(hwnd, frame);
+
+                // P7.10: AutoArm, evaluated here so it can see the frame count
+                // this loop maintains. Both conditions, then one attempt, then
+                // never again - a retry loop around arming is a retry loop
+                // around a one-shot.
+                if (!autoarm_done && frame >= autoarm_at)
+                {
+                    const unsigned long long quiet =
+                        mgpu::adapter::ms_since_last_swapchain_event();
+                    if (quiet >= AUTOARM_QUIET_MS)
+                    {
+                        mgpu::gpu1::ui_state ast;
+                        mgpu::gpu1::ui_read(ast);
+                        if (ast.armed)
+                        {
+                            // Armed by hand while we were waiting. Stand down
+                            // silently rather than arming a second time.
+                            autoarm_done = true;
+                        }
+                        else
+                        {
+                            autoarm_done = true;
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P7.10] AutoArm firing at frame %llu (%llu ms since the "
+                                     "last swapchain event). Identical to pressing CTRL+ALT+F10 - "
+                                     "same one-shot, same path. If the game is still in a menu the "
+                                     "stream is armed against menu frames, which is correct but "
+                                     "measures nothing.",
+                                     (unsigned long long)frame, quiet);
+                            mgpu::diag::info(line);
+                            mgpu::gpu1::stream_request();
+                        }
+                    }
+                    else if (!autoarm_waiting_logged)
+                    {
+                        autoarm_waiting_logged = true;
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P7.10] AutoArm reached its frame count at %llu but the "
+                                 "game's swapchain changed %llu ms ago - waiting for %llu ms of "
+                                 "quiet. Arming across a swapchain rebuild is what produces a "
+                                 "session-long run of DROPPED and REORDERED seals.",
+                                 (unsigned long long)frame, quiet,
+                                 (unsigned long long)AUTOARM_QUIET_MS);
+                        mgpu::diag::info(line);
+                    }
                 }
 
                 // The device-removal poll, moved from the 250 ms timer to

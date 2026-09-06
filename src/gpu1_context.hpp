@@ -237,6 +237,28 @@ void capture_poll();
 // mgpu.ini to run the old chain again, with the stream deliberately not armed.
 bool probes_enabled();
 
+// ---- P7.10: two settings worker.cpp needs, read through this file's reader ----
+//
+// Both come out of the same mgpu.ini the P7.2 line names and the P4.0 arm line
+// reports. They live here rather than in worker.cpp because the ini reader and
+// its buffer are in this file's anonymous namespace, and a second parser in a
+// second file is how two files start disagreeing about the settings.
+
+// Monitor= auto | <index>. -1 = auto, meaning the bridge adapter's first
+// output attached to the desktop. An index selects among THAT ADAPTER's
+// outputs - not Windows' display numbering - because the point of the setting
+// is to keep scan-out on the card that did the neural work.
+int monitor_index();
+
+// AutoArm= 0 | 1 | <frames>. 0 = off (the default, and what every published
+// measurement ran under). 1 = on at the built-in delay; a larger value is that
+// delay in presented bridge frames. The delay is load-bearing: the stream is
+// armed once against the game's swapchain as it exists at that moment, so
+// arming while the game is still building it - or while the user is still in
+// the graphics menu - leaves the consumer bound to an arrangement that is about
+// to be replaced.
+unsigned autoarm_frames();
+
 // ---- P6.4: what the overlay panel reads and writes ----
 //
 // Plain scalars on purpose. This header names no ReShade type and no ImGui

@@ -90,6 +90,26 @@ namespace mgpu::adapter
     HANDLE ready_event();
     void   get_selection(selection_result &out);
 
+    // P7.10. Milliseconds since the last init_swapchain event of any kind,
+    // resizes included; 0 when none has arrived yet, which reads as "not
+    // quiet" and is the safe answer for the caller.
+    //
+    // AutoArm needs it. The stream is armed once against the game's swapchain
+    // as it stands at that instant - source size, format, row pitch and the
+    // shared heap are fixed then - so a game that rebuilds its swapchain
+    // afterwards leaves the consumer bound to an arrangement that no longer
+    // exists. A rig log caught exactly that: a ResizeBuffers on the game's
+    // chain, then a continuous run of DROPPED and REORDERED seals a second
+    // later. Anything arming by itself waits for this to go quiet.
+    unsigned long long ms_since_last_swapchain_event();
+
+    // P7.10. How many swapchain events named a device that was not d3d12.
+    // Nonzero with no selection means the title is D3D11 or Vulkan rather than
+    // a D3D12 title that has not reached its swapchain yet - a distinction the
+    // panel cannot make any other way, and without which the only honest thing
+    // it could display is "waiting", forever.
+    unsigned non_d3d12_swapchain_events();
+
     // T3 instrumentation: log the adapter LUID of any device event in the
     // process (init_device / destroy_device) - including our own T3
     // device, which independently confirms the binding.

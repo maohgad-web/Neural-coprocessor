@@ -253,77 +253,46 @@ namespace
 // and holding a value across the gap is how a slider fights with a hotkey.
 static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 {
+    // P7.10: THE UNSUPPORTED-API MESSAGE HAS TO LIVE HERE, and it is worth
+    // saying why, because the obvious place was the bridge window's title and
+    // that place cannot work. On a D3D11 or Vulkan title no D3D12 render device
+    // is ever found, so no adapter is selected, so no device is created, so no
+    // window exists to carry a title. This panel is registered on the GAME's
+    // runtime as well, and ReShade's overlay draws on D3D11 and Vulkan - so it
+    // is the one surface that still exists when the add-on has nothing to do.
+    // A user who installs this on a D3D11 game and sees nothing at all has been
+    // given no way to find out why, and will reasonably conclude it is broken.
+    {
+        mgpu::adapter::selection_result sel;
+        mgpu::adapter::get_selection(sel);
+        if (!sel.valid && mgpu::adapter::non_d3d12_swapchain_events() != 0)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                               "D3D11 and Vulkan are not supported. This add-on does nothing here.");
+            ImGui::TextDisabled("It hooks ReShade's D3D12 path. Some Unity titles accept -force-d3d12.");
+            return;
+        }
+    }
+
     mgpu::gpu1::ui_state st;
     mgpu::gpu1::ui_read(st);
 
+    // One status line, not three. It changes rather than accumulating.
     if (!st.armed)
-    {
-        ImGui::TextUnformatted("Stream not armed. Press CTRL+ALT+F10 in gameplay.");
-        ImGui::TextUnformatted("Values set here become the starting values.");
-    }
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                           "Not armed - CTRL+ALT+F10 in gameplay. Settings below apply on arm.");
     else if (st.summarised)
-    {
-        ImGui::TextUnformatted("Stream finished - it ran to its bound. Restart to run another.");
-    }
+        ImGui::TextUnformatted("Finished - ran to its bound. Restart the game to run another.");
 
-    bool neural = st.neural;
-    if (ImGui::Checkbox("Neural stage", &neural))
-        mgpu::gpu1::ui_set_neural(neural);
-    ImGui::SameLine();
-    ImGui::TextDisabled(st.nr_ok ? "(up)" : "(not running - transport only)");
+    // ---- Model tuning, first and always visible ----
+    //
+    // Moved to the top in P7.10. These are the controls the reference
+    // implementation sets and this one leaves at the feature's defaults, so
+    // they are the first thing to reach for when the image looks wrong - and
+    // "the image looks wrong" is why most people will open this panel at all.
+    // Burying them under four other groups meant nobody found them.
+    ImGui::SeparatorText("Model");
 
-    int passes = (int)st.passes;
-    ImGui::TextUnformatted("Passes");
-    for (unsigned i = 1; i <= st.max_passes; ++i)
-    {
-        char lab[8];
-        snprintf(lab, sizeof lab, "x%u", i);
-        if (i > 1) ImGui::SameLine();
-        if (ImGui::RadioButton(lab, &passes, (int)i))
-            mgpu::gpu1::ui_set_passes(i);
-    }
-    // ONE line, and it goes red when the setting it warns about is active.
-    // The panel used to carry six lines of explanation here; a warning nobody
-    // finishes reading is not a warning. The full reasoning is in mgpu.ini.
-    if (passes >= 2)
-        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
-                           "x2 costs the game nothing but pushes the second GPU to its "
-                           "power limit. Use at your own discretion - x1 recommended.");
-    else
-        ImGui::TextDisabled("x1 leaves the second GPU about half idle.");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("View");
-    int pm = st.present_mode;
-    if (ImGui::RadioButton("output", &pm, 0))      mgpu::gpu1::ui_set_present_mode(0);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("input", &pm, 1))       mgpu::gpu1::ui_set_present_mode(1);
-    ImGui::SameLine();
-    if (ImGui::RadioButton("split", &pm, 2))       mgpu::gpu1::ui_set_present_mode(2);
-    ImGui::TextDisabled("split = left of the seam is input, right is output, SAME frame.");
-    ImGui::TextDisabled("The neural stage and its timing are identical in all three.");
-
-    float sp = st.split_pos;
-    if (ImGui::SliderFloat("seam", &sp, 0.0f, 1.0f, "%.2f"))
-        mgpu::gpu1::ui_set_split_pos(sp);
-    ImGui::TextDisabled("CTRL+ALT+LEFT / RIGHT move the seam without opening this");
-    ImGui::TextDisabled("panel - hold SHIFT for a coarse step. Use those on camera.");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Model tuning");
-    if (!st.tuning_on)
-        ImGui::TextDisabled("Not applied - move any control below to enable.");
-    else
-    {
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Applied - this is a tuning run.");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("reset")) mgpu::gpu1::ui_set_tuning(false);
-    }
-
-    // Visible by default rather than behind a checkbox: these are the controls
-    // the reference implementation sets and this one did not, so they are the
-    // first thing to reach for when the image looks wrong. Touching any of them
-    // enables the whole group - see ui_set_tuning_value.
     int style_i = (int)(st.style + 0.5f);
     ImGui::TextUnformatted("Style");
     ImGui::SameLine();
@@ -345,29 +314,56 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     bool mask = st.auto_mask;
     if (ImGui::Checkbox("auto mask", &mask))
         mgpu::gpu1::ui_set_tuning_value(4, mask ? 1.0f : 0.0f);
-    ImGui::TextDisabled("Reference values: style C, tone 1.14, structure 1.09,");
-    ImGui::TextDisabled("skin 1.03, auto mask on, intensity 0.84.");
 
-    ImGui::Separator();
-    ImGui::TextUnformatted("Intensity shape");
+    if (!st.tuning_on)
+        ImGui::TextDisabled("Not applied yet - move any control above to enable the group.");
+    else
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Applied - this is a tuning run.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("reset")) mgpu::gpu1::ui_set_tuning(false);
+    }
+    ImGui::TextDisabled("Washed or flat colour? Take tone down - 0.00 fixed it on the dev rig.");
+
+    // ---- Passes ----
+    ImGui::SeparatorText("Passes");
+    int passes = (int)st.passes;
+    for (unsigned i = 1; i <= st.max_passes; ++i)
+    {
+        char lab[8];
+        snprintf(lab, sizeof lab, "x%u", i);
+        if (i > 1) ImGui::SameLine();
+        if (ImGui::RadioButton(lab, &passes, (int)i))
+            mgpu::gpu1::ui_set_passes(i);
+    }
+    // ONE line, and it goes red when the setting it warns about is active. The
+    // panel used to carry six lines of explanation here; a warning nobody
+    // finishes reading is not a warning. The reasoning is in mgpu.ini.
+    if (passes >= 2)
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                           "x2 is free to the game but holds the second GPU near its power "
+                           "limit. x1 recommended.");
+    else
+        ImGui::TextDisabled("x1 leaves the second GPU about half idle.");
+
+    bool neural = st.neural;
+    if (ImGui::Checkbox("neural stage", &neural))
+        mgpu::gpu1::ui_set_neural(neural);
+    ImGui::SameLine();
+    ImGui::TextDisabled(st.nr_ok ? "(running)" : "(transport only)");
+
+    // ---- Intensity ----
+    ImGui::SeparatorText("Intensity");
     int pr = st.preset;
-    if (ImGui::RadioButton("manual", &pr, 0))      mgpu::gpu1::ui_set_preset(0);
+    if (ImGui::RadioButton("manual", &pr, 0))       mgpu::gpu1::ui_set_preset(0);
     ImGui::SameLine();
     if (ImGui::RadioButton("front-loaded", &pr, 1)) mgpu::gpu1::ui_set_preset(1);
     ImGui::SameLine();
     if (ImGui::RadioButton("back-loaded", &pr, 2))  mgpu::gpu1::ui_set_preset(2);
-    ImGui::TextDisabled("front = pass 1 at 2.00, the other at 0.10.");
-    ImGui::TextDisabled("back  = the LAST active pass at 2.00, the other at 0.10.");
-    ImGui::TextDisabled("At x1 all three are identical - there is only one pass to shape.");
-    ImGui::TextDisabled("Moving a slider by hand returns this to manual.");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Intensity (0.00 - 2.00)");
 
     float all = st.intensity[0];
     if (ImGui::SliderFloat("all passes", &all, 0.0f, 2.0f, "%.2f"))
         mgpu::gpu1::ui_set_intensity(0, all);
-
     for (unsigned i = 0; i < st.passes && i < st.max_passes; ++i)
     {
         char lab[24];
@@ -376,26 +372,39 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ImGui::SliderFloat(lab, &v, 0.0f, 2.0f, "%.2f"))
             mgpu::gpu1::ui_set_intensity(i + 1, v);
     }
-    ImGui::TextDisabled("Live from the next frame - NGX parameters are set per evaluate.");
+    if (st.passes == 1)
+        ImGui::TextDisabled("At x1 the three shapes are identical - there is one pass to shape.");
 
+    // ---- View ----
+    ImGui::SeparatorText("View");
+    int pm = st.present_mode;
+    if (ImGui::RadioButton("output", &pm, 0)) mgpu::gpu1::ui_set_present_mode(0);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("input", &pm, 1))  mgpu::gpu1::ui_set_present_mode(1);
+    ImGui::SameLine();
+    if (ImGui::RadioButton("split", &pm, 2))  mgpu::gpu1::ui_set_present_mode(2);
+    float sp = st.split_pos;
+    if (ImGui::SliderFloat("seam", &sp, 0.0f, 1.0f, "%.2f"))
+        mgpu::gpu1::ui_set_split_pos(sp);
+    ImGui::TextDisabled("Split: input left of the seam, output right, same frame.");
+    ImGui::TextDisabled("CTRL+ALT+LEFT/RIGHT move it with no overlay open (SHIFT = coarse).");
+
+    // ---- Counters ----
     if (st.armed)
     {
-        ImGui::Separator();
-        char c1[160], c2[200];
-        snprintf(c1, sizeof c1, "produced %llu   consumed %llu", st.produced, st.consumed);
-        snprintf(c2, sizeof c2, "dropped %llu   overrun %llu   nr skipped %llu",
-                 st.dropped, st.overrun, st.skipped);
+        ImGui::SeparatorText("Counters");
+        char c1[200];
+        snprintf(c1, sizeof c1,
+                 "produced %llu  consumed %llu  dropped %llu  overrun %llu  skipped %llu",
+                 st.produced, st.consumed, st.dropped, st.overrun, st.skipped);
         ImGui::TextUnformatted(c1);
-        ImGui::TextUnformatted(c2);
-        ImGui::TextDisabled("skipped = seal checked, neural work not run because a newer");
-        ImGui::TextDisabled("frame was already waiting. Not a drop.");
         if (st.overrun != 0)
-            ImGui::TextDisabled("overrun climbing = GPU 1 is past its budget at this pass count.");
+            ImGui::TextDisabled("Overrun climbing = GPU 1 is past its budget at this pass count.");
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Anything changed here makes this run a TUNING run, not a");
-    ImGui::TextDisabled("measurement - the summary in the log will say so.");
+    ImGui::TextDisabled("Do not change resolution, DLSS mode or presets while armed - disarm first.");
+    ImGui::TextDisabled("Frame generation is untested. Changes here make this a tuning run.");
 }
 #endif
 

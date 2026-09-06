@@ -7221,6 +7221,57 @@ namespace
         return 2;
     }
 
+    // P7.10: Monitor= auto | <index>. Which of the BRIDGE adapter's own outputs
+    // the window is created on.
+    //
+    // The defect this exists to close: the window was created at CW_USEDEFAULT
+    // and the fit code then asked MonitorFromWindow which panel it had landed
+    // on. That is an inference from where Windows happened to put it, so on
+    // every launch it sized itself correctly to the wrong display - GPU 1's
+    // output presented on GPU 0's panel, which is the exact cross-adapter
+    // present this topology exists to avoid. The adapter knows its own outputs;
+    // asking it is a statement rather than an inference.
+    //
+    // auto (the default) = the bridge adapter's first output attached to the
+    // desktop. An index selects among that adapter's outputs, for a rig with
+    // more than one panel on the second card. Note it indexes THAT ADAPTER's
+    // outputs, not Windows' display numbering, because the whole point is to
+    // stay on the card that did the neural work.
+    int ini_read_monitor_index()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return -1;
+        const char *k = ini_find(buf, "Monitor");
+        if (k == nullptr) return -1;
+        if (k[0] == 'a' || k[0] == 'A') return -1;   // auto
+        if (k[0] < '0' || k[0] > '9')    return -1;  // anything unparseable = auto
+        return atoi(k);
+    }
+
+    // P7.10: AutoArm= 0 | 1 | <frames>. 0 or absent = off, which is what every
+    // published measurement ran under and stays the default for measuring.
+    //
+    // 1 means "on, at the built-in delay". A number above 1 is that delay in
+    // presented bridge frames. There IS a delay rather than arming at frame one,
+    // and the reason is not politeness: the stream is armed once, against the
+    // game's swapchain as it exists at that moment - source size, format and row
+    // pitch are all fixed then. A game still building its swapchain during
+    // startup, or a user still in the graphics menu, will rebuild it, and the
+    // stream then consumes against an arrangement that no longer exists. The
+    // caller pairs this count with a swapchain-quiet check for the same reason.
+    unsigned ini_read_autoarm_frames()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0;
+        const char *k = ini_find(buf, "AutoArm");
+        if (k == nullptr) return 0;
+        if (k[0] < '0' || k[0] > '9') return 0;
+        const int v = atoi(k);
+        if (v <= 0) return 0;
+        if (v == 1) return 600;   // ~10 s at vblank pace
+        return (unsigned)v;
+    }
+
     // P7.6: Frames=0 means NO BOUND - the stream runs until the game closes.
     //
     // Deliberately implemented as "a bound nothing will ever reach" rather than
@@ -7928,6 +7979,22 @@ bool stream_present_gate(unsigned long timeout_ms)
 bool probes_enabled()
 {
     return ini_read_probes();
+}
+
+// P7.10. Both read the same mgpu.ini the arm line reports, through the same
+// reader, so a value that appears in the log is the value that took effect.
+// They are wrappers rather than the readers themselves because the reader and
+// its buffer live in this file's anonymous namespace and worker.cpp cannot see
+// them - and duplicating an ini parser in a second file is how two files start
+// disagreeing about what the settings say.
+int monitor_index()
+{
+    return ini_read_monitor_index();
+}
+
+unsigned autoarm_frames()
+{
+    return ini_read_autoarm_frames();
 }
 
 // ---- P6.3: intensity on the hotkeys ----
