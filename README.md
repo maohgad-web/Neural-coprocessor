@@ -133,10 +133,15 @@ and buy a second GPU.
 
 **GeForce RTX 50-series cards.** NVIDIA documents DLSS Neural Rendering as a
 50-series feature. It is not available on 40-series or older hardware, and this
-add-on cannot change that: it drives the NGX libraries already on your machine
-and cannot enable something they will not run. **It does not check your
-hardware**, so on an older card expect it to load, log normally, and produce
-nothing.
+add-on cannot change that: it drives the `nvngx_dlssnr.dll` already on your
+machine and cannot enable something that file will not run. **It does not check
+your hardware**, so on an older card expect it to load, log normally, and
+produce nothing.
+
+**GeForce RTX 40-series cards.** I know there are modded versions of
+`nvngx_dlssnr.dll` that do run on Ada. The architecture here has no problem with
+Ada in theory, it has simply never been tested, because I do not own the
+hardware to test it on.  I just cannot help you troubleshoot it.
 
 Strictly it is the *second* card that runs the neural stage, so that is the card
 the requirement applies to. A mixed pair has never been tested, and the
