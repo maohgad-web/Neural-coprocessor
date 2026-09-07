@@ -106,7 +106,7 @@ both cards on CPU lanes at PCIe 5.0 x8 shows what the same code does when the
 link is not the constraint. Slot topology, verified against the board
 specifications, is in [RESULTS.md](RESULTS.md) §3.
 
-HAT YOU NEED FIRST
+WHAT YOU NEED FIRST
 -------------------
  
 1. ReShade 6.8.0 or newer, installed WITH ADD-ON SUPPORT.
