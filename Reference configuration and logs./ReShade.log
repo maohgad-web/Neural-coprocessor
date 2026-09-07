@@ -1,0 +1,597 @@
+11:34:00:528 [29328] | INFO  | Initializing crosire's ReShade version '6.8.0.2155' (64-bit) loaded from 'C:\Games\Cyberpunk 2077\bin\x64\dxgi.dll' into 'C:\Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe' (0x491EA19E) ...
+11:34:00:528 [29328] | INFO  | Registering hooks for 'user32.dll' ...
+11:34:00:528 [29328] | INFO  | > Libraries loaded.
+11:34:00:529 [29328] | INFO  | > Found 21 match(es). Installing ...
+11:34:00:562 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\dinput.dll' ...
+11:34:00:562 [29328] | INFO  | > Delayed.
+11:34:00:563 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\dinput8.dll' ...
+11:34:00:563 [29328] | INFO  | > Delayed.
+11:34:00:563 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d2d1.dll' ...
+11:34:00:563 [29328] | INFO  | > Delayed.
+11:34:00:563 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d9.dll' ...
+11:34:00:563 [29328] | INFO  | > Delayed.
+11:34:00:563 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d10.dll' ...
+11:34:00:563 [29328] | INFO  | > Delayed.
+11:34:00:563 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d10_1.dll' ...
+11:34:00:564 [29328] | INFO  | > Delayed.
+11:34:00:564 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d11.dll' ...
+11:34:00:564 [29328] | INFO  | > Delayed.
+11:34:00:564 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d12.dll' ...
+11:34:00:564 [29328] | INFO  | > Delayed.
+11:34:00:564 [29328] | INFO  | Registering hooks for 'C:\WINDOWS\system32\dxgi.dll' ...
+11:34:00:564 [29328] | INFO  | > Delayed until first call to an exported function.
+11:34:00:564 [29328] | INFO  | Registering hooks for 'openvr_api.dll' ...
+11:34:00:564 [29328] | INFO  | > Delayed.
+11:34:00:564 [29328] | INFO  | Initialized.
+11:34:01:009 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FECE8) ...
+11:34:01:009 [29328] | INFO  | Installing export hooks for 'C:\WINDOWS\system32\dxgi.dll' ...
+11:34:01:010 [29328] | INFO  | > Found 5 match(es). Installing ...
+11:34:01:414 [29328] | INFO  | Installing delayed hooks for 'C:\WINDOWS\system32\d3d12.dll' (Just loaded via LoadLibrary('C:\WINDOWS\SYSTEM32\d3d12.dll')) ...
+11:34:01:415 [29328] | INFO  | > Found 8 match(es). Installing ...
+11:34:01:478 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FDF40) ...
+11:34:01:489 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FDF30) ...
+11:34:01:499 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FDF40) ...
+11:34:02:478 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FDF40) ...
+11:34:02:490 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FDF30) ...
+11:34:02:499 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FDF40) ...
+11:34:02:606 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {50C83A1C-E072-4C48-87B0-3630FA36A6D0}, ppFactory = 000001D4653DC4C0) ...
+11:34:02:607 [29328] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 000001E129526700, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 0000000000000000) ...
+11:34:02:609 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FD298) ...
+11:34:02:685 [29328] | INFO  | Installing delayed hooks for 'C:\WINDOWS\system32\dinput8.dll' (Just loaded via LoadLibrary('C:\WINDOWS\SYSTEM32\DINPUT8.dll')) ...
+11:34:02:686 [29328] | INFO  | > Found 2 match(es). Installing ...
+11:34:02:723 [29328] | INFO  | Installing delayed hooks for 'C:\WINDOWS\system32\d3d11.dll' (Just loaded via LoadLibrary('C:\WINDOWS\SYSTEM32\d3d11.dll')) ...
+11:34:02:724 [29328] | INFO  | > Found 3 match(es). Installing ...
+11:34:02:810 [29328] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 000001E12C28D8C0, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 0000000000000000) ...
+11:34:02:813 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FD298) ...
+11:34:02:915 [29328] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 000001E12C28D3B0, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 0000000000000000) ...
+11:34:02:960 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FD298) ...
+11:34:02:963 [29328] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 000001E129526700, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 000000312A5FD990) ...
+11:34:02:963 [29328] | INFO  | Searching for add-ons (*.addon, *.addon64) in 'C:\Games\Cyberpunk 2077\bin\x64' ...
+11:34:02:963 [29328] | INFO  | Loading add-on from 'C:\Games\Cyberpunk 2077\bin\x64\nvngx.dll_mgpu_bridge.addon64' ...
+11:34:02:964 [29328] | INFO  | Registered add-on "MGPU Bridge" v0.0.0.0 using ReShade API version 20.
+11:34:02:964 [29328] | INFO  | [MGPU Bridge] [MGPU][T1] MGPU Bridge add-on registered - stock ReShade, add-on API version 20
+11:34:02:964 [29328] | INFO  | [MGPU Bridge] [MGPU][P6.4] overlay panel registered - open the ReShade overlay (Home) over the BRIDGE window to get passes, the neural on/off and the intensity sliders. The CTRL+ALT+F8/F9/F11 hotkeys still work and drive the same values.
+11:34:02:965 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FD298) ...
+11:34:03:199 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {770AAE78-F26F-4DBA-A829-253C83D1B387}, ppFactory = 000000312A5FB4C8) ...
+11:34:03:243 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] init_device luid=0x00000000-0x00012723 captured as PROVISIONAL game luid (init_device is not trusted - a UE5 probe device is not the game's renderer; the swapchain-derived luid overrides it)
+11:34:03:244 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FD1D8) ...
+11:34:03:244 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] adapter[0] luid=0x00000000-0x00012723 flags=0x0 vendor=0x10DE device=0x2D04 dedicated_vram=16050MB outputs=2 desc="NVIDIA GeForce RTX 5060 Ti"
+11:34:03:244 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] adapter[0] vmem(local) budget=15282MB current_usage=17MB avail_reservation=7769MB current_reservation=0MB (diagnostic only - this process's usage on this adapter)
+11:34:03:244 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] adapter[1] luid=0x00000000-0x00013BC5 flags=0x0 vendor=0x10DE device=0x2D04 dedicated_vram=16050MB outputs=0 desc="NVIDIA GeForce RTX 5060 Ti"
+11:34:03:244 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] adapter[1] vmem(local) budget=15282MB current_usage=0MB avail_reservation=7769MB current_reservation=0MB (diagnostic only - this process's usage on this adapter)
+11:34:03:245 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] adapter[2] luid=0x00000000-0x00015128 flags=0x2 vendor=0x1414 device=0x008C dedicated_vram=0MB outputs=0 desc="Microsoft Basic Render Driver"
+11:34:03:245 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] adapter[2] vmem(local) budget=15114MB current_usage=0MB avail_reservation=7685MB current_reservation=0MB (diagnostic only - this process's usage on this adapter)
+11:34:03:245 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FD680) ...
+11:34:03:280 [29328] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 000000312A5FD9D0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 000001D4653DC4D0) ...
+11:34:03:281 [29328] | INFO  | > Dumping command queue description:
+11:34:03:281 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:281 [29328] | INFO  |   | Parameter                               | Value                                   |
+11:34:03:281 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:281 [29328] | INFO  |   | Type                                    | 0                                       |
+11:34:03:281 [29328] | INFO  |   | Priority                                | 0                                       |
+11:34:03:281 [29328] | INFO  |   | Flags                                   | 0                                       |
+11:34:03:281 [29328] | INFO  |   | NodeMask                                | 0                                       |
+11:34:03:281 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:315 [29328] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 000000312A5FD9D0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 000001D4653DC4D8) ...
+11:34:03:316 [29328] | INFO  | > Dumping command queue description:
+11:34:03:316 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:316 [29328] | INFO  |   | Parameter                               | Value                                   |
+11:34:03:316 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:316 [29328] | INFO  |   | Type                                    | 2                                       |
+11:34:03:316 [29328] | INFO  |   | Priority                                | 0                                       |
+11:34:03:316 [29328] | INFO  |   | Flags                                   | 0                                       |
+11:34:03:316 [29328] | INFO  |   | NodeMask                                | 0                                       |
+11:34:03:316 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:328 [29328] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 000000312A5FD9D0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 000001D4653DC630) ...
+11:34:03:328 [29328] | INFO  | > Dumping command queue description:
+11:34:03:328 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:328 [29328] | INFO  |   | Parameter                               | Value                                   |
+11:34:03:328 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:03:328 [29328] | INFO  |   | Type                                    | 3                                       |
+11:34:03:328 [29328] | INFO  |   | Priority                                | 0                                       |
+11:34:03:329 [29328] | INFO  |   | Flags                                   | 0                                       |
+11:34:03:329 [29328] | INFO  |   | NodeMask                                | 0                                       |
+11:34:03:329 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:04:766 [29328] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 000000312A5FEC58, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 000001E12BFA1C10) ...
+11:34:04:766 [29328] | INFO  | > Dumping command queue description:
+11:34:04:766 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:04:766 [29328] | INFO  |   | Parameter                               | Value                                   |
+11:34:04:766 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:04:766 [29328] | INFO  |   | Type                                    | 0                                       |
+11:34:04:766 [29328] | INFO  |   | Priority                                | 0                                       |
+11:34:04:766 [29328] | INFO  |   | Flags                                   | 0                                       |
+11:34:04:766 [29328] | INFO  |   | NodeMask                                | 0                                       |
+11:34:04:767 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:04:797 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE4F8) ...
+11:34:04:798 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE7A8) ...
+11:34:04:798 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE688) ...
+11:34:04:798 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FEA28) ...
+11:34:04:799 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FEA28) ...
+11:34:04:799 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE9F8) ...
+11:34:04:799 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE9F8) ...
+11:34:04:800 [29328] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 000000312A5FEC28, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 000001E12BFA2B30) ...
+11:34:04:800 [29328] | INFO  | > Dumping command queue description:
+11:34:04:800 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:04:800 [29328] | INFO  |   | Parameter                               | Value                                   |
+11:34:04:800 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:04:800 [29328] | INFO  |   | Type                                    | 0                                       |
+11:34:04:800 [29328] | INFO  |   | Priority                                | 0                                       |
+11:34:04:800 [29328] | INFO  |   | Flags                                   | 0                                       |
+11:34:04:800 [29328] | INFO  |   | NodeMask                                | 0                                       |
+11:34:04:800 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:04:823 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE4C8) ...
+11:34:04:824 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE778) ...
+11:34:04:824 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE898) ...
+11:34:04:839 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FF028) ...
+11:34:05:125 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FED88) ...
+11:34:05:126 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FEBD0) ...
+11:34:05:127 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FEBD0) ...
+11:34:05:128 [29328] | INFO  | Redirecting RegisterClassExW(lpWndClassEx = 000000312A5FEB70 { "W2ViewportClass", style = 0xb }) ...
+11:34:05:377 [29328] | INFO  | Redirecting IDXGIFactory2::CreateSwapChainForHwnd(this = 000001C059E35230, pDevice = 000001E12BA11F30, hWnd = 0000000000040B6E, pDesc = 000000312A5FEA60, pFullscreenDesc = 000000312A5FEAF8, pRestrictToOutput = 0000000000000000, ppSwapChain = ) ...
+11:34:05:378 [29328] | INFO  | > Dumping swap chain description:
+11:34:05:378 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:378 [29328] | INFO  |   | Parameter                               | Value                                   |
+11:34:05:378 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:378 [29328] | INFO  |   | Width                                   | 1920                                    |
+11:34:05:378 [29328] | INFO  |   | Height                                  | 1080                                    |
+11:34:05:378 [29328] | INFO  |   | RefreshRate                             | 0                   0                   |
+11:34:05:378 [29328] | INFO  |   | Format                                  | DXGI_FORMAT_R8G8B8A8_UNORM              |
+11:34:05:378 [29328] | INFO  |   | Stereo                                  | FALSE                                   |
+11:34:05:378 [29328] | INFO  |   | ScanlineOrdering                        | 0                                       |
+11:34:05:378 [29328] | INFO  |   | Scaling                                 | 0                                       |
+11:34:05:379 [29328] | INFO  |   | SampleCount                             | 1                                       |
+11:34:05:379 [29328] | INFO  |   | SampleQuality                           | 0                                       |
+11:34:05:379 [29328] | INFO  |   | BufferUsage                             | 0x20                                    |
+11:34:05:379 [29328] | INFO  |   | BufferCount                             | 3                                       |
+11:34:05:379 [29328] | INFO  |   | Windowed                                | TRUE                                    |
+11:34:05:379 [29328] | INFO  |   | SwapEffect                              | 4                                       |
+11:34:05:379 [29328] | INFO  |   | AlphaMode                               | 0                                       |
+11:34:05:379 [29328] | INFO  |   | Flags                                   | 0x840                                   |
+11:34:05:379 [29328] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:435 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {770AAE78-F26F-4DBA-A829-253C83D1B387}, ppFactory = 000000312A5FA7C8) ...
+11:34:05:469 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE1F0) ...
+11:34:05:469 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE1F0) ...
+11:34:05:470 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE1F0) ...
+11:34:05:470 [29328] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000312A5FE1F0) ...
+11:34:05:470 [29328] | INFO  | Running on NVIDIA GeForce RTX 5060 Ti Driver 616.64.
+11:34:05:701 [29328] | INFO  | [MGPU Bridge] [MGPU][T3] bridge thread spawned (thread id 0x7314)
+11:34:05:702 [29460] | INFO  | [MGPU Bridge] [MGPU][T3] bridge thread started - owns all GPU 1 objects (window + message pump arrive with T4)
+11:34:05:702 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] init_swapchain: swapchain-derived game luid=0x00000000-0x00012723 established (the device CreateSwapChainForHwnd was called on) - overrides the provisional init_device value
+11:34:05:702 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] adapter[2] rejected as software (flags=0x2 vendor=0x1414) - enumerated and logged, never selectable
+11:34:05:702 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] SELECTED adapter[1] luid=0x00000000-0x00013BC5 desc="NVIDIA GeForce RTX 5060 Ti" outputs=0 rule="exclusion (luid != swapchain game luid) + software filter" | game luid=0x00000000-0x00012723 (source: swapchain)
+11:34:05:702 [29460] | INFO  | [MGPU Bridge] [MGPU][T3] D3D12CreateDevice begin: selected luid=0x00000000-0x00013BC5 desc="NVIDIA GeForce RTX 5060 Ti" (game luid=known, see [MGPU][T2] final line)
+11:34:05:702 [29460] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 000001E12C700EB0, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 00000031349BEAE8) ...
+11:34:05:702 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 00000031349BE478) ...
+11:34:05:717 [29328] | INFO  | Recreated runtime environment on runtime 000001E41C7B3480 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade.ini').
+11:34:05:757 [29460] | INFO  | Redirecting CreateDXGIFactory1(riid = {770AAE78-F26F-4DBA-A829-253C83D1B387}, ppFactory = 00000031349BC6A8) ...
+11:34:05:788 [29460] | INFO  | [MGPU Bridge] [MGPU][T3] init_device (subsequent) luid=0x00000000-0x00013BC5
+11:34:05:788 [29460] | INFO  | [MGPU Bridge] [MGPU][T3] CrossAdapterRowMajorTextureSupported hr=0x00000000 supported=0 (record only)
+11:34:05:788 [29460] | INFO  | [MGPU Bridge] [MGPU][T3] D3D12CreateDevice hr=0x00000000 luid=0x00000000-0x00013BC5 - device live on the second adapter; game rendering unaffected
+11:34:05:788 [29328] | INFO  | Redirecting IDXGISwapChain::SetFullscreenState(this = 000001E41C28AC70, Fullscreen = FALSE, pTarget = 0000000000000000) ...
+11:34:05:789 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.2] mgpu.ini read from beside the add-on: "C:\Games\Cyberpunk 2077\bin\x64\mgpu.ini". This is the file whose values appear on the arm line.
+11:34:05:789 [29460] | ERROR | [MGPU Bridge] [MGPU][P6.1] mgpu.ini is LARGER than this build reads (8191 bytes taken, more follow). EVERY KEY PAST THAT POINT READS AS ABSENT AND ITS DEFAULT IS USED SILENTLY. Shorten the file or move the keys you care about to the top; the values reported on the arm line are what actually took effect.
+11:34:05:790 [29328] | INFO  | Redirecting IDXGISwapChain::SetFullscreenState(this = 000001E41C28AC70, Fullscreen = FALSE, pTarget = 0000000000000000) ...
+11:34:05:790 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.10] window placement - auto, from the DESKTOP monitor list because the bridge adapter reported no outputs of its own: the first non-primary monitor - monitor 0 of 2, rect (-3200,-218)-(0,1582). CHECK THIS ONE: it is placed away from the primary display, not proven to be on the second card, because DXGI would not say. Set Monitor=<n> if it p
+11:34:05:790 [29328] | INFO  | Redirecting IDXGISwapChain::ResizeBuffers(this = 000001E41C28AC70, BufferCount = 3, Width = 1920, Height = 1080, NewFormat = 28, SwapChainFlags = 0x840) ...
+11:34:05:790 [29328] | INFO  | Destroyed runtime environment on runtime 000001E41C7B3480 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade.ini').
+11:34:05:796 [29460] | INFO  | [MGPU Bridge] [MGPU][T4] window created: class="MGPU_Bridge_Wnd_00007FFC24C80000" hwnd=0x0000000000080BBC client=1280x720 (0,0,1280,720) thread id 0x7314 (client area is the T4-fixed 1280x720)
+11:34:05:799 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.5] seam hotkeys: CTRL+ALT+LEFT/RIGHT move the split seam = OK/OK | add SHIFT for a coarse step = OK/OK. They repeat when held and need NO overlay open, so the seam can be dragged across a face while the game is the only thing on screen - which is the point of having them at all.
+11:34:05:800 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.4] view hotkey: CTRL+ALT+F7 cycles output -> input -> split = OK. Split shows the frame handed TO the model on the left and what it produced on the right, THE SAME FRAME, so the two halves cannot disagree about time, camera or lighting. The neural stage is unchanged in all three.
+11:34:05:800 [29460] | INFO  | [MGPU Bridge] [MGPU][P6.3] intensity hotkeys: CTRL+ALT+F8 cycle target (all/p1/p2/...) = OK | CTRL+ALT+F9 down = OK | CTRL+ALT+F11 up = OK. Steps of 0.05, clamped 0.00-2.00, live from the next frame - NGX parameters are set per evaluate, so no re-arm and no relaunch. DOWN and UP repeat when held; the target key does not.
+11:34:05:800 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3g] hotkey registered: CTRL+ALT+F10 runs the transit probe on demand, from any foreground window. Press it once the game has settled - in gameplay, not the menu - and again with a different window focused; each run labels itself and records which window held the foreground.
+11:34:05:800 [29460] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E42220A4D0, pDesc = 00000031349BEAB0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00000031349BEA10) ...
+11:34:05:800 [29460] | INFO  | > Dumping command queue description:
+11:34:05:800 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:801 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:05:801 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:801 [29460] | INFO  |   | Type                                    | 0                                       |
+11:34:05:801 [29460] | INFO  |   | Priority                                | 0                                       |
+11:34:05:801 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:05:801 [29460] | INFO  |   | NodeMask                                | 0                                       |
+11:34:05:802 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:803 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] init_swapchain (resize) luid=0x00000000-0x00012723 - swapchain-derived game luid 0x00000000-0x00012723 already established; not re-selecting
+11:34:05:814 [29328] | INFO  | Recreated runtime environment on runtime 000001E41C7B3480 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade.ini').
+11:34:05:814 [29328] | INFO  | Redirecting IDXGISwapChain3::SetColorSpace1(ColorSpace = 0) ...
+11:34:05:823 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FEC00) ...
+11:34:05:825 [29328] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000312A5FEC00) ...
+11:34:05:835 [29328] | INFO  | Redirecting IDXGISwapChain::SetFullscreenState(this = 000001E41C28AC70, Fullscreen = FALSE, pTarget = 0000000000000000) ...
+11:34:05:835 [29328] | INFO  | Redirecting IDXGISwapChain::ResizeBuffers(this = 000001E41C28AC70, BufferCount = 3, Width = 1920, Height = 1080, NewFormat = 28, SwapChainFlags = 0x840) ...
+11:34:05:836 [29328] | INFO  | Destroyed runtime environment on runtime 000001E41C7B3480 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade.ini').
+11:34:05:841 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {50C83A1C-E072-4C48-87B0-3630FA36A6D0}, ppFactory = 00000031349BEA00) ...
+11:34:05:842 [29460] | INFO  | Redirecting IDXGIFactory2::CreateSwapChainForHwnd(this = 000001E3F5706790, pDevice = 000001E426947A70, hWnd = 0000000000080BBC, pDesc = 00000031349BEAD0, pFullscreenDesc = 0000000000000000, pRestrictToOutput = 0000000000000000, ppSwapChain = ) ...
+11:34:05:843 [29460] | INFO  | > Dumping swap chain description:
+11:34:05:843 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:843 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:05:843 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:843 [29460] | INFO  |   | Width                                   | 1280                                    |
+11:34:05:843 [29460] | INFO  |   | Height                                  | 720                                     |
+11:34:05:843 [29460] | INFO  |   | RefreshRate                             | 0                   0                   |
+11:34:05:844 [29460] | INFO  |   | Format                                  | DXGI_FORMAT_R10G10B10A2_UNORM           |
+11:34:05:844 [29460] | INFO  |   | Stereo                                  | FALSE                                   |
+11:34:05:844 [29460] | INFO  |   | ScanlineOrdering                        | 0                                       |
+11:34:05:844 [29460] | INFO  |   | Scaling                                 | 0                                       |
+11:34:05:844 [29460] | INFO  |   | SampleCount                             | 1                                       |
+11:34:05:844 [29460] | INFO  |   | SampleQuality                           | 0                                       |
+11:34:05:844 [29460] | INFO  |   | BufferUsage                             | 0x20                                    |
+11:34:05:844 [29460] | INFO  |   | BufferCount                             | 2                                       |
+11:34:05:845 [29460] | INFO  |   | Windowed                                | TRUE                                    |
+11:34:05:845 [29460] | INFO  |   | SwapEffect                              | 4                                       |
+11:34:05:845 [29460] | INFO  |   | AlphaMode                               | 0                                       |
+11:34:05:845 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:05:845 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:849 [29328] | INFO  | [MGPU Bridge] [MGPU][T2] init_swapchain (resize) luid=0x00000000-0x00012723 - swapchain-derived game luid 0x00000000-0x00012723 already established; not re-selecting
+11:34:05:853 [29328] | INFO  | Recreated runtime environment on runtime 000001E41C7B3480 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade.ini').
+11:34:05:853 [29328] | INFO  | Redirecting IDXGISwapChain3::SetColorSpace1(ColorSpace = 0) ...
+11:34:05:922 [29460] | INFO  | Redirecting CreateDXGIFactory1(riid = {770AAE78-F26F-4DBA-A829-253C83D1B387}, ppFactory = 00000031349BA898) ...
+11:34:05:948 [32524] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\LUT.fx' in 0.001000 s.
+11:34:05:948 [32312] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\Daltonize.fx' in 0.001000 s.
+11:34:05:948 [32560] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\UIMask.fx' in 0.001000 s.
+11:34:05:948 [32540] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\Deband.fx' in 0.001000 s.
+11:34:05:948 [32536] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\DisplayDepth.fx' in 0.001000 s.
+11:34:05:979 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 00000031349BE2C0) ...
+11:34:05:980 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 00000031349BE2C0) ...
+11:34:05:980 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 00000031349BE2C0) ...
+11:34:05:982 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 00000031349BE2C0) ...
+11:34:05:982 [29460] | INFO  | Running on NVIDIA GeForce RTX 5060 Ti Driver 616.64.
+11:34:05:983 [29460] | INFO  | [MGPU Bridge] [MGPU][T2] init_swapchain luid=0x00000000-0x00013BC5 - swapchain-derived game luid 0x00000000-0x00012723 already established; not re-selecting
+11:34:05:985 [29460] | INFO  | Recreated runtime environment on runtime 000001E3F538CC30 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade2.ini').
+11:34:05:985 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=2 swapeffect=FLIP_DISCARD queue=DIRECT client=1280x720 CreateSwapChainForHwnd hr=0x00000000 hwnd=0x0000000000080BBC (vsync present, non-resizable window - no ResizeBuffers at P0)
+11:34:05:988 [ 5024] | INFO  | [MGPU Bridge] [MGPU][P1.6] GAME runtime preset="C:\Games\Cyberpunk 2077\bin\x64\ReShadePreset.ini" | 0 of 6 techniques ENABLED. This line exists because a stale gpu1.ini once drew a motion-flow debug view over the neural output and three code hypotheses were spent on it. If anything unexpected is listed here, what is on screen is not what this add-on produced.
+11:34:05:988 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.0c] ngx modules: _nvngx.dll=0x00007FFBCD730000 (already resident) nvngx_dlssnr.dll=0x00007FFB5B4E0000 (loaded)
+11:34:05:989 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.0c] ngx exports: Init=core+snippet(used:core) Init_Ext=core+snippet(used:core) GetCapabilityParameters=core+-(used:core) DestroyParameters=core+-(used:core) Shutdown1=core+snippet(used:core) CreateFeature=core+snippet(used:snippet) ReleaseFeature=core+snippet(used:snippet) EvaluateFeature=core+snippet(used:snippet)
+11:34:05:989 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.0c] snippet-only exports: Init=yes Init_Ext=yes Init_Ext2=no PopulateParameters_Impl=yes
+11:34:05:989 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.0c] Init: result=0xBAD0000C (FAIL_OutOfDate) device=0x000001E42220A4D0 luid=00000000-00013BC5 app_id=0 sdk_version=0x00000015 log_callback=installed(VERBOSE) data_path="C:\Games\Cyberpunk 2077\bin\x64\"
+11:34:05:989 [29460] | WARN  | [MGPU Bridge] [MGPU][P1.0c] FAIL_OutOfDate at init is an ENVIRONMENT fault, not a defect in this add-on - the same call succeeded repeatedly on this rig with this binary. Confirm in nvngx.log: its first line will be "NGXInitValidateSnippets: installed NGX API is older than the one used by client application" with NO telemetry blocks after it. FIX, reproduced on the rig 2026-09-03: OPEN THE NVIDIA APP, then relaunch the game. Every earlier clearing event was an instance of this - an app update, a reboot, a settings change - each of which restarted or refreshed that app. Relaunching the game ALONE does not reliably clear it. The OTA model store is NOT the cause and is exonerated: failing runs still parse C:\ProgramData\NVIDIA\NGX\models and MapProjectId succeeds in them. THIS RUN ANSWERS NOTHING ABOUT NGX and no NGX result from it may be recorded - but it does NOT void probes that never touch NGX. P1.3 builds its own devices and produced a valid cross-adapter transit result on a launch that failed here. Void the NGX portion, not the launch.
+11:34:05:989 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.0c] teardown: complete - D3D12 objects released, NGX session intentionally retained
+11:34:05:989 [29460] | WARN  | [MGPU Bridge] [MGPU][P1.0c] PROBE FAILED at Init - see the result code above. Bridge continues.
+11:34:05:990 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] ===== RUN "startup" ===== foreground hwnd=0x0000000000040B6E owner=this process class="W2ViewportClass" uptime=21561843 ms. A "startup" run is contaminated by construction (menu, shaders compiling) and its timings are an upper bound only. A manual run is quieter but is STILL not a performance figure: no shared fence, no pipelining, CPU-serialised round trip. What manual runs buy is repetition and a controlled foreground - n>1 in one launch, and a named focus condition per sample.
+11:34:05:990 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] no debug layer (see comment above transit_drain_info_queue) - the split per-call HRESULTs below are the instrument.
+11:34:05:990 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {50C83A1C-E072-4C48-87B0-3630FA36A6D0}, ppFactory = 00000031349BDBB8) ...
+11:34:05:990 [29460] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 000001E42F3779C0, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 00000031349BDE40) ...
+11:34:05:990 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 00000031349BD568) ...
+11:34:05:990 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {50C83A1C-E072-4C48-87B0-3630FA36A6D0}, ppFactory = 00000031349BDBB8) ...
+11:34:05:992 [29460] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 000001E42F377600, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 00000031349BDEB0) ...
+11:34:05:992 [29460] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 00000031349BD568) ...
+11:34:05:993 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] own devices: gpu0(game adapter) hr=0x00000000 luid=00000000-00012723 | gpu1 hr=0x00000000 luid=00000000-00013BC5 (the game's own device is NOT touched)
+11:34:05:993 [29460] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 00000031349BDCE0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00000031349BDE48) ...
+11:34:05:993 [29460] | INFO  | > Dumping command queue description:
+11:34:05:993 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:993 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:05:993 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:05:993 [29460] | INFO  |   | Type                                    | 0                                       |
+11:34:05:993 [29460] | INFO  |   | Priority                                | 0                                       |
+11:34:05:993 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:05:993 [29460] | INFO  |   | NodeMask                                | 0                                       |
+11:34:05:993 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:028 [29460] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E42220A4D0, pDesc = 00000031349BDCE0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00000031349BDEB8) ...
+11:34:06:028 [29460] | INFO  | > Dumping command queue description:
+11:34:06:029 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:029 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:06:029 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:029 [29460] | INFO  |   | Type                                    | 0                                       |
+11:34:06:029 [29460] | INFO  |   | Priority                                | 0                                       |
+11:34:06:030 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:06:030 [29460] | INFO  |   | NodeMask                                | 0                                       |
+11:34:06:030 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:066 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] ExistingHeaps support: gpu0=1 gpu1=1 (path A' needs both)
+11:34:06:067 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.0 VirtualAlloc: addr=0x000001E43E650000 bytes=3735552 (payload 3686400, rounded to 64 KB)
+11:34:06:067 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.1 QueryInterface(ID3D12Device3): hr=0x00000000
+11:34:06:068 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.2 OpenExistingHeapFromAddress on GPU 0: hr=0x00000000
+11:34:06:069 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.3 OpenExistingHeapFromAddress on GPU 1: hr=0x00000000 <- same host pages, second adapter
+11:34:06:069 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.3b heap desc: gpu0 size=3735552 align=65536 type=4(DEFAULT=1,UPLOAD=2,READBACK=3,CUSTOM=4) cpuPage=3 pool=1(L0=1,L1=2) flags=0x421 | gpu1 size=3735552 align=65536 type=4 cpuPage=3 pool=1 flags=0x421
+11:34:06:070 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.4 CreatePlacedResource on GPU 0, flags=NONE state=COMMON: hr=0x80070057
+11:34:06:070 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.4 CreatePlacedResource on GPU 0, flags=ALLOW_CROSS_ADAPTER state=COMMON: hr=0x00000000  <- ACCEPTED
+11:34:06:070 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.5 CreatePlacedResource on GPU 1, flags=NONE state=COMMON: hr=0x80070057
+11:34:06:070 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 A'.5 CreatePlacedResource on GPU 1, flags=ALLOW_CROSS_ADAPTER state=COMMON: hr=0x00000000  <- ACCEPTED
+11:34:06:078 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.4b] 1280x720 SAME-ADAPTER CONTROL (GPU 0, identical two copies, destination LOCAL to GPU 0): hr=0x00000000 sub=1.06 wait=0.00 total=1.06 ms for 3.52 MiB. Compare against wait0 in the breakdown below: the DIFFERENCE is what crossing the adapter costs on this link; what is left is GPU 0 being busy with the game.
+11:34:06:087 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 1280x720 via A'(host-pinned): 3.52 MiB round trip in 2.13 ms (1654 MiB/s apparent) differing=0 of 921600 sentinel=0
+11:34:06:087 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.4a] 1280x720 path=A'(host-pinned) forced=A-prime breakdown: rec0=0.03 sub0=0.06 wait0=0.22 | rec1=0.39 sub1=1.45 wait1=0.00 | cpu(rec+sub)=1.94 waits=0.22 (10% of the trip) round_trip=2.13 verify=7.32 ms. LINK: this rig is PCIe 3.0 x2 on chipset lanes (~1.6 GB/s usable), so ~28 MiB across it is ~17.5 ms of pure link time at 1440p. These absolute numbers are a property of THIS interconnect and do not decide whether the architecture is viable. What they do decide is A versus A', because both are measured over the same link.
+11:34:06:088 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] PAYLOAD INTACT - every pixel crossed the bus unchanged.
+11:34:06:088 [29460] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 00000031349BE0A0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00000031349BDE98) ...
+11:34:06:088 [29460] | INFO  | > Dumping command queue description:
+11:34:06:088 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:088 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:06:088 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:088 [29460] | INFO  |   | Type                                    | 3                                       |
+11:34:06:088 [29460] | INFO  |   | Priority                                | 0                                       |
+11:34:06:088 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:06:089 [29460] | INFO  |   | NodeMask                                | 0                                       |
+11:34:06:089 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:096 [29460] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E42220A4D0, pDesc = 00000031349BE0A0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00000031349BDEF8) ...
+11:34:06:097 [29460] | INFO  | > Dumping command queue description:
+11:34:06:097 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:097 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:06:097 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:097 [29460] | INFO  |   | Type                                    | 3                                       |
+11:34:06:097 [29460] | INFO  |   | Priority                                | 0                                       |
+11:34:06:097 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:06:097 [29460] | INFO  |   | NodeMask                                | 0                                       |
+11:34:06:097 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:108 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] 1280x720 setup: COPY queues on both adapters, 4-deep ring, cross-adapter producer fence (CreateFence(SHARED|SHARED_CROSS_ADAPTER) on GPU 0 -> OpenSharedHandle on GPU 1): hr=0x00000000
+11:34:06:129 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] 1280x720 bands=4 rows_per_band=180 pitch=5120
+11:34:06:129 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] 1280x720 path=A'(host-pinned) buffer-to-buffer over the shared heap, 3.52 MiB | SERIAL(1 band, CPU wait between sides): ok=yes 0.91 ms (3856 MiB/s) differing=0 sentinel=0 | PIPELINED(4 bands, COPY queues, GPU-side fence wait): ok=yes 1.58 ms (2223 MiB/s) differing=0 sentinel=0
+11:34:06:129 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] PROBE PASSED (CORRECTNESS ONLY) - both arms delivered the payload byte-exact with no sentinel survivors, so the 4-band ring transports correctly and the GPU-side fence ordering between the two adapters holds at every band boundary. NO SPEED CLAIM IS MADE OR IMPLIED. The two durations above are single noisy wall-clock samples of a NARROWER path than P1.3's (shared-heap traversal only, no texture stages), neither is a GPU timestamp, and on this rig the pipelined arm has been the SLOWER of the two - both halves cross the same link, so overlapping them adds contention, not bandwidth. The overlap that could pay is transfer against neural execution, which this block does not test.
+11:34:06:139 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.0 VirtualAlloc: addr=0x000001E46EB00000 bytes=14745600 (payload 14745600, rounded to 64 KB)
+11:34:06:139 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.1 QueryInterface(ID3D12Device3): hr=0x00000000
+11:34:06:140 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.2 OpenExistingHeapFromAddress on GPU 0: hr=0x00000000
+11:34:06:142 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.3 OpenExistingHeapFromAddress on GPU 1: hr=0x00000000 <- same host pages, second adapter
+11:34:06:142 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.3b heap desc: gpu0 size=14745600 align=65536 type=4(DEFAULT=1,UPLOAD=2,READBACK=3,CUSTOM=4) cpuPage=3 pool=1(L0=1,L1=2) flags=0x421 | gpu1 size=14745600 align=65536 type=4 cpuPage=3 pool=1 flags=0x421
+11:34:06:142 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.4 CreatePlacedResource on GPU 0, flags=NONE state=COMMON: hr=0x80070057
+11:34:06:142 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.4 CreatePlacedResource on GPU 0, flags=ALLOW_CROSS_ADAPTER state=COMMON: hr=0x00000000  <- ACCEPTED
+11:34:06:142 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.5 CreatePlacedResource on GPU 1, flags=NONE state=COMMON: hr=0x80070057
+11:34:06:143 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 A'.5 CreatePlacedResource on GPU 1, flags=ALLOW_CROSS_ADAPTER state=COMMON: hr=0x00000000  <- ACCEPTED
+11:34:06:160 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.4b] 2560x1440 SAME-ADAPTER CONTROL (GPU 0, identical two copies, destination LOCAL to GPU 0): hr=0x00000000 sub=0.18 wait=0.21 total=0.38 ms for 14.06 MiB. Compare against wait0 in the breakdown below: the DIFFERENCE is what crossing the adapter costs on this link; what is left is GPU 0 being busy with the game.
+11:34:06:190 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] 2560x1440 via A'(host-pinned): 14.06 MiB round trip in 2.47 ms (5684 MiB/s apparent) differing=0 of 3686400 sentinel=0
+11:34:06:190 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.4a] 2560x1440 path=A'(host-pinned) forced=A-prime breakdown: rec0=0.03 sub0=0.06 wait0=0.73 | rec1=0.05 sub1=0.10 wait1=1.53 | cpu(rec+sub)=0.24 waits=2.27 (92% of the trip) round_trip=2.47 verify=25.47 ms. LINK: this rig is PCIe 3.0 x2 on chipset lanes (~1.6 GB/s usable), so ~28 MiB across it is ~17.5 ms of pure link time at 1440p. These absolute numbers are a property of THIS interconnect and do not decide whether the architecture is viable. What they do decide is A versus A', because both are measured over the same link.
+11:34:06:190 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] PAYLOAD INTACT - every pixel crossed the bus unchanged.
+11:34:06:190 [29460] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E1294A0AA0, pDesc = 00000031349BE0A0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00000031349BDE98) ...
+11:34:06:190 [29460] | INFO  | > Dumping command queue description:
+11:34:06:190 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:190 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:06:190 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:190 [29460] | INFO  |   | Type                                    | 3                                       |
+11:34:06:190 [29460] | INFO  |   | Priority                                | 0                                       |
+11:34:06:192 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:06:192 [29460] | INFO  |   | NodeMask                                | 0                                       |
+11:34:06:192 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:199 [29460] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E42220A4D0, pDesc = 00000031349BE0A0, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00000031349BDEF8) ...
+11:34:06:199 [29460] | INFO  | > Dumping command queue description:
+11:34:06:199 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:199 [29460] | INFO  |   | Parameter                               | Value                                   |
+11:34:06:199 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:200 [29460] | INFO  |   | Type                                    | 3                                       |
+11:34:06:200 [29460] | INFO  |   | Priority                                | 0                                       |
+11:34:06:200 [29460] | INFO  |   | Flags                                   | 0                                       |
+11:34:06:200 [29460] | INFO  |   | NodeMask                                | 0                                       |
+11:34:06:200 [29460] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:06:209 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] 2560x1440 setup: COPY queues on both adapters, 4-deep ring, cross-adapter producer fence (CreateFence(SHARED|SHARED_CROSS_ADAPTER) on GPU 0 -> OpenSharedHandle on GPU 1): hr=0x00000000
+11:34:06:280 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] 2560x1440 bands=4 rows_per_band=360 pitch=10240
+11:34:06:280 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] 2560x1440 path=A'(host-pinned) buffer-to-buffer over the shared heap, 14.06 MiB | SERIAL(1 band, CPU wait between sides): ok=yes 2.61 ms (5387 MiB/s) differing=0 sentinel=0 | PIPELINED(4 bands, COPY queues, GPU-side fence wait): ok=yes 1.83 ms (7700 MiB/s) differing=0 sentinel=0
+11:34:06:280 [29460] | INFO  | [MGPU Bridge] [MGPU][P2.1] PROBE PASSED (CORRECTNESS ONLY) - both arms delivered the payload byte-exact with no sentinel survivors, so the 4-band ring transports correctly and the GPU-side fence ordering between the two adapters holds at every band boundary. NO SPEED CLAIM IS MADE OR IMPLIED. The two durations above are single noisy wall-clock samples of a NARROWER path than P1.3's (shared-heap traversal only, no texture stages), neither is a GPU timestamp, and on this rig the pipelined arm has been the SLOWER of the two - both halves cross the same link, so overlapping them adds contention, not bandwidth. The overlap that could pay is transfer against neural execution, which this block does not test.
+11:34:06:288 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] NOTE: the timings above are a CPU-serialised round trip measured during game startup, with no shared fence and no pipelining. Treat the RATIO between the two sizes as the signal and the absolute numbers as an upper bound; a real figure needs cross-adapter GPU clock calibration and a settled scene (P2).
+11:34:06:319 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.3] transit probe torn down - both probe-owned devices released
+11:34:06:319 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.10] AutoArm is ON: the stream will arm itself after 600 presented frames AND 3000 ms with no swapchain event. For a MEASUREMENT leave it off and arm by hand in gameplay - that is what every published figure ran under.
+11:34:06:322 [29460] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 00000031349BA290) ...
+11:34:06:322 [29080] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\Daltonize.fx' in 0.001000 s.
+11:34:06:323 [29044] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\LUT.fx' in 0.001000 s.
+11:34:06:323 [11416] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\Deband.fx' in 0.002000 s.
+11:34:06:323 [31828] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\UIMask.fx' in 0.001000 s.
+11:34:06:323 [27924] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\DisplayDepth.fx' in 0.002000 s.
+11:34:06:351 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] first successful present (frame 1) - the vsync-paced present loop is alive
+11:34:06:352 [29460] | INFO  | [MGPU Bridge] [MGPU][P1.6] BRIDGE runtime preset="C:\Games\Cyberpunk 2077\bin\x64\gpu1.ini" | 0 of 6 techniques ENABLED. This line exists because a stale gpu1.ini once drew a motion-flow debug view over the neural output and three code hypotheses were spent on it. If anything unexpected is listed here, what is on screen is not what this add-on produced.
+11:34:09:194 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 600 thread id 0x7314
+11:34:09:194 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.10] AutoArm firing at frame 600 (3203 ms since the last swapchain event). Identical to pressing CTRL+ALT+F10 - same one-shot, same path. If the game is still in a menu the stream is armed against menu frames, which is correct but measures nothing.
+11:34:09:195 [29460] | INFO  | [MGPU Bridge] [MGPU][P6.2] knobs | intensity p1=1.000 (0 per-pass overrides, * marks them). Set.* keys are passed to NGX VERBATIM and this add-on does not know whether the snippet reads them - a key listed here was SENT, not necessarily HONOURED. Intensity is the only one proven live (P1.2: 0.00 vs 1.60 changed 98.03% of pixels).
+11:34:09:195 [29460] | INFO  | [MGPU Bridge] [MGPU][P4.0] stream REQUESTED - ring depth 6, NO BOUND (Frames=0) - this run does not end and prints no summary. SESSIONS BEYOND A FEW MINUTES ARE UNTESTED: watch GPU load and temperature, fault="none", neural=ON (P4.1 - DLSS-NR runs on every consumed frame), profile=off, present=nr (the neural output), passes=1, window=fit (borderless full screen). Every game frame from the next one is sealed and transited until the bound is reached, then a summary is printed. Stay in gameplay: a stream of menu frames measures identity and ordering correctly and tells you nothing about anything else.
+11:34:09:195 [29460] | INFO  | [MGPU Bridge] [MGPU][P4.0] ignoring events from the bridge's own runtime (correct - said once)
+11:34:09:218 [32672] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 000001E42220A4D0, pDesc = 000000312B2FE458, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00007FFC24CB0EA8) ...
+11:34:09:218 [32672] | INFO  | > Dumping command queue description:
+11:34:09:218 [32672] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:09:218 [32672] | INFO  |   | Parameter                               | Value                                   |
+11:34:09:218 [32672] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:09:218 [32672] | INFO  |   | Type                                    | 0                                       |
+11:34:09:218 [32672] | INFO  |   | Priority                                | 0                                       |
+11:34:09:218 [32672] | INFO  |   | Flags                                   | 0                                       |
+11:34:09:218 [32672] | INFO  |   | NodeMask                                | 0                                       |
+11:34:09:218 [32672] | INFO  |   +-----------------------------------------+-----------------------------------------+
+11:34:09:245 [32672] | INFO  | [MGPU Bridge] [MGPU][P2.2] GPU timestamps on GPU 1: query heap + GetTimestampFrequency hr=0x00000000 freq=1000000000 ticks/s -> ON. These are GPU time, not wall-clock; no cross-adapter clock is involved.
+11:34:09:245 [32672] | INFO  | [MGPU Bridge] [MGPU][P4.0] stream arm hr=0x00000000 source=1920x1080 fmt=28 rowPitch=7680 payload=8294400 slot=8294912 ring=6 heap=49807360 bytes. The heap is created on the GAME's device: its command list can only reference resources from the device that made it.
+11:34:09:265 [29460] | INFO  | [MGPU Bridge] [MGPU][P4.1] Init: result=0xBAD0000C (FAIL_OutOfDate)
+11:34:09:624 [29460] | INFO  | [MGPU Bridge] [MGPU][P4.1] CreateFeature(Reserved18) handle 1/2 1920x1080 fmt=28: result=0x00000001 (Success) handle=0x000001E44123D600 elapsed=232ms
+11:34:09:752 [29460] | INFO  | [MGPU Bridge] [MGPU][P4.1] CreateFeature(Reserved18) handle 2/2 1920x1080 fmt=28: result=0x00000001 (Success) handle=0x000001E5E91692D0 elapsed=128ms
+11:34:09:767 [29460] | WARN  | [MGPU Bridge] [MGPU][P7.3] BACKBUFFER FORMAT MISMATCH CORRECTED: the present chain was created DXGI format 24 and this game renders 28. CopyTextureRegion does not convert, so every pixel copied so far was reinterpreted across different channel boundaries - that is the colour noise on the bridge window, and it is a display fault only: the neural stage and the transport were unaffected and their figures stand. Resizing the chain to 28 now.
+11:34:09:768 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.1] resizing the present window - draining GPU 1. The producer is NOT paused, so expect one burst of DROPPED / REORDERED / STALE seals across the next few frames. That is this resize, not the transport; frames after it return to gap=1 OK.
+11:34:09:769 [29460] | INFO  | Redirecting IDXGISwapChain::ResizeBuffers(this = 000001E4473CF900, BufferCount = 2, Width = 1920, Height = 1080, NewFormat = 28, SwapChainFlags = 0) ...
+11:34:09:772 [29460] | INFO  | Destroyed runtime environment on runtime 000001E3F538CC30 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade2.ini').
+11:34:09:782 [29460] | INFO  | [MGPU Bridge] [MGPU][T2] init_swapchain (resize) luid=0x00000000-0x00013BC5 - swapchain-derived game luid 0x00000000-0x00012723 already established; not re-selecting
+11:34:09:784 [29460] | INFO  | Recreated runtime environment on runtime 000001E3F538CC30 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade2.ini').
+11:34:09:784 [29460] | INFO  | [MGPU Bridge] [MGPU][P7.3] present chain resized: mode=fit source=1920x1080 fmt=28 -> window 3200x1800 at (-3200,-218), swapchain 1920x1080 fmt=28, monitor 3200x1800 at (-3200,-218). DXGI SCALES on presentation - the copy into the backbuffer is still 1:1 and nothing in this add-on resamples, but what reaches the panel has been stretched by the compositor. Say so in any capture.
+11:34:09:800 [29460] | INFO  | [MGPU Bridge] [MGPU][P5.0] the bridge window is now showing the NEURAL OUTPUT - every pixel on screen is a pixel DLSS-NR produced on the second adapter - THE WHOLE of the 1920x1080 frame at 1920x1080, one CopyTextureRegion, no resampling in this add-on. The cycling colour returns when the stream ends.
+11:34:09:803 [ 2216] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\Daltonize.fx' in 0.001000 s.
+11:34:09:803 [28028] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\LUT.fx' in 0.001000 s.
+11:34:09:803 [28492] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\Deband.fx' in 0.002000 s.
+11:34:09:803 [29148] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\UIMask.fx' in 0.001000 s.
+11:34:09:804 [31408] | INFO  | Successfully compiled 'C:\Games\Cyberpunk 2077\bin\x64\reshade-shaders\Shaders\DisplayDepth.fx' in 0.001000 s.
+11:34:10:277 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=61 slot=0 gap=1 lat=28.53ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:10:769 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=122 slot=1 gap=1 lat=29.19ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:11:255 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=183 slot=2 gap=1 lat=27.90ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:11:747 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=244 slot=3 gap=1 lat=30.08ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:12:229 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=305 slot=4 gap=1 lat=28.27ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:12:713 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=366 slot=5 gap=1 lat=30.84ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:13:182 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=427 slot=0 gap=1 lat=23.30ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:13:661 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=488 slot=1 gap=1 lat=26.68ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:14:145 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=549 slot=2 gap=1 lat=33.10ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:14:625 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=610 slot=3 gap=1 lat=30.05ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:15:100 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=671 slot=4 gap=1 lat=26.92ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:15:585 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=732 slot=5 gap=1 lat=32.29ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:16:057 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=793 slot=0 gap=1 lat=24.81ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:16:141 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 1200 thread id 0x7314
+11:34:16:542 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=854 slot=1 gap=1 lat=33.88ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:17:013 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=915 slot=2 gap=1 lat=25.33ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:17:488 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=976 slot=3 gap=1 lat=23.92ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:17:970 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1037 slot=4 gap=1 lat=29.65ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:18:444 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1098 slot=5 gap=1 lat=27.81ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:18:926 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1159 slot=0 gap=1 lat=27.78ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:19:405 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1220 slot=1 gap=1 lat=30.05ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:19:876 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1281 slot=2 gap=1 lat=26.89ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:20:359 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1342 slot=3 gap=1 lat=33.18ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:20:831 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1403 slot=4 gap=1 lat=28.52ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:21:312 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1464 slot=5 gap=1 lat=32.95ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:21:782 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1525 slot=0 gap=1 lat=26.14ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:22:268 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1586 slot=1 gap=1 lat=32.61ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:22:460 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 1800 thread id 0x7314
+11:34:22:744 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1647 slot=2 gap=1 lat=30.00ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:23:214 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1708 slot=3 gap=1 lat=27.04ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:23:695 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1769 slot=4 gap=1 lat=32.60ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:24:167 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1830 slot=5 gap=1 lat=27.11ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:24:649 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1891 slot=0 gap=1 lat=33.54ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:25:131 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=1952 slot=1 gap=1 lat=29.94ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:25:607 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2013 slot=2 gap=1 lat=25.00ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:26:087 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2074 slot=3 gap=1 lat=26.71ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:26:570 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2135 slot=4 gap=1 lat=31.89ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:27:042 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2196 slot=5 gap=1 lat=25.13ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:27:522 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2257 slot=0 gap=1 lat=30.41ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:28:004 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2318 slot=1 gap=1 lat=27.97ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:28:488 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2379 slot=2 gap=1 lat=33.33ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:28:750 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 2400 thread id 0x7314
+11:34:28:960 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2440 slot=3 gap=1 lat=30.19ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:29:445 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2501 slot=4 gap=1 lat=34.14ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:29:921 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2562 slot=5 gap=1 lat=26.77ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:30:476 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2623 slot=0 gap=1 lat=24.75ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:30:989 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2684 slot=1 gap=1 lat=29.02ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:31:494 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2745 slot=2 gap=1 lat=33.79ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:31:990 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2806 slot=3 gap=1 lat=25.89ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:32:280 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2867 slot=4 gap=1 lat=22.68ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:32:569 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2928 slot=5 gap=1 lat=21.55ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:32:859 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=2989 slot=0 gap=1 lat=20.83ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:33:148 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3050 slot=1 gap=1 lat=17.90ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:33:446 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3111 slot=2 gap=1 lat=27.56ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:33:734 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3172 slot=3 gap=1 lat=26.07ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:34:025 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3233 slot=4 gap=1 lat=25.28ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:34:316 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3294 slot=5 gap=1 lat=25.68ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:34:606 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3355 slot=0 gap=1 lat=25.77ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:34:898 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3416 slot=1 gap=1 lat=26.79ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:35:181 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3477 slot=2 gap=1 lat=17.92ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:35:281 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 3000 thread id 0x7314
+11:34:35:480 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3538 slot=3 gap=1 lat=27.59ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:35:768 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3599 slot=4 gap=1 lat=25.49ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:36:061 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3660 slot=5 gap=1 lat=27.93ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:36:350 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3721 slot=0 gap=1 lat=27.18ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:36:638 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3782 slot=1 gap=1 lat=24.97ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:36:930 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3843 slot=2 gap=1 lat=26.11ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:37:220 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3904 slot=3 gap=1 lat=26.30ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:37:513 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=3965 slot=4 gap=1 lat=27.82ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:37:906 [29460] | ERROR | [MGPU Bridge] [MGPU][SEAL] DROPPED f=4019 gap=7 (last_new=4018)
+11:34:37:907 [29460] | ERROR | [MGPU Bridge] [MGPU][SEAL] REORDERED f=4020: seal says 4020, last seen 4025
+11:34:37:907 [29460] | ERROR | [MGPU Bridge] [MGPU][SEAL] REORDERED f=4021: seal says 4021, last seen 4025
+11:34:37:907 [29460] | ERROR | [MGPU Bridge] [MGPU][SEAL] REORDERED f=4022: seal says 4022, last seen 4025
+11:34:37:908 [29460] | ERROR | [MGPU Bridge] [MGPU][SEAL] REORDERED f=4023: seal says 4023, last seen 4025
+11:34:37:919 [29460] | ERROR | [MGPU Bridge] [MGPU][SEAL] REORDERED f=4024: seal says 4024, last seen 4025
+11:34:37:920 [29460] | ERROR | [MGPU Bridge] [MGPU][SEAL] STALE f=4025: the slot still holds seal 4025. The fence said frame 4025 had landed and it had not.
+11:34:37:920 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4026 slot=5 gap=1 lat=13.70ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:38:210 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4087 slot=0 gap=1 lat=24.04ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:38:497 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4148 slot=1 gap=1 lat=19.96ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:38:792 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4209 slot=2 gap=1 lat=24.48ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:39:077 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4270 slot=3 gap=1 lat=18.96ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:39:383 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4331 slot=4 gap=1 lat=26.01ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:39:672 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4392 slot=5 gap=1 lat=25.09ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:39:962 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4453 slot=0 gap=1 lat=24.00ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:40:253 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4514 slot=1 gap=1 lat=15.93ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:40:546 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4575 slot=2 gap=1 lat=26.05ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:40:971 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4636 slot=3 gap=1 lat=17.68ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:41:262 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4697 slot=4 gap=1 lat=14.28ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:41:585 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4758 slot=5 gap=1 lat=11.84ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:42:803 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4819 slot=0 gap=1 lat=38.96ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:43:479 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 3600 thread id 0x7314
+11:34:43:553 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4880 slot=1 gap=1 lat=38.80ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:44:312 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=4941 slot=2 gap=1 lat=39.69ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:45:064 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5002 slot=3 gap=1 lat=34.44ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:45:843 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5063 slot=4 gap=1 lat=33.06ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:46:912 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5124 slot=5 gap=1 lat=35.88ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:47:745 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5185 slot=0 gap=1 lat=37.41ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:48:829 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5246 slot=1 gap=1 lat=36.71ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:49:665 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5307 slot=2 gap=1 lat=33.94ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:50:445 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5368 slot=3 gap=1 lat=33.16ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:51:235 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5429 slot=4 gap=1 lat=32.36ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:51:832 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 4200 thread id 0x7314
+11:34:52:040 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5490 slot=5 gap=1 lat=31.81ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:52:849 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5551 slot=0 gap=1 lat=33.52ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:53:664 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5612 slot=1 gap=1 lat=32.25ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:54:498 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5673 slot=2 gap=1 lat=34.55ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:55:335 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5734 slot=3 gap=1 lat=34.05ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:56:156 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5795 slot=4 gap=1 lat=32.74ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:56:980 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5856 slot=5 gap=1 lat=32.88ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:57:802 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5917 slot=0 gap=1 lat=33.71ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:58:617 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=5978 slot=1 gap=1 lat=33.02ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:34:59:382 [32360] | INFO  | [MGPU Bridge] [MGPU][P6.4] passes 1 -> 2, live from the next frame. Handles for all 2 were created at arm, so nothing is built or torn down here.
+11:34:59:435 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6039 slot=2 gap=1 lat=40.70ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:00:208 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 4800 thread id 0x7314
+11:35:00:252 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6100 slot=3 gap=1 lat=40.90ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:00:368 [29328] | INFO  | [MGPU Bridge] [MGPU][P6.4] passes 2 -> 1, live from the next frame. Handles for all 2 were created at arm, so nothing is built or torn down here.
+11:35:01:062 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6161 slot=4 gap=1 lat=33.07ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:01:886 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6222 slot=5 gap=1 lat=33.87ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:02:730 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6283 slot=0 gap=1 lat=37.51ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:03:605 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6344 slot=1 gap=1 lat=33.83ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:04:534 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6405 slot=2 gap=1 lat=35.58ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:05:535 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6466 slot=3 gap=1 lat=40.15ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:06:502 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6527 slot=4 gap=1 lat=36.01ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:07:449 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6588 slot=5 gap=1 lat=33.12ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:08:414 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6649 slot=0 gap=1 lat=33.84ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:09:265 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 5400 thread id 0x7314
+11:35:09:379 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6710 slot=1 gap=1 lat=34.21ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:10:339 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6771 slot=2 gap=1 lat=39.59ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:11:271 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6832 slot=3 gap=1 lat=39.52ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:12:185 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6893 slot=4 gap=1 lat=32.90ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:13:080 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=6954 slot=5 gap=1 lat=36.25ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:13:961 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7015 slot=0 gap=1 lat=34.60ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:14:862 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7076 slot=1 gap=1 lat=33.97ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:15:737 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7137 slot=2 gap=1 lat=32.98ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:16:640 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7198 slot=3 gap=1 lat=34.32ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:17:568 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7259 slot=4 gap=1 lat=34.53ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:18:233 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 6000 thread id 0x7314
+11:35:18:510 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7320 slot=5 gap=1 lat=35.72ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:19:482 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7381 slot=0 gap=1 lat=38.65ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:20:453 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7442 slot=1 gap=1 lat=32.65ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:21:425 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7503 slot=2 gap=1 lat=37.09ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:22:392 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7564 slot=3 gap=1 lat=36.36ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:23:366 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7625 slot=4 gap=1 lat=36.06ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:24:342 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7686 slot=5 gap=1 lat=35.54ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:25:312 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7747 slot=0 gap=1 lat=34.31ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:26:285 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7808 slot=1 gap=1 lat=37.93ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:27:259 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7869 slot=2 gap=1 lat=37.86ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:27:784 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 6600 thread id 0x7314
+11:35:28:227 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7930 slot=3 gap=1 lat=37.99ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:29:220 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=7991 slot=4 gap=1 lat=39.57ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:30:207 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8052 slot=5 gap=1 lat=37.21ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:31:195 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8113 slot=0 gap=1 lat=37.01ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:32:181 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8174 slot=1 gap=1 lat=38.13ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:33:167 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8235 slot=2 gap=1 lat=37.46ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:34:145 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8296 slot=3 gap=1 lat=37.54ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:35:125 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8357 slot=4 gap=1 lat=37.15ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:36:103 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8418 slot=5 gap=1 lat=35.28ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:37:088 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8479 slot=0 gap=1 lat=36.28ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:37:458 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 7200 thread id 0x7314
+11:35:38:065 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8540 slot=1 gap=1 lat=36.43ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:39:033 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8601 slot=2 gap=1 lat=37.34ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:39:997 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8662 slot=3 gap=1 lat=38.18ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:40:944 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8723 slot=4 gap=1 lat=35.32ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:41:899 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8784 slot=5 gap=1 lat=37.92ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:42:850 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8845 slot=0 gap=1 lat=33.93ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:43:807 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8906 slot=1 gap=1 lat=39.59ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:44:765 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=8967 slot=2 gap=1 lat=36.96ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:45:718 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9028 slot=3 gap=1 lat=38.31ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:46:672 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9089 slot=4 gap=1 lat=37.92ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:46:875 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 7800 thread id 0x7314
+11:35:47:632 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9150 slot=5 gap=1 lat=36.29ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:48:359 [32716] | INFO  | [MGPU Bridge] [MGPU][P6.4] passes 1 -> 2, live from the next frame. Handles for all 2 were created at arm, so nothing is built or torn down here.
+11:35:48:595 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9211 slot=0 gap=1 lat=50.52ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:49:535 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9272 slot=1 gap=1 lat=47.14ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:49:719 [32676] | INFO  | [MGPU Bridge] [MGPU][P6.4] passes 2 -> 1, live from the next frame. Handles for all 2 were created at arm, so nothing is built or torn down here.
+11:35:50:470 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9333 slot=2 gap=1 lat=38.33ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:51:417 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9394 slot=3 gap=1 lat=35.50ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:52:365 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9455 slot=4 gap=1 lat=35.10ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:53:304 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9516 slot=5 gap=1 lat=41.38ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:54:217 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9577 slot=0 gap=1 lat=32.69ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:55:136 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9638 slot=1 gap=1 lat=34.24ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:56:052 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9699 slot=2 gap=1 lat=39.12ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:56:424 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 8400 thread id 0x7314
+11:35:56:977 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9760 slot=3 gap=1 lat=36.17ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:57:891 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9821 slot=4 gap=1 lat=34.51ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:58:856 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9882 slot=5 gap=1 lat=34.64ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:35:59:889 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=9943 slot=0 gap=1 lat=39.38ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:00:901 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10004 slot=1 gap=1 lat=39.20ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:01:969 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10065 slot=2 gap=1 lat=39.21ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:02:960 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10126 slot=3 gap=1 lat=37.71ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:03:996 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10187 slot=4 gap=1 lat=19.09ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:04:267 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10248 slot=5 gap=1 lat=28.23ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:04:557 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10309 slot=0 gap=1 lat=27.78ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:04:848 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10370 slot=1 gap=1 lat=28.09ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:05:130 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10431 slot=2 gap=1 lat=18.08ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:05:423 [29460] | INFO  | [MGPU Bridge] [MGPU][SEAL] new f=10492 slot=3 gap=1 lat=21.61ms pitch=7680 fmt=28 bytes=8294400 bc=0(unimplemented) OK
+11:36:05:545 [29460] | INFO  | [MGPU Bridge] [MGPU][T5] present loop alive: frame 9000 thread id 0x7314
+11:36:06:199 [29328] | INFO  | Redirecting IDXGISwapChain::SetFullscreenState(this = 000001E41C28AC70, Fullscreen = FALSE, pTarget = 0000000000000000) ...
+11:36:07:426 [29328] | INFO  | Destroyed runtime environment on runtime 000001E41C7B3480 ('C:\Games\Cyberpunk 2077\bin\x64\ReShade.ini').
+11:36:08:906 [29328] | INFO  | Unregistered add-on "MGPU Bridge".
+11:36:08:933 [29328] | INFO  | Exiting ...
+11:36:08:934 [29328] | INFO  | Uninstalling 40 hook(s) ...
+11:36:09:969 [29328] | INFO  | Finished exiting.
