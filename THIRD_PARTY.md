@@ -107,9 +107,8 @@ here because the terms are NVIDIA's to state and a stale copy would be worse
 than a reference.
 
 **No NVIDIA runtime component is distributed with this project.** `_nvngx.dll`,
-`nvngx_dlssnr.dll` and the DLSS-NR weights come from the user's own driver
-installation and are located at run time. Adding any of them to a release
-package would be redistribution of NVIDIA binaries and must not be done.
+`nvngx_dlssnr.dll` and the DLSS-NR weights come from the user's own machine and are located at run time.
+. Adding any of them to a release package would be redistribution of NVIDIA binaries and must not be done.
 
 ## Provenance
 
