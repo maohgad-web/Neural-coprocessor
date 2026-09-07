@@ -145,12 +145,11 @@ bridge on an RTX 4080 SUPER (rendering) paired with an RTX 5060 Ti (second
 card), on Horizon Forbidden West and Cyberpunk 2077, using a modded
 `nvngx_dlssnr.dll` sourced independently rather than the OptiScaler bundle
 they'd tried first, which did not work for them. That also answers the PCIe
-question this setup raises: both of their cards run at PCIe 4.0 x8, and their
-testing at 3440x1440 10-bit put throughput well clear of that link's ceiling,
-so bandwidth was not the cause of the frame-smoothness issue they saw at high
-load. I still don't own Ada hardware myself, so I still can't troubleshoot a
-40-series setup directly - but it's no longer an untested guess, it's a
-result, from a second machine (see the [discussion](https://github.com/maohgad-web/Neural-coprocessor/discussions/3)).
+question this setup raises: both of their cards run at PCIe 4.0 x8,
+. I still don't own Ada hardware myself, so I still can't troubleshoot a
+40-series setup directly - but it's no longer an untested guess, 
+it's a result, from a second machine (see the 
+[discussion](https://github.com/maohgad-web/Neural-coprocessor/discussions/3)).
 
 **Two GPUs and two monitors, one on each card.** A requirement, not a nicety. The
 neural output is displayed by the card that produced it, so nothing has to travel
