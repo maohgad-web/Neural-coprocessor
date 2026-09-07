@@ -34,6 +34,7 @@ each, and the measured runs were separate and unrecorded.
 | [VENDOR_LOCK.md](VENDOR_LOCK.md) | the machine, driver and configuration every number was taken on |
 | [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) | prior work, AI use, disclaimer |
 | [THIRD_PARTY.md](THIRD_PARTY.md) | licences and provenance |
+| [reference/](reference/) | a working `ReShade.ini` and a complete `ReShade.log`, to diff yours against |
 | [history/](history/) | the milestone record, the verified-facts ledger, the instrument design |
 
 ---
@@ -153,6 +154,8 @@ latency, one variable, five minutes apart.
 common reason nothing happens. The effects-only build never loads `.addon64`
 files and says nothing about it, because the add-on was never loaded to write a
 log line. If the log has no `Registered add-on "MGPU Bridge"` line, this is why.
+[reference/](reference/) has a complete log from a working run, and the five
+lines worth checking first, so you can diff yours against it.
 
 **A DirectX 12 game.** D3D11 and Vulkan titles do nothing: the add-on loads,
 finds no D3D12 render device, stands down, and says so in the log and in the
