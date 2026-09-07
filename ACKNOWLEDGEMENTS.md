@@ -107,6 +107,15 @@ makes the offload figure mean anything.
 
 Thank you to all of them. Mistakes in this repository are ours, not theirs.
 
+## Community testing
+
+**[salient-cyanocitta](https://github.com/salient-cyanocitta)** confirmed this
+running on an RTX 4080 SUPER + RTX 5060 Ti pair, closing the open question on
+40-series (Ada) hardware in [discussion #3](https://github.com/maohgad-web/Neural-coprocessor/discussions/3).
+That report also ruled out PCIe bandwidth as the cause of a smoothness issue
+seen at high load, on a machine running both cards at PCIe 4.0 x8. Thank you
+for the testing, the log, and the video.
+
 ## Please read the code before you run it
 
 This is research code. It creates a second D3D12 device, allocates
