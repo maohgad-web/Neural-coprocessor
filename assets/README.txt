@@ -28,13 +28,12 @@ WHAT YOU NEED FIRST
    no error, no log line, because the add-on was never loaded to write one. If
    the log has no "Registered add-on \"MGPU Bridge\"" line, this is why.
  
-2. A second NVIDIA GPU in the machine, with a current driver. DLSS-NR comes
-   from your driver installation.
+2. A second NVIDIA GPU in the machine, with a current driver.
  
    GEFORCE RTX 50-SERIES. NVIDIA documents DLSS Neural Rendering as a
    50-series feature - it is not available on 40-series or older cards, and
-   this add-on cannot change that. It drives the NGX libraries already in your
-   driver and cannot enable something the driver will not run. THIS ADD-ON
+   this add-on cannot change that. It drives the NGX libraries already on your
+   machine and cannot enable something they will not run. THIS ADD-ON
    DOES NOT CHECK YOUR HARDWARE: on an older card expect it to load, log
    normally, and produce nothing.
  
@@ -50,7 +49,7 @@ WHAT YOU NEED FIRST
  
    YOU DO NOT NEED ANY OTHER ADD-ON. This one reaches DLSS Neural Rendering on
    its own: it creates its own D3D12 device on the second GPU and drives the
-   NGX libraries in your driver directly. Nothing else has to be present.
+   NGX libraries directly. Nothing else has to be present.
  
    DO NOT RUN A SECOND NEURAL PATH ALONGSIDE IT. Untested, and this project has
    already seen two independent NGX consumers sharing one parameter block
@@ -74,9 +73,22 @@ WHAT YOU NEED FIRST
    NVIDIA documents against Vulkan. Everything here is built on ReShade's
    D3D12 path.
  
-NOTHING FROM NVIDIA IS INCLUDED HERE. _nvngx.dll, nvngx_dlssnr.dll and the
-DLSS-NR weights come from your own driver install. Do not add them to this
-folder to make it work for somebody else.
+NOTHING FROM NVIDIA IS INCLUDED HERE, AND NONE OF IT MAY BE. The two NGX
+modules do not arrive the same way, and earlier versions of this file said they
+did:
+
+  _nvngx.dll          the driver core. Already resident in the game process on
+                      a current driver - that is logged rather than assumed.
+
+  nvngx_dlssnr.dll    the DLSS-NR snippet. Loaded FROM THE GAME'S OWN FOLDER,
+                      not from the driver store. On the machines this was built
+                      on it was already present there. THIS PROJECT DOES NOT
+                      SHIP IT, CANNOT SHIP IT, AND DOES NOT DOCUMENT HOW TO
+                      OBTAIN IT. If the neural stage never starts and the log
+                      shows the snippet failing to load, that file is what is
+                      missing.
+
+Do not put either of them in a package you hand to somebody else.
 
 
 INSTALL
@@ -121,12 +133,21 @@ THREE THINGS THAT ARE NOT IN THIS DOWNLOAD, AND WHY
      will not load the add-on and will not tell you so. You do not need to tick
      any effect packages.
 
-  2. DLSS Neural Rendering. It comes from YOUR NVIDIA DRIVER INSTALL, not from
-     here. _nvngx.dll, nvngx_dlssnr.dll and the model weights already live on
-     your machine if your driver is current enough - 616.64 was used for every
-     figure published with this project. Nothing to download, and nothing to
-     copy: DO NOT put those files in the game folder, and do not send them to
-     anybody else. No NVIDIA binary is redistributed by this project.
+  2. The NGX modules that do the neural work, and they do not arrive the same
+     way as each other.
+
+     _nvngx.dll is the driver core and is already resident in the game process
+     on a current driver - 616.64 was used for every figure published with this
+     project. Nothing to do about that one.
+
+     nvngx_dlssnr.dll is the DLSS-NR snippet and is loaded FROM THE GAME'S OWN
+     FOLDER. On the machines this was built on it was already there. This
+     project does not ship it, cannot ship it, and does not document how to
+     obtain it - if the neural stage never starts, check the log for the
+     snippet failing to load, because that is the likely reason.
+
+     No NVIDIA binary is redistributed by this project, and you should not
+     redistribute one either.
 
   3. Your own ReShade.ini and ReShadePreset.ini. Deliberately left out, because
      shipping ours would overwrite your existing setup. See "CHECK YOUR OWN
