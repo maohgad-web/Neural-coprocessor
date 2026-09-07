@@ -133,8 +133,8 @@ and buy a second GPU.
 
 **GeForce RTX 50-series cards.** NVIDIA documents DLSS Neural Rendering as a
 50-series feature. It is not available on 40-series or older hardware, and this
-add-on cannot change that: it drives the NGX libraries already in your driver and
-cannot enable something the driver will not run. **It does not check your
+add-on cannot change that: it drives the NGX libraries already on your machine
+and cannot enable something they will not run. **It does not check your
 hardware**, so on an older card expect it to load, log normally, and produce
 nothing.
 
@@ -163,14 +163,25 @@ Some Unity titles can be forced with `-force-d3d12`.
 **No shader pack, and no other add-on.** Ticking effect packages in the ReShade
 installer is optional, and this was tested with none installed. This add-on
 reaches DLSS-NR on its own: it creates its own D3D12 device on the second card
-and drives the NGX libraries in your driver directly. Do not run a second neural
+and drives the NGX libraries directly. Do not run a second neural
 path alongside it - untested, and this project has already seen two independent
 NGX consumers sharing one parameter block produce a visibly wrong image while
 every transport counter stayed clean.
 
-**Nothing from NVIDIA is included here.** `_nvngx.dll`, `nvngx_dlssnr.dll` and
-the DLSS-NR weights come from your own driver install. Do not add them to the
-download folder to make it work for somebody else.
+**Nothing from NVIDIA is included here, and none of it may be.** The two NGX
+modules do not arrive the same way, and this documentation previously said they
+did:
+
+- **`_nvngx.dll`** is the driver core. It is already resident in the game process
+  on a current driver, with no DLSS add-on loaded - that is logged rather than
+  assumed.
+- **`nvngx_dlssnr.dll`** is the DLSS-NR snippet, and it is loaded **from the
+  game's own folder**, not from the driver store. On the machines this was built
+  on it was already present there. **This project does not ship it, cannot ship
+  it, and does not document how to obtain it.** If the neural stage never starts
+  and the log shows the snippet failing to load, that file is what is missing.
+
+Do not add either of them to a release package or send them to anybody else.
 
 ### What this is, in plain terms
 
@@ -259,8 +270,10 @@ and does its work elsewhere.
 shared heap and the seal, the NGX core/snippet split and the result-code ladder,
 and the present path.
 
-It uses NVIDIA's NGX libraries from your driver installation. Nothing from
-NVIDIA is redistributed here.
+It uses NVIDIA's NGX libraries: the core resolved from the driver, the DLSS-NR
+snippet loaded from the game folder. Nothing from NVIDIA is redistributed here,
+and the snippet is a prerequisite this project does not supply. See
+[THIRD_PARTY.md](THIRD_PARTY.md).
 
 ---
 
