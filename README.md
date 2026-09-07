@@ -143,11 +143,6 @@ produce nothing.
 Ada in theory, it has simply never been tested, because I do not own the
 hardware to test it on.  I just cannot help you troubleshoot it.
 
-Strictly it is the *second* card that runs the neural stage, so that is the card
-the requirement applies to. A mixed pair has never been tested, and the
-cross-adapter shared-heap workaround this depends on is itself 50-series
-specific. Two RTX 5060 Ti 16 GB is the only configuration this has run on.
-
 **Two GPUs and two monitors, one on each card.** A requirement, not a nicety. The
 neural output is displayed by the card that produced it, so nothing has to travel
 back across the link. Running the second card headless works and is meaningfully
