@@ -21,6 +21,7 @@ add_library(mgpu_bridge SHARED
     src/dllmain.cpp
     src/diag.cpp
     src/adapter.cpp
+    src/adapter_selection.cpp
     src/worker.cpp
     src/gpu1_context.cpp
 )
@@ -114,3 +115,17 @@ target_link_libraries(mgpu_bridge PRIVATE
 # P0: warnings visible, not fatal. A compile error costs the same round
 # trip as a logic error and teaches less - keep the first-try bar low.
 target_compile_options(mgpu_bridge PRIVATE /W3)
+
+option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
+if(MGPU_BUILD_TESTS)
+    enable_testing()
+    add_executable(mgpu_adapter_selection_test
+        tests/adapter_selection_test.cpp
+        src/adapter_selection.cpp
+    )
+    target_include_directories(mgpu_adapter_selection_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    add_test(NAME mgpu_adapter_selection_test
+             COMMAND mgpu_adapter_selection_test)
+endif()
