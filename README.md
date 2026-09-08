@@ -350,6 +350,18 @@ Two settings in `mgpu.ini` are worth knowing before the first launch:
 a hotkey first. Set it to `0` before measuring anything: every published figure
 was armed by hand, in gameplay, at a moment that was chosen.
 
+### Configuration file boundary
+
+The reader accepts the existing line-oriented `key=value` syntax, leading
+spaces/tabs, and whole-line `;` or `#` comments. It accepts UTF-8 files with an
+optional UTF-8 BOM; UTF-16, malformed UTF-8, embedded NULs, and unsupported
+control bytes are rejected. The complete file is bounded at 64 KiB (65535
+payload bytes, with one byte reserved for the terminator). This is intentionally
+large enough for the shipped comment-heavy `mgpu.ini`. A file beyond the bound
+is rejected as a whole rather than being clipped, so a setting after a long
+comment cannot silently fall back to a default. The diagnostic identifies the
+rejection and the documented built-in defaults remain in force.
+
 ---
 
 ## Limitations
