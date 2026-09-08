@@ -18,6 +18,7 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "mgpu_ini_parser.hpp"
 
 // P1.0: the NGX headers, fetched by CI into ext/ngx/ and never committed
 // (THIRD_PARTY.md, "NVIDIA NGX headers"). CMakeLists.txt is closed and
@@ -6834,31 +6835,20 @@ namespace
     // ini_find returns a pointer just past "<key>=" for the first occurrence
     // that starts a line (leading spaces and tabs allowed) and is not preceded
     // on that line by ';' or '#'. Returns nullptr when there is no such line.
+    // The bounded, BOM-aware implementation is shared with the portable
+    // regression test; this wrapper preserves the existing call sites.
     const char *ini_find(const char *buf, const char *key)
     {
-        const size_t klen = strlen(key);
-        const char *p = buf;
-        while (*p != '\0')
-        {
-            // p is at the start of a line. Skip leading blanks.
-            const char *q = p;
-            while (*q == ' ' || *q == '\t') ++q;
-            if (*q != ';' && *q != '#' &&
-                strncmp(q, key, klen) == 0 && q[klen] == '=')
-                return q + klen + 1;
-            // advance to the next line
-            while (*p != '\0' && *p != '\n') ++p;
-            if (*p == '\n') ++p;
-        }
-        return nullptr;
+        return mgpu::config::find(buf, strlen(buf), key);
     }
 
-    // Reads the file once into `buf`. False when there is nothing to read -
-    // callers then keep their default, because a missing or unreadable
-    // mgpu.ini must never be a reason a run does not happen.
-    // The ini is read whole into a stack buffer. 8 KB is far more than any
-    // sane config, and anything beyond it is now reported rather than dropped.
-    static const size_t INI_BYTES = 8192;
+    // Reads the file once into `buf`. False when there is nothing to read or
+    // the document is malformed. Callers then keep their documented defaults;
+    // a malformed document is rejected as a whole, never partially applied.
+    // The ini is read whole into a bounded stack buffer. 64 KiB accommodates
+    // the shipped comment-heavy config while keeping malformed/unbounded
+    // input from driving allocation or a partial parse.
+    static const size_t INI_BYTES = mgpu::config::MAX_BYTES + 1;
 
     // DEFECT D, found on the rig 2026-09-05 and fixed here. This read 1023
     // bytes into a 1024-byte buffer AND SAID NOTHING when the file was longer.
@@ -6874,8 +6864,8 @@ namespace
     // was perfectly well-formed. Section 00 again.
     //
     // Two changes, and the second one matters more than the first: the buffer
-    // is now 8 KB, and a file that does not fit is REPORTED BY NAME rather
-    // than quietly clipped.
+    // is now bounded at 64 KiB, and a file that does not fit is rejected
+    // rather than quietly clipped or partially applied.
     // P7.2. DEFECT G. mgpu.ini was opened as a BARE RELATIVE PATH, so it
     // resolved against the process's CURRENT WORKING DIRECTORY - which is not
     // the add-on's folder, is not something the add-on controls, and is not
@@ -6934,6 +6924,11 @@ namespace
 
     bool ini_slurp(char *buf, size_t n)
     {
+        if (buf == nullptr || n < 2)
+        {
+            mgpu::diag::error("[MGPU][P6.1] internal mgpu.ini buffer is too small; rejecting config");
+            return false;
+        }
         buf[0] = '\0';
         FILE *f = nullptr;
         bool beside = false;
@@ -6978,6 +6973,7 @@ namespace
         const size_t got = fread(buf, 1, n - 1, f);
         // Is there anything left? One byte past what we took is enough to know.
         const bool truncated = (fgetc(f) != EOF);
+        const bool read_error = ferror(f) != 0;
         fclose(f);
         buf[got] = '\0';
         if (truncated)
@@ -6988,15 +6984,46 @@ namespace
                 said = true;
                 char tl[400];
                 snprintf(tl, sizeof tl,
-                         "[MGPU][P6.1] mgpu.ini is LARGER than this build reads (%zu bytes taken, "
-                         "more follow). EVERY KEY PAST THAT POINT READS AS ABSENT AND ITS DEFAULT "
-                         "IS USED SILENTLY. Shorten the file or move the keys you care about to "
-                         "the top; the values reported on the arm line are what actually took "
-                         "effect.", got);
+                         "[MGPU][P6.1] mgpu.ini is larger than the %zu-byte limit (%zu bytes read, "
+                         "more follow). The complete config is REJECTED; no partial keys are applied "
+                         "and documented built-in defaults are used. Shorten comments or the file.",
+                         mgpu::config::MAX_BYTES, got);
                 mgpu::diag::error(tl);
             }
+            return false;
         }
-        return got != 0;
+        if (read_error)
+        {
+            mgpu::diag::error("[MGPU][P6.1] mgpu.ini read error; complete config rejected and built-in defaults used");
+            return false;
+        }
+        const mgpu::config::validation result = mgpu::config::validate(buf, got);
+        if (result != mgpu::config::validation::ok)
+        {
+            const char *reason = "invalid text";
+            switch (result)
+            {
+            case mgpu::config::validation::invalid_input: reason = "invalid input pointer"; break;
+            case mgpu::config::validation::empty: reason = "empty file"; break;
+            case mgpu::config::validation::utf16_bom: reason = "UTF-16 BOM (only UTF-8 is supported)"; break;
+            case mgpu::config::validation::embedded_nul: reason = "embedded NUL byte"; break;
+            case mgpu::config::validation::invalid_control: reason = "unsupported control byte"; break;
+            case mgpu::config::validation::invalid_utf8: reason = "malformed UTF-8"; break;
+            case mgpu::config::validation::too_large: reason = "size limit exceeded"; break;
+            case mgpu::config::validation::ok: break;
+            }
+            char ml[320];
+            snprintf(ml, sizeof ml,
+                     "[MGPU][P6.1] mgpu.ini rejected (%s); no partial keys are applied and documented "
+                     "built-in defaults are used.", reason);
+            mgpu::diag::error(ml);
+            return false;
+        }
+        // UTF-8 BOM is valid and common on Windows. Strip it before the
+        // existing line reader sees the first key; UTF-16 is rejected above.
+        size_t usable = got;
+        mgpu::config::strip_utf8_bom(buf, usable);
+        return usable != 0;
     }
 
     // P5.2. DEFECT C's second half. The one-shot probe chain (P1.3 transit,
