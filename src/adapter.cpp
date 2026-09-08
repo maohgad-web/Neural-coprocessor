@@ -50,6 +50,7 @@
 #include <vector>
 
 #include "adapter.hpp"
+#include "adapter_selection.hpp"
 #include "diag.hpp"
 
 // get_native() returns uint64_t: unwrapping it to ID3D12Device * needs
@@ -278,6 +279,8 @@ namespace
         // adapter (a LUID match, never an index match).
         std::vector<size_t> hw;     // hardware adapters
         std::vector<size_t> cand;   // of those, luid != the game LUID
+        std::vector<choice_input> policy;
+        policy.reserve(S.table.size());
         for (size_t i = 0; i < S.table.size(); ++i)
         {
             // The flag is not reliable on its own - see the rule 3 note at
@@ -288,6 +291,7 @@ namespace
             const bool is_software =
                 (S.table[i].flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
                 S.table[i].vendor_id == 0x1414;
+            policy.push_back({S.table[i].luid, is_software, S.table[i].outputs});
             if (is_software)
             {
                 snprintf(line, sizeof line,
@@ -305,12 +309,30 @@ namespace
         const char *rule = "none";
         size_t sel = static_cast<size_t>(-1);
         bool degenerate = false;
+        const choice_result choice =
+            choose_adapter(policy.data(), policy.size(), game);
 
-        if (cand.size() == 1)
+        if (!choice.game_luid_found)
         {
-            // [rule 1] satisfied: exactly one candidate.
-            sel = cand[0];
-            rule = "exclusion (luid != swapchain game luid) + software filter";
+            // The authoritative game LUID is absent from the enumeration.
+            // Every hardware adapter is therefore an untrusted candidate;
+            // output count cannot identify the game's own card in this state.
+            snprintf(line, sizeof line,
+                     "[MGPU][T2] REFUSING: the swapchain-derived game luid=0x%08X-0x%08X matches "
+                     "no enumerated adapter (%zu hardware adapters, all candidates) - the "
+                     "game's own card is unidentified. Selecting nothing rather than guessing.",
+                     (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
+            mgpu::diag::error(line);
+            rule = "none (refused: game luid not in adapter table)";
+        }
+        else if (choice.valid)
+        {
+            sel = choice.selected_index;
+            degenerate = choice.degenerate;
+            rule = degenerate
+                       ? "exclusion + software filter + output-count tiebreak "
+                         "(display on target card)"
+                       : "exclusion (luid != swapchain game luid) + software filter";
         }
         else if (cand.empty())
         {
@@ -342,49 +364,17 @@ namespace
             }
             if (hw.size() > 2)
             {
-                // This project's topology puts the display on the target
-                // card: prefer the single candidate that has outputs, when
-                // exactly one does. Any ambiguity refuses - a rig with
-                // displays on both cards breaks that rule silently.
-                size_t with_outputs = static_cast<size_t>(-1);
                 size_t n_with_outputs = 0;
                 for (size_t c : cand)
                     if (S.table[c].outputs > 0)
-                    {
-                        with_outputs = c;
                         ++n_with_outputs;
-                    }
-                if (n_with_outputs == 1)
-                {
-                    sel = with_outputs;
-                    degenerate = true;
-                    rule = "exclusion + software filter + output-count tiebreak "
-                           "(display on target card)";
-                }
-                else
-                {
-                    snprintf(line, sizeof line,
-                             "[MGPU][T2] REFUSING: %zu non-game hardware adapters remain and the "
-                             "output-count tiebreak is ambiguous (%zu with outputs>0) - it applies "
-                             "only when it picks exactly one. Selecting nothing rather than guessing.",
-                             cand.size(), n_with_outputs);
-                    mgpu::diag::error(line);
-                    rule = "none (refused: ambiguous)";
-                }
-            }
-            else
-            {
-                // Two hardware adapters total, both "candidates": the
-                // swapchain-derived game LUID matched no enumerated
-                // adapter. The game's own card is unidentified - refusing
-                // is the only safe outcome.
                 snprintf(line, sizeof line,
-                         "[MGPU][T2] REFUSING: the swapchain-derived game luid=0x%08X-0x%08X matches "
-                         "no enumerated adapter (%zu hardware adapters, all candidates) - the "
-                         "game's own card is unidentified. Selecting nothing rather than guessing.",
-                         (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
+                         "[MGPU][T2] REFUSING: %zu non-game hardware adapters remain and the "
+                         "output-count tiebreak is ambiguous (%zu with outputs>0) - it applies "
+                         "only when it picks exactly one. Selecting nothing rather than guessing.",
+                         cand.size(), n_with_outputs);
                 mgpu::diag::error(line);
-                rule = "none (refused: game luid not in adapter table)";
+                rule = "none (refused: ambiguous)";
             }
         }
 
