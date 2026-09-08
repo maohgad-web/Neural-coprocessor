@@ -33,6 +33,7 @@ each, and the measured runs were separate and unrecorded.
 | [METHOD.md](METHOD.md) | the working rules, and what they cost to learn |
 | [VENDOR_LOCK.md](VENDOR_LOCK.md) | the machine, driver and configuration every number was taken on |
 | [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) | prior work, AI use, disclaimer |
+| [CONTRIBUTORS.md](CONTRIBUTORS.md) | code contributed by people other than the primary author |
 | [THIRD_PARTY.md](THIRD_PARTY.md) | licences and provenance |
 | [reference/](reference/) | a working `ReShade.ini` and a complete `ReShade.log`, to diff yours against |
 | [history/](history/) | the milestone record, the verified-facts ledger, the instrument design |
