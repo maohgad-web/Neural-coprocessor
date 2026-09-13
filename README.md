@@ -74,6 +74,20 @@ Each completed a bounded run, arming and exiting cleanly. The logs are at [docs/
 
 A launch and transport check, not a benchmark. The counters in those logs are cumulative from frame one, so a title that changes resolution while loading shows a miss count that stops growing once the engine settles.
 
+### Reported by users
+
+I cannot test every game, so any report helps.
+
+| Title | Resolution | Reported in | State |
+|-------|-----------|-------------|-------|
+| Battlefield 6 (SP executable) | 3840x2160 | [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) | Runs clean with the workaround below. Two issues open |
+
+**Battlefield 6** ([issue #14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On the shipped defaults the title goes down inside its own `sl.common.dll`, and the motion vector lane never delivers a frame. Both are under investigation and a hotfix will follow. It looks engine-level rather than specific to this title, so the fix is likely to carry a guard that covers other engines the same way.
+
+**Workaround until then:** set `Calib=0` and `MVec=0` in `mgpu.ini`. The transport then runs clean - 600 of 600 frames sealed on the reporter's rig, no drop, reorder, alias or contract mismatch. The model gets depth without motion vectors, and Super Resolution on the second card stays off.
+
+**Not the add-on.** The reporter also saw `bf6.exe` crash on its own with `KERNELBASE.dll / 0x80070057`, reproduced with an empty game folder and no add-ons installed.
+
 ---
 
 ## System Requirements
