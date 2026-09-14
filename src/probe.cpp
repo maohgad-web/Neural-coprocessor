@@ -2121,7 +2121,12 @@ void dump()
     const unsigned long long frames = g_frames.load(std::memory_order_relaxed);
     const double f = (frames != 0) ? (double)frames : 1.0;
 
-    char line[1400];
+    // R117. 1400 -> 4400. MEASURED, not precautionary: the R71 line has been
+    // TRUNCATED in every log this project has collected. Its source ends with
+    // "READ THE [R82] LINE BELOW INSTEAD" and that sentence has never once
+    // reached a log file - the pointer to the line that actually answers the
+    // question was the part being cut off.
+    char line[4400];
 
     if (g_depth_on.load(std::memory_order_relaxed))
     {
@@ -2290,23 +2295,30 @@ void dump()
                               sw[i], sh[i], sc[i]);
             const size_t at = (v > 0) ? (size_t)v : 0;
             snprintf(line + at, sizeof line - at,
-                "|| TRANSPORT SOURCE res=0x%llx (0 means not identified yet - it needs a "
-                "display-extent candidate with render-target binds), handed to the transport "
+                "|| TRANSPORT SOURCE res=0x%llx (0 means nothing has supplied one yet - "
+                "either R103 from the calibrator's own table, or a ranked candidate), handed to the transport "
                 "%llu times, %llu second-binds-in-a-frame skipped. || EVICTIONS: %llu resources destroyed and removed from the tables (R76 - a "
                 "resolution change destroys every render target, and a stale entry is a copy "
                 "from freed memory). RTV BINDS SEEN IN TOTAL: %llu. THE RANK ABOVE IS NOW RENDER TARGET BINDS, "
                 "NOT SRV CREATIONS. R25 ranked by SRVs created, got 6/5/3/3, and called it \"a "
                 "candidate, not an identification\" - that flatness was the SIGNAL being wrong, "
                 "not the game. An SRV creation count is a LIFETIME number; a velocity buffer is "
-                "RENDERED INTO once per frame, and RTVBINDS is that. THE EXTENT TO MATCH IS THE "
-                "DISPLAY EXTENT %ux%u, not the render extent: the game's own DLSS telemetry says "
-                "ColorExtentHeight=936 with MVExtentWidth=2560 MVExtentHeight=1440, so this "
-                "title feeds HIGH-RESOLUTION motion vectors. A single candidate marked "
-                "<-DISPLAY-EXTENT with RTVBINDS close to the frame count is the velocity buffer. "
+                "RENDERED INTO once per frame, and RTVBINDS is that. THE BAND BEING MATCHED IS "
+                "%ux%u, taken from the game's swapchain. The sentence that used to sit here "
+                "quoted ColorExtentHeight=936 and MVExtentWidth=2560 as if they were live - they "
+                "were hard-coded numbers from one 2026-09 Plague Tale run, printed on every "
+                "title. Removed 2026-09-14: a log line must not state another game's telemetry "
+                "as though it were this one's. With DLSS ON the render extent is BELOW the "
+                "swapchain extent and every candidate moves with it, so a list that suddenly "
+                "reads 1280x720 against a 1920x1080 window is the upscaler, not a regression. "
                 "RTV BINDS SEEN = 0 with candidates present means THIS EVENT did not see it, "
-                "and says nothing whatever about the other two. R81 retracted the sentence that "
-                "used to sit here - it named optical flow and NGX hooking as the routes left, "
-                "before anyone had read the event list. READ THE [R82] LINE BELOW INSTEAD.",
+                "and says nothing whatever about the other two. WHAT R103 CHANGED, AND WHAT IT "
+                "DID NOT: when the calibrator has the game's table, TRANSPORT SOURCE above is "
+                "the game's OWN MVec address and this whole ranking is bypassed. Measured "
+                "2026-09-14 on Battlefield 6 - the source was exactly right and copies were "
+                "still ZERO, because the barrier trigger never fired on it. THE ADDRESS AND THE "
+                "MOMENT ARE DIFFERENT PROBLEMS. Everything above solves the address. READ THE "
+                "[R82] LINE BELOW FOR THE MOMENT.",
                 g_mvec_src.load(std::memory_order_relaxed),
                 g_mvec_copies.load(std::memory_order_relaxed),
                 g_mvec_skips.load(std::memory_order_relaxed),
@@ -2317,7 +2329,7 @@ void dump()
 
             // ---- R82: WHICH SIGNAL SEES THE VELOCITY BUFFER ----
             {
-                char r2[2000];
+                char r2[3000];
                 const unsigned long long fr2 = g_frames.load(std::memory_order_relaxed);
                 const double barns = (fr2 != 0)
                     ? (double)g_bar_ns.load(std::memory_order_relaxed) / (double)fr2
@@ -2377,7 +2389,13 @@ void dump()
                     "bind events cannot offer. NOTE THE STALENESS R78 DID NOT STATE: both bind "
                     "events fire BEFORE the pass runs, so a copy taken there carries the "
                     "PREVIOUS frame's vectors. All three silent with candidates present is the "
-                    "only reading that makes optical flow or NGX hooking the honest next step. "
+                    "reading that made NGX hooking the honest next step - and it was taken: "
+                    "R101 hooks NGX and MvecFromEval=1 copies from the evaluate. MEASURED "
+                    "2026-09-14 on Battlefield 6 with DLSS on: that route carried 1931 of 2705 "
+                    "frames while this barrier route carried ZERO on the same run with the "
+                    "SAME correct source address. On this engine the bind events are blind and "
+                    "the barrier trigger does not fire, so the evaluate is not a fallback here, "
+                    "it is the only path. "
                     "Two of the barriers per frame on the published source are OURS.");
                 mgpu::diag::info(r2);
 

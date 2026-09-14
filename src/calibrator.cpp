@@ -1365,7 +1365,10 @@ void log_summary()
     const unsigned long long ns = g_cost_ns.load(std::memory_order_relaxed);
     const double per_frame = (f != 0) ? (double)ns / (double)f : 0.0;
 
-    char line[3600];
+    // R117. Widened: the rewritten HOW TO READ IT is longer than the old
+    // one, and a truncated explanation on the line that already misled us
+    // once would be the same mistake with fewer characters.
+    char line[5600];
     int w = std::snprintf(line, sizeof line,
         "[MGPU][R101] CALIBRATOR mode=%d rung=%d site=%s | slots=%llu data-slots=%llu modules=%llu gpa-calls=%llu "
         "| resolved=%llu creates=%llu sr-handle=%s | evaluates=%llu captured=%llu "
@@ -1390,8 +1393,8 @@ void log_summary()
             "|| THE GAME'S OWN TABLE: color=0x%llx depth=0x%llx MVEC=0x%llx "
             "output=0x%llx | MVecScale %.4f,%.4f | jitter %.4f,%.4f | Reset=%u "
             "| CreateFlags=0x%x -> DepthInverted=%u MVLowRes=%u MVJittered=%u "
-            "IsHDR=%u AutoExposure=%u | quality=%u | render %ux%u -> display "
-            "%ux%u | dynamic %ux%u..%ux%u | subrect %ux%u at color(%u,%u) "
+            "IsHDR=%u AutoExposure=%u | quality=%u | NGX Width/Height %ux%u, "
+            "OutWidth/OutHeight %ux%u | dynamic %ux%u..%ux%u | subrect %ux%u at color(%u,%u) "
             "depth(%u,%u) MV(%u,%u) out(%u,%u) | have=0x%x. ",
             t.color, t.depth, t.mvec, t.output,
             (double)t.mv_scale_x, (double)t.mv_scale_y,
@@ -1407,23 +1410,38 @@ void log_summary()
     if (w > 0 && w < (int)sizeof line)
     {
         std::snprintf(line + w, sizeof line - (size_t)w,
-            "|| HOW TO READ IT. resolved=0 with evaluates=0 means no module "
-            "asked for the entry point after we installed - either the title "
-            "does not use DLSS, or it resolved before the addon loaded; the "
-            "barrier path is untouched either way and is still what drives. "
+            "|| HOW TO READ IT, REWRITTEN 2026-09-14 AFTER THIS LINE MISLED US "
+            "FOR FOUR RUNS. evaluates=0 creates=0 DOES NOT MEAN THE HOOK "
+            "FAILED. The first thing to check is whether the title has "
+            "upscaling switched ON: with it off, the game never creates a "
+            "DLSS feature, never evaluates, and a perfectly working hook "
+            "reports exactly these zeros. creates=0 is the tell - an idle "
+            "DLSS still creates its feature, an absent one does not. Only "
+            "after confirming the setting is on does resolved=0 mean what it "
+            "used to say here: nobody asked for the entry point after we "
+            "installed, either because it resolved before the addon loaded or "
+            "because this producer reaches NGX another way. "
             "sr-handle=UNFILTERED means we were not present for CreateFeature, "
             "so the table may be from frame generation rather than super "
-            "sampling - check that render/display extents look like a "
-            "supersampling pair before trusting it. MVEC here is the GAME'S "
-            "answer to the question every round from R70 to R100 tried to "
-            "infer; if it does not equal the handle the barrier probe armed on "
-            "Dragon Sword, the probe was wrong on a title we believed, and "
-            "THAT is the finding. have=0 bits name the keys this producer does "
-            "not populate - Streamline and the raw SDK do not set the same "
-            "subset, and the difference is a fact about the route, not a bug. "
-            "MVLowRes IS DEFERRED OPTION 11 ANSWERED: 1 means the game's motion "
-            "vectors are at RENDER resolution, 0 means display resolution, and "
-            "we have been inferring that from buffer sizes since R83. Read it "
+            "sampling - check the extents and the subrect against each other "
+            "before trusting it. THE TWO EXTENT PAIRS ARE PRINTED BY THEIR NGX "
+            "KEY NAMES ON PURPOSE: this line used to label them render and "
+            "display and got the pair the wrong way round on Battlefield 6, "
+            "where Width/Height read 1920x1080 while the subrect, MVecScale "
+            "and every candidate said the render extent was 1280x720. Trust "
+            "the subrect and MVecScale over either pair until that is "
+            "understood. MVEC here is the GAME'S OWN answer, and R103 hands it "
+            "straight to the transport - so TRANSPORT SOURCE on the R71 line "
+            "should equal it, and on every run measured so far it does. THAT "
+            "AGREEMENT IS NOT THE SAME AS THE TRANSPORT WORKING: measured "
+            "2026-09-14, the source was correct and copies were still ZERO "
+            "with MvecFromEval=0, because the barrier trigger never fired on "
+            "this engine. The address and the moment are different problems "
+            "and this line only settles the address. have=0 bits name the keys "
+            "this producer does not populate - Streamline and the raw SDK do "
+            "not set the same subset, and the difference is a fact about the "
+            "route, not a bug. MVLowRes: 1 means the game's motion vectors are "
+            "at RENDER resolution, 0 means display resolution. Read it "
             "together with MVecScale - a low-res field with a display-sized "
             "scale is the shape that makes reprojection look almost right.");
     }
