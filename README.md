@@ -233,5 +233,6 @@ Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after
 - Photon\-to\-photon latency not measured
 - Image quality assessment not performed
 - Settings and driver versions may affect results over time
-SINGLE PLAYER, OFFLINE. DO NOT RUN THIS ON AN ONLINE GAME. {#single-player-offline}
+-SINGLE PLAYER, OFFLINE. DO NOT RUN THIS ON AN ONLINE GAME. {#single-player-offline}
+
 *Neural Coprocessor is research code. Measurements and their conditions are in `RESULTS.md`.*
