@@ -6,7 +6,7 @@
 
 **This is a ReShade add\-on.** It is called **MGPU Bridge**, it is a `.addon64` file that ReShade loads into a D3D12 game, and every log line it writes is prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a replacement for anything, and it needs an **add\-on\-enabled** ReShade build to load at all. There is no game modification of any kind: the add\-on reads each finished frame and does its work elsewhere.
 
-This is research code with published measurements. It is not a product.
+This is research code with published measurements. It is not a product. -Anti\-cheat and online games are at your own risk--
 
 * * *
 
@@ -24,7 +24,7 @@ Also in 0.2.0:
 
 **0\.2.1 is a hotfix on top of this.** `mgpu_depth_tap.fx` no longer needs ReShade's standard effects pack \- it included `ReShade.fxh` from that pack, so skipping the pack in the installer made the tap fail to compile and the bridge never arm. Reported by a user after 0.2.0 shipped; the report was correct. Super Resolution on the second card also gained two named modes in the panel, `Native Upscaling` and `Experimental Upscaler`, with Native Upscaling as the default because it is the higher quality of the two.
 
-**0\.2.2 is a second hotfix.** It fixes a startup crash on titles that ship NVIDIA Streamline, reported on Battlefield 6 SP Campaign --Anti\-cheat: online games are at your own risk-- ([issue \#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. It also turned up a limitation worth knowing before you rely on them: the second card can only be handed the engine's motion vectors when the game itself is running DLSS or DLAA. With TAA, there is nothing to take them from and the model falls back to deriving motion from colour, which is what 0.1.0 ran on throughout. Neural rendering itself is unaffected. See Limitations.
+**0\.2.2 is a second hotfix.** It fixes a startup crash on titles that ship NVIDIA Streamline, reported on Battlefield 6 SP Campaign ([issue \#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. It also turned up a limitation worth knowing before you rely on them: the second card can only be handed the engine's motion vectors when the game itself is running DLSS or DLAA. With TAA, there is nothing to take them from and the model falls back to deriving motion from colour, which is what 0.1.0 ran on throughout. Neural rendering itself is unaffected. See Limitations.
 
 * * *
 
