@@ -11,6 +11,7 @@
 #include <unknwn.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>   // SL3: _wcsnicmp on the owning module name
 
 namespace mgpu::slprobe
 {
@@ -53,6 +54,7 @@ namespace
     bool  g_said_census      = false;
     bool  g_said_acquisition = false;
     bool  g_said_shape       = false;   // SL2a
+    bool  g_said_prov        = false;   // SL3
     void *g_game_device      = nullptr;
 
     const char *kind_name(kind k)
@@ -249,6 +251,116 @@ void report(void *our_device, void *game_device)
     // SL2a. Straight after the census, on the same one-shot, so the two
     // lines are always read together and neither needs a call site.
     report_api_shape();
+    report_import_provenance();
+}
+
+// ---- SL3: WHO SERVES OUR OWN D3D IMPORTS. See sl_probe.hpp. ----
+void report_import_provenance()
+{
+    if (g_said_prov) return;
+    g_said_prov = true;
+
+    static const char *const WANT[] = { "D3D12CreateDevice", "CreateDXGIFactory2",
+                                        "CreateDXGIFactory1", "CreateDXGIFactory" };
+    const unsigned WANT_N = (unsigned)(sizeof WANT / sizeof WANT[0]);
+
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&report_import_provenance, &self);
+    if (self == nullptr)
+    {
+        mgpu::diag::warn("[MGPU][SL3] IMPORT PROVENANCE: could not identify this module. "
+                         "Nothing was read.");
+        return;
+    }
+
+    char out[1400];
+    int w = snprintf(out, sizeof out, "[MGPU][SL3] IMPORT PROVENANCE:");
+    unsigned found = 0;
+    bool via_sl = false;
+
+    unsigned char *base = (unsigned char *)self;
+    __try
+    {
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+        IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+        const IMAGE_DATA_DIRECTORY dir =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (dir.VirtualAddress != 0)
+        {
+            IMAGE_IMPORT_DESCRIPTOR *imp =
+                (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress);
+            for (; imp->Name != 0; ++imp)
+            {
+                if (imp->FirstThunk == 0 || imp->OriginalFirstThunk == 0) continue;
+                IMAGE_THUNK_DATA *nam = (IMAGE_THUNK_DATA *)(base + imp->OriginalFirstThunk);
+                IMAGE_THUNK_DATA *addr= (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+                for (; nam->u1.AddressOfData != 0 && addr->u1.Function != 0; ++nam, ++addr)
+                {
+                    if (IMAGE_SNAP_BY_ORDINAL(nam->u1.Ordinal)) continue;
+                    IMAGE_IMPORT_BY_NAME *ibn =
+                        (IMAGE_IMPORT_BY_NAME *)(base + nam->u1.AddressOfData);
+                    for (unsigned i = 0; i < WANT_N; ++i)
+                    {
+                        if (strcmp((const char *)ibn->Name, WANT[i]) != 0) continue;
+                        ++found;
+
+                        HMODULE owner = nullptr;
+                        wchar_t path[MAX_PATH * 2] = {};
+                        const void *bound = (const void *)(uintptr_t)addr->u1.Function;
+                        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               (LPCWSTR)bound, &owner) && owner != nullptr)
+                            GetModuleFileNameW(owner, path, MAX_PATH * 2);
+
+                        const wchar_t *leaf = path;
+                        for (const wchar_t *p = path; *p; ++p)
+                            if (*p == L'\\' || *p == L'/') leaf = p + 1;
+                        if (_wcsnicmp(leaf, L"sl.", 3) == 0) via_sl = true;
+
+                        if (w >= 0 && w < (int)sizeof out - 200)
+                            w += snprintf(out + w, sizeof out - (size_t)w,
+                                          " | %s -> %ls (0x%p)", WANT[i],
+                                          (path[0] != L'\0') ? leaf : L"unknown", bound);
+                    }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        mgpu::diag::warn("[MGPU][SL3] IMPORT PROVENANCE: faulted while reading this module's "
+                         "own import table. Nothing was changed; the reading is simply absent.");
+        return;
+    }
+
+    if (found == 0)
+    {
+        mgpu::diag::info("[MGPU][SL3] IMPORT PROVENANCE: neither D3D12CreateDevice nor a "
+                         "CreateDXGIFactory variant appears in this module's import table by "
+                         "name. Nothing here is wrong; it means they are bound some other way "
+                         "and this instrument cannot see them.");
+        return;
+    }
+
+    if (w > 0 && w < (int)sizeof out)
+        snprintf(out + w, sizeof out - (size_t)w,
+            ". HOW TO READ IT. These are the modules the LOADER bound this add-on's own D3D "
+            "imports to, read from our own import table. It matters because the FIRST "
+            "engine-adjacent thing the bridge does is enumerate adapters and create a device "
+            "on the second one, during startup, which is the only window any fault on this "
+            "title has ever appeared in - and until now nothing said where those two calls "
+            "went. An sl.* module here would mean our own startup calls execute Streamline "
+            "code on the game's behalf, which is a different and much better suspect than "
+            "anything the calibrator does. A system or ReShade module here means they do "
+            "not, and that suspect is closed. NOTE WHAT THIS IS NOT: the census says the "
+            "device we got BACK is not a proxy. That is a fact about the result. This is a "
+            "fact about the route, and the two are independent.%s",
+            via_sl ? " THIS RUN: AT LEAST ONE IMPORT IS SERVED BY AN sl.* MODULE." : "");
+
+    if (via_sl) mgpu::diag::warn(out);
+    else        mgpu::diag::info(out);
 }
 
 // ---- SL2a: THE API SHAPE ----

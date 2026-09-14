@@ -102,4 +102,25 @@ namespace mgpu::slprobe
     //
     // Said once, from report(), so it needs no call site of its own.
     void report_api_shape();
+
+    // ---- SL3: WHO SERVES OUR OWN D3D IMPORTS ----
+    //
+    // WHAT IT ANSWERS. sl.interposer wraps D3D12CreateDevice and
+    // CreateDXGIFactory for the process that loads it. This add-on calls both
+    // as ordinary imported symbols, which the loader binds at load time to
+    // whichever module in the search order exports them - and nothing has
+    // ever said which module that was. So the earliest engine-adjacent thing
+    // the bridge does, enumerating adapters and creating its own device, has
+    // been going somewhere unnamed.
+    //
+    // The census answers a neighbouring question and not this one: it says
+    // the device we got back is not a proxy. It cannot say whether the call
+    // that produced it executed Streamline code on the way.
+    //
+    // HOW IT ASKS. It walks THIS MODULE'S OWN import table, reads the two
+    // bound addresses, and asks the loader which module owns each. Read-only,
+    // our own memory, nothing resolved and nothing called.
+    //
+    // Said once, from report().
+    void report_import_provenance();
 }

@@ -699,9 +699,34 @@ unsigned scan_cached_pointers()
     {
         do
         {
+            // ---- R112: NAME THE MODULE WE WROTE INTO ----
+            //
+            // WHY THIS LINE EXISTS. This rung writes eight-byte words into
+            // OTHER modules' data sections. Until now the log said how many
+            // words - data-slots=2 on Battlefield 6, both runs - and never
+            // said WHOSE. That is the one question the reporter's crash
+            // actually turns on: sl.common.dll+0x611AA is where it dies, and
+            // whether this rung wrote into sl.common.dll is a fact we have
+            // been in a position to state all along and did not.
+            //
+            // Costs nothing when nothing is patched, which is every module
+            // but one or two.
+            const unsigned before = hits;
             hits += patch_module_data(me.hModule, ngx, ev, (void *)&hook_evaluate);
             if (cr != nullptr)
                 hits += patch_module_data(me.hModule, ngx, cr, (void *)&hook_create);
+            if (hits != before)
+            {
+                char ml[420];
+                std::snprintf(ml, sizeof ml,
+                    "[MGPU][R112] DATA-SCAN WROTE INTO \"%ls\" - %u word(s) swapped in that "
+                    "module's writable data. This is the rung that reaches a pointer cached "
+                    "before we loaded, and this line names the module it reached into. If a "
+                    "title faults inside a module listed here, the two facts are finally "
+                    "side by side instead of being inferred from a slot count.",
+                    me.szModule, hits - before);
+                mgpu::diag::warn(ml);
+            }
         } while (Module32NextW(snap, &me));
     }
     CloseHandle(snap);
