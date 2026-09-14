@@ -602,6 +602,29 @@ unsigned scan_and_patch(void *find, void *repl)
 // .data instead of the IAT - no code bytes touched, no trampoline, no length
 // disassembler, and reversible by the identical mechanism.
 //
+// ---- R115: WHAT THE RUNG ACTUALLY WROTE, RECORDED ----
+//
+// Every hit is recorded here before anything is said about it. POD only, and
+// filled INSIDE the structured handler where no C++ object may live, so the
+// logging happens afterwards from the caller.
+//
+// WHY IT EXISTS. The comment below asserts that a word equal to the address of
+// one specific NGX export IS that pointer - that a false positive cannot
+// happen. That is an assumption, it has never been checked, and the whole rung
+// rests on it. On Battlefield 6 this rung writes two words into
+// sl.common.dll, the module the reporter's game dies inside, and returns
+// evaluates=0 on every run we have. Before deciding anything about that, we
+// should know what those two words are.
+struct data_hit
+{
+    HMODULE  mod;
+    char     section[12];
+    unsigned rva;              // from the module base
+    unsigned long long was;    // the value we replaced
+};
+data_hit g_hits[16] = {};
+unsigned g_hit_n = 0;
+
 // WHAT IS SKIPPED AND WHY IT MATTERS. Our own module, always: g_real_eval
 // holds that exact address, and swapping it would point this file's
 // pass-through at itself - unbounded recursion on the first frame. The nvngx
@@ -650,6 +673,19 @@ unsigned patch_module_data(HMODULE mod, HMODULE skip, void *find, void *repl)
                 DWORD old = 0;
                 if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
                     continue;
+
+                // R115. Record before the write, not after: `was` is the whole
+                // point and it is gone one line later.
+                if (g_hit_n < 16u)
+                {
+                    data_hit &h = g_hits[g_hit_n++];
+                    h.mod = mod;
+                    for (unsigned c = 0; c < 8u; ++c) h.section[c] = (char)sec->Name[c];
+                    h.section[8] = '\0';
+                    h.rva = (unsigned)(sec->VirtualAddress + (unsigned)off);
+                    h.was = (unsigned long long)(uintptr_t)*slot;
+                }
+
                 *slot = repl;
                 VirtualProtect(slot, sizeof(void *), old, &old);
                 ++hits;
@@ -739,6 +775,227 @@ unsigned scan_cached_pointers()
         g_resolved.fetch_add(1, std::memory_order_relaxed);
     }
     return hits;
+}
+
+// ---- R115: THE REFERENCE PROBE ----
+//
+// THE QUESTION. R102 writes 8-byte words into other modules' writable data,
+// on the claim that a word equal to the address of one NGX export can only be
+// a cached pointer to it. On Battlefield 6 it writes two of them into
+// sl.common.dll - the module the reporter's game faults inside - and the
+// calibrator has reported evaluates=0 on every run since. Either those words
+// are a cache nobody calls, or they are not a cache at all.
+//
+// MODE 1: THE ON-DISK REFERENCE. No load, no execution, no second module.
+// Open the module's own file, convert the RVA we wrote to a file offset
+// through the section headers, and read the 8 bytes that live there on disk.
+//
+//   pristine 0 or a small relocation-shaped value, live = an nvngx address
+//       -> it IS a runtime cache, written at slInit. The rung is doing what
+//          it claims and the only open question is whether writing it is safe.
+//   pristine already equal to the live value
+//       -> it is NOT a runtime cache. We are writing into something static
+//          that merely matched, inside the module that crashes.
+//
+// MODE 2: THE PRIVATE COPY, which is his test. Windows keys module identity by
+// resolved PATH, so a copy of sl.common.dll under mgpu\ loads as a SECOND
+// module with its own data - the same trick the private nvngx_dlssnr.dll
+// already uses. We load it, read the same RVA, write a sentinel there, read it
+// back and put it back.
+//
+// WHAT MODE 2 CAN AND CANNOT SETTLE, stated so the result is not over-read.
+// It settles: that the copy loads, that the RVA is where we think it is, and
+// that VirtualProtect plus an 8-byte store works there. It does NOT settle
+// whether writing the LIVE copy is safe, because nothing is executing inside a
+// module nobody calls - and the hazard, if there is one, is a pointer being
+// swapped while Streamline is mid-call through it, not the store itself. An
+// aligned 8-byte store is atomic on x64, so there is no torn pointer to find.
+//
+// Mode 2 also runs sl.common's DllMain a second time in this process. That is
+// why it is not the default. On our own rig it is a run; nothing ships.
+bool rva_to_file_offset(HMODULE mod, unsigned rva, unsigned &out)
+{
+    if (mod == nullptr) return false;
+    BYTE *base = (BYTE *)mod;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+    {
+        const unsigned va = sec->VirtualAddress;
+        const unsigned vz = (unsigned)sec->Misc.VirtualSize;
+        if (rva >= va && rva < va + vz)
+        {
+            out = sec->PointerToRawData + (rva - va);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool read_file_qword(const wchar_t *path, unsigned off, unsigned long long &out)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li{};
+    li.QuadPart = (LONGLONG)off;
+    bool ok = false;
+    if (SetFilePointerEx(f, li, nullptr, FILE_BEGIN))
+    {
+        DWORD got = 0;
+        unsigned long long v = 0;
+        if (ReadFile(f, &v, 8, &got, nullptr) && got == 8) { out = v; ok = true; }
+    }
+    CloseHandle(f);
+    return ok;
+}
+
+// <folder of the running exe>\mgpu\<leaf of src>
+bool private_copy_path(const wchar_t *src, wchar_t *out, size_t out_n)
+{
+    wchar_t exe[MAX_PATH * 2] = {};
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH * 2) == 0) return false;
+    wchar_t *slash = wcsrchr(exe, L'\\');
+    if (slash == nullptr) return false;
+    *slash = L'\0';
+    const wchar_t *leaf = wcsrchr(src, L'\\');
+    leaf = (leaf != nullptr) ? leaf + 1 : src;
+    _snwprintf_s(out, out_n, _TRUNCATE, L"%s\\mgpu\\%s", exe, leaf);
+    return true;
+}
+
+void report_hits(int probe_mode)
+{
+    if (g_hit_n == 0u) return;
+
+    for (unsigned i = 0; i < g_hit_n; ++i)
+    {
+        const data_hit &h = g_hits[i];
+
+        wchar_t path[MAX_PATH * 2] = {};
+        GetModuleFileNameW(h.mod, path, MAX_PATH * 2);
+        const wchar_t *leaf = wcsrchr(path, L'\\');
+        leaf = (leaf != nullptr) ? leaf + 1 : path;
+
+        char line[900];
+        std::snprintf(line, sizeof line,
+            "[MGPU][R115] DATA-SCAN HIT %u/%u: \"%ls\" section %s +0x%X (module base +0x%X) | "
+            "replaced 0x%llx with our hook. THIS IS THE WORD ITSELF, which the log has never "
+            "named. A writable data section holding one NGX export address is what R102 "
+            "assumes is a cached pointer; that assumption has never been checked and this "
+            "line is the first half of checking it.",
+            i + 1u, g_hit_n, leaf, h.section, h.rva, h.rva, h.was);
+        mgpu::diag::warn(line);
+
+        if (probe_mode < 1) continue;
+
+        unsigned foff = 0;
+        unsigned long long disk = 0;
+        if (!rva_to_file_offset(h.mod, h.rva, foff))
+        {
+            mgpu::diag::warn("[MGPU][R115] the RVA does not fall inside any section header - "
+                             "no on-disk reference for this hit.");
+            continue;
+        }
+        if (!read_file_qword(path, foff, disk))
+        {
+            mgpu::diag::warn("[MGPU][R115] could not read the module's own file for the "
+                             "on-disk reference. Nothing else is affected.");
+            continue;
+        }
+
+        const bool looks_cached = (disk != h.was);
+        std::snprintf(line, sizeof line,
+            "[MGPU][R115] ON-DISK REFERENCE for hit %u: file offset 0x%X holds 0x%llx, the "
+            "live image held 0x%llx. VERDICT: %s. HOW TO READ IT. Different means the word is "
+            "written at RUN TIME - a cache filled after load, which is what R102 claims it is, "
+            "and the open question narrows to whether swapping it is safe. THE SAME means it "
+            "is NOT a runtime cache: it is static data that merely equalled the address we "
+            "searched for, and R102 has been writing into something it does not understand, "
+            "inside the module that crashes. No load, no execution and no second module was "
+            "involved in producing this line.",
+            i + 1u, foff, disk, h.was,
+            looks_cached ? "RUNTIME-WRITTEN, consistent with a cached pointer"
+                         : "IDENTICAL ON DISK - NOT a runtime cache");
+        if (looks_cached) mgpu::diag::info(line);
+        else              mgpu::diag::error(line);
+
+        if (probe_mode < 2) continue;
+
+        // ---- MODE 2: the private copy ----
+        wchar_t priv[MAX_PATH * 2] = {};
+        if (!private_copy_path(path, priv, MAX_PATH * 2)) continue;
+
+        if (GetFileAttributesW(priv) == INVALID_FILE_ATTRIBUTES)
+        {
+            if (!CopyFileW(path, priv, TRUE))
+            {
+                std::snprintf(line, sizeof line,
+                    "[MGPU][R115] PRIVATE COPY: could not create \"%ls\" (err %lu). The mgpu "
+                    "folder beside the exe has to exist and be writable. Skipped.",
+                    priv, GetLastError());
+                mgpu::diag::warn(line);
+                continue;
+            }
+        }
+
+        std::snprintf(line, sizeof line,
+            "[MGPU][R115] PRIVATE COPY step 1/3: loading \"%ls\" as a SECOND module. Windows "
+            "keys module identity by resolved path, so this gets its own data. IT ALSO RUNS "
+            "THAT MODULE'S DllMain A SECOND TIME IN THIS PROCESS - that is the cost of this "
+            "test and the reason it is not the default. IF THIS IS THE LAST R115 LINE, IT DIED "
+            "HERE.", priv);
+        mgpu::diag::warn(line);
+
+        HMODULE pm = LoadLibraryW(priv);
+        if (pm == nullptr)
+        {
+            std::snprintf(line, sizeof line,
+                "[MGPU][R115] PRIVATE COPY: LoadLibrary failed (err %lu). That is a result: the "
+                "module will not load standalone, so routing anything through a copy of it is "
+                "not available to us.", GetLastError());
+            mgpu::diag::error(line);
+            continue;
+        }
+
+        mgpu::diag::info("[MGPU][R115] PRIVATE COPY step 2/3: reading and writing the SAME RVA "
+                         "in the private image. IF THIS IS THE LAST R115 LINE, IT DIED HERE.");
+
+        unsigned long long before = 0, after = 0;
+        bool wrote = false;
+        void **slot = (void **)((BYTE *)pm + h.rva);
+        __try
+        {
+            before = (unsigned long long)(uintptr_t)*slot;
+            DWORD old = 0;
+            if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
+            {
+                *slot = (void *)(uintptr_t)0xD1AGD1AGD1AGD1AGull;
+                after = (unsigned long long)(uintptr_t)*slot;
+                *slot = (void *)(uintptr_t)before;
+                VirtualProtect(slot, sizeof(void *), old, &old);
+                wrote = true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { wrote = false; }
+
+        std::snprintf(line, sizeof line,
+            "[MGPU][R115] PRIVATE COPY step 3/3 DONE: base 0x%p, same RVA +0x%X held 0x%llx, "
+            "sentinel write %s (read back 0x%llx), original restored. WHAT THIS SETTLES: the "
+            "copy loads, the RVA is where we think it is, and the store works there. WHAT IT "
+            "DOES NOT SETTLE: whether writing the LIVE copy is safe - nothing executes inside "
+            "a module nobody calls, and an aligned 8-byte store is atomic on x64, so the store "
+            "was never the suspect. The suspect is swapping a pointer while Streamline is "
+            "mid-call through it, and only the live module can answer that.",
+            (void *)pm, h.rva, before, wrote ? "SUCCEEDED" : "FAILED", after);
+        mgpu::diag::warn(line);
+
+        FreeLibrary(pm);
+        mgpu::diag::info("[MGPU][R115] PRIVATE COPY unloaded.");
+    }
 }
 
 // The reverse, for detach. Same walk, swapped arguments.
@@ -913,8 +1170,11 @@ void apply_jitter_offset(void *nr_params, float sx, float sy)
 // probe.hpp.
 void install(int packed)
 {
-    const int mode = packed & 0xFF;
-    const int rung = (packed >> 8) & 0xF;
+    const int mode  = packed & 0xFF;
+    const int rung  = (packed >> 8) & 0xF;
+    // R115. CalibProbe, bits 12-15. 0 off, 1 on-disk reference only,
+    // 2 also load a private copy under mgpu\ and write to it.
+    const int probe = (packed >> 12) & 0xF;
 
     if (mode == 0) return;                       // nothing touched at all
     std::lock_guard<std::mutex> lk(g_install_cs);
@@ -929,17 +1189,19 @@ void install(int packed)
                        (LPCWSTR)&install, &g_self);
 
     {
-        char pre[560];
+        char pre[760];
         std::snprintf(pre, sizeof pre,
             "[MGPU][R110] CALIB INSTALL BEGIN mode=%d rung=%d (%s). Nothing has "
             "been touched yet. If this is the last calibrator line in the log, "
             "the process died in the step named by the next BEGIN line that is "
             "missing - read the two step lines below it, not this one. rung=0 "
             "both, 1 import swap alone, 2 data scan alone; set CalibRung= in "
-            "mgpu.ini to run one at a time.",
+            "mgpu.ini to run one at a time. CalibProbe=%d (0 off, 1 on-disk reference for "
+            "every data-scan hit, 2 also loads a private copy under mgpu\\ and writes to it).",
             mode, rung,
             (rung == 1) ? "import swap alone"
-                        : ((rung == 2) ? "data scan alone" : "both"));
+                        : ((rung == 2) ? "data scan alone" : "both"),
+            probe);
         mgpu::diag::info(pre);
     }
 
@@ -997,6 +1259,12 @@ void install(int packed)
     {
         mgpu::diag::info("[MGPU][R110] CALIB step 2/2 SKIPPED by CalibRung=1.");
     }
+
+    // R115. After both rungs and before the INSTALLED line, so the words the
+    // data scan wrote are named next to the count of them. Says nothing when
+    // nothing was written, and nothing at all when CalibProbe is 0 beyond the
+    // hit lines themselves.
+    report_hits(probe);
 
     g_site = (dh != 0) ? "data-scan"
                        : ((hits != 0) ? "iat"

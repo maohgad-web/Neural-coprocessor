@@ -226,6 +226,12 @@ std::atomic<int> g_calib{2};
 // 2 the data-section scan alone.
 std::atomic<int> g_calib_rung{0};
 
+// R115. CalibProbe: what the calibrator says about the words its data scan
+// wrote. 0 off, 1 the on-disk reference for every hit, 2 also loads a private
+// copy of the module under mgpu\ and writes to it. Diagnostic only - it
+// changes nothing about what is patched.
+std::atomic<int> g_calib_probe{0};
+
 // SLT1. The Streamline tag tap's mode, from mgpu.ini's SLTags= key. Parsed
 // here with every other key, and OFF by default: this one installs an import
 // hook, and an instrument that hooks must be asked for.
@@ -2876,7 +2882,8 @@ int calib_mode()
     // before; bits 8-11 carry the rung. With CalibRung absent the top
     // bits are zero and the value is literally the old value.
     return g_calib.load(std::memory_order_relaxed) |
-           (g_calib_rung.load(std::memory_order_relaxed) << 8);
+           (g_calib_rung.load(std::memory_order_relaxed) << 8) |
+           (g_calib_probe.load(std::memory_order_relaxed) << 12);
 }
 
 int jitter_mode()
@@ -2967,6 +2974,13 @@ mode mode_from_ini()
         int rv = 0;
         if (rk != nullptr) rv = atoi(rk);
         g_calib_rung.store((rv < 0 || rv > 2) ? 0 : rv, std::memory_order_relaxed);
+    }
+    {
+        // R115. CalibProbe. Absent means 0.
+        const char *pk = mgpu::config::find(buf, strlen(buf), "CalibProbe");
+        int pv = 0;
+        if (pk != nullptr) pv = atoi(pk);
+        g_calib_probe.store((pv < 0 || pv > 2) ? 0 : pv, std::memory_order_relaxed);
     }
     {
         // SLT1. SLTags: the Streamline tag tap. 0 off - and off is the

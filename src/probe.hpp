@@ -94,6 +94,8 @@ mode mode_from_ini();
 //
 //     bits 0-7   capture mode, from Calib=      0 off, 1 latch, 2 live
 //     bits 8-11  install rung, from CalibRung=  0 both, 1 IAT, 2 data-scan
+//     bits 12-15 probe depth, from CalibProbe= 0 off, 1 on-disk reference,
+//                                              2 also a private-copy write
 //
 // Calib says what the tap does once NGX is running. CalibRung says which of
 // the two install rungs is allowed to run at all, which is a different

@@ -138,8 +138,17 @@ namespace
         // So: count it, say it, skip the frame, and come back next time.
         unsigned long long present_stalls = 0;      // slot-reuse waits that timed out
         unsigned present_stall_run = 0;             // consecutive; any good frame clears it
-        unsigned long long present_occluded = 0;    // Present returned DXGI_STATUS_OCCLUDED
-        unsigned last_present_status = 0;           // last non-zero Present return, success codes included
+        // R114b. ATOMIC, AND THAT IS THE WHOLE POINT OF THE CHANGE.
+        //
+        // These two are written from the present path, which runs every
+        // presented frame. R111 wrote them under S.cs, which put a NEW MUTEX
+        // ACQUISITION on the frame path to maintain a diagnostic counter.
+        // That is exactly the kind of incidental change this round is meant
+        // not to make: the bug being chased is a stall on this thread, and
+        // adding a lock to the thread that stalls is how a diagnostic becomes
+        // a cause. As atomics they are a relaxed store and nothing else.
+        std::atomic<unsigned long long> present_occluded{0};  // Present returned DXGI_STATUS_OCCLUDED
+        std::atomic<unsigned> last_present_status{0};         // last non-zero Present return, success codes included
         bool present_stall_logged = false;          // one-shot for the first stall
         bool neural_shown = false;   // P5.0: one-shot "the window is live" log
         // P7.0: the chain is resizable now. `hwnd` is kept because a resize has
@@ -564,8 +573,8 @@ bool create_present_chain(HWND hwnd)
         // the consecutive-stall limit fire on a chain that never stalled.
         S.present_stalls = 0;
         S.present_stall_run = 0;
-        S.present_occluded = 0;
-        S.last_present_status = 0;
+        S.present_occluded.store(0, std::memory_order_relaxed);
+        S.last_present_status.store(0, std::memory_order_relaxed);
         S.present_stall_logged = false;
         // The state owns them now; the locals must not release them twice.
         queue = nullptr;
@@ -761,17 +770,22 @@ bool present_frame(float r, float g, float b)
             const UINT64 done = fence->GetCompletedValue();
 
             unsigned long long stalls = 0, occ = 0;
-            unsigned run = 0, lps = 0;
-            bool say = false;
+            unsigned lps = 0;
             HWND wnd = nullptr;
             {
                 std::lock_guard<std::mutex> lk(S.cs);
                 stalls = ++S.present_stalls;
-                run = ++S.present_stall_run;
-                occ = S.present_occluded;
-                lps = S.last_present_status;
+                occ = S.present_occluded.load(std::memory_order_relaxed);
+                lps = S.last_present_status.load(std::memory_order_relaxed);
                 wnd = S.hwnd;
-                if (!S.present_stall_logged) { S.present_stall_logged = true; say = true; }
+                // R114. present_stall_run and present_stall_logged survive as
+                // state because the counters are read by the line below and
+                // reset by a good frame, but nothing branches on them any
+                // more: the first stall is the last one, so a consecutive
+                // count and a one-shot say-it-once bit have nothing left to
+                // decide.
+                S.present_stall_run = 1;
+                S.present_stall_logged = true;
             }
 
             // Its own buffer: `line` is 800 and the reading below is longer
@@ -793,50 +807,73 @@ bool present_frame(float r, float g, float b)
                 return fail("slot reuse wait (device removed)", (unsigned)removed);
             }
 
-            // R111b. THE LIMIT. A queue that has not retired a frame in ten
-            // minutes of wall clock is not parked, it is gone, and spinning
-            // on it forever would be the other way to make a session
-            // undiagnosable. 120 consecutive five-second waits is that.
-            if (run >= 120u)
-            {
-                snprintf(r111, sizeof r111,
-                         "[MGPU][R111] PRESENT STALLED FOR %u CONSECUTIVE WAITS (about %u "
-                         "minutes) with the device still healthy. Giving up and tearing down "
-                         "in order. slot_prev=%llu completed=%llu occluded=%llu "
-                         "last Present status=0x%08X.",
-                         run, (run * 5u) / 60u, (unsigned long long)slot_prev,
-                         (unsigned long long)done, occ, lps);
-                mgpu::diag::error(r111);
-                return fail("slot reuse wait (stalled past the limit)", (unsigned)wr);
-            }
-
-            if (say || (stalls % 12ull) == 0ull)
+            // ---- R114: STOP PRETENDING THIS RECOVERS ----
+            //
+            // R111 skipped the frame and came back. MEASURED, 2026-09-14
+            // 08:34: five stalls, 5.01 seconds apart to the millisecond, and
+            // then STREAM FAILED anyway. Skipping cannot unjam a fence that is
+            // stuck - nothing about waiting again changes what the queue is
+            // waiting for - so all the retry bought was twenty seconds of a
+            // frozen window before the same ending, with the producer still
+            // filling the ring and throwing DROPPED bursts into the log.
+            //
+            // The old fast teardown was better for the person playing. What
+            // was missing was never the retry: it was TELLING THEM. A bridge
+            // that vanishes with a developer's HRESULT in a log file is a
+            // blind failure, and this one has a workaround a player can
+            // actually perform.
+            //
+            // So: fail on the FIRST stall, the way it did before R111, and say
+            // two things - the numbers, for us, and one plain sentence, for
+            // them.
+            //
+            // WHAT WE HONESTLY KNOW, and the wording below is held to it:
+            // this has only ever been seen with the bridge window not the top
+            // window on its own display. That is an OBSERVED CORRELATION and
+            // not a mechanism - DXGI reported zero occluded presents on the
+            // run that produced it, the window was visible and not minimised,
+            // and Present returned S_OK. So the message says what to try, and
+            // does not claim to know why it works.
+            //
+            // NOT WIRED, deliberately: the R108 idle screen's error codes.
+            // Drawing one needs a present, and a jammed present chain is the
+            // thing being reported. A code nobody can see is worse than none.
             {
                 const int iconic  = (wnd != nullptr) ? (IsIconic(wnd) ? 1 : 0) : -1;
                 const int visible = (wnd != nullptr) ? (IsWindowVisible(wnd) ? 1 : 0) : -1;
                 snprintf(r111, sizeof r111,
-                         "[MGPU][R111] PRESENT STALL (not fatal, frame skipped): the fence for "
-                         "this present slot did not advance within 5000 ms. wait=0x%08X "
-                         "slot_prev=%llu completed=%llu | stalls=%llu consecutive=%u "
-                         "occluded-presents=%llu last Present status=0x%08X | window "
-                         "minimised=%d visible=%d | DeviceRemovedReason=0x%08X. HOW TO READ IT. "
-                         "The device is healthy, so this is a queue that has not retired a "
-                         "frame, not a fault. A flip-model swapchain nobody is compositing "
-                         "stops retiring: occluded-presents above zero, or minimised=1, says "
-                         "that is what happened and the bridge will resume on its own the "
-                         "moment the window is composited again. Before R111 this line was "
-                         "'present failed ... hr=0x00000000' and it ended the session.",
+                         "[MGPU][R111] PRESENT STALL: the fence for this present slot did not "
+                         "advance within 5000 ms. wait=0x%08X slot_prev=%llu completed=%llu | "
+                         "stalls=%llu occluded-presents=%llu last Present status=0x%08X | "
+                         "window minimised=%d visible=%d | DeviceRemovedReason=0x%08X. HOW TO "
+                         "READ IT. The device is healthy and exactly one submission is "
+                         "outstanding, so this is our own queue holding work that never "
+                         "completes - not a removed device and not composition. R111's "
+                         "skip-and-retry was measured on 2026-09-14 and did not recover: five "
+                         "stalls at 5.01 s and then STREAM FAILED, so the bridge now stops at "
+                         "the first one instead of freezing for twenty seconds first. The "
+                         "cause is open; the copy queue's GPU gate is where it is being "
+                         "chased, because it fired on exactly the frame count the neural "
+                         "stage stopped at.",
                          (unsigned)wr, (unsigned long long)slot_prev,
-                         (unsigned long long)done, stalls, run, occ, lps,
+                         (unsigned long long)done, stalls, occ, lps,
                          iconic, visible, (unsigned)removed);
-                mgpu::diag::warn(r111);
-            }
+                mgpu::diag::error(r111);
 
-            // Skip this frame. Nothing has been reset, recorded or submitted
-            // yet - the allocator reset is below this block - so there is no
-            // half-built frame to unwind, and the next call re-reads the
-            // fence and takes the same decision with fresher numbers.
-            return true;
+                mgpu::diag::error(
+                    "[MGPU][R114] THE BRIDGE HAS STOPPED, AND THE GAME IS FINE - close nothing "
+                    "in a hurry. WHAT TO DO: restart the game, and before arming, put the "
+                    "bridge window on the second display and make sure it is the TOP window "
+                    "there, not covered by the game or anything else. Every time this has been "
+                    "seen, the bridge window was not the top window on its own display. WE DO "
+                    "NOT YET KNOW WHY THAT MATTERS - Windows did not report the window as "
+                    "covered or minimised on the run we caught, so this is something we have "
+                    "observed and not something we can explain, and it may not be the whole "
+                    "story. It is being worked on. Nothing on your machine has been left in a "
+                    "bad state: the add-on shuts down in order from here, and the game keeps "
+                    "running.");
+            }
+            return fail("slot reuse wait (stalled, not recoverable)", (unsigned)wr);
         }
     }
 
@@ -1187,16 +1224,17 @@ bool present_frame(float r, float g, float b)
     // above times out. It has been happening in silence.
     if (hr != S_OK)
     {
+        // R114b. NO LOCK HERE. Two relaxed atomic stores on the frame path,
+        // where R111 took S.cs to do the same bookkeeping. Nothing reads
+        // these except the stall path, which runs once and then tears down,
+        // so relaxed ordering is all the guarantee they need.
         bool say = false;
         unsigned long long occ = 0;
+        S.last_present_status.store((unsigned)hr, std::memory_order_relaxed);
+        if (hr == DXGI_STATUS_OCCLUDED)
         {
-            std::lock_guard<std::mutex> lk(S.cs);
-            S.last_present_status = (unsigned)hr;
-            if (hr == DXGI_STATUS_OCCLUDED)
-            {
-                occ = ++S.present_occluded;
-                say = (occ == 1ull) || ((occ % 600ull) == 0ull);
-            }
+            occ = S.present_occluded.fetch_add(1, std::memory_order_relaxed) + 1ull;
+            say = (occ == 1ull) || ((occ % 600ull) == 0ull);
         }
         if (say)
         {

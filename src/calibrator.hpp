@@ -161,6 +161,13 @@ enum
 //           handle is a dead pointer - which is the failure mode this whole
 //           file exists to remove.
 //
+// BITS 12-15 - CalibProbe=, how much the calibrator says about the words its
+// data scan wrote. 0 nothing beyond the count; 1 names each hit and reads the
+// same offset out of the module's own FILE, so a runtime cache can be told
+// from static data that merely matched; 2 also loads a private copy of that
+// module under mgpu\ and writes a sentinel into the same RVA. Diagnostic
+// only - it never changes what is patched in the live process.
+//
 // BITS 8-11 - CalibRung=, which install rung is allowed to run at all:
 //       0 = both, in the existing order. The default and the 0.2.1 behaviour.
 //       1 = the import-table swap alone (R101).
