@@ -148,19 +148,37 @@ enum
     KEY_DYNAMIC    = 1u << 12
 };
 
-// mode: 0 = never install (no bytes touched, no imports walked)
+// R110. THE ARGUMENT IS PACKED. Low byte is the capture mode, exactly as it
+// has always been; bits 8-11 are the install rung. mgpu::probe::calib_mode()
+// builds it and this is its only consumer, so dllmain's one install() line
+// needs no change and cannot disagree with the ini.
+//
+// LOW BYTE - Calib=, what the tap does once NGX is running:
+//       0 = never install (no bytes touched, no imports walked)
 //       1 = latch. Capture, then stop reading once the table is stable.
 //       2 = live. Read every evaluate, all run. The default, because a
 //           resolution or preset change replaces the resources and a latched
 //           handle is a dead pointer - which is the failure mode this whole
 //           file exists to remove.
 //
+// BITS 8-11 - CalibRung=, which install rung is allowed to run at all:
+//       0 = both, in the existing order. The default and the 0.2.1 behaviour.
+//       1 = the import-table swap alone (R101).
+//       2 = the data-section scan alone (R102).
+//
+// The rung exists because Calib never selected anything here. Install ran
+// both rungs for Calib=1 and Calib=2 alike, so the two modes installed
+// identically and a crash inside install could not be attributed. Running one
+// rung per launch attributes it in two runs.
+//
 // Safe to call before any NGX module is loaded: if none is present the import
 // hook stays armed and picks it up when it arrives.
-void install(int mode);
+void install(int packed);
 
 // Puts every patched import entry back. Idempotent. After this returns no
-// pointer in the process refers to anything in this file.
+// pointer in the process refers to anything in this file. Not gated on the
+// rung: the reverse of a rung that never ran finds nothing to put back, and
+// an unwind that can be skipped is worse than one that does nothing.
 void uninstall();
 
 // Lock-free snapshot. Returns false if nothing has ever been captured. Never

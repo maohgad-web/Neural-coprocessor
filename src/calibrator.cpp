@@ -132,6 +132,11 @@ typedef FARPROC(WINAPI *pf_gpa)(HMODULE, LPCSTR);
 // ---- STATE ----
 
 std::atomic<int>  g_mode{0};
+// R110. Which install rung is allowed to run: 0 both, 1 the import swap
+// alone, 2 the data-section scan alone. Separate from g_mode because the two
+// answer different questions - g_mode is what we do once NGX is running,
+// g_rung is what we are allowed to touch before it ever is.
+std::atomic<int>  g_rung{0};
 std::atomic<bool> g_installed{false};
 const char *g_site = "?";   // R101b: which event installed us
 
@@ -840,41 +845,150 @@ void apply_jitter_offset(void *nr_params, float sx, float sy)
     }
 }
 
-void install(int mode)
+// ---- R110: INSTALL, SAID OUT LOUD, ONE RUNG AT A TIME ----
+//
+// WHAT THIS ROUND CHANGES AND WHY.
+//
+// Reported on a title that dies 3 ms after CALIBRATOR INSTALLED, inside
+// sl.common.dll. The reporter ran Calib=1 and Calib=2 and got the same
+// crash at the same offset, which was read at the time as the mode not
+// being the variable. It is stronger than that: the two modes install
+// IDENTICALLY. Every line below the mode store ran the same way for
+// both, because mode has never had any part in install - it is read at
+// evaluate time and nowhere else. So the pair of runs did not narrow
+// anything, and could not have.
+//
+// Two rungs run here, in sequence and unconditionally: the import-table
+// swap (R101) and the data-section scan for pointers cached before we
+// existed (R102). One of them is what the engine does not like, and the
+// log could not name which, for two reasons that are both fixed below:
+//
+//   1. Nothing was said BEFORE either rung, only after both. A process
+//      that dies inside rung A and a process that dies inside rung B
+//      leave the identical log - the INSTALLED line absent in both.
+//      This is the C0 rule the arm path already follows: announce the
+//      step, then take it, so the last line printed is the step that
+//      killed it.
+//   2. There was no way to run one rung alone. CalibRung= is that way.
+//      Two runs, one key, and the answer is which one survives.
+//
+// Also fixed here: the INSTALLED line reported the IAT hit count only.
+// On this title INSTALLED is the LAST calibrator line that will ever
+// print - site= and data-slots= live on the periodic line, which needs
+// 300 frames and never arrives. The one line that survives now carries
+// every field needed to reconstruct what was touched.
+//
+// g_dslots.fetch_add(0) sat here and was read as a defect. It is not
+// one: scan_cached_pointers() adds its own hits at the point it takes
+// them, so the counter was always right and this line did nothing at
+// all. Removed as dead, not as a fix.
+//
+// The argument is PACKED - low byte Calib, bits 8-11 CalibRung - so
+// that dllmain's single install() line is untouched by this round. See
+// probe.hpp.
+void install(int packed)
 {
+    const int mode = packed & 0xFF;
+    const int rung = (packed >> 8) & 0xF;
+
     if (mode == 0) return;                       // nothing touched at all
     std::lock_guard<std::mutex> lk(g_install_cs);
     if (g_installed.load(std::memory_order_relaxed)) return;
 
     qpc_init();
     g_mode.store(mode, std::memory_order_relaxed);
+    g_rung.store(rung, std::memory_order_relaxed);
 
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCWSTR)&install, &g_self);
 
+    {
+        char pre[560];
+        std::snprintf(pre, sizeof pre,
+            "[MGPU][R110] CALIB INSTALL BEGIN mode=%d rung=%d (%s). Nothing has "
+            "been touched yet. If this is the last calibrator line in the log, "
+            "the process died in the step named by the next BEGIN line that is "
+            "missing - read the two step lines below it, not this one. rung=0 "
+            "both, 1 import swap alone, 2 data scan alone; set CalibRung= in "
+            "mgpu.ini to run one at a time.",
+            mode, rung,
+            (rung == 1) ? "import swap alone"
+                        : ((rung == 2) ? "data scan alone" : "both"));
+        mgpu::diag::info(pre);
+    }
+
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     g_real_gpa = (pf_gpa)GetProcAddress(k32, "GetProcAddress");
-    if (g_real_gpa == nullptr) return;
+    if (g_real_gpa == nullptr)
+    {
+        mgpu::diag::warn("[MGPU][R110] CALIB INSTALL ABORTED: GetProcAddress "
+                         "could not be resolved from kernel32. Nothing was "
+                         "patched and the calibrator is not installed.");
+        return;
+    }
 
-    const unsigned hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
-    g_slots.fetch_add(hits, std::memory_order_relaxed);
-    // R102: the rung above. If a caller cached the pointer before we
-    // existed - Streamline always does - the import walk found nothing to
-    // reach it with, and this does.
-    const unsigned dh = scan_cached_pointers();
-    g_dslots.fetch_add(0, std::memory_order_relaxed);
-    g_site = (dh != 0) ? "data-scan" : ((hits != 0) ? "iat" : "iat-nohits");
+    // ---- RUNG A: the import-table swap ----
+    unsigned hits = 0;
+    if (rung == 0 || rung == 1)
+    {
+        mgpu::diag::info(
+            "[MGPU][R110] CALIB step 1/2 BEGIN: import-table swap. Walking every "
+            "module in the process except our own and replacing import slots "
+            "whose value is kernel32!GetProcAddress. Pointer stores only - no "
+            "instruction byte is modified anywhere.");
+        hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
+        g_slots.fetch_add(hits, std::memory_order_relaxed);
+        char sl[256];
+        std::snprintf(sl, sizeof sl,
+            "[MGPU][R110] CALIB step 1/2 DONE: %u slot(s) across %llu module(s).",
+            hits, g_modules.load(std::memory_order_relaxed));
+        mgpu::diag::info(sl);
+    }
+    else
+    {
+        mgpu::diag::info("[MGPU][R110] CALIB step 1/2 SKIPPED by CalibRung=2.");
+    }
+
+    // ---- RUNG B: R102, the cached-pointer scan ----
+    // If a caller cached the pointer before we existed - Streamline always
+    // does - the import walk found nothing to reach it with, and this does.
+    unsigned dh = 0;
+    if (rung == 0 || rung == 2)
+    {
+        mgpu::diag::info(
+            "[MGPU][R110] CALIB step 2/2 BEGIN: R102 data-section scan. Reading "
+            "the writable data sections of every loaded module looking for the "
+            "8-byte word that equals the real NGX entry point. This is the rung "
+            "that reaches Streamline, and it is the one that touches memory "
+            "belonging to modules we did not load.");
+        dh = scan_cached_pointers();
+        char dl[256];
+        std::snprintf(dl, sizeof dl,
+            "[MGPU][R110] CALIB step 2/2 DONE: %u cached pointer(s) swapped.", dh);
+        mgpu::diag::info(dl);
+    }
+    else
+    {
+        mgpu::diag::info("[MGPU][R110] CALIB step 2/2 SKIPPED by CalibRung=1.");
+    }
+
+    g_site = (dh != 0) ? "data-scan"
+                       : ((hits != 0) ? "iat"
+                                      : ((rung == 2) ? "data-nohits" : "iat-nohits"));
     g_installed.store(true, std::memory_order_relaxed);
 
-    char line[512];
+    char line[700];
     std::snprintf(line, sizeof line,
-        "[MGPU][R101] CALIBRATOR INSTALLED mode=%d | %u import slot(s) patched "
-        "across %llu module(s). This is a POINTER SWAP, not a code patch - no "
+        "[MGPU][R101] CALIBRATOR INSTALLED mode=%d rung=%d site=%s | slots=%u "
+        "data-slots=%u modules=%llu | %u import slot(s) patched across %llu "
+        "module(s). This is a POINTER SWAP, not a code patch - no "
         "instruction anywhere in this process was modified, and Calib=0 puts "
         "every slot back. Our own module is skipped so the bridge's own "
         "DLSS-NR evaluates are never mistaken for the game's.",
-        mode, hits, g_modules.load(std::memory_order_relaxed));
+        mode, rung, g_site, hits, dh,
+        g_modules.load(std::memory_order_relaxed),
+        hits, g_modules.load(std::memory_order_relaxed));
     mgpu::diag::info(line);
 }
 
@@ -928,13 +1042,25 @@ void note_frame()
     if (g_resolved.load(std::memory_order_relaxed) != 0) return;
     if ((f % 60ull) != 0ull || f > 1800ull) return;
 
-    const unsigned hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
-    if (hits != 0) g_slots.fetch_add(hits, std::memory_order_relaxed);
+    // R110. The rescan runs the SAME rungs install was allowed to run. A
+    // CalibRung that excluded a rung at install and then let it back in
+    // sixty frames later would make the key a delay rather than a
+    // selector, and the run would prove nothing.
+    const int rung = g_rung.load(std::memory_order_relaxed);
+
+    if (rung == 0 || rung == 1)
+    {
+        const unsigned hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
+        if (hits != 0) g_slots.fetch_add(hits, std::memory_order_relaxed);
+    }
 
     // R102. Retried, not done once: nvngx may not be loaded yet at install,
     // and there is nothing to compare against until it is. Stops the moment
     // anything resolves, by the guard at the top of this function.
-    if (scan_cached_pointers() != 0) g_site = "data-scan";
+    if (rung == 0 || rung == 2)
+    {
+        if (scan_cached_pointers() != 0) g_site = "data-scan";
+    }
 }
 
 void log_summary()
@@ -948,10 +1074,11 @@ void log_summary()
 
     char line[3600];
     int w = std::snprintf(line, sizeof line,
-        "[MGPU][R101] CALIBRATOR mode=%d site=%s | slots=%llu data-slots=%llu modules=%llu gpa-calls=%llu "
+        "[MGPU][R101] CALIBRATOR mode=%d rung=%d site=%s | slots=%llu data-slots=%llu modules=%llu gpa-calls=%llu "
         "| resolved=%llu creates=%llu sr-handle=%s | evaluates=%llu captured=%llu "
         "| cost %.0f ns/frame | eval-copies=%llu eval-skips=%llu. ",
-        g_mode.load(std::memory_order_relaxed), g_site,
+        g_mode.load(std::memory_order_relaxed),
+        g_rung.load(std::memory_order_relaxed), g_site,
         g_slots.load(std::memory_order_relaxed),
         g_dslots.load(std::memory_order_relaxed),
         g_modules.load(std::memory_order_relaxed),

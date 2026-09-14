@@ -207,6 +207,23 @@ std::atomic<unsigned long long> g_frames;
 // handle dies with the next resolution or DLSS preset change, and that is the
 // exact failure this tap exists to remove.
 std::atomic<int> g_calib{2};
+
+// R110. WHICH RUNG OF THE CALIBRATOR IS ALLOWED TO RUN.
+//
+// The calibrator installs itself twice over: an import-table swap
+// (R101) and a data-section scan for pointers cached before we existed
+// (R102). Until now both ran unconditionally, in sequence, on every
+// value of Calib - which is why Calib=1 and Calib=2 produced a
+// byte-identical install and why a title that dies inside install
+// cannot tell us which of the two killed it. Calib selects what
+// happens at EVALUATE time; it never selected what happens at INSTALL
+// time. This key does.
+//
+// 0 both, in the existing order. The default, and byte-identical to
+//   0.2.1 when the key is absent.
+// 1 the import swap alone.
+// 2 the data-section scan alone.
+std::atomic<int> g_calib_rung{0};
 std::atomic<int> g_jitter{0};   // R104: 0 off, 1 apply, -1 apply negated
 std::atomic<int> g_evalcopy{0}; // R106: 0 barrier trigger, 1 evaluate trigger
 
@@ -2835,7 +2852,14 @@ bool slurp(char *buf, size_t cap)
 // these produce is called, and because nothing else in the file starts that way.
 int calib_mode()
 {
-    return g_calib.load(std::memory_order_relaxed);
+    // PACKED, and packed rather than given a second accessor because
+    // dllmain's one install() line is the only consumer and a second
+    // argument there would mean editing a file this round does not
+    // otherwise touch. Low byte is the capture mode, exactly as
+    // before; bits 8-11 carry the rung. With CalibRung absent the top
+    // bits are zero and the value is literally the old value.
+    return g_calib.load(std::memory_order_relaxed) |
+           (g_calib_rung.load(std::memory_order_relaxed) << 8);
 }
 
 int jitter_mode()
@@ -2917,6 +2941,15 @@ mode mode_from_ini()
         int cv = 2;
         if (ck != nullptr) cv = atoi(ck);
         g_calib.store((cv < 0 || cv > 2) ? 2 : cv, std::memory_order_relaxed);
+    }
+    {
+        // R110. CalibRung: which install rung is allowed to run. Absent
+        // means 0 (both), which is 0.2.1's behaviour exactly - a key
+        // nobody sets must never change what the bridge does.
+        const char *rk = mgpu::config::find(buf, strlen(buf), "CalibRung");
+        int rv = 0;
+        if (rk != nullptr) rv = atoi(rk);
+        g_calib_rung.store((rv < 0 || rv > 2) ? 0 : rv, std::memory_order_relaxed);
     }
     {
         // R104. Two keys because the sign is the ONE thing worth settling on

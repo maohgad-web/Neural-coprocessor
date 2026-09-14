@@ -89,6 +89,19 @@ mode mode_from_ini();
 // R101. The NGX tap's mode, from mgpu.ini's Calib= key. Parsed HERE, in the
 // one place that already owns the ini, so no second file can disagree with
 // this one about what the user asked for. 0 off, 1 latch, 2 live.
+//
+// R110. The return value is PACKED and the low byte is unchanged:
+//
+//     bits 0-7   capture mode, from Calib=      0 off, 1 latch, 2 live
+//     bits 8-11  install rung, from CalibRung=  0 both, 1 IAT, 2 data-scan
+//
+// Calib says what the tap does once NGX is running. CalibRung says which of
+// the two install rungs is allowed to run at all, which is a different
+// question and was never answerable before: both rungs ran on every non-zero
+// Calib, so Calib=1 and Calib=2 installed identically. With CalibRung absent
+// the top bits are zero and this returns exactly what 0.2.1 returned.
+//
+// mgpu::calibrator::install() is the only consumer and unpacks it there.
 int calib_mode();
 
 // R103. Force the transport's source handle. The calibrator reads the
