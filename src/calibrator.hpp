@@ -256,6 +256,11 @@ void override_scale(float &sx, float &sy);
 void set_mvec_hook(void (*fn)(void *cmd_list, unsigned long long handle));
 void set_eval_copy(int mode);
 
+// R118. What the ini asked for: 0 off, 1 on, 2 AUTO. Read by gpu1_context so
+// the auto-fallback can tell "the user wants auto" from "the user said on",
+// without a second parse of mgpu.ini.
+int eval_copy_mode();
+
 void set_jitter_mode(int mode);
 void apply_jitter_offset(void *nr_params, float mvec_scale_x, float mvec_scale_y);
 

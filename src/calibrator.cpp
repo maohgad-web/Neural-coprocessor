@@ -374,8 +374,13 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
             // ---- R106: THE COPY, TAKEN HERE INSTEAD OF AT A BARRIER ----
             // Before the real evaluate runs, because the game has finished
             // writing the buffer - that is why it is handing it over.
+            // R118. ONLY 1 COPIES. 2 is AUTO and means "not yet": it sits
+            // inert until gpu1_context measures the barrier route at zero and
+            // calls set_eval_copy(1). Testing != 0 here, as this did, would
+            // make auto identical to on and there would be no fallback, just
+            // a second name for the same setting.
             const int ec = g_eval_copy_mode.load(std::memory_order_relaxed);
-            if (ec != 0 && cl != nullptr && g_mvec_hook_fn != nullptr)
+            if (ec == 1 && cl != nullptr && g_mvec_hook_fn != nullptr)
             {
                 // ---- R106b: ONCE PER FRAME, AND ONLY THE SUPERSAMPLING
                 //      FEATURE. THIS IS WHAT WAS CORRUPTING THE PICTURE ----
@@ -1034,6 +1039,14 @@ bool  g_jprobed = false;
 void set_mvec_hook(void (*fn)(void *, unsigned long long))
 {
     g_mvec_hook_fn = fn;
+}
+
+// R118. The getter, so gpu1_context can ask what the user set WITHOUT
+// reading mgpu.ini a second time. The ini is parsed in exactly one place and
+// that rule is worth more than the three lines this saves.
+int eval_copy_mode()
+{
+    return g_eval_copy_mode.load(std::memory_order_relaxed);
 }
 
 void set_eval_copy(int mode)

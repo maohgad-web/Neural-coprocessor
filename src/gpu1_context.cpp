@@ -8113,6 +8113,11 @@ namespace
         std::atomic<unsigned char> mvec_slot_valid[RING] = {};
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
+        // R118. One-shot: the fallback arms once per armed stream and never
+        // disarms itself. A route that was dead for 300 frames and then
+        // flickers is not a reason to start toggling the copy trigger
+        // mid-session.
+        bool mvec_auto_armed = false;
         // Written from the game's render thread WITHOUT this struct's mutex -
         // it counts the times that mutex was not taken. Atomic for that reason
         // and no other.
@@ -15145,6 +15150,57 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 if (f >= s.mvec_report_at)
                 {
                     s.mvec_report_at = f + 300ull;
+
+                    // ---- R118: THE AUTO-FALLBACK ----
+                    //
+                    // MEASURED, Battlefield 6, 2026-09-14, two runs one
+                    // variable: with MvecFromEval=1 the transport carried 1931
+                    // of 2705 frames; with it at 0 it carried ZERO - on the
+                    // same run, holding the SAME correct source address handed
+                    // over by R103. The address was never the problem on that
+                    // engine. The barrier trigger simply does not fire there.
+                    //
+                    // On Plague Tale the barrier route works, and R106b exists
+                    // because BOTH routes reaching the copy corrupted the
+                    // picture. So neither setting is right for every title,
+                    // and a global default would break one engine to fix the
+                    // other.
+                    //
+                    // The bridge can tell which engine it is on in 300 frames:
+                    // if the barrier route has produced NOTHING by then, and
+                    // the calibrator holds the game's own table, the route is
+                    // dead here and the evaluate is the only one left. Arm it.
+                    //
+                    // It cannot fire where the barrier route works, because
+                    // copies would not be zero. That is the whole safety
+                    // argument and it is structural, not a guard we maintain.
+                    if (mgpu::calibrator::eval_copy_mode() == 2 &&
+                        !s.mvec_auto_armed &&
+                        s.mvec_copies.load(std::memory_order_relaxed) == 0ull)
+                    {
+                        mgpu::calibrator::table at{};
+                        if (mgpu::calibrator::read(at) &&
+                            (at.have & mgpu::calibrator::KEY_MVEC) != 0u &&
+                            at.mvec != 0ull)
+                        {
+                            s.mvec_auto_armed = true;
+                            mgpu::calibrator::set_eval_copy(1);
+                            char al[900];
+                            snprintf(al, sizeof al,
+                                "[MGPU][R118] MVEC AUTO-FALLBACK ARMED at frame %llu. The "
+                                "barrier route has produced ZERO copies in %llu frames while "
+                                "the calibrator holds the game's own table (MVEC=0x%llx), so "
+                                "on this engine the barrier trigger does not fire and the DLSS "
+                                "evaluate is the only route left. Copying from the evaluate "
+                                "from here. THIS LINE IS THE ENGINE TELLING US WHAT IT IS - it "
+                                "cannot appear on a title where the barrier route works, "
+                                "because copies would not be zero. If it appears and copies "
+                                "STAY at zero, the evaluate is not carrying either and the "
+                                "finding is that neither route reaches this title.",
+                                f, f, at.mvec);
+                            mgpu::diag::warn(al);
+                        }
+                    }
                     const unsigned long long mtot = s.mvec_seen_valid + s.mvec_seen_invalid;
                     // Its own buffer: `line` is 1400 and the depth report
                     // above already fills most of it.

@@ -3023,9 +3023,17 @@ mode mode_from_ini()
     {
         // R106. The copy's TRIGGER, not its source. Off by default because it
         // assumes a resource state the barrier path is told; see calibrator.hpp.
+        // R118. THREE VALUES NOW, and 2 is the one that ships.
+        //   0 off, hard. Nothing arms it, which is what makes a controlled
+        //     A/B run possible - the R116 attribution run could not have been
+        //     done against a fallback that armed itself.
+        //   1 on from the start, as before.
+        //   2 AUTO: off until the transport proves the barrier route is dead
+        //     on this title, then armed by gpu1_context. See R118.
         const char *ek = mgpu::config::find(buf, strlen(buf), "MvecFromEval");
-        g_evalcopy.store((ek != nullptr && atoi(ek) != 0) ? 1 : 0,
-                         std::memory_order_relaxed);
+        int ev = 0;
+        if (ek != nullptr) ev = atoi(ek);
+        g_evalcopy.store((ev < 0 || ev > 2) ? 0 : ev, std::memory_order_relaxed);
     }
     {
         // R74. MVecProbe=1 reads the velocity field. MVecProbeIndex picks which
