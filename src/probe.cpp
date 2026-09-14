@@ -37,6 +37,7 @@
 #include "mgpu_ini_parser.hpp"
 #include "probe.hpp"
 #include "sl_probe.hpp"   // SL1
+#include "sl_tags.hpp"    // SLT1
 
 namespace mgpu
 {
@@ -224,6 +225,11 @@ std::atomic<int> g_calib{2};
 // 1 the import swap alone.
 // 2 the data-section scan alone.
 std::atomic<int> g_calib_rung{0};
+
+// SLT1. The Streamline tag tap's mode, from mgpu.ini's SLTags= key. Parsed
+// here with every other key, and OFF by default: this one installs an import
+// hook, and an instrument that hooks must be asked for.
+std::atomic<int> g_sltags{0};
 std::atomic<int> g_jitter{0};   // R104: 0 off, 1 apply, -1 apply negated
 std::atomic<int> g_evalcopy{0}; // R106: 0 barrier trigger, 1 evaluate trigger
 
@@ -2375,6 +2381,17 @@ void dump()
                     g_bind_fires.load(std::memory_order_relaxed),
                     g_rp_fires.load(std::memory_order_relaxed),
                     g_bar_fires.load(std::memory_order_relaxed));
+
+                // SLT1. Installed from HERE rather than from the add-on's
+                // one-shot, and that placement is the safeguard rather than a
+                // convenience: this site only runs once the title has been
+                // rendering for a while, so the tap cannot exist during the
+                // startup window that is the only place the sl.common fault
+                // has ever been seen. tick() defers again on its own count,
+                // so both ends of the rule are enforced where they are read.
+                mgpu::sltags::tick(g_frames.load(std::memory_order_relaxed),
+                                   g_sltags.load(std::memory_order_relaxed));
+                mgpu::sltags::report();
             }
         }
 
@@ -2950,6 +2967,16 @@ mode mode_from_ini()
         int rv = 0;
         if (rk != nullptr) rv = atoi(rk);
         g_calib_rung.store((rv < 0 || rv > 2) ? 0 : rv, std::memory_order_relaxed);
+    }
+    {
+        // SLT1. SLTags: the Streamline tag tap. 0 off - and off is the
+        // default, because this key installs an import hook on a title where
+        // an interception is already under suspicion. 1 reads each buffer
+        // type once, 2 also re-reads when a resource pointer changes.
+        const char *sk = mgpu::config::find(buf, strlen(buf), "SLTags");
+        int sv = 0;
+        if (sk != nullptr) sv = atoi(sk);
+        g_sltags.store((sv < 0 || sv > 2) ? 0 : sv, std::memory_order_relaxed);
     }
     {
         // R104. Two keys because the sign is the ONE thing worth settling on
