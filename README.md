@@ -6,7 +6,7 @@
 
 **This is a ReShade add\-on.** It is called **MGPU Bridge**, it is a `.addon64` file that ReShade loads into a D3D12 game, and every log line it writes is prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a replacement for anything, and it needs an **add\-on\-enabled** ReShade build to load at all. There is no game modification of any kind: the add\-on reads each finished frame and does its work elsewhere.
 
-This is research code with published measurements. It is not a product. Run games with Anti\-cheat and online games are at your own risk.
+This is research code with published measurements. It is not a product. Run games with Anti\-cheat and online games at your own risk.
 
 * * *
 
