@@ -44,6 +44,13 @@ add_library(mgpu_bridge SHARED
     # documented QueryInterface. No new link library: version.dll is
     # resolved at run time, the way d3dcompiler_47 already is.
     src/sl_probe.cpp
+    # SLT1: the Streamline tag tap. Self-contained like the four above - no
+    # ReShade type, no gpu1_context type, no Streamline header and no link
+    # library; every Streamline struct is read by byte offset, and every
+    # offset is quoted from the public header beside it. OFF unless
+    # SLTags= is set in mgpu.ini, so this source compiles into every build
+    # and touches nothing in any of them until it is asked for.
+    src/sl_tags.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
