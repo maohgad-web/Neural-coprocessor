@@ -52,6 +52,7 @@ namespace
 
     bool  g_said_census      = false;
     bool  g_said_acquisition = false;
+    bool  g_said_shape       = false;   // SL2a
     void *g_game_device      = nullptr;
 
     const char *kind_name(kind k)
@@ -244,6 +245,119 @@ void report(void *our_device, void *game_device)
 
     if (ours == kind::proxy) mgpu::diag::warn(line);
     else                     mgpu::diag::info(line);
+
+    // SL2a. Straight after the census, on the same one-shot, so the two
+    // lines are always read together and neither needs a call site.
+    report_api_shape();
+}
+
+// ---- SL2a: THE API SHAPE ----
+//
+// Every name below is a documented public Streamline entry point. The
+// measurement is presence, by GetProcAddress, and nothing is called - see
+// sl_probe.hpp for why that restraint is the point rather than caution.
+//
+// WHAT THE ANSWER MEANS.
+//
+//   slSetTagForFrame present  - Streamline 2.x tagging with an explicit
+//                               frame token. The current route, and the one
+//                               a 2.9 interposer is expected to carry.
+//   slSetTag present alone    - the deprecated single-argument tagging call.
+//   both absent, interposer   - the title links Streamline but does not tag
+//   resident                    through the interposer's own exports, which
+//                               would make the tag route unreachable from
+//                               here and is itself the finding.
+//   slGetNativeInterface      - the documented escape hatch as a FUNCTION,
+//                               beside the GUID the census already uses.
+//   slUpgradeInterface        - present means proxies can be produced for
+//                               interfaces created before slInit.
+//
+// This says what the surface is. It does not say the game uses it - only a
+// tap on the call can say that, and a tap is an interception, which is the
+// class of thing currently under suspicion on this very title. So the
+// surface is measured first and separately, and the decision about the tap
+// is taken with this line in hand.
+void report_api_shape()
+{
+    if (g_said_shape) return;
+    g_said_shape = true;
+
+    HMODULE sl = GetModuleHandleW(L"sl.interposer.dll");
+    if (sl == nullptr)
+    {
+        mgpu::diag::info(
+            "[MGPU][SL2] API SHAPE: sl.interposer.dll is not loaded in this process, so there "
+            "is no Streamline surface to describe and nothing on this route applies to this "
+            "title. This is not a fault and needs no action.");
+        return;
+    }
+
+    // The documented surface, grouped so the line reads as three questions:
+    // does it tag, can it be interrogated, and can interfaces be unwrapped.
+    static const char *const NAMES[] =
+    {
+        "slInit", "slShutdown",
+        "slSetTagForFrame", "slSetTag",
+        "slGetNewFrameToken", "slSetConstants",
+        "slIsFeatureSupported", "slIsFeatureLoaded", "slSetFeatureLoaded",
+        "slGetFeatureVersion", "slGetFeatureRequirements",
+        "slGetFeatureFunction", "slEvaluateFeature",
+        "slAllocateResources", "slFreeResources",
+        "slGetNativeInterface", "slUpgradeInterface",
+        "slSetD3DDevice",
+    };
+    const unsigned N = (unsigned)(sizeof NAMES / sizeof NAMES[0]);
+
+    char have[900] = {};
+    char miss[600] = {};
+    int hw = 0, mw = 0;
+    unsigned nhave = 0;
+    bool tag_frame = false, tag_old = false;
+
+    for (unsigned i = 0; i < N; ++i)
+    {
+        const bool present = (GetProcAddress(sl, NAMES[i]) != nullptr);
+        if (present)
+        {
+            ++nhave;
+            if (strcmp(NAMES[i], "slSetTagForFrame") == 0) tag_frame = true;
+            if (strcmp(NAMES[i], "slSetTag") == 0)         tag_old   = true;
+            if (hw >= 0 && hw < (int)sizeof have - 32)
+                hw += snprintf(have + hw, sizeof have - (size_t)hw,
+                               "%s%s", (nhave > 1) ? " " : "", NAMES[i]);
+        }
+        else if (mw >= 0 && mw < (int)sizeof miss - 32)
+        {
+            mw += snprintf(miss + mw, sizeof miss - (size_t)mw,
+                           "%s%s", (mw > 0) ? " " : "", NAMES[i]);
+        }
+    }
+    if (have[0] == '\0') snprintf(have, sizeof have, "none");
+    if (miss[0] == '\0') snprintf(miss, sizeof miss, "none");
+
+    const char *route =
+        tag_frame ? "TAGGED, slSetTagForFrame (Streamline 2.x, frame-token form)"
+                  : (tag_old ? "TAGGED, slSetTag only (the deprecated form)"
+                             : "NOT TAGGED THROUGH THE INTERPOSER'S EXPORTS");
+
+    char l[2000];
+    snprintf(l, sizeof l,
+        "[MGPU][SL2] API SHAPE: %u of %u documented entry point(s) exported | ROUTE=%s | "
+        "present: %s | absent: %s. NOTHING WAS CALLED - this is GetProcAddress and a null "
+        "check, so no Streamline struct crossed this boundary and no ABI was assumed. HOW TO "
+        "READ IT. ROUTE=TAGGED means the game's own depth, motion vector, colour and UI "
+        "buffers are declared to Streamline inside this process, with extent and format "
+        "attached. That declaration is AUTHORITATIVE where our candidate ranking is a guess: "
+        "on this title 15 motion-vector candidates were identical in size, format and bind "
+        "count, so the ranking is decided by a barrier tiebreak and the source has been seen "
+        "to change between reports. It is also where a HDR colour buffer is NAMED rather than "
+        "inferred from R10G10B10A2. ROUTE=NOT TAGGED closes that route and is worth just as "
+        "much: it says the declaration is not reachable from here and the barrier path stays "
+        "the only answer. Reading the tag VALUES needs a tap on the call, which is an "
+        "interception of the same class as the calibrator, and that is a separate decision "
+        "taken with this line in hand - not a thing this build does.",
+        nhave, N, route, have, miss);
+    mgpu::diag::info(l);
 }
 
 void report_acquisition(unsigned long long bind_fires,

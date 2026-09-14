@@ -81,4 +81,25 @@ namespace mgpu::slprobe
     void report_acquisition(unsigned long long bind_fires,
                             unsigned long long rp_fires,
                             unsigned long long bar_fires);
+
+    // ---- SL2a: THE API SHAPE, READ WITHOUT CALLING ANYTHING ----
+    //
+    // WHAT IT ANSWERS. Whether this title drives Streamline through the
+    // TAGGED route - the host hands Streamline its depth, motion vectors,
+    // colour and UI by tagging resources, and Streamline evaluates - or
+    // through some other shape. If it is the tagged route then the game's
+    // own declaration of its motion vector buffer exists inside this
+    // process, with the extent and format attached, and it is authoritative
+    // in a way no ranking of ours can be. It is also where a HDR colour
+    // buffer would be named rather than guessed at from a format.
+    //
+    // HOW IT ASKS. GetProcAddress on the already-loaded sl.interposer.dll,
+    // by documented public name, and NOTHING IS CALLED. A non-null pointer
+    // means the export exists; that is the entire measurement. No slInit, no
+    // SDK struct, no argument passed to anything, and therefore no ABI this
+    // file could get wrong - the failure mode that makes an instrument into
+    // the fault it was sent to find.
+    //
+    // Said once, from report(), so it needs no call site of its own.
+    void report_api_shape();
 }

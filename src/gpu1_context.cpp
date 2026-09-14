@@ -29,6 +29,14 @@
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 
+// R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
+// Guarded because it is a SUCCESS code and a build where it went missing
+// would fail silently in the worst way: the occlusion branch would simply
+// never be taken, which is the state R111 exists to end.
+#ifndef DXGI_STATUS_OCCLUDED
+#define DXGI_STATUS_OCCLUDED ((HRESULT)0x087A0001L)
+#endif
+
 // P1.0: the NGX headers, fetched by CI into ext/ngx/ and never committed
 // (THIRD_PARTY.md, "NVIDIA NGX headers"). CMakeLists.txt is closed and
 // gains no include directory, so this is a quote include resolved relative
@@ -111,6 +119,28 @@ namespace
         HANDLE fence_event = nullptr;
         UINT64 fence_value = 0;
         bool present_failed_logged = false;
+        // ---- R111: THE PRESENT STALL, COUNTED INSTEAD OF FATAL ----
+        //
+        // MEASURED, Battlefield 6, 2026-09-14 07:34:49.495: the slot-reuse
+        // wait timed out after exactly 5000 ms, GetDeviceRemovedReason said
+        // S_OK, and the bridge tore itself down while the game carried on
+        // rendering for another 24 seconds. One transient stall of GPU 1's
+        // present queue ended the session permanently, because present_frame
+        // returning false makes the worker loop break into the ordered
+        // teardown and there is no way back from it.
+        //
+        // A stall is not a fault. A flip-model swapchain that nobody is
+        // compositing does not retire frames, and a fence value that has not
+        // been reached yet is the correct behaviour of a queue whose presents
+        // are still parked. The ONE thing that makes it fatal is a removed
+        // device, and that is already a separate question with its own answer.
+        //
+        // So: count it, say it, skip the frame, and come back next time.
+        unsigned long long present_stalls = 0;      // slot-reuse waits that timed out
+        unsigned present_stall_run = 0;             // consecutive; any good frame clears it
+        unsigned long long present_occluded = 0;    // Present returned DXGI_STATUS_OCCLUDED
+        unsigned last_present_status = 0;           // last non-zero Present return, success codes included
+        bool present_stall_logged = false;          // one-shot for the first stall
         bool neural_shown = false;   // P5.0: one-shot "the window is live" log
         // P7.0: the chain is resizable now. `hwnd` is kept because a resize has
         // to move the window as well as the buffers, and `chain_w/h` because
@@ -529,6 +559,14 @@ bool create_present_chain(HWND hwnd)
         S.fence_event = event;
         S.fence_value = 0;
         S.present_failed_logged = false;
+        // R111. A new chain starts with a clean stall history: the counters
+        // describe THIS chain, and carrying them across a rebuild would make
+        // the consecutive-stall limit fire on a chain that never stalled.
+        S.present_stalls = 0;
+        S.present_stall_run = 0;
+        S.present_occluded = 0;
+        S.last_present_status = 0;
+        S.present_stall_logged = false;
         // The state owns them now; the locals must not release them twice.
         queue = nullptr;
         sc3 = nullptr;
@@ -703,9 +741,103 @@ bool present_frame(float r, float g, float b)
         const HRESULT ehr = fence->SetEventOnCompletion(slot_prev, event);
         if (FAILED(ehr))
             return fail("SetEventOnCompletion (slot reuse)", static_cast<unsigned>(ehr));
-        if (WaitForSingleObject(event, 5000) != WAIT_OBJECT_0)
-            return fail("slot reuse wait (GetLastError)",
-                        static_cast<unsigned>(GetLastError()));
+
+        const DWORD wr = WaitForSingleObject(event, 5000);
+        if (wr != WAIT_OBJECT_0)
+        {
+            // ---- R111. WHAT THIS USED TO SAY, AND WHY IT WAS WRONG ----
+            //
+            // It reported GetLastError() on a path whose normal outcome is
+            // WAIT_TIMEOUT, where GetLastError carries nothing, and it
+            // printed that nothing through the fail() lambda's hr= field.
+            // The log therefore read "present failed ... hr=0x00000000",
+            // which is the code for SUCCESS. A line that says a thing failed
+            // with no error is the instrument failing, not the bridge.
+            //
+            // Now: the wait's own return, the two fence values that decide
+            // the wait, the occlusion count and the last Present status -
+            // the four numbers that separate a parked queue from a dead one.
+            const HRESULT removed = dev->GetDeviceRemovedReason();
+            const UINT64 done = fence->GetCompletedValue();
+
+            unsigned long long stalls = 0, occ = 0;
+            unsigned run = 0, lps = 0;
+            bool say = false;
+            HWND wnd = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(S.cs);
+                stalls = ++S.present_stalls;
+                run = ++S.present_stall_run;
+                occ = S.present_occluded;
+                lps = S.last_present_status;
+                wnd = S.hwnd;
+                if (!S.present_stall_logged) { S.present_stall_logged = true; say = true; }
+            }
+
+            // Its own buffer: `line` is 800 and the reading below is longer
+            // than that. A truncated diagnostic on the one path that used to
+            // end the session is not a saving.
+            char r111[1600];
+
+            // A removed device is the one reading that is genuinely fatal,
+            // and it keeps the old behaviour exactly.
+            if (FAILED(removed))
+            {
+                snprintf(r111, sizeof r111,
+                         "[MGPU][R111] PRESENT STALL WITH A REMOVED DEVICE - this one IS fatal. "
+                         "wait=0x%08X slot_prev=%llu completed=%llu stalls=%llu occluded=%llu "
+                         "last Present status=0x%08X.",
+                         (unsigned)wr, (unsigned long long)slot_prev,
+                         (unsigned long long)done, stalls, occ, lps);
+                mgpu::diag::error(r111);
+                return fail("slot reuse wait (device removed)", (unsigned)removed);
+            }
+
+            // R111b. THE LIMIT. A queue that has not retired a frame in ten
+            // minutes of wall clock is not parked, it is gone, and spinning
+            // on it forever would be the other way to make a session
+            // undiagnosable. 120 consecutive five-second waits is that.
+            if (run >= 120u)
+            {
+                snprintf(r111, sizeof r111,
+                         "[MGPU][R111] PRESENT STALLED FOR %u CONSECUTIVE WAITS (about %u "
+                         "minutes) with the device still healthy. Giving up and tearing down "
+                         "in order. slot_prev=%llu completed=%llu occluded=%llu "
+                         "last Present status=0x%08X.",
+                         run, (run * 5u) / 60u, (unsigned long long)slot_prev,
+                         (unsigned long long)done, occ, lps);
+                mgpu::diag::error(r111);
+                return fail("slot reuse wait (stalled past the limit)", (unsigned)wr);
+            }
+
+            if (say || (stalls % 12ull) == 0ull)
+            {
+                const int iconic  = (wnd != nullptr) ? (IsIconic(wnd) ? 1 : 0) : -1;
+                const int visible = (wnd != nullptr) ? (IsWindowVisible(wnd) ? 1 : 0) : -1;
+                snprintf(r111, sizeof r111,
+                         "[MGPU][R111] PRESENT STALL (not fatal, frame skipped): the fence for "
+                         "this present slot did not advance within 5000 ms. wait=0x%08X "
+                         "slot_prev=%llu completed=%llu | stalls=%llu consecutive=%u "
+                         "occluded-presents=%llu last Present status=0x%08X | window "
+                         "minimised=%d visible=%d | DeviceRemovedReason=0x%08X. HOW TO READ IT. "
+                         "The device is healthy, so this is a queue that has not retired a "
+                         "frame, not a fault. A flip-model swapchain nobody is compositing "
+                         "stops retiring: occluded-presents above zero, or minimised=1, says "
+                         "that is what happened and the bridge will resume on its own the "
+                         "moment the window is composited again. Before R111 this line was "
+                         "'present failed ... hr=0x00000000' and it ended the session.",
+                         (unsigned)wr, (unsigned long long)slot_prev,
+                         (unsigned long long)done, stalls, run, occ, lps,
+                         iconic, visible, (unsigned)removed);
+                mgpu::diag::warn(r111);
+            }
+
+            // Skip this frame. Nothing has been reset, recorded or submitted
+            // yet - the allocator reset is below this block - so there is no
+            // half-built frame to unwind, and the next call re-reads the
+            // fence and takes the same decision with fresher numbers.
+            return true;
+        }
     }
 
     // The allocator must be reset explicitly - resetting the command list
@@ -1046,6 +1178,41 @@ bool present_frame(float r, float g, float b)
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
 
+    // ---- R111: THE SUCCESS CODES PRESENT RETURNS, WHICH WERE INVISIBLE ----
+    //
+    // DXGI_STATUS_OCCLUDED is 0x087A0001 - the high bit is clear, so FAILED()
+    // is false and the check above steps straight over it. It is DXGI saying
+    // the frame was accepted and will not be shown, which is exactly the
+    // condition under which the queue stops retiring and the slot-reuse wait
+    // above times out. It has been happening in silence.
+    if (hr != S_OK)
+    {
+        bool say = false;
+        unsigned long long occ = 0;
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            S.last_present_status = (unsigned)hr;
+            if (hr == DXGI_STATUS_OCCLUDED)
+            {
+                occ = ++S.present_occluded;
+                say = (occ == 1ull) || ((occ % 600ull) == 0ull);
+            }
+        }
+        if (say)
+        {
+            char occl[800];
+            snprintf(occl, sizeof occl,
+                     "[MGPU][R111] PRESENT OCCLUDED x%llu (0x%08X). The frame was accepted and "
+                     "will not be shown: nothing is compositing this window. This is not an "
+                     "error and the loop keeps running, but it is the condition that parks the "
+                     "present queue, and a parked queue is what R111's stall counter above is "
+                     "counting. If stalls and this number move together, the window being "
+                     "covered or off-screen is the whole story.",
+                     occ, (unsigned)hr);
+            mgpu::diag::warn(occl);
+        }
+    }
+
     // D6: NO WAIT HERE. This is the stall the ring exists to remove - a full
     // GPU round trip taken on the consume thread, once per presented frame,
     // for no reason but allocator reuse. The reuse wait above is where that
@@ -1062,6 +1229,10 @@ bool present_frame(float r, float g, float b)
         std::lock_guard<std::mutex> lk(S.cs);
         S.fence_value = fence_value;
         S.slot_value[slot] = fence_value;   // D6: this slot is busy until here
+        // R111. A frame that reached Present clears the consecutive count.
+        // The total is left alone: it is the session's history and the thing
+        // the occlusion reading is checked against.
+        S.present_stall_run = 0;
     }
     return true;
 }
