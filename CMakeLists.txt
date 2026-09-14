@@ -38,6 +38,12 @@ add_library(mgpu_bridge SHARED
     # no font file, no ImGui - so it renders in exactly the situation where
     # nothing else can: an empty reshade-shaders folder.
     src/screen.cpp
+    # SL1: the Streamline interposer probe. Self-contained like the three
+    # above - it holds no ReShade types and no gpu1_context types, every
+    # interface arrives as a void*, and the whole instrument is one
+    # documented QueryInterface. No new link library: version.dll is
+    # resolved at run time, the way d3dcompiler_47 already is.
+    src/sl_probe.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
