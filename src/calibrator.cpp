@@ -973,7 +973,7 @@ void report_hits(int probe_mode)
             DWORD old = 0;
             if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
             {
-                *slot = (void *)(uintptr_t)0xD1AGD1AGD1AGD1AGull;
+                *slot = (void *)(uintptr_t)0xD1A6D1A6D1A6D1A6ull;
                 after = (unsigned long long)(uintptr_t)*slot;
                 *slot = (void *)(uintptr_t)before;
                 VirtualProtect(slot, sizeof(void *), old, &old);
