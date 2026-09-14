@@ -173,6 +173,42 @@ void *acquire_native(void *iface)
     return reinterpret_cast<void *>(nat);
 }
 
+// ---- SL4. See sl_probe.hpp. ----
+void report_object(const char *what, void *iface)
+{
+    if (what == nullptr) return;
+
+    void *nat = nullptr;
+    const kind k = classify(iface, &nat);
+
+    char line[1200];
+    int w = snprintf(line, sizeof line,
+        "[MGPU][SL4] OBJECT CHECK: %s = %s (0x%p", what, kind_name(k), iface);
+    if (k == kind::proxy && w > 0 && w < (int)sizeof line)
+        w += snprintf(line + w, sizeof line - (size_t)w, " -> native 0x%p)", nat);
+    else if (w > 0 && w < (int)sizeof line)
+        w += snprintf(line + w, sizeof line - (size_t)w, ")");
+
+    if (w > 0 && w < (int)sizeof line)
+        snprintf(line + w, sizeof line - (size_t)w,
+            ". HOW TO READ IT. The census asks this of the DEVICE and has always "
+            "answered native. This asks it of an object on the path the "
+            "2026-09-14 crash actually took: add-on -> ReShade's dxgi proxy -> "
+            "sl.interposer -> sl.dlss_g -> sl.common, faulting on a null read "
+            "while the bridge created its factory on the SECOND adapter. "
+            "SL-PROXY here means sl.interposer wrapped an object WE created for "
+            "an adapter it was never told about, and every call we make on it "
+            "re-enters Streamline - including the swapchain calls made THROUGH a "
+            "wrapped factory, because a factory hands out the objects it makes. "
+            "native means this object is not wrapped, which does NOT prove the "
+            "creating call stayed out of the interposer - only that what came "
+            "back is clean. The route and the result are different questions and "
+            "this line answers the second one.");
+
+    if (k == kind::proxy) mgpu::diag::warn(line);
+    else                  mgpu::diag::info(line);
+}
+
 bool interposer_resident()
 {
     return GetModuleHandleW(L"sl.interposer.dll") != nullptr;
@@ -319,10 +355,18 @@ void report_import_provenance()
                             if (*p == L'\\' || *p == L'/') leaf = p + 1;
                         if (_wcsnicmp(leaf, L"sl.", 3) == 0) via_sl = true;
 
-                        if (w >= 0 && w < (int)sizeof out - 200)
+                        // SL4. FULL PATH, not the leaf. This line used to print
+                        // "dxgi.dll" and there are TWO of those in the process -
+                        // ReShade's proxy beside the exe and the system copy in
+                        // System32, at different bases. The 2026-09-14 stack says
+                        // our factory call went through the proxy; the leaf name
+                        // could never have told us that, which made the
+                        // instrument unable to answer the one question it exists
+                        // for.
+                        if (w >= 0 && w < (int)sizeof out - 320)
                             w += snprintf(out + w, sizeof out - (size_t)w,
                                           " | %s -> %ls (0x%p)", WANT[i],
-                                          (path[0] != L'\0') ? leaf : L"unknown", bound);
+                                          (path[0] != L'\0') ? path : L"unknown", bound);
                     }
                 }
             }

@@ -401,10 +401,24 @@ bool create_present_chain(HWND hwnd)
         // The in-tree precedent (adapter.cpp, T2): CreateDXGIFactory2 with
         // the requested interface. IDXGIFactory2 is the surface that has
         // CreateSwapChainForHwnd and MakeWindowAssociation.
+        // SL4. SAY IT BEFORE IT HAPPENS. The 2026-09-14 dump faulted on this
+        // exact call: add-on -> ReShade's dxgi proxy -> sl.interposer ->
+        // sl.dlss_g -> sl.common+0x611AA, a null read, while the bridge was
+        // building its present chain on the SECOND adapter. If this is the
+        // last line in a log, that is where it died and the stack is already
+        // written down in STARTUP_CRASH_LEDGER.
+        mgpu::diag::info(
+            "[MGPU][SL4] creating the bridge's DXGI factory. IF THIS IS THE LAST LINE, IT DIED "
+            "INSIDE CreateDXGIFactory2 - which on a Streamline title means the interposer, not "
+            "DXGI. Nothing is bypassed here; this build only measures.");
+
         const HRESULT fhr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2),
                                                reinterpret_cast<void **>(&factory));
         if (FAILED(fhr))
             return fail("CreateDXGIFactory2", fhr);
+
+        // SL4. Read-only: one documented QueryInterface, reference released.
+        mgpu::slprobe::report_object("bridge DXGI factory", factory);
 
         // The desc is flat (gotcha 4): no BufferDesc, no OutputWindow, no
         // Windowed member - the HWND is a parameter of
@@ -442,6 +456,11 @@ bool create_present_chain(HWND hwnd)
             static_cast<IUnknown *>(queue), hwnd, &scd, nullptr, nullptr, &sc1);
         if (FAILED(swapchain_hr))
             return fail("CreateSwapChainForHwnd", swapchain_hr);
+
+        // SL4. The object a possibly-wrapped factory just handed us. A factory
+        // hands out the objects it makes, so if the factory is a proxy this
+        // one is too - and the swapchain is what DLSS Frame Generation wraps.
+        mgpu::slprobe::report_object("bridge swapchain", sc1);
 
         // Gotcha 5: without this, DXGI installs its own message hook on
         // our window and Alt+Enter toggles it to fullscreen - on the

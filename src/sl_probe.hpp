@@ -123,4 +123,22 @@ namespace mgpu::slprobe
     //
     // Said once, from report().
     void report_import_provenance();
+
+    // ---- SL4: CLASSIFY ONE OBJECT WE JUST CREATED, AND SAY SO ----
+    //
+    // WHAT IT ANSWERS. The 2026-09-14 crash dump put the fault inside
+    // sl.common, reached from sl.dlss_g, reached from sl.interposer, reached
+    // from ReShade's dxgi.dll proxy, reached from THIS add-on - while the
+    // bridge was creating its DXGI factory on the second adapter. The census
+    // asks the escape-GUID question of the DEVICE and gets `native`. Nothing
+    // has ever asked it of the FACTORY or the SWAPCHAIN, which are the objects
+    // actually on that path.
+    //
+    // Read-only, one QueryInterface, the same documented GUID the census
+    // already uses. Nothing is created, kept or unwrapped: the reference
+    // QueryInterface takes is released before this returns.
+    //
+    // `what` is a short label that appears verbatim in the line, so the call
+    // site names itself - "bridge DXGI factory", "bridge swapchain".
+    void report_object(const char *what, void *iface);
 }
