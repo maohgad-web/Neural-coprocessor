@@ -338,6 +338,12 @@ void capture(const NVSDK_NGX_Parameter *p)
                         std::memory_order_relaxed);
 }
 
+// R121. ngx_module() is defined further down, beside the data scan that first
+// needed it. The hooks below now resolve late as a second line of defence, so
+// they need it too - declared here rather than moved, because moving it would
+// reorder a file this round has no other reason to touch.
+HMODULE ngx_module();
+
 // ---- THE HOOKS ----
 
 NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
@@ -446,6 +452,21 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
         }
     }
 
+    // R121. Same late resolve as hook_create, for the same reason. Evaluate's
+    // failure mode is different - it has no out-handle, so the caller is told
+    // Fail and nothing is left dangling - but a DLSS evaluate that silently
+    // fails for a whole window is a black frame, and the fix costs one lookup.
+    if (g_real_eval == nullptr)
+    {
+        HMODULE ngx = ngx_module();
+        if (ngx != nullptr)
+        {
+            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_EVAL)
+                                             : GetProcAddress(ngx, NAME_EVAL));
+            if (late != nullptr && late != (void *)&hook_evaluate)
+                g_real_eval = (pf_evaluate)late;
+        }
+    }
     if (g_real_eval == nullptr) return NVSDK_NGX_Result_Fail;
     return g_real_eval(cl, h, p, cb);
 }
@@ -457,7 +478,40 @@ NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
 {
     g_creates.fetch_add(1, std::memory_order_relaxed);
 
-    if (g_real_create == nullptr) return NVSDK_NGX_Result_Fail;
+    // ---- R121: NEVER RETURN WITHOUT ANSWERING THE OUT-HANDLE ----
+    //
+    // The ordering fix above closes the window that made this reachable. This
+    // is the second line of defence, because the failure it produced was a
+    // crash in somebody else's module and the cost of being wrong again is
+    // too high to rely on one fix.
+    //
+    // Two changes. FIRST, try to resolve the real entry point here rather
+    // than giving up - by the time anything calls us the NGX module is loaded
+    // by definition, so a late resolve almost always succeeds. SECOND, if it
+    // genuinely cannot be resolved, ZERO THE OUT-HANDLE before returning
+    // Fail. A caller that ignores the result and dereferences *out then reads
+    // a null it can be blamed for, instead of whatever was on its stack.
+    if (g_real_create == nullptr)
+    {
+        HMODULE ngx = ngx_module();
+        if (ngx != nullptr)
+        {
+            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_CREATE)
+                                             : GetProcAddress(ngx, NAME_CREATE));
+            if (late != nullptr && late != (void *)&hook_create)
+                g_real_create = (pf_create)late;
+        }
+    }
+    if (g_real_create == nullptr)
+    {
+        if (out != nullptr) *out = nullptr;
+        mgpu::diag::error(
+            "[MGPU][R121] CreateFeature reached our hook with no real entry point behind it. "
+            "Returning Fail with the out-handle zeroed. THIS SHOULD NOW BE UNREACHABLE: the "
+            "real pointer is published before any slot is patched. If this line appears, the "
+            "ordering fix did not take and the window it closed is open again.");
+        return NVSDK_NGX_Result_Fail;
+    }
     const NVSDK_NGX_Result r = g_real_create(cl, id, p, out);
 
     if (ok(r) && out != nullptr && *out != nullptr &&
@@ -730,6 +784,34 @@ unsigned scan_cached_pointers()
     // Already ours: a previous scan took. Nothing to do.
     if (ev == (void *)&hook_evaluate) return 0;
 
+    // ---- R121: PUBLISH THE REAL POINTERS BEFORE PATCHING A SINGLE SLOT ----
+    //
+    // THIS ORDERING IS THE BUG. These two assignments used to sit AFTER the
+    // module walk below, in the `if (hits != 0)` block. The walk crosses 150+
+    // modules and was MEASURED at 33-46 ms. For that entire window, a slot in
+    // sl.common.dll already pointed at hook_create while g_real_create was
+    // still null - so anything that called CreateFeature during the walk hit
+    // the early-out in hook_create, got NVSDK_NGX_Result_Fail, and got its
+    // out-handle left untouched. A caller that then dereferences that handle
+    // reads address zero, inside sl.common.dll.
+    //
+    // That is the reported crash exactly: 0xC0000005, READ at 0x0, inside
+    // sl.common.dll, only when the calibrator installs, identical for Calib=1
+    // and Calib=2 because both install the same way.
+    //
+    // WHY IT IS ONE-IN-TEN ON ONE RIG AND EVERY TIME ON ANOTHER. It is a race
+    // against a 33 ms window. A machine that calls CreateFeature inside that
+    // window crashes every launch; one that calls it afterwards never does.
+    // Nothing about the machines needs to differ except when the title gets
+    // round to creating its feature - which is why this looked like a
+    // poison, a residue and a timing quirk in turn.
+    //
+    // The fix is free: the addresses are already resolved above. Publish them
+    // first and the window does not exist. Guarded so a rescan cannot
+    // overwrite a good pointer with a stale one.
+    if (g_real_eval == nullptr) g_real_eval = (pf_evaluate)ev;
+    if (cr != nullptr && g_real_create == nullptr) g_real_create = (pf_create)cr;
+
     unsigned hits = 0;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -774,8 +856,10 @@ unsigned scan_cached_pointers()
 
     if (hits != 0)
     {
-        g_real_eval = (pf_evaluate)ev;
-        if (cr != nullptr) g_real_create = (pf_create)cr;
+        // R121. The two assignments that used to be here have moved ABOVE the
+        // walk. Leaving them here as well would be harmless but would leave
+        // two places that look like they establish the same fact, and the
+        // whole defect was that this one ran too late.
         g_dslots.fetch_add(hits, std::memory_order_relaxed);
         g_resolved.fetch_add(1, std::memory_order_relaxed);
     }
