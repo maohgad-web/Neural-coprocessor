@@ -36,6 +36,7 @@
 #include "diag.hpp"
 #include "mgpu_ini_parser.hpp"
 #include "probe.hpp"
+#include "sl_probe.hpp"   // SL1
 
 namespace mgpu
 {
@@ -2350,6 +2351,13 @@ void dump()
                     "only reading that makes optical flow or NGX hooking the honest next step. "
                     "Two of the barriers per frame on the published source are OURS.");
                 mgpu::diag::info(r2);
+
+                // SL1. Said once, and only once a lane has fired, so an
+                // early dump reports earliness rather than blindness.
+                mgpu::slprobe::report_acquisition(
+                    g_bind_fires.load(std::memory_order_relaxed),
+                    g_rp_fires.load(std::memory_order_relaxed),
+                    g_bar_fires.load(std::memory_order_relaxed));
             }
         }
 

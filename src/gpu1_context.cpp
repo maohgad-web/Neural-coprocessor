@@ -27,6 +27,7 @@
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
+#include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 
 // P1.0: the NGX headers, fetched by CI into ext/ngx/ and never committed
 // (THIRD_PARTY.md, "NVIDIA NGX headers"). CMakeLists.txt is closed and
@@ -232,6 +233,12 @@ bool create_device(const adapter::selection_result &sel)
              "second adapter; game rendering unaffected",
              (unsigned)luid.HighPart, (unsigned)luid.LowPart);
     mgpu::diag::info(line);
+
+    // SL1. The device exists and nothing has been built on it yet, which
+    // is the only moment where the answer is still free. If sl.interposer
+    // wrapped it, every call we make from here re-enters Streamline.
+    mgpu::slprobe::report(dev, nullptr);
+
     return true;
 }
 

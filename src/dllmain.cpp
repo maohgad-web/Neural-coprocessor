@@ -77,6 +77,7 @@
 #include "gpu1_context.hpp"
 #include "calibrator.hpp"
 #include "probe.hpp"
+#include "sl_probe.hpp"   // SL1
 #include "worker.hpp"
 
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
@@ -214,6 +215,11 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             {
                 if (auto *sd12 = reinterpret_cast<ID3D12Device *>(sd->get_native()))
                 {
+                    // SL1. Stored, not queried here: the census line wants
+                    // both devices and this is the side that can see the
+                    // game's. No reference is taken.
+                    mgpu::slprobe::note_game_device(sd12);
+
                     const LUID sl = sd12->GetAdapterLuid();
                     sc_is_game = (sl.LowPart == ssel.game_luid.LowPart &&
                                   sl.HighPart == ssel.game_luid.HighPart);
