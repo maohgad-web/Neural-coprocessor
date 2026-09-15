@@ -28,7 +28,23 @@ choice_result choose_adapter(const choice_input *entries, std::size_t count,
         out.game_luid_found = out.game_luid_found || game_match;
         if (entries[i].software)
             continue;
+
+        // `hardware` stays a count of PHYSICAL adapters, including ones that
+        // cannot run the neural stage. It is only consulted by the rule 4
+        // gate below, whose question is "how many real GPUs are in this
+        // machine" - and an iGPU is a real GPU. Narrowing it here would
+        // change that gate's meaning for a reason unrelated to it.
         hardware.push_back(i);
+
+        // R131. What DOES narrow is candidacy. An adapter that cannot run
+        // the neural stage is not a thing to select, so it must not reach
+        // the tiebreak and must not be able to make it ambiguous. This is
+        // strictly narrowing: it can only remove an adapter that would have
+        // failed after selection, so no selection that succeeds today
+        // changes.
+        if (!entries[i].neural_capable)
+            continue;
+
         if (!game_match)
             candidates.push_back(i);
     }

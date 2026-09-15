@@ -11,6 +11,23 @@ namespace mgpu::adapter
         LUID luid{};
         bool software = false;
         UINT outputs = 0;
+
+        // R131. Can this adapter run the neural stage at all?
+        //
+        // The stage is DLSS Neural Rendering, which needs an NVIDIA RTX
+        // adapter. An integrated AMD or Intel GPU is hardware, is not
+        // software, and could never have been a valid selection - but until
+        // R131 it entered the candidate list anyway, and on a machine with a
+        // display attached to it, it made the rule 4 tiebreak ambiguous and
+        // the whole selection refuse. Reported against 0.2.2 on a rig with
+        // three adapters carrying displays by design.
+        //
+        // DEFAULTS TRUE so that every existing aggregate initialiser - the
+        // test file included - keeps its meaning. The vendor rule itself
+        // lives in adapter.cpp beside the enumeration that owns vendor ids
+        // and does the logging, exactly as `software` already does. This
+        // file stays pure policy and knows no vendor numbers.
+        bool neural_capable = true;
     };
 
     struct choice_result

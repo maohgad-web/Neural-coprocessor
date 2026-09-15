@@ -291,7 +291,17 @@ namespace
             const bool is_software =
                 (S.table[i].flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
                 S.table[i].vendor_id == 0x1414;
-            policy.push_back({S.table[i].luid, is_software, S.table[i].outputs});
+
+            // R131. The neural stage is DLSS Neural Rendering and it needs an
+            // NVIDIA adapter. 0x10DE is NVIDIA. Anything else is real
+            // hardware that could never have run the stage, so it is
+            // enumerated, logged, and never a candidate - the same contract
+            // `software` has had since rule 3, with its own line because
+            // calling an AMD iGPU "software" in a log would be a lie.
+            const bool neural_capable = (S.table[i].vendor_id == 0x10DE);
+
+            policy.push_back({S.table[i].luid, is_software, S.table[i].outputs,
+                              neural_capable});
             if (is_software)
             {
                 snprintf(line, sizeof line,
@@ -302,6 +312,18 @@ namespace
                 continue;
             }
             hw.push_back(i);
+            if (!neural_capable)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] adapter[%zu] not neural-capable (vendor=0x%04X, not NVIDIA "
+                         "0x10DE) - real hardware, counted as a GPU, never a candidate. DLSS "
+                         "Neural Rendering does not run here, so selecting it could only fail "
+                         "later. A display attached to this adapter is fine and is ignored by "
+                         "the rule 4 tiebreak.",
+                         i, (unsigned)S.table[i].vendor_id);
+                mgpu::diag::info(line);
+                continue;
+            }
             if (!luid_eq(S.table[i].luid, game))
                 cand.push_back(i);
         }
