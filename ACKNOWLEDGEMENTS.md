@@ -104,6 +104,14 @@ makes the offload figure mean anything.
   quantised local model that drafted P0, and the model behind it.
 - **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** and **LM
   Studio** — what made running that model on this hardware possible at all.
+  
+  **Special K** (https://github.com/SpecialKO/SpecialK) is what makes the
+single-display workaround possible. Its input and window handling is what lets
+a game keep receiving input while the bridge window sits on top of it.
+
+No Special K code is included here. `workarounds/single-display/` carries a
+configuration file for it and nothing else. Special K is not affiliated with
+this project and its authors have not endorsed this use of it.
 
 Thank you to all of them. Mistakes in this repository are ours, not theirs.
 
