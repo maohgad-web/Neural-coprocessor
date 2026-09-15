@@ -117,6 +117,39 @@ int main()
     check_case("ambiguous output tiebreak", ambiguous_output, 3, luid(0, 60),
                false, static_cast<std::size_t>(-1), true, false);
 
+    // R131. An adapter that cannot run the neural stage is real hardware but
+    // never a candidate. Without the filter this topology - game card, a
+    // capable second card, and an iGPU with a display - has two candidates
+    // with outputs and refuses as ambiguous. With it, exactly one candidate
+    // remains and the selection is direct rather than degenerate.
+    const choice_input igpu_with_display[] = {
+        {luid(0, 80), false, 1, true},   // game card
+        {luid(0, 81), false, 1, true},   // the second NVIDIA card
+        {luid(0, 82), false, 1, false},  // iGPU, display attached on purpose
+    };
+    check_case("iGPU with a display is never a candidate", igpu_with_display, 3,
+               luid(0, 80), true, 1, true, false);
+
+    // The same topology WITHOUT the filter is the 0.2.2 failure, kept as a
+    // test so the regression is visible rather than remembered.
+    const choice_input igpu_unfiltered[] = {
+        {luid(0, 80), false, 1, true},
+        {luid(0, 81), false, 1, true},
+        {luid(0, 82), false, 1, true},
+    };
+    check_case("three capable adapters with outputs still refuse",
+               igpu_unfiltered, 3, luid(0, 80), false,
+               static_cast<std::size_t>(-1), true, false);
+
+    // A non-capable adapter must not stop the game's own LUID being found,
+    // and must not be selectable even when it is the only non-game adapter.
+    const choice_input only_igpu[] = {
+        {luid(0, 90), false, 1, true},
+        {luid(0, 91), false, 1, false},
+    };
+    check_case("iGPU as the only non-game adapter refuses", only_igpu, 2,
+               luid(0, 90), false, static_cast<std::size_t>(-1), true, false);
+
     // LUID comparison must include HighPart; matching only LowPart would
     // incorrectly treat the second entry as the game adapter.
     const choice_input high_luid_mismatch[] = {
