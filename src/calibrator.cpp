@@ -179,6 +179,78 @@ unsigned long long g_eval_last_frame = 0xFFFFFFFFFFFFFFFFull;
 std::atomic<unsigned long long> g_sr_handle{0};
 std::atomic<bool> g_handle_known{false};
 
+// ---- R135: A SET OF SCENE FEATURES, NOT ONE ----
+//
+// The comment above says "only one of them carries the parameter block we
+// want" and that turned out to be false. MEASURED on Cyberpunk 2077,
+// 2026-09-15, one in-game toggle and nothing else changed:
+//
+//   Ray Reconstruction OFF -> [R134] id=1  | sr-handle=known
+//                             eval-copies=7732 eval-skips=0    | copies=7105
+//   Ray Reconstruction ON  -> [R134] id=13 | sr-handle=UNFILTERED
+//                             eval-copies=0 eval-skips=4219    | copies=0
+//
+// With Ray Reconstruction on, this title creates NO SuperSampling feature at
+// all. The latch below fired only on SuperSampling, so nothing was ever
+// latched, every evaluate failed the handle test, and all 4219 of them were
+// skipped - correctly, by a guard doing exactly what it was written to do.
+// Depth kept crossing throughout, which is what made it read as "this title
+// has no velocity buffer". Reported against 0.2.2 by the issue 15 reporter,
+// who had reached the same zero on his own rig and reasonably blamed Calib.
+//
+// SO THE FIX IS THE INPUT SET, NOT THE RULE. Latch every id known to consume
+// the SCENE's motion vectors; latch nothing else. Frame generation stays out
+// by simply never being added - which matters, because it is the feature that
+// caused the corruption this guard exists to prevent: measured on A Plague
+// Tale, eval-copies=6002 against 3001 sealed frames, exactly 2:1, every frame
+// getting the scene's vectors overwritten by frame generation's.
+//
+// FOUR SLOTS. If a title ever creates more scene features than that, the log
+// says so and the set is full rather than silently wrong.
+constexpr unsigned int SCENE_FEATURE_SLOTS = 4u;
+std::atomic<unsigned long long> g_scene_handles[SCENE_FEATURE_SLOTS];
+std::atomic<unsigned int> g_scene_handle_n{0};
+
+// 13 IS A MEASUREMENT, NOT A HEADER CONSTANT. It is the id this title creates
+// with Ray Reconstruction enabled, read off the [R134] line. It is written as
+// a number on purpose: the SDK header available to this build does not name
+// it, and inventing an enum name for a value nobody has verified is how the
+// wrong feature gets latched. If a future SDK names it, replace the literal
+// and keep this note.
+constexpr unsigned int FEATURE_ID_RAY_RECONSTRUCTION = 13u;
+
+// Is this an id whose evaluate carries the scene's motion vectors?
+bool is_scene_feature(unsigned int idv)
+{
+    return idv == (unsigned int)NVSDK_NGX_Feature_SuperSampling ||
+           idv == FEATURE_ID_RAY_RECONSTRUCTION;
+}
+
+// Latch, if it is not already in the set. Create is rare - a handful of calls
+// per launch - so a linear scan is the right shape and no lock is needed.
+void latch_scene_handle(unsigned long long hv)
+{
+    const unsigned int n = g_scene_handle_n.load(std::memory_order_relaxed);
+    for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
+        if (g_scene_handles[i].load(std::memory_order_relaxed) == hv) return;
+    if (n >= SCENE_FEATURE_SLOTS) return;
+    g_scene_handles[n].store(hv, std::memory_order_relaxed);
+    // RELEASE, paired with the acquire in is_latched_scene_handle: the handle
+    // has to be visible before the count that makes it readable. Writers are
+    // the game's own CreateFeature path and are effectively serialised, so the
+    // scan above needs nothing stronger.
+    g_scene_handle_n.store(n + 1u, std::memory_order_release);
+}
+
+// The evaluate-side test. Replaces a single == against g_sr_handle.
+bool is_latched_scene_handle(unsigned long long hv)
+{
+    const unsigned int n = g_scene_handle_n.load(std::memory_order_acquire);
+    for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
+        if (g_scene_handles[i].load(std::memory_order_relaxed) == hv) return true;
+    return false;
+}
+
 // The create flags, latched at CreateFeature. They are a CREATE-time fact, so
 // the evaluate path cannot be relied on to carry them - but it is tried there
 // too, because Streamline builds its own block and may keep them in it.
@@ -410,10 +482,12 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
                 // deserve the same permissiveness.
                 const unsigned long long fr =
                     g_frames.load(std::memory_order_relaxed);
+                // R135. Any LATCHED scene feature, not just SuperSampling.
+                // The rule is unchanged - an unidentified handle still copies
+                // nothing - only the set of identified handles grew.
                 const bool sr_ok =
                     g_handle_known.load(std::memory_order_relaxed) &&
-                    ((unsigned long long)(uintptr_t)h ==
-                     g_sr_handle.load(std::memory_order_relaxed));
+                    is_latched_scene_handle((unsigned long long)(uintptr_t)h);
 
                 if (!sr_ok || g_eval_last_frame == fr)
                 {
@@ -549,27 +623,36 @@ NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
             char fl[420];
             snprintf(fl, sizeof fl,
                      "[MGPU][R134] GAME CreateFeature: id=%u result=0x%08X handle=%p%s. "
-                     "SuperSampling is id=%u and is the ONLY id the evaluate-copy filter "
-                     "latches on - any other id here evaluates and is skipped, which reads "
-                     "as eval-copies=0 with eval-skips climbing and a motion vector lane "
-                     "that carries nothing. If this line names an id that is not %u on a "
-                     "title whose vectors never arrive, THAT is the number the filter has "
-                     "to learn.",
+                     "R135: the evaluate-copy filter latches the SCENE features - id=%u "
+                     "(SuperSampling) and id=%u (measured as Ray Reconstruction on "
+                     "Cyberpunk 2077) - and nothing else. An id absent from that set "
+                     "evaluates and is skipped on purpose, which reads as eval-copies=0 "
+                     "with eval-skips climbing and a lane that carries nothing while depth "
+                     "keeps working. Frame generation is excluded deliberately: copying "
+                     "from it overwrote the scene's vectors every frame on A Plague Tale. "
+                     "IF THIS LINE NAMES AN ID OUTSIDE THE SET ON A TITLE WHOSE VECTORS "
+                     "NEVER ARRIVE, that is the next number to measure - do not guess it.",
                      idv, (unsigned)r,
                      (out != nullptr) ? (void *)*out : nullptr,
-                     (idv == (unsigned int)NVSDK_NGX_Feature_SuperSampling)
-                         ? " <- SuperSampling, the latch fires on this one" : "",
+                     is_scene_feature(idv)
+                         ? " <- scene feature, the latch fires on this one"
+                         : " <- NOT a latched scene feature, evaluates from it are skipped",
                      (unsigned int)NVSDK_NGX_Feature_SuperSampling,
-                     (unsigned int)NVSDK_NGX_Feature_SuperSampling);
+                     FEATURE_ID_RAY_RECONSTRUCTION);
             mgpu::diag::info(fl);
         }
     }
 
     if (ok(r) && out != nullptr && *out != nullptr &&
-        id == NVSDK_NGX_Feature_SuperSampling)
+        is_scene_feature((unsigned int)id))
     {
+        // R135. g_sr_handle keeps its old meaning - the most recent scene
+        // feature - because the census and the R101 report line both read it
+        // and neither should change shape for this. The SET is what the
+        // evaluate filter now tests against.
         g_sr_handle.store((unsigned long long)(uintptr_t)(*out),
                           std::memory_order_relaxed);
+        latch_scene_handle((unsigned long long)(uintptr_t)(*out));
         g_handle_known.store(true, std::memory_order_relaxed);
 
         // THE ONE PLACE THE CREATE FLAGS ARE GUARANTEED TO EXIST. Read here,
