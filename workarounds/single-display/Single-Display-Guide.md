@@ -36,7 +36,7 @@ If you would rather watch it: https://youtu.be/\_K1H3mgcHy4
 
 1. Install Special K.
 
-2. Download `Single-display.txt` from the folder this guide is in.
+2. Download `Single-Display.txt` from the folder this guide is in.
 
 3. Open it and put its contents into:
    
