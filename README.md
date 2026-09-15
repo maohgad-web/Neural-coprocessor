@@ -143,7 +143,7 @@ See `assets/README.txt` for complete installation instructions. Critical require
 
 Anything else is structural rather than a missing feature. The bridge presents the second card's output through its own swapchain, in its own window, so it needs somewhere to put that window. Sharing one screen with the game means presenting into the game's swapchain instead, which is a different architecture.
 
-It can still be made to work. With the display on the neural card and a third\-party tool handling input, one monitor runs here \- a controller is required, because with the bridge window on top the mouse cannot reach the game. Unmeasured beyond a single comparison, and liable to break when any of the pieces update. Write\-up in [workarounds/single\-display](https://github.com/maohgad-web/Neural-coprocessor/tree/main/workarounds/single-display).
+**One display, only one card connected.** It can still be made to work, on one cable, one display, two GPUs \- with the card that renders the game the one that has nothing plugged into it. The display goes on the neural card, a third\-party tool handles input, and a controller is required, because with the bridge window on top the mouse cannot reach the game.  Write\-up in [workarounds/single\-display](https://github.com/maohgad-web/Neural-coprocessor/tree/main/workarounds/single-display).
 
 Two cables from two cards into one monitor was explored and did not reach anything worth shipping. A pull request is welcome if you find an arrangement that does.
 
