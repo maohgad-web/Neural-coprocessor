@@ -3,6 +3,16 @@
 Two machines, one game. Read the limitations section before quoting anything
 here.
 
+> **Every performance figure in this document was measured on 0.1.0 and has not
+> been re-measured since.** That matters more than a version number usually
+> does, because 0.1.0 sent the colour buffer and nothing else. 0.2.0 added the
+> game's depth and velocity buffers to the same link - on a 4K title the depth
+> lane alone is 33.2 MB per frame - so the transport these figures were taken
+> over is not the transport the current build runs. The architectural result in
+> section 4 is about *where the neural work executes* and does not depend on
+> payload size. The absolute frame rates, and section 6 in particular, do.
+> Re-measuring 0.2.x is open work.
+
 ## Where to look first
 
 **Rig B, section 4b, is the complete measurement.** Three arms at one
@@ -136,8 +146,11 @@ Not matched, and unmatchable:
 - RenoDX hooks at its own chosen point (`HookPoint=5`, order 2); the bridge
   hooks at ReShade's present. Different insertion points in the frame.
 
-The bridge feeds colour and motion vectors only. Depth is null. Tone and
-strength parameters are wired but unset.
+**As measured, the bridge fed colour only**, with motion derived from colour on
+the second card and depth null. Tone and strength parameters were wired but
+unset. Since 0.2.0 the bridge sends the engine's real depth and velocity buffers
+instead, which is a change to the very arm measured here - one more reason these
+figures describe 0.1.0 rather than the current build.
 
 ---
 
@@ -213,8 +226,8 @@ The frame-rate gap is not the finding. The **shape** is.
 
 Across the full DLSS range, from DLAA down to Ultra Performance:
 
-- RenoDX local gains **+30%** (43.5 → 56.5)
-- Offloaded gains **+65%** (48 → 79)
+- RenoDX local gains **+30%** (43.5 -> 56.5)
+- Offloaded gains **+65%** (48 -> 79)
 
 With neural rendering local, the neural stage saturates the render GPU. Lowering
 the render resolution frees capacity that the neural stage immediately consumes,
@@ -352,16 +365,44 @@ per-frame transport cost does not fall when the game renders at a lower
 internal resolution, because the frame transported is always the output frame.
 
 It does not flatten. Frame rate climbs across the whole range at both
-resolutions, and the 1440p → 1080p gain is roughly constant at ~45% in every
-DLSS mode. On this rig, at these resolutions, the link is not the limit.
+resolutions, and the 1440p -> 1080p gain is roughly constant at ~45% in every
+DLSS mode. On this rig, at these resolutions, **with a colour-only payload**,
+the link is not the limit.
+
+**That qualifier is doing real work now, and a user rig has already found the
+other side of it.** This section was measured on 0.1.0, when one lane crossed.
+0.2.0 crosses three. A reported dual-RTX-5090 machine with the second card on a
+chipset-fed PCIe 4.0 x4 link measured the three lanes demanding about 11 GB/s at
+160 fps against roughly 7 GB/s available, and 65% of frames were skipped as a
+result - 1201 of 1850. Nothing failed and no frame was mis-sealed. The producer
+copies at the game's rate rather than the consumer's, so the excess bandwidth is
+spent on frames that nothing ever evaluates.
+
+Two things follow and neither is settled: a throttle paced to the consumer would
+pay for itself on a link that narrow, and block compression - `bc=0
+(unimplemented)` in every seal line - is the lever that would halve the colour
+and depth lanes. **The claim that survives unchanged is the narrow one. On the
+rigs in this document, at these resolutions, with the payload of the build that
+was measured, the link was not the limit.**
 
 ---
 
 ## 7. Limitations
 
 **Stability is untested beyond the durations recorded here**, sessions of
-minutes, not hours. The longest clean run was 16,775 frames (~5.5 minutes) with
-the transport reporting no gaps throughout.
+minutes, not hours. The longest run recorded with a retained log is a
+**twenty-minute two-pass session** that sat at 174 W of a 180 W limit and was
+completely stable throughout - the run that ruled out simple power saturation as
+the explanation for the six-pass failure below. Two shorter sessions carry the
+transport evidence: 16,775 frames with no gaps reported, and 16,958 frames with
+zero dropped, reordered or stale seals, which is the measurement `RingWindow=1`
+was settled on.
+
+Longer sessions have been run without a retained log, and are stated that way
+rather than counted. An earlier revision of this section gave 5.5 minutes as the
+longest clean run; that was the longest one whose log was still to hand at the
+time of writing, not the longest that had happened, and it understated what the
+build had actually survived.
 
 ~~One session ended with the game rendering black on both displays after several
 minutes; the bridge logged no fault and no device removal, and the cause was not
@@ -383,10 +424,37 @@ filed as a curiosity rather than as the one open safety question. **Scope is a
 judgement about what a result depends on, not a reason to leave the only
 dangerous observation unexamined.**
 
+**Engine motion vectors can need the game to be running DLSS or DLAA.** Measured
+on a Frostbite title for 0.2.2: 98% of frames carried real vectors with DLSS on,
+96% with DLAA, none at all with TAA. Where an engine writes velocity with a
+compute shader instead of to a render target, the only place the lane can read
+it is the title's own DLSS call, and with no DLSS feature there is nothing to
+read. Neural rendering still runs in that state and depth still crosses; the
+model falls back to deriving motion from colour, which is what 0.1.0 ran on.
+Whether this holds on other engines is not established.
+
+**The present chain can stall, and it is not fixed.** GPU 1's present fence
+occasionally stops advancing while the device stays healthy and the fence sits
+exactly one behind. It is rare, it has not been isolated, and the shipped build
+fails fast and asks the player to restart rather than hanging silently. Any run
+that ends this way produced no measurement and none is recorded here.
+
+**This is an add-on-enabled ReShade build reading a game's depth buffer and
+patching import tables in a live process.** Every figure here was taken in
+single player, offline. The README's anti-cheat section is where the
+consequences of running it anywhere else are set out, and they are the reader's
+risk to carry rather than something this document can measure away.
+
 **One game, one scene, two machines.** Both are dual RTX 5060 Ti 16 GB. Nothing
 here says how this scales to higher-tier cards, and no claim is made that it
 does - a bigger card changes both the render cost and the neural cost, and which
 one moves further is not something this project has measured.
+
+**Titles have been run since without producing figures.** Resonance - A Plague
+Tale Legacy, CONTROL, DragonSword Awakening, Cyberpunk 2077, The Blood of
+Dawnwalker, a Frostbite title and a UE5 title have all completed bounded runs
+that armed and exited cleanly on 0.2.x. Those are launch and transport checks,
+not benchmarks, and none of them appears as a number in this document.
 
 **Quality is not assessed here.** Image quality under this architecture is a
 separate question requiring exposure-normalised comparison and is deliberately
