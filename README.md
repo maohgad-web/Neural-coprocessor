@@ -139,13 +139,14 @@ See `assets/README.txt` for complete installation instructions. Critical require
 
 ## Display setup
 
-**Two displays, extended.** That is the supported configuration and the only one measured. Each card drives its own screen, which keeps their work separate and is what makes a log readable when something goes wrong.
+**Two displays, extended, one per card.** That is the supported configuration and the only one measured.
 
-A single display is not supported, and the reason is structural rather than a missing feature. The bridge presents the second card's output through its own swapchain, in its own window. With one screen that window has to share glass with the game, and getting it there reliably means presenting into the game's swapchain instead - a different architecture, not a setting.
+Anything else is structural rather than a missing feature. The bridge presents the second card's output through its own swapchain, in its own window, so it needs somewhere to put that window. Sharing one screen with the game means presenting into the game's swapchain instead, which is a different architecture.
 
-**There is a workaround, and it is not supported either.** With the display on the neural card and a third-party tool handling input, one monitor does work here. It requires a controller, because with the bridge window on top the mouse cannot reach the game. Nothing about it is guaranteed, nothing about it is measured beyond a single comparison, and it may stop working when any of the pieces update. If that is an acceptable trade, it is written up in [workarounds/single-display](https://github.com/maohgad-web/Neural-coprocessor/tree/main/workarounds/single-display).
+It can still be made to work. With the display on the neural card and a third\-party tool handling input, one monitor runs here \- a controller is required, because with the bridge window on top the mouse cannot reach the game. Unmeasured beyond a single comparison, and liable to break when any of the pieces update. Write\-up in [workarounds/single\-display](https://github.com/maohgad-web/Neural-coprocessor/tree/main/workarounds/single-display).
 
-Two cables from two cards into one monitor was explored and did not reach something worth shipping. If you find an arrangement that works, a pull request is welcome.
+Two cables from two cards into one monitor was explored and did not reach anything worth shipping. A pull request is welcome if you find an arrangement that does.
+
 
 * * *
 
