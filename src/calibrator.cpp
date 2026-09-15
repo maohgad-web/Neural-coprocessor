@@ -514,6 +514,57 @@ NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
     }
     const NVSDK_NGX_Result r = g_real_create(cl, id, p, out);
 
+    // ---- R134: NAME EVERY FEATURE THE GAME CREATES, ONCE PER ID ----
+    //
+    // The latch below fires ONLY on SuperSampling, and until now nothing in
+    // any log said what else a title had created. That is the difference
+    // between two Cyberpunk 2077 runs on 0.2.2: one reports
+    // "creates=1 sr-handle=known | eval-copies=6751 eval-skips=0" and the
+    // other "eval-copies=0 eval-skips=3892". The evaluate fallback copies
+    // only when the evaluating handle is the latched one, so a title whose
+    // upscale is a DIFFERENT feature - Ray Reconstruction replaces the
+    // separate upscale and denoise passes with one DLSS-D feature - creates
+    // no SuperSampling handle at all, and every evaluate is correctly and
+    // uselessly skipped.
+    //
+    // THIS LINE DOES NOT FIX THAT. It prints the number needed to fix it,
+    // because widening the latch to an enum value nobody has measured is a
+    // guess, and a wrong one silently copies frame generation's vectors over
+    // the scene's - the exact corruption the filter was added to stop.
+    //
+    // Sixteen slots, one line each, first time only. No allocation, no lock,
+    // and nothing here changes what is latched or copied.
+    {
+        static std::atomic<unsigned int> seen[16];
+        static std::atomic<unsigned int> seen_n{0};
+        bool said = false;
+        const unsigned int idv = (unsigned int)id;
+        const unsigned int n = seen_n.load(std::memory_order_relaxed);
+        for (unsigned int i = 0; i < n && i < 16u; ++i)
+            if (seen[i].load(std::memory_order_relaxed) == idv) { said = true; break; }
+        if (!said && n < 16u)
+        {
+            seen[n].store(idv, std::memory_order_relaxed);
+            seen_n.store(n + 1u, std::memory_order_relaxed);
+            char fl[420];
+            snprintf(fl, sizeof fl,
+                     "[MGPU][R134] GAME CreateFeature: id=%u result=0x%08X handle=%p%s. "
+                     "SuperSampling is id=%u and is the ONLY id the evaluate-copy filter "
+                     "latches on - any other id here evaluates and is skipped, which reads "
+                     "as eval-copies=0 with eval-skips climbing and a motion vector lane "
+                     "that carries nothing. If this line names an id that is not %u on a "
+                     "title whose vectors never arrive, THAT is the number the filter has "
+                     "to learn.",
+                     idv, (unsigned)r,
+                     (out != nullptr) ? (void *)*out : nullptr,
+                     (idv == (unsigned int)NVSDK_NGX_Feature_SuperSampling)
+                         ? " <- SuperSampling, the latch fires on this one" : "",
+                     (unsigned int)NVSDK_NGX_Feature_SuperSampling,
+                     (unsigned int)NVSDK_NGX_Feature_SuperSampling);
+            mgpu::diag::info(fl);
+        }
+    }
+
     if (ok(r) && out != nullptr && *out != nullptr &&
         id == NVSDK_NGX_Feature_SuperSampling)
     {
