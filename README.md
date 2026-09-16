@@ -1,12 +1,20 @@
 # Neural Coprocessor
 
+**A second GPU runs a game's DLSS Neural Rendering while the first one renders the game.**
+
+### [Download the latest release](https://github.com/maohgad-web/Neural-coprocessor/releases)
+
+Unpack into the folder containing the game's `.exe`. Full install steps and every known limitation are in `README.txt` inside the zip, and summarised below.
+
+Research code with published measurements, not a product. Run games with anti-cheat and online games at your own risk.
+
+* * *
+
 ## Project Overview
 
-**A second GPU running a game's neural post-processing, while the first one renders.** Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It takes a finished frame and returns a finished frame, so it can be picked up and executed somewhere else entirely.
+Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It takes a finished frame and returns a finished frame, so it can be picked up and executed somewhere else entirely.
 
 **This is a ReShade add-on.** It is called **MGPU Bridge**, it is a `.addon64` file that ReShade loads into a D3D12 game, and every log line it writes is prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a replacement for anything, and it needs an **add-on-enabled** ReShade build to load at all. There is no game modification of any kind: the add-on reads each finished frame and does its work elsewhere.
-
-This is research code with published measurements. It is not a product. Run games with anti-cheat and online games at your own risk.
 
 * * *
 
@@ -28,15 +36,15 @@ Also in 0.2.0:
 
 **0.2.3** - three fixes, all found from [@Zonnery](https://github.com/Zonnery)'s reports in [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) and [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16):
 
-- **iGPU detection is improved.** If you have an integrated GPU enabled alongside your two graphics cards, it no longer causes problems - and you do not have to disable it. Verified on his rig with the iGPU monitor attached.
+- **iGPU detection is improved.** If you have an integrated GPU enabled alongside your two graphics cards, it no longer causes problems - and you do not have to disable it. Verified on a rig with the iGPU monitor attached.
 - **Depth and motion vector support for 007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)). The same fix also covers Cyberpunk 2077, where depth would not bind if you had Ray Reconstruction enabled ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)).
-- **The bridge window reports a bad install instead of waiting.** `ERROR 204` when the game's ReShade runtime never compiled the depth tap - almost always `EffectSearchPaths`, which is what he traced on 007 - and `ERROR 205` for a missing `mgpu.ini`. Read-only: the add-on never writes your `ReShade.ini`.
+- **The bridge window reports a bad install instead of waiting.** `ERROR 204` when the game's ReShade runtime never compiled the depth tap - almost always `EffectSearchPaths` - and `ERROR 205` for a missing `mgpu.ini`. Read-only: the add-on never writes your `ReShade.ini`.
 
 * * *
 
 ## Performance Results
 
-The Blood of Dawnwalker at 1920 x 1080, across the whole DLSS range, on two RTX 5060 Ti 16 GB:
+**Measured on 0.1.0.** The Blood of Dawnwalker at 1920 x 1080, across the whole DLSS range, on two RTX 5060 Ti 16 GB:
 
 | DLSS mode | DLSS 5 off | DLSS 5 on render card | DLSS 5 on second card |
 | --- | --- | --- | --- |
@@ -64,8 +72,6 @@ The Blood of Dawnwalker at 1920 x 1080, across the whole DLSS range, on two RTX 
 
 **Key Finding:** Moving neural post-processing to a second GPU restores 86% of available performance gains from upscaling, compared to 39% when running on the render card.
 
-Measured on 0.1.0. Not re-measured on 0.2.0.
-
 * * *
 
 ## Titles run on 0.2.0
@@ -84,7 +90,7 @@ A launch and transport check, not a benchmark. The counters in those logs are cu
 
 ### Reported by users
 
-I cannot test every game, so any report helps. Both entries below came from [@Zonnery](https://github.com/Zonnery), who found them and tested the fixes on his own hardware before either release shipped. Thank you.
+I cannot test every game, so any report helps. Both entries below came from [@Zonnery](https://github.com/Zonnery), who found them and tested the fixes before either release shipped. Thank you.
 
 | Title | Resolution | Reported in | State |
 | --- | --- | --- | --- |
@@ -137,13 +143,13 @@ The game's rendering is never touched; the bridge reads the finished frame and e
 
 ## Installation
 
-See `assets/README.txt` for complete installation instructions. Critical requirements:
+**[Get the zip from Releases](https://github.com/maohgad-web/Neural-coprocessor/releases)**, then follow `README.txt` inside it. Critical requirements:
 
 - ReShade must support add-ons (effects-only build will not load `.addon64` files)
 - File name must contain the literal substring `nvngx.dll`
 - **`nvngx_dlssnr.dll` goes in a folder called `mgpu`, next to the add-on. NOT beside the game executable.** Beside the executable some titles load it themselves and the neural stage will crash. This changed in 0.2.0.
 - **`mgpu_depth_tap.fx` goes in ReShade's `Shaders` folder.** The add-on switches it on itself, so nothing needs enabling in the effects list. Without it ReShade never binds a depth buffer and the bridge waits instead of arming. On 0.2.0 it also needs ReShade's standard effects pack installed - or upgrade to 0.2.1 or newer, which removes that requirement.
-- **And check `EffectSearchPaths` in the game's `ReShade.ini`.** Putting the file in the right folder is not enough: ReShade only compiles effects it finds through that setting, so if it does not point at the folder you put the tap in, the file is in the right place and is still invisible. A ReShade install that skipped the effect packages can leave it pointing at the game folder instead of `.\reshade-shaders\Shaders\**`. Only the **game's** runtime matters here - the bridge window has its own config that ships correct, which is why every other line in the log can look healthy while nothing arms. 0.2.3 prints `[MGPU][R142]` with your path and ours side by side, and shows `ERROR 204` on the bridge window.
+- **And check `EffectSearchPaths` in the game's `ReShade.ini`.** Putting the file in the right folder is not enough: ReShade only compiles effects it finds through that setting, so if it does not point at the folder you put the tap in, the file is in the right place and is still invisible. A ReShade install that skipped the effect packages can leave it pointing at the game folder instead of `.\reshade-shaders\Shaders\**`. Only the **game's** runtime matters here, and when it is wrong every other line in the log still looks healthy - so check that `[MGPU][P1.6] GAME runtime` reports a non-zero technique count. 0.2.3 prints `[MGPU][R142]` with your path and ours side by side, and shows `ERROR 204` on the bridge window.
 
 * * *
 
