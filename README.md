@@ -91,7 +91,7 @@ I cannot test every game, so any report helps.
 | Battlefield 6 (SP executable) | 3840x2160 | [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) | Runs clean on 0.2.2 |
 | 007 First Light | 3840x2160 | [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16) | Runs clean on 0.2.3 |
 
-**Battlefield 6** SP Campaign, anti-cheat: online games are at your own risk ([issue #14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On 0.2.0 and 0.2.1 this title crashed inside its own `sl.common.dll` on some machines every launch, and never delivered a motion vector frame on any of them. **Both are fixed in 0.2.2**, verified by the reporter on the machine that crashed every time.
+**Battlefield 6** SP Campaign, anti-cheat: online games are at your own risk ([issue #14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On 0.2.0 and 0.2.1 this title crashed inside its own `sl.common.dll` on some machines every launch, and never delivered a motion vector frame on any of them. **Both are fixed in 0.2.2**, verified by [@Zonnery](https://github.com/Zonnery) on the machine that crashed every time.
 
 What that rig measures on 0.2.2, at 3840x2160:
 
@@ -103,9 +103,11 @@ What that rig measures on 0.2.2, at 3840x2160:
 
 The last row is a limitation rather than a fault - see Limitations. Neural rendering itself runs in all three states.
 
-**Not the add-on.** The reporter also saw `bf6.exe` crash on its own with `KERNELBASE.dll / 0x80070057`, reproduced with an empty game folder and no add-ons installed.
+**Not the add-on.** @Zonnery also saw `bf6.exe` crash on its own with `KERNELBASE.dll / 0x80070057`, reproduced with an empty game folder and no add-ons installed.
 
-**007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)), 3840x2160, path tracing with Ray Reconstruction - game on an RTX 5090, neural stage on an RTX 5070 Ti. On 0.2.2 it armed and then stopped, because the game's ReShade runtime was never compiling the depth tap. Fixed in 0.2.3.
+**007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)), reported and tested by @Zonnery. 3840x2160, path tracing with Ray Reconstruction - game on an RTX 5090, neural stage on an RTX 5070 Ti. On 0.2.2 it armed and then stopped, because the game's ReShade runtime was never compiling the depth tap. Fixed in 0.2.3.
+
+Both hotfixes were tested on @Zonnery's hardware before they were released, and most of 0.2.3's new diagnostics exist because of those two threads. Thank you - see `ACKNOWLEDGEMENTS.md`.
 
 * * *
 
