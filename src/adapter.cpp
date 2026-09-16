@@ -219,11 +219,40 @@ namespace
             e.desc[127] = '\0';
             S.table.push_back(e);
 
+            // ---- R141: THE DRIVER VERSION, HERE, WHERE THE ADAPTER IS ----
+            //
+            // It has only ever existed in nvngx.log, which is a SEPARATE FILE
+            // a reporter may not send and which nothing in ReShade.log points
+            // at. Establishing "which driver was this run on" cost a round
+            // trip more than once during issue 15, and on the one occasion it
+            // mattered - a device hang that appeared on 616.92 and not on
+            // 616.64 - it was the whole question.
+            //
+            // CheckInterfaceSupport(IDXGIDevice) returns the user-mode driver
+            // version as a packed LARGE_INTEGER. It is the documented way and
+            // it costs one call per adapter, once. A failure is not an error:
+            // some adapters legitimately do not answer, and 0.0.0.0 says so
+            // rather than pretending.
+            unsigned dv[4] = {0, 0, 0, 0};
+            if (S.table.back().adapter != nullptr)
+            {
+                LARGE_INTEGER umd{};
+                if (SUCCEEDED(S.table.back().adapter->CheckInterfaceSupport(
+                        __uuidof(IDXGIDevice), &umd)))
+                {
+                    dv[0] = (unsigned)((umd.QuadPart >> 48) & 0xFFFF);
+                    dv[1] = (unsigned)((umd.QuadPart >> 32) & 0xFFFF);
+                    dv[2] = (unsigned)((umd.QuadPart >> 16) & 0xFFFF);
+                    dv[3] = (unsigned)( umd.QuadPart        & 0xFFFF);
+                }
+            }
+
             char line[512];
             snprintf(line, sizeof line,
-                     "[MGPU][T2] adapter[%u] luid=0x%08X-0x%08X flags=0x%X vendor=0x%04X "
+                     "[MGPU][T2] adapter[%u] driver=%u.%u.%u.%u luid=0x%08X-0x%08X flags=0x%X vendor=0x%04X "
                      "device=0x%04X dedicated_vram=%lluMB outputs=%u desc=\"%s\"",
-                     i, (unsigned)e.luid.HighPart, (unsigned)e.luid.LowPart,
+                     i, dv[0], dv[1], dv[2], dv[3],
+                     (unsigned)e.luid.HighPart, (unsigned)e.luid.LowPart,
                      (unsigned)e.flags, (unsigned)e.vendor_id, (unsigned)e.device_id,
                      (unsigned long long)(e.dedicated_vram / (1024ull * 1024ull)),
                      (unsigned)e.outputs, e.desc);

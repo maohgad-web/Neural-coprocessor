@@ -401,6 +401,22 @@ std::atomic<unsigned int> g_band_miss_w{0};
 std::atomic<unsigned int> g_band_miss_h{0};
 std::atomic<unsigned long long> g_band_miss_area{0};
 
+// R141. THE FLOOR, WHICH R132 LEFT UNWATCHED AND THAT WAS A TRAP.
+//
+// R132 records the largest candidate refused by the UPPER bound and its line
+// says, when it finds none, "none of them by the upper bound". That sentence
+// is true and it is misleading: the 20% FLOOR can be refusing every candidate
+// at the same moment, and the line would still say it and then point the
+// reader at [R53] instead. A title rendering well below its display extent -
+// path tracing, an aggressive upscaler - is exactly where that happens.
+//
+// So the floor gets the same treatment: the SMALLEST-area candidate refused
+// for being too small, which is the one closest to the floor and therefore
+// the one that says how far off the mark is.
+std::atomic<unsigned int> g_floor_miss_w{0};
+std::atomic<unsigned int> g_floor_miss_h{0};
+std::atomic<unsigned long long> g_floor_miss_area{0};
+
 // R132. The upper bound, as a percentage, so an unusual presentation can be
 // accommodated on the rig that has it rather than by loosening the default
 // for everybody. 105 IS THE SHIPPED VALUE AND IT IS NOT ARBITRARY: a 2048x2048
@@ -412,6 +428,11 @@ std::atomic<unsigned long long> g_band_miss_area{0};
 // scales into the client area - where the number to compare against was never
 // the swapchain in the first place.
 std::atomic<unsigned int> g_band_ceiling_pct{105};
+
+// R141. Diagnose=1. Read once with the rest of the keys; consulted at the
+// three store sites below so that the forcing is visible where each value is
+// decided rather than hidden in a branch far from it.
+std::atomic<int> g_diagnose{0};
 
 // ---------------------------------------------------------------------------
 // R37 - DEPTH COMPARE. The A/B arms, on GPU 0, with no transport at all.
@@ -1037,13 +1058,30 @@ void note_band_reject(unsigned int w, unsigned int h)
     const double scene = (double)g_scene_w * (double)g_scene_h;
     const double ceil_frac =
         (double)g_band_ceiling_pct.load(std::memory_order_relaxed) / 100.0;
-    if (area <= scene * ceil_frac) return;   // refused by the floor, not this
 
     const unsigned long long a = (unsigned long long)w * (unsigned long long)h;
-    if (a <= g_band_miss_area.load(std::memory_order_relaxed)) return;
-    g_band_miss_area.store(a, std::memory_order_relaxed);
-    g_band_miss_w.store(w, std::memory_order_relaxed);
-    g_band_miss_h.store(h, std::memory_order_relaxed);
+
+    if (area > scene * ceil_frac)
+    {
+        // Refused by the ceiling. Keep the LARGEST - closest to being the
+        // scene buffer.
+        if (a <= g_band_miss_area.load(std::memory_order_relaxed)) return;
+        g_band_miss_area.store(a, std::memory_order_relaxed);
+        g_band_miss_w.store(w, std::memory_order_relaxed);
+        g_band_miss_h.store(h, std::memory_order_relaxed);
+        return;
+    }
+
+    if (area < scene * 0.20)
+    {
+        // R141. Refused by the floor. Keep the LARGEST of those too - it is
+        // the one nearest the boundary, so its percentage is the one that
+        // says whether the floor is marginally wrong or wildly wrong.
+        if (a <= g_floor_miss_area.load(std::memory_order_relaxed)) return;
+        g_floor_miss_area.store(a, std::memory_order_relaxed);
+        g_floor_miss_w.store(w, std::memory_order_relaxed);
+        g_floor_miss_h.store(h, std::memory_order_relaxed);
+    }
 }
 
 // Linear scan, most-recently-hit first. A ranking table converges fast: after
@@ -2199,35 +2237,38 @@ void dump()
         const unsigned int cp = g_band_ceiling_pct.load(std::memory_order_relaxed);
         const unsigned long long rej =
             g_turn_rejected.load(std::memory_order_relaxed);
-        char b[1400];
-        if (mw != 0 && mh != 0 && g_scene_w != 0 && g_scene_h != 0)
-        {
-            const double pct = 100.0 * ((double)mw * (double)mh) /
-                               ((double)g_scene_w * (double)g_scene_h);
-            snprintf(b, sizeof b,
-                     "[MGPU][R132] BAND: scene %ux%u (area %llu) | accepted 20%%..%u%% | "
-                     "REFUSED %llu depth clear(s), and the largest refused candidate is "
-                     "%ux%u at %.2f%% of the band. IF THAT PERCENTAGE IS JUST OVER %u THE "
-                     "BAND IS THE FAULT, NOT THE GAME: the swapchain is smaller than the "
-                     "buffers it is gating, which is what a bordered window or a title that "
-                     "renders at its configured resolution and scales into the client area "
-                     "produces. Set SceneBandCeiling in mgpu.ini a little above that "
-                     "percentage and relaunch. Do NOT set it near 113: a square shadow "
-                     "atlas is about that much of a 16:9 scene and admitting one binds the "
-                     "wrong buffer, which looks like working depth and is not.",
-                     g_scene_w, g_scene_h,
-                     (unsigned long long)g_scene_w * (unsigned long long)g_scene_h,
-                     cp, rej, mw, mh, pct, cp);
-        }
-        else
-        {
-            snprintf(b, sizeof b,
-                     "[MGPU][R132] BAND: scene %ux%u | accepted 20%%..%u%% | %llu depth "
-                     "clear(s) refused, none of them by the upper bound. Nothing here is "
-                     "holding the depth lane: if depth is missing the reason is elsewhere, "
-                     "and the [R53] TECHNIQUE LANE line is the next one to read.",
-                     g_scene_w, g_scene_h, cp, rej);
-        }
+        char b[2000];
+        const unsigned int fw = g_floor_miss_w.load(std::memory_order_relaxed);
+        const unsigned int fh = g_floor_miss_h.load(std::memory_order_relaxed);
+        const double sa = (double)g_scene_w * (double)g_scene_h;
+
+        char hi[64] = "none", lo[64] = "none";
+        if (mw != 0 && mh != 0 && sa > 0.0)
+            snprintf(hi, sizeof hi, "%ux%u at %.2f%%", mw, mh,
+                     100.0 * ((double)mw * (double)mh) / sa);
+        if (fw != 0 && fh != 0 && sa > 0.0)
+            snprintf(lo, sizeof lo, "%ux%u at %.2f%%", fw, fh,
+                     100.0 * ((double)fw * (double)fh) / sa);
+
+        const bool any = (mw != 0 && mh != 0) || (fw != 0 && fh != 0);
+        snprintf(b, sizeof b,
+                 "[MGPU][R132] BAND: scene %ux%u (area %llu) | accepted 20%%..%u%% | %llu depth "
+                 "clear(s) refused | nearest ABOVE the ceiling: %s | nearest BELOW the floor: "
+                 "%s. %s R141: BOTH BOUNDS ARE REPORTED HERE ON PURPOSE. An earlier build named "
+                 "only the ceiling, so a run whose every candidate was refused for being too "
+                 "SMALL read as 'nothing refused by the upper bound' and sent the reader "
+                 "somewhere else entirely. A title rendering well below its display extent - "
+                 "path tracing, an aggressive upscaler - lands under the floor, not over the "
+                 "ceiling. SceneBandCeiling raises the upper bound; the floor is fixed at 20%% "
+                 "and a candidate under it is genuinely too small to be the scene.",
+                 g_scene_w, g_scene_h,
+                 (unsigned long long)g_scene_w * (unsigned long long)g_scene_h,
+                 cp, rej, hi, lo,
+                 any ? "IF EITHER PERCENTAGE IS CLOSE TO ITS BOUND, THE BAND IS THE FAULT AND "
+                       "NOT THE GAME: the swapchain is not describing the buffers it is gating."
+                     : "Nothing is being refused by either bound, so the band is not holding "
+                       "the depth lane: if depth is missing the reason is elsewhere, and the "
+                       "[R53] TECHNIQUE LANE and [R140] ARM HELD lines are the next to read.");
         mgpu::diag::info(b);
     }
 
@@ -3079,6 +3120,77 @@ mode mode_from_ini()
     }
 
     {
+        // ---- R141: Diagnose, ONE KEY INSTEAD OF FIVE ----
+        //
+        // MetaProbe, MVecProbe, DepthCompare and CalibProbe are four separate
+        // keys, each with its own value space, and asking a person reporting a
+        // bug to set four keys correctly is asking for a run that answers the
+        // wrong question. Diagnose=1 turns the probe's own set on at their
+        // most useful values and SAYS SO, so the log records that the run was
+        // a diagnostic one rather than leaving a reader to infer it from the
+        // extra lines.
+        //
+        // It does NOT touch Probes= in gpu1_context - that key re-runs the
+        // one-shot probe chain under a live stream and is a different kind of
+        // decision. The line below says so rather than pretending this is a
+        // master switch for everything.
+        const char *gk = mgpu::config::find(buf, strlen(buf), "Diagnose");
+        const bool diag_on = (gk != nullptr) && (atoi(gk) != 0);
+        if (diag_on)
+        {
+            mgpu::diag::warn(
+                "[MGPU][R141] Diagnose=1 - DIAGNOSTIC RUN. MetaProbe=both, MVecProbe=1 and "
+                "CalibProbe=1 are being forced on for this launch whatever mgpu.ini says for "
+                "them individually, so the tables, the velocity field and the calibrator's "
+                "own hits are all in this log. THIS COSTS FRAMES and it is not a measurement "
+                "configuration - no figure taken under it should be quoted. It does NOT set "
+                "Probes= in the stream, which re-runs the one-shot probe chain under a live "
+                "stream and stays a separate decision. Set Diagnose=0 and relaunch to go back "
+                "to the shipped behaviour.");
+        }
+        g_diagnose.store(diag_on ? 1 : 0, std::memory_order_relaxed);
+    }
+    {
+        // R141. THE INI, ECHOED ONCE, AS IT WAS ACTUALLY READ.
+        //
+        // [P7.2] already names WHICH file took effect and that has been worth
+        // having. It does not say what was IN it, and twice in one week that
+        // cost a run: a folder holding five mgpu.ini variants, and a key that
+        // differed from the one a reporter was running without either side
+        // noticing. The values are already in memory here; printing them is
+        // free and it makes every log self-describing.
+        //
+        // Comments and blank lines are dropped - the shipped file is mostly
+        // commentary and none of it is state.
+        static bool echoed = false;
+        if (!echoed)
+        {
+            echoed = true;
+            char e[1900];
+            int w = snprintf(e, sizeof e, "[MGPU][R141] INI IN FORCE: ");
+            const char *p = buf;
+            while (*p != '\0' && w > 0 && (size_t)w < sizeof e - 2)
+            {
+                while (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') ++p;
+                const char *eol = p;
+                while (*eol != '\0' && *eol != '\r' && *eol != '\n') ++eol;
+                if (*p != ';' && *p != '[' && *p != '\0' && eol > p)
+                {
+                    const int n2 = (int)(eol - p);
+                    const int wrote = snprintf(e + w, sizeof e - (size_t)w, "%.*s ", n2, p);
+                    if (wrote <= 0) break;
+                    w += wrote;
+                }
+                p = eol;
+            }
+            snprintf(e + w, sizeof e - (size_t)w,
+                     "| Every key in force this run, comments stripped. Compare against the "
+                     "shipped mgpu.ini before trusting any A/B: a value that differs from the "
+                     "one a report was made under is the commonest reason two logs disagree.");
+            mgpu::diag::info(e);
+        }
+    }
+    {
         // R132. SceneBandCeiling. The candidate size band's UPPER bound, as a
         // percentage of the game swapchain's area. Absent or out of range
         // means 105, which is exactly what every build before 0.2.3 did.
@@ -3125,7 +3237,12 @@ mode mode_from_ini()
         const char *pk = mgpu::config::find(buf, strlen(buf), "CalibProbe");
         int pv = 0;
         if (pk != nullptr) pv = atoi(pk);
-        g_calib_probe.store((pv < 0 || pv > 2) ? 0 : pv, std::memory_order_relaxed);
+        if (pv < 0 || pv > 2) pv = 0;
+        // R141. Diagnose lifts this to 1 - name every data-scan hit - but
+        // never to 2, which loads a second copy of a module and is a
+        // deliberate act rather than a diagnostic default.
+        if (pv == 0 && g_diagnose.load(std::memory_order_relaxed) != 0) pv = 1;
+        g_calib_probe.store(pv, std::memory_order_relaxed);
     }
     {
         // SLT1. SLTags: the Streamline tag tap. 0 off - and off is the
@@ -3167,8 +3284,11 @@ mode mode_from_ini()
         // of the RTV-ranked candidates - 0 is the top, which on this title is
         // the DISPLAY-extent buffer DLSS itself is fed.
         const char *k2 = mgpu::config::find(buf, strlen(buf), "MVecProbe");
-        g_mv_mode.store((k2 != nullptr && atoi(k2) != 0) ? 1 : 0,
-                        std::memory_order_relaxed);
+        // R141. Diagnose forces this on; an explicit MVecProbe=1 still works
+        // on its own, so the key keeps its meaning when Diagnose is off.
+        const bool mv_on = (k2 != nullptr && atoi(k2) != 0) ||
+                           (g_diagnose.load(std::memory_order_relaxed) != 0);
+        g_mv_mode.store(mv_on ? 1 : 0, std::memory_order_relaxed);
         const char *k3 = mgpu::config::find(buf, strlen(buf), "MVecProbeIndex");
         const int mi = (k3 != nullptr) ? atoi(k3) : 0;
         g_mv_index.store((mi >= 0 && mi < 8) ? (unsigned)mi : 0u,
@@ -3183,6 +3303,9 @@ mode mode_from_ini()
     }
 
     k = mgpu::config::find(buf, strlen(buf), "MetaProbe");
+    // R141. Diagnose overrides the mode entirely: both lanes, which is the
+    // only setting that answers "what did the probe see" without a second run.
+    if (g_diagnose.load(std::memory_order_relaxed) != 0) return mode::both;
     if (k == nullptr) return mode::off;
 
     if (*k == 'd' || *k == 'D') return mode::depth;

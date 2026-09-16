@@ -40,6 +40,22 @@
 #include <cstring>    // R137: strstr, to spot the depth tap by its effect name.
 #include <atomic>     // R138: the present counter and the said-once flags.
 
+// ---- R141: BUILD IDENTITY, SAID ONCE, FIRST ----
+//
+// The add-on has never logged what it is. ReShade prints
+// 'Registered add-on "MGPU Bridge" v0.0.0.0' - the version field was never
+// filled in - so every report has had to identify the build by the FILE SIZE
+// IN BYTES. Two days of issue 15 triage were spent that way, and one run was
+// nearly taken against a stale binary because 382,464 and 416,768 look alike
+// in a folder listing.
+//
+// __DATE__ and __TIME__ are deliberate: they need no CI change and no build
+// system co-operation, and a timestamp cannot be stale in the way a version
+// constant that somebody forgot to bump can be. The version string beside it
+// is bumped by hand at release and the two disagreeing is itself information.
+#define MGPU_VERSION_STR "0.2.3"
+
+
 // ---- P6.4: the overlay panel ----
 //
 // reshade.hpp wires up the ImGui function table ONLY when IMGUI_VERSION_NUM is
@@ -1904,6 +1920,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // T2: per-event logging, provisional LUID capture, one-time table
         // enumeration; the selection itself is deferred to the
         // swapchain-derived game LUID.
+        {
+            // R141. Before anything else this add-on says, say what it is.
+            char v[420];
+            snprintf(v, sizeof v,
+                     "[MGPU][R141] MGPU Bridge %s | built %s %s | add-on API 20. IDENTIFY EVERY "
+                     "LOG BY THIS LINE. ReShade's own 'Registered add-on' line carries "
+                     "v0.0.0.0 because that field has never been filled in, which is why "
+                     "reports have had to quote the file size in bytes instead. If this line "
+                     "is absent the build predates 0.2.3.",
+                     MGPU_VERSION_STR, __DATE__, __TIME__);
+            mgpu::diag::info(v);
+        }
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         // T3: device lifecycle instrumentation + teardown trigger.
