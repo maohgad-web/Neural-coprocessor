@@ -653,7 +653,22 @@ void ui_set_tap_state(int state)
 static std::atomic<bool> g_game_fx_absent{false};
 void ui_set_game_fx_absent(bool absent)
 {
-    if (absent) g_game_fx_absent.store(true, std::memory_order_relaxed);
+    // R149. IT IS NOT A LATCH, AND CALLING IT ONE WAS WRONG.
+    //
+    // R143 justified never clearing this with "the condition it reports cannot
+    // un-happen within a process". That is false. The counter behind it stops
+    // the moment an effect pass is seen, so the THRESHOLD can only be crossed
+    // by a runtime that has stayed silent past it - but a runtime that has been
+    // silent for 600 presents can still start. A cold shader cache is the
+    // ordinary way: ReShade compiles on load, 600 presents is ten seconds at
+    // 60 fps, and a first launch with a dozen effects and no cache can spend
+    // longer than that before the first pass runs. With the store one-way that
+    // run got a red ERROR 204 for the rest of the session on a game that then
+    // worked - a fault report manufactured by the fault reporter.
+    //
+    // So it stores what it is told. The game path clears it on any finish
+    // effects event, because one effect pass is proof the claim is wrong.
+    g_game_fx_absent.store(absent, std::memory_order_relaxed);
 }
 
 namespace
@@ -10098,7 +10113,7 @@ namespace
         {
             if (s.sr_snippet != 0u)
                 mgpu::diag::warn("[MGPU][C2-SR] no driver-side nvngx_dlss.dll found (registry "
-                                 "NGXCore\FullPath, System32, DriverStore all checked). "
+                                 "NGXCore\\FullPath, System32, DriverStore all checked). "
                                  "Falling back to the game's copy - preset availability is "
                                  "then whatever that DLL carries.");
 
@@ -11948,6 +11963,12 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
     static const bool     ini_found  = ini_file_present();
     static const unsigned autoarm_at = autoarm_frames();
 
+    // R150. Roughly one minute at 60 fps. Chosen against measurement, not
+    // taste: a healthy arm on Resonance completes at 252 frames on the depth
+    // lane and ~1305 on the velocity lane, so this is four times the slowest
+    // lane of a known-good run.
+    const unsigned long long ARM_REPORT_FRAMES = 3600ull;
+
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
 
@@ -12095,15 +12116,49 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
     // depth_arm_waits and mvec_arm_waits are incremented by the two arm-hold
     // paths in stream_on_finish_effects and by nothing else, so a non-zero
     // count IS that path having run. No new state, no inference.
+    // R150. PAST A MINUTE THE LANE NAME IS NO LONGER THE USEFUL THING.
+    //
+    // Naming the lane was R145's fix for "ARMING" being indistinguishable from
+    // a hang, and for the first half-minute it is the right answer - the hold
+    // is normal and the screen should look normal. Past that it stops being
+    // information: the person has read it, it has not changed, and what they
+    // need is somewhere to send the log.
+    //
+    // ARM_REPORT_FRAMES is counted in GAME frames by the same two counters the
+    // hold paths increment, so a faster machine reaches it sooner in wall
+    // clock. That is the right direction - a 120 fps rig that has held for
+    // 5400 frames has waited 45 seconds with twice the chances to succeed.
+    //
+    // The screen does NOT claim a fault here. See MGPU_H207_L2: it states the
+    // condition under which this is one, and leaves the judgement with the
+    // person who can see whether a scene is on screen.
     else if (s.hold_lane == 1)
     {
-        st_out = mgpu::screen::st_waiting;
-        l2 = MGPU_WAIT_DEPTH_L2;
+        if (s.depth_arm_waits > ARM_REPORT_FRAMES)
+        {
+            st_out = mgpu::screen::st_error;
+            l1 = MGPU_H207_DEPTH_L1;
+            l2 = MGPU_H207_L2;
+        }
+        else
+        {
+            st_out = mgpu::screen::st_waiting;
+            l2 = MGPU_WAIT_DEPTH_L2;
+        }
     }
     else if (s.hold_lane == 2)
     {
-        st_out = mgpu::screen::st_waiting;
-        l2 = MGPU_WAIT_MVEC_L2;
+        if (s.mvec_arm_waits > ARM_REPORT_FRAMES)
+        {
+            st_out = mgpu::screen::st_error;
+            l1 = MGPU_H207_MVEC_L1;
+            l2 = MGPU_H207_L2;
+        }
+        else
+        {
+            st_out = mgpu::screen::st_waiting;
+            l2 = MGPU_WAIT_MVEC_L2;
+        }
     }
     else
     {

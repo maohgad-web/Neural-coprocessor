@@ -40,9 +40,13 @@ enum state
 // lines of text centred in the upper third. The render target must already be
 // in RENDER_TARGET state - the caller's existing clear has it there.
 //
-// Text is UPPER CASE A-Z, 0-9, space, '-', '.' and ':'. Anything else draws as
-// a space rather than as a wrong glyph, because a wrong glyph in an error
-// message is worse than a gap.
+// Text is UPPER CASE A-Z, 0-9, space, '-', '.', ':' and '/'. Anything else
+// draws as a space rather than as a wrong glyph, because a wrong glyph in an
+// error message is worse than a gap.
+//
+// R150: '/' WAS ALREADY IN THE TABLE AND THIS COMMENT DID NOT SAY SO. It is
+// listed now because the report lines below put a URL on screen and depend on
+// it - an undeclared glyph is one refactor away from being dropped as unused.
 // ---- THE CODES ----
 //
 // A number AND a sentence. The number is what a user types into a search box
@@ -52,6 +56,45 @@ enum state
 //
 // 2xx is setup - something the user can fix by moving a file.
 // 3xx is environment - hardware or driver.
+// ---- R150: WHEN TO GIVE A FIX, AND WHEN TO ASK FOR THE LOG ----
+//
+// A screen that tells someone to go and change a setting is making a claim
+// about their machine. It is worth making when the claim has been checked and
+// the remedy is one action. It is not worth making otherwise, because a wrong
+// instruction costs them an evening and then they report the wrong thing.
+//
+// SO THERE ARE TWO KINDS OF SECOND LINE, AND ONLY TWO.
+//
+//   A REMEDY, where the diagnosis is confirmed and the fix is one action:
+//   205 (the file is missing - copy it) and 204 (the log line prints their own
+//   EffectSearchPaths beside ours and the exact line to change).
+//
+//   A REQUEST FOR THE LOG, everywhere else: where the condition is rare enough
+//   that it has never been observed, where a false positive is possible, or
+//   where the log cannot yet be searched for the code. 203 and 302 are here,
+//   and so is an arm that has held past a minute.
+//
+// Reporting costs the user one upload and costs us nothing. A wrong remedy
+// costs them the evening and then arrives as a bad report anyway.
+#define MGPU_REPORT_L2 \
+    "SEND RESHADE.LOG TO GITHUB.COM/MAOHGAD-WEB/NEURAL-COPROCESSOR"
+
+// R150. The arm has held past ARM_REPORT_FRAMES. Measured for contrast: a
+// healthy Resonance arm completes in 252 frames on the depth lane and about
+// 1305 on the velocity lane, twice, within 1.2% of each other.
+//
+// "IF YOU ARE IN GAMEPLAY" IS THE WHOLE SAFETY OF THIS MESSAGE. R54 measured
+// 20 seconds before ReShade bound a depth buffer and R56 measured 35, both
+// from a menu, and a player can sit in a menu or a cutscene for as long as
+// they like. The screen cannot tell a long menu from a fault - so it does not
+// try. It states the condition under which this IS a fault and lets the person
+// holding the controller decide, which is the one thing they can do that the
+// add-on cannot.
+#define MGPU_H207_DEPTH_L1 "NO DEPTH AFTER ONE MINUTE"
+#define MGPU_H207_MVEC_L1  "NO MOTION VECTORS AFTER ONE MINUTE"
+#define MGPU_H207_L2 \
+    "IF YOU ARE IN GAMEPLAY " MGPU_REPORT_L2
+
 #define MGPU_E201_L1 "ERROR 201"
 #define MGPU_E201_L2 "NVNGX-DLSSNR.DLL NOT FOUND - PUT IT BESIDE THE GAME EXE"
 
@@ -59,7 +102,13 @@ enum state
 #define MGPU_E202_L2 "MGPU-DEPTH-TAP.FX NOT IN RESHADE-SHADERS.SHADERS"
 
 #define MGPU_E203_L1 "ERROR 203"
-#define MGPU_E203_L2 "EFFECT NOT ENABLED - TURN IT ON IN THE RESHADE MENU"
+// R150. WAS "TURN IT ON IN THE RESHADE MENU", AND THAT WAS A GUESS.
+// The add-on enables this technique itself; if that did not take, doing it by
+// hand may not either, and the reason would be the interesting part. The
+// condition has never been observed - after R147 it needs find_technique to
+// return a null handle twice in a row on a tap that IS present and compiled.
+// An unobserved condition does not get a confident remedy.
+#define MGPU_E203_L2 MGPU_REPORT_L2
 
 // R142. The GAME runtime never loaded the tap at all. NOT the same fault as
 // 202: the file can be exactly where the guide says and this still fires,

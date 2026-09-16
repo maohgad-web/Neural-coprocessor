@@ -1893,6 +1893,13 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     // enumeration every 300 frames and is unchanged by this.
     if (rt_is_game) mgpu::gpu1::ui_set_tap_state(mgpu::probe::tap_state());
 
+    // R149. This handler running AT ALL, on the game's runtime, is proof that
+    // the game's effect runtime runs effects - which is the exact claim
+    // ui_set_game_fx_absent makes. Clear it here rather than trusting the
+    // 600-present threshold to have been right: a slow first compile can cross
+    // that threshold on a run that is about to work perfectly.
+    if (rt_is_game) mgpu::gpu1::ui_set_game_fx_absent(false);
+
     // ---- R139: THE ENGINE'S OWN DEPTH, BESIDE THE ONE WE USE ----
     //
     // Depth today comes from ONE route and it is the fragile one: an effect's
