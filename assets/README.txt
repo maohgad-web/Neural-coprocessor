@@ -270,8 +270,11 @@ folder needs its own copy. The log line beginning [MGPU][P7.2] names the exact
 file that took effect - if it names somewhere unexpected, or is missing, every
 setting is at its default no matter what you edited.
 
-RUN This build ships with AutoArm=1, so the stream arms itself once the game
-is presenting. You do not have to press anything.
+RUN
+---
+
+This build ships with AutoArm=1, so the stream arms itself once the game is
+presenting. You do not have to press anything.
 
 THE BRIDGE CAN TAKE A WHILE TO ARM, AND THAT IS NORMAL. It does not arm until
 the game has bound a depth buffer and a velocity buffer, and neither exists in
@@ -291,18 +294,23 @@ Panel               the ReShade overlay (Home). The MGPU Bridge panel is
                     registered on both the game's overlay and the bridge
                     window's, so you can drive it without leaving the game.
 
-CTRL+ALT+F10        arm the stream by hand CTRL+ALT+F7         view: neural
-output -> input -> split CTRL+ALT+LEFT/RIGHT move the split seam. Add SHIFT
-for a coarse step.
+CTRL+ALT+F10        arm the stream by hand
+
+CTRL+ALT+F7         view: neural output -> input -> split
+
+CTRL+ALT+LEFT/RIGHT move the split seam. Add SHIFT for a coarse step.
 
                     These need no overlay open, so the seam can be dragged
                     across a face with nothing on screen but the game.
 
-CTRL+ALT+F8         pick which pass the intensity keys act on CTRL+ALT+F9 /
-F11   intensity down / up Split shows the frame handed TO the model on the
-left and what it produced on the right, in one window, THE SAME FRAME, with a
-white seam between them. It is the only honest way to compare the two: no two
-runs of a game contain the same frame.
+CTRL+ALT+F8         pick which pass the intensity keys act on
+
+CTRL+ALT+F9 / F11   intensity down / up
+
+Split shows the frame handed TO the model on the left and what it produced on
+the right, in one window, THE SAME FRAME, with a white seam between them. It
+is the only honest way to compare the two: no two runs of a game contain the
+same frame.
 
 THE SETTINGS WORTH KNOWING ABOUT
 --------------------------------
