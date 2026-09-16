@@ -26,11 +26,11 @@ Also in 0.2.0:
 
 **0.2.2** - fixes a startup crash on titles that ship NVIDIA Streamline, reported by [@Zonnery](https://github.com/Zonnery) on Battlefield 6 SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. The same report turned up a limitation: the engine's motion vectors are only available while the game itself is running DLSS or DLAA - with TAA the model falls back to deriving motion from colour, which is what 0.1.0 ran on. See Limitations.
 
-**0.2.3** - three fixes:
+**0.2.3** - three fixes, all found from [@Zonnery](https://github.com/Zonnery)'s reports in [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) and [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16):
 
-- **iGPU detection is improved.** If you have an integrated GPU enabled alongside your two graphics cards, it no longer causes problems - and you do not have to disable it.
-- **Depth and motion vector support for 007 First Light**, reported by [@Zonnery](https://github.com/Zonnery) ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)). The same fix also covers Cyberpunk 2077, where depth would not bind if you had Ray Reconstruction enabled.
-- **The bridge window reports a bad install instead of waiting.** `ERROR 204` when the game's ReShade runtime never compiled the depth tap - almost always `EffectSearchPaths` - and `ERROR 205` for a missing `mgpu.ini`. Read-only: the add-on never writes your `ReShade.ini`.
+- **iGPU detection is improved.** If you have an integrated GPU enabled alongside your two graphics cards, it no longer causes problems - and you do not have to disable it. Verified on his rig with the iGPU monitor attached.
+- **Depth and motion vector support for 007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)). The same fix also covers Cyberpunk 2077, where depth would not bind if you had Ray Reconstruction enabled ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)).
+- **The bridge window reports a bad install instead of waiting.** `ERROR 204` when the game's ReShade runtime never compiled the depth tap - almost always `EffectSearchPaths`, which is what he traced on 007 - and `ERROR 205` for a missing `mgpu.ini`. Read-only: the add-on never writes your `ReShade.ini`.
 
 * * *
 
@@ -84,14 +84,14 @@ A launch and transport check, not a benchmark. The counters in those logs are cu
 
 ### Reported by users
 
-I cannot test every game, so any report helps.
+I cannot test every game, so any report helps. Both entries below came from [@Zonnery](https://github.com/Zonnery), who found them and tested the fixes on his own hardware before either release shipped. Thank you.
 
 | Title | Resolution | Reported in | State |
 | --- | --- | --- | --- |
 | Battlefield 6 (SP executable) | 3840x2160 | [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) | Runs clean on 0.2.2 |
 | 007 First Light | 3840x2160 | [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16) | Runs clean on 0.2.3 |
 
-**Battlefield 6** SP Campaign, anti-cheat: online games are at your own risk ([issue #14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On 0.2.0 and 0.2.1 this title crashed inside its own `sl.common.dll` on some machines every launch, and never delivered a motion vector frame on any of them. **Both are fixed in 0.2.2**, verified by [@Zonnery](https://github.com/Zonnery) on the machine that crashed every time.
+**Battlefield 6** SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On 0.2.0 and 0.2.1 this title crashed inside its own `sl.common.dll` on some machines every launch, and never delivered a motion vector frame on any of them. **Both are fixed in 0.2.2**, verified on the machine that crashed every time. Anti-cheat: online games are at your own risk.
 
 What that rig measures on 0.2.2, at 3840x2160:
 
@@ -103,11 +103,9 @@ What that rig measures on 0.2.2, at 3840x2160:
 
 The last row is a limitation rather than a fault - see Limitations. Neural rendering itself runs in all three states.
 
-**Not the add-on.** [@Zonnery](https://github.com/Zonnery) also saw `bf6.exe` crash on its own with `KERNELBASE.dll / 0x80070057`, reproduced with an empty game folder and no add-ons installed.
+**Not the add-on.** The same rig also saw `bf6.exe` crash on its own with `KERNELBASE.dll / 0x80070057`, reproduced with an empty game folder and no add-ons installed.
 
-**007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)), reported and tested by [@Zonnery](https://github.com/Zonnery). 3840x2160, path tracing with Ray Reconstruction - game on an RTX 5090, neural stage on an RTX 5070 Ti. On 0.2.2 it armed and then stopped, because the game's ReShade runtime was never compiling the depth tap. Fixed in 0.2.3.
-
-Both hotfixes were tested on [@Zonnery](https://github.com/Zonnery)'s hardware before they were released, and most of 0.2.3's new diagnostics exist because of those two threads. Thank you - see `ACKNOWLEDGEMENTS.md`.
+**007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)), 3840x2160, path tracing with Ray Reconstruction - game on an RTX 5090, neural stage on an RTX 5070 Ti. On 0.2.2 it armed and then stopped, because the game's ReShade runtime was never compiling the depth tap. Fixed in 0.2.3.
 
 * * *
 
