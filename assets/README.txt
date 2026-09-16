@@ -91,11 +91,6 @@ travel back across the link. With both monitors on the render card, the same
 build measured 33% lower throughput and roughly double the latency on the
 development machine.
 
-A HEADLESS NEURAL CARD WORKS AND IS SLOWER. Headless here means nothing is
-plugged into the SECOND card, so its output has to travel back across the link
-to reach a display on the render card - which is exactly the cost that one
-monitor per card exists to avoid. It runs; it is not the recommendation.
-
 A SINGLE DISPLAY IS NOT SUPPORTED, BUT IT CAN BE MADE TO WORK. There is an
 unsupported workaround, and it is THE OTHER WAY ROUND FROM HEADLESS: the
 display goes on the NEURAL card - the second card, the one the bridge presents
