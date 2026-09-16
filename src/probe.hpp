@@ -157,6 +157,26 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr);
 // is set to: the transport must not silently require the probe to be on.
 unsigned long long depth_source();
 
+// ---- R145: THE LIVE STATE OF THE DEPTH TAP'S TECHNIQUE ----
+//
+// tech_scan() already computes this, self-enables the technique when it finds
+// it off, and re-runs every 300 frames from depth_source(). This exposes the
+// value it maintains. There is no work here - it is a read of an int.
+//
+//   -2  NO SCAN HAS RUN YET. Not an answer; do not report a fault on it.
+//   -1  mgpu_depth_tap.fx was not enumerated on the GAME runtime at all
+//    0  enumerated, technique off AND the self-enable did not take
+//    1  enumerated and on
+//
+// WHY IT EXISTS RATHER THAN THE ONE-SHOT IT REPLACES. R142 pushed the tap
+// state to the idle screen from log_preset_once, which fires ONCE, at the
+// first non-empty enumeration - which is BEFORE tech_scan has self-enabled
+// anything. Measured 2026-09-16 on Resonance: [R53] reported TAP = OFF on a
+// run where the tap was present, compiled and working, because the snapshot
+// was taken a few frames too early and then frozen for the session. A latched
+// 0 is a false fault; only this value is safe to show a user.
+int tap_state();
+
 // ---- P12.9 (R78): the MVec acquisition handover ----
 //
 // The velocity buffer is in a KNOWN state at exactly one moment - while it is
