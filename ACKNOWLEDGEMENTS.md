@@ -120,33 +120,32 @@ Thank you to all of them. Mistakes in this repository are ours, not theirs.
 **[@Zonnery](https://github.com/Zonnery)** is the community tester for 0.2.2
 and 0.2.3.
 
-He did not only send logs. He ran the experiments himself - moving a
-third-party effect pack out of the shader folder to see whether it mattered,
-forcing the tap on by hand from the preset to see what changed, re-running on
-each new build and reporting what every one of them did. A good deal of that
-was testing ideas of his own, on his own time, and it is why each round was
+Not only logs: the experiments were run too - moving a third-party effect pack
+out of the shader folder to see whether it mattered, forcing the tap on by
+hand from the preset to see what changed, re-running on each new build and
+reporting what every one of them did. A good deal of that was testing ideas
+that came from that side rather than this one, and it is why each round was
 shorter than the one before it.
 
-On [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) he
-reported the startup crash on Battlefield 6 that titles shipping NVIDIA
-Streamline could hit - every launch on his machine - and tested the fix on
-that same machine. The same thread established how the engine's motion vectors
-behave across DLSS, DLAA and TAA, which is why that is now a documented
-limitation rather than something people find on their own.
+On [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) came the
+startup crash on Battlefield 6 that titles shipping NVIDIA Streamline could
+hit - every launch on that machine - and then the test of the fix on the same
+machine. The same thread established how the engine's motion vectors behave
+across DLSS, DLAA and TAA, which is why that is now a documented limitation
+rather than something people find on their own.
 
-On [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16) he ran
-007 First Light at 3840x2160 with path tracing and Ray Reconstruction, and
-traced a title that armed and then stopped to the game runtime's
-`EffectSearchPaths`.
+On [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16), 007
+First Light at 3840x2160 with path tracing and Ray Reconstruction, and a title
+that armed and then stopped traced to the game runtime's `EffectSearchPaths`.
 
-His logs are the reason the diagnostics were rebuilt. `[R53]`,
+Those logs are the reason the diagnostics were rebuilt. `[R53]`,
 `[R134]`/`[R135]`, `[R139]` and `[R142]`, and the `ERROR 204` and `205`
-screens, were each written to answer a question he had asked - and together
+screens, were each written to answer a question raised there - and together
 they are what turned a silent no-arm into something the add-on reports by
 itself.
 
 Both hotfixes were shaped in that back-and-forth rather than handed over
-finished, and both were tested on his hardware before anyone else received
+finished, and both were tested on that hardware before anyone else received
 them.
 
 **[salient-cyanocitta](https://github.com/salient-cyanocitta)** confirmed this
