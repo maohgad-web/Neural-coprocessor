@@ -601,6 +601,23 @@ void ui_set_split_pos(float v);
 void intensity_cycle_target();
 void intensity_step(int dir);
 
+// ---- R142: THE GAME RUNTIME'S DEPTH-TAP STATE, FOR THE IDLE SCREEN ----
+//
+// Pushed in from dllmain, which is the only file that can see a ReShade
+// runtime. A plain scalar for the same reason set_mvec_hook is a function
+// pointer: this header names no ReShade type and dllmain names no stream
+// type, and that boundary is older than this milestone.
+//
+//   -2  not determined yet - the enumeration has not settled
+//   -1  mgpu_depth_tap.fx was NOT enumerated on the GAME runtime at all
+//    0  enumerated, technique off
+//    1  enumerated and on - the state Depth=1 needs
+//
+// ONLY THE GAME RUNTIME IS EVER REPORTED HERE. The bridge runtime has no
+// depth to tap, so its own tap state is not a fault and must never reach this
+// screen. Any thread; a relaxed atomic store and nothing else.
+void ui_set_tap_state(int state);
+
 // Bridge thread. Arms the stream; inert until called, one stream per process.
 // Reads Fault= from mgpu.ini beside the add-on - absent means no fault, so the
 // shipped default is a clean run and a missing file is never an error.

@@ -636,6 +636,16 @@ bool create_present_chain(HWND hwnd)
 // the two things that can reach the game.
 static std::atomic<unsigned> g_present_vsync{1u};
 
+// R142. The GAME runtime's depth-tap state, pushed in from dllmain. See the
+// header. Relaxed on both ends: it is read once per present to pick an idle
+// screen, and a frame of staleness on a condition that lasts for the whole
+// session cannot matter.
+static std::atomic<int> g_tap_state_game{-2};
+void ui_set_tap_state(int state)
+{
+    g_tap_state_game.store(state, std::memory_order_relaxed);
+}
+
 namespace
 {
     // P5.0. Defined with the stream, below. Returns the neural output texture
@@ -11861,6 +11871,10 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
 
+    // R142. Read ONCE: the branch below tests it twice and the two tests must
+    // not be able to disagree with each other across a store from dllmain.
+    const int tap_state = g_tap_state_game.load(std::memory_order_relaxed);
+
     l1 = MGPU_IDLE_L1;
     // V43. FIRST, because it outranks everything else this screen can say.
     // In a recovery launch nothing is going to arm and nothing is waiting, so
@@ -11894,6 +11908,32 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
         // The one screen someone stares at when nothing works at all, so it
         // carries the place to send the log rather than just the symptom.
         l2 = "DLSS DID NOT START - SEND RESHADE.LOG TO GITHUB.COM/MAOHGAD-WEB/NEURAL-COPROCESSOR";
+    }
+    // ---- R142: THE TAP IS NOT THERE, AND THIS SCREEN IS WHERE THEY LOOK ----
+    //
+    // V30 above earned the first error code because a run sat on "WAITING FOR
+    // THE FIRST FRAME" for nine thousand frames while the log had already
+    // said, five seconds in, that nothing was coming. THIS IS THE SAME SHAPE
+    // ONE CONDITION OVER: with Depth=1 and no usable tap on the GAME runtime
+    // the arm holds forever by design - it is a chain of guarded early
+    // returns that never touches a game resource, so it cannot crash and
+    // cannot draw attention to itself. The screen said "ARMING" for days
+    // while the correct line sat in the log.
+    //
+    //   -1 -> 204, the GAME runtime never enumerated the tap. Its search path
+    //         does not reach the file. [R142] in the log prints their
+    //         EffectSearchPaths and ours side by side.
+    //    0 -> 203, enumerated but off, and the self-enable did not take.
+    //
+    // Depth=0 IS EXCLUDED DELIBERATELY: that run does not want depth, and an
+    // absent tap is not a fault in it. -2 is excluded too - the enumeration
+    // waits up to 900 frames to settle, and reporting a fault before it has
+    // is the "empty list recorded as a fact" mistake P1.6 exists to avoid.
+    else if (s.depth_mode != 0 && !s.armed && tap_state >= -1 && tap_state <= 0)
+    {
+        st_out = mgpu::screen::st_error;
+        if (tap_state < 0) { l1 = MGPU_E204_L1; l2 = MGPU_E204_L2; }
+        else               { l1 = MGPU_E203_L1; l2 = MGPU_E203_L2; }
     }
     else if (s.armed)
     {

@@ -38,6 +38,7 @@
 #include <d3d12.h>
 #include <cstdio>     // P1.6: snprintf. This file had no formatted logging before.
 #include <cstring>    // R137: strstr, to spot the depth tap by its effect name.
+#include <cwchar>     // R142: wcsrchr, to split our own module path for [R142].
 #include <atomic>     // R138: the present counter and the said-once flags.
 
 // ---- R141: BUILD IDENTITY, SAID ONCE, FIRST ----
@@ -407,6 +408,38 @@ namespace
             p->used += (size_t)wrote;
     }
 
+    // R142. Where OUR mgpu_depth_tap.fx actually is. The add-on sits beside
+    // dxgi.dll, which sits beside the executable, so the add-on's folder is
+    // also the game's - and the shipped layout puts the tap under
+    // reshade-shaders\Shaders\ inside it. Derived rather than assumed,
+    // because the whole point of [R142] is to print a path the reader can
+    // compare against their own.
+    //
+    // Never writes anything. Returns false if the module path cannot be split,
+    // and the caller prints that rather than an empty string that would read
+    // as a real answer.
+    bool tap_shader_dir(char *out, size_t out_n)
+    {
+        if (out == nullptr || out_n < 8) return false;
+        out[0] = '\0';
+
+        wchar_t mod[MAX_PATH * 2] = {};
+        const DWORD n = GetModuleFileNameW(mgpu::module_handle(), mod, MAX_PATH * 2);
+        if (n == 0 || n >= MAX_PATH * 2) return false;
+
+        wchar_t *slash = wcsrchr(mod, L'\\');
+        if (slash == nullptr) return false;
+        *(slash + 1) = L'\0';
+
+        char dir[MAX_PATH * 2] = {};
+        if (WideCharToMultiByte(CP_UTF8, 0, mod, -1, dir, (int)sizeof dir,
+                                nullptr, nullptr) == 0)
+            return false;
+
+        snprintf(out, out_n, "%sreshade-shaders\\Shaders\\", dir);
+        return out[0] != '\0';
+    }
+
     // `tag` is "GAME" or "BRIDGE". Two independent probes, because the two
     // runtimes load different presets and either one can change what is on
     // screen.
@@ -447,39 +480,102 @@ namespace
                      (p.enabled != 0) ? p.names : "");
         mgpu::diag::info(line);
 
-        // ---- R137: THE LINE THE README HAS ALWAYS PROMISED ----
+        // ---- R137 / R142: THE LINE THE README HAS ALWAYS PROMISED ----
         //
         // Emitted per runtime, right after P1.6, from the same enumeration.
-        // The GAME runtime is the one that matters - the bridge runtime has no
-        // depth to tap - but both are printed, because a reader who finds only
-        // one of them cannot tell whether the other was checked and clean or
-        // never looked at.
+        //
+        // R142. UNTIL 0.2.3 THIS LINE DID NOT SAY WHICH RUNTIME GOVERNS DEPTH,
+        // and that cost a user several days. Both lines print. The BRIDGE one
+        // called its own OFF state "a bridge fault" - which it is not, because
+        // the bridge runtime has no depth buffer to tap and its tap state
+        // cannot affect whether anything arms - so the reader chased the
+        // runtime that cannot matter while the GAME line sat beside it holding
+        // the real answer. Every branch now names its runtime and what that
+        // runtime governs.
+        const bool is_game_rt = (std::strcmp(tag, "GAME") == 0);
         const char *tap = p.tap_present ? (p.tap_enabled ? "ON" : "OFF")
                                         : "ABSENT";
-        char t53[1800];   // R137: longest branch measured at ~1160 bytes with the prefix.
+
+        // R142. The idle screen needs this, and ONLY the GAME runtime's answer
+        // is a fault. See ui_set_tap_state in gpu1_context.hpp.
+        if (is_game_rt)
+            mgpu::gpu1::ui_set_tap_state(p.tap_present ? (p.tap_enabled ? 1 : 0) : -1);
+
+        char t53[2200];   // R142: longest branch measured at 743 with the prefix.
         snprintf(t53, sizeof t53,
                  "[MGPU][R53] TECHNIQUE LANE: %s runtime | %u technique(s) enumerated | "
-                 "TAP = %s. %s",
+                 "TAP = %s. %s%s",
                  tag, p.total, tap,
+                 is_game_rt
+                     ? "THIS IS THE RUNTIME THAT GOVERNS DEPTH - it owns the game's depth "
+                       "buffer, and mgpu_depth_tap.fx can only supply depth from here. "
+                     : "THIS RUNTIME DOES NOT GOVERN DEPTH. The bridge has no depth buffer "
+                       "to tap, the add-on's self-enable deliberately does not run here, and "
+                       "nothing this line says about the tap can affect whether the stream "
+                       "arms. It is printed so a reader can see it was checked, not because "
+                       "it is a fault. ",
                  p.tap_present
                      ? (p.tap_enabled
-                            ? "mgpu_depth_tap.fx is compiled AND its technique is enabled, "
-                              "which is the state Depth=1 needs. THIS DOES NOT PROVE DEPTH IS "
-                              "BOUND: the tap keeps ReShade's depth buffer alive, and whether "
-                              "ReShade picked the right one is a separate question the [R63] "
-                              "line answers."
-                            : "mgpu_depth_tap.fx IS present and compiled, and its technique is "
-                              "SWITCHED OFF. This add-on enables it itself, so this is a bridge "
-                              "fault rather than an install fault - do not go looking for the "
-                              "file, it is where it should be. With Depth=1 the stream will "
-                              "wait for a depth buffer that nothing is keeping alive.")
+                            ? "mgpu_depth_tap.fx is compiled AND its technique is enabled. "
+                              "THIS DOES NOT PROVE DEPTH IS BOUND: the tap keeps ReShade's "
+                              "depth buffer alive, and whether ReShade picked the right one "
+                              "is a separate question the [R63] line answers."
+                            : "mgpu_depth_tap.fx IS present and compiled, and its technique "
+                              "is SWITCHED OFF. The add-on enables it itself on the GAME "
+                              "runtime, so present-but-off THERE means that did not take. "
+                              "On the bridge runtime this is the shipped state and is "
+                              "expected - gpu1.ini ships with an empty Techniques= on "
+                              "purpose.")
                      : "NO technique from mgpu_depth_tap.fx was enumerated on this runtime. "
-                       "Either the file is not in ReShade's Shaders folder, or it failed to "
-                       "compile - ReShade logs a compile error of its own in that case. With "
-                       "Depth=1 the stream will never arm. R137: this line did not exist "
-                       "before 0.2.3 even though the install guide described it, so a log "
-                       "without it is an older build and not a missing tap.");
+                       "DO NOT ASSUME THE FILE IS MISSING - the more common cause by far is "
+                       "that this runtime's EffectSearchPaths does not reach the folder the "
+                       "file is in. The [R142] line below prints both paths. R137: this line "
+                       "did not exist before 0.2.3, so a log without it is an older build "
+                       "and not a missing tap.");
         mgpu::diag::info(t53);
+
+        // ---- R142: READ THEIR CONFIG AND SAY WHAT IS ACTUALLY WRONG ----
+        //
+        // READ ONLY, AND THAT IS A DECISION RATHER THAN A LIMITATION. A
+        // working ReShade.ini belongs to the user and this project does not
+        // rewrite it behind their back. What this removes is the guesswork
+        // from the fault that has cost the most support time: the GAME runtime
+        // searching a folder the tap is not in, while the file sits exactly
+        // where the install guide put it.
+        //
+        // Runs only when the GAME runtime came up without the tap, so a
+        // healthy install pays one strcmp for it and nothing else.
+        if (is_game_rt && !p.tap_present)
+        {
+            char paths[1024] = {};
+            size_t pn = sizeof paths - 1;
+            const bool got = reshade::get_config_value(runtime, "GENERAL",
+                                                       "EffectSearchPaths", paths, &pn);
+
+            char want[MAX_PATH * 2] = {};
+            const bool know = tap_shader_dir(want, sizeof want);
+
+            // Worst case measured at ~2250: 700 of fixed text plus a 1023-byte
+            // path list plus a 520-byte folder. Sized past it rather than to
+            // it, because the one line that explains the whole fault is the
+            // last line that should ever truncate.
+            char r142[3400];
+            snprintf(r142, sizeof r142,
+                     "[MGPU][R142] ERROR 204 - THE GAME RUNTIME CANNOT SEE THE TAP. Its "
+                     "EffectSearchPaths = %s | mgpu_depth_tap.fx ships at %s | THE FIX: add "
+                     "that folder to EffectSearchPaths in the ReShade.ini beside the game "
+                     "executable and relaunch - for a default install that is "
+                     "EffectSearchPaths=.\\reshade-shaders\\Shaders\\** (and the matching "
+                     "TextureSearchPaths). WHY THIS IS NOT \"the file is missing\": the "
+                     "BRIDGE runtime loads the same file through its own ReShade2.ini and is "
+                     "unaffected, so every other line in this log looks healthy. Depth can "
+                     "only come from the GAME runtime. With Depth=1 the stream holds at the "
+                     "arm from here - it will not crash, it will not stop the game, and it "
+                     "will not say anything further. The bridge window shows ERROR 204.",
+                     got ? paths : "(could not be read)",
+                     know ? want : "(could not resolve the add-on's folder)");
+            mgpu::diag::error(r142);
+        }
     }
 }
 

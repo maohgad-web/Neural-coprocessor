@@ -61,6 +61,14 @@ enum state
 #define MGPU_E203_L1 "ERROR 203"
 #define MGPU_E203_L2 "EFFECT NOT ENABLED - TURN IT ON IN THE RESHADE MENU"
 
+// R142. The GAME runtime never loaded the tap at all. NOT the same fault as
+// 202: the file can be exactly where the guide says and this still fires,
+// because what is wrong is the SEARCH PATH of the runtime that owns the
+// depth - not the location of the file. The log's [R142] line prints their
+// EffectSearchPaths and ours side by side.
+#define MGPU_E204_L1 "ERROR 204"
+#define MGPU_E204_L2 "GAME RESHADE IS NOT LOADING THE TAP - SEE ERROR 204 IN RESHADE.LOG"
+
 #define MGPU_E301_L1 "ERROR 301"
 #define MGPU_E301_L2 "NO SECOND ADAPTER FOUND"
 
