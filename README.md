@@ -188,6 +188,8 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `Depth=1` | Send the game's depth to the second card and bind it. Needs `mgpu_depth_tap.fx` |
 | `MVec=3` | Send the game's motion vectors and bind them. `0` leaves the model to its own derivation |
 | `MvecFromEval=2` | Where the vectors are taken from. `2` is automatic: the usual route, falling back to the DLSS pass on engines where it never fires. New in 0.2.2 |
+| `Calib=2` | How the add-on reads the game's own DLSS calls. `0` turns the whole tap off |
+| `CalibRung=0` | Which install route the calibrator may use. `0` both, `1` the import table alone, `2` the cached-pointer scan alone. Leave at `0` unless a title faults at startup. New in 0.2.2 |
 | `SRPreset=0` | 0 title default, 11 K, 12 L, 13 M |
 | `Frames=0` | Stop after this many frames. `0` runs until you quit |
 
