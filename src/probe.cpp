@@ -2034,6 +2034,18 @@ unsigned g_tech_n = 0;
 unsigned g_tech_seen = 0;
 unsigned long long g_tap_enables = 0;   // times we had to switch it on
 int      g_tap_state = -1;              // -1 absent, 0 present-off, 1 present-on
+// R147. CONSECUTIVE SCANS THAT DID NOT END WITH THE TAP ON.
+//
+// One bad scan is not a fault. enumerate_techniques can return a partial list
+// while ReShade is reloading effects, and find_technique can miss in the same
+// window - either one leaves g_tap_state at -1 or 0 for ONE scan, and the next
+// scan 300 frames later puts it back to 1. Reported straight through, that is
+// a red ERROR 203 or 204 on screen for five seconds on a healthy run, which
+// then "recovers" - exactly the behaviour the 12:28 build was shipped with and
+// exactly what made three identical launches look like three different bugs.
+//
+// A fault that clears itself was never a fault. Two in a row, or nothing.
+unsigned g_tap_bad_scans = 0;
 
 void tech_cb(reshade::api::effect_runtime *rt,
              reshade::api::effect_technique t, void *)
@@ -2079,6 +2091,11 @@ void tech_scan()
             ++g_tap_enables;
         }
     }
+
+    // R147. Counted per SCAN, not per frame: a scan is the only event that
+    // can change the answer, and 300 frames apart is the cadence above.
+    if (g_tap_state == 1) g_tap_bad_scans = 0;
+    else                  ++g_tap_bad_scans;
 }
 
 void sem_scan()
@@ -3240,7 +3257,10 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr)
 // 204 on screen during normal startup.
 int tap_state()
 {
-    return (g_tech_seen == 0) ? -2 : g_tap_state;
+    if (g_tech_seen == 0)        return -2;   // no scan has completed
+    if (g_tap_state == 1)        return 1;    // healthy, report immediately
+    if (g_tap_bad_scans < 2u)    return -2;   // R147: one bad scan is not a fault
+    return g_tap_state;                       // -1 or 0, confirmed twice
 }
 
 unsigned long long depth_source()
