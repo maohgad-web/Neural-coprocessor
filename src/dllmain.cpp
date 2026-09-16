@@ -37,6 +37,8 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <cstdio>     // P1.6: snprintf. This file had no formatted logging before.
+#include <cstring>    // R137: strstr, to spot the depth tap by its effect name.
+#include <atomic>     // R138: the present counter and the said-once flags.
 
 // ---- P6.4: the overlay panel ----
 //
@@ -320,20 +322,68 @@ namespace
         size_t used = 0;
         unsigned enabled = 0;
         unsigned total = 0;
+
+        // ---- R137: THE TECHNIQUE LANE, WHICH WAS DOCUMENTED AND NEVER EMITTED ----
+        //
+        // assets/README.txt has told users since 0.2.0 to check a line reading
+        //
+        //   [MGPU][R53] TECHNIQUE LANE: ... TAP = ON
+        //
+        // and to treat TAP = ABSENT as "mgpu_depth_tap.fx is not in the shader
+        // path or failed to compile, and with Depth=1 the bridge will never
+        // arm". THAT LINE HAS NEVER EXISTED. It appears in no log this project
+        // has collected - not 007 First Light on either driver, not Lunar
+        // Eclipse, not Resonance. A user was asked for it twice during issue 15
+        // triage and answered, correctly, with ReShade's own "Successfully
+        // compiled" message, because that was the only evidence available to
+        // him. Compiled is not enabled, and enabled is not "ReShade bound a
+        // depth buffer" - three different claims, and the log could only make
+        // the first.
+        //
+        // The enumeration needed to answer it was already here: P1.6 walks
+        // every technique with its effect name. It was only ever asked which
+        // ones were ENABLED, and it discarded everything else.
+        //
+        // THREE STATES, NOT TWO. The README described ON and ABSENT. OFF is
+        // real and is a different fault: the add-on enables this technique
+        // itself, so present-but-off means that did not happen, which is a
+        // bridge problem rather than an install problem. Collapsing it into
+        // ABSENT would send the reader to re-check a file that is already in
+        // the right place.
+        bool tap_present = false;
+        bool tap_enabled = false;
     };
+
+    // The effect that carries the depth tap. Matched on the effect name rather
+    // than the technique name because the technique can be renamed inside the
+    // file without the install instructions changing.
+    constexpr const char *TAP_EFFECT = "mgpu_depth_tap";
 
     void technique_cb(reshade::api::effect_runtime *rt,
                       reshade::api::effect_technique tech, void *user)
     {
         preset_probe *p = static_cast<preset_probe *>(user);
         ++p->total;
-        if (!rt->get_technique_state(tech)) return;
-        ++p->enabled;
 
+        // R137. The effect name is read for EVERY technique now, enabled or
+        // not. The tap has to be findable while it is switched off - that is
+        // the state the old two-valued line could not express - and the early
+        // return below used to discard the name before anything looked at it.
         char tn[128] = {}; size_t tns = sizeof tn - 1;
         rt->get_technique_name(tech, tn, &tns);
         char en[128] = {}; size_t ens = sizeof en - 1;
         rt->get_technique_effect_name(tech, en, &ens);
+
+        const bool is_tap = (std::strstr(en, TAP_EFFECT) != nullptr) ||
+                            (std::strstr(tn, TAP_EFFECT) != nullptr);
+        if (is_tap)
+        {
+            p->tap_present = true;
+            if (rt->get_technique_state(tech)) p->tap_enabled = true;
+        }
+
+        if (!rt->get_technique_state(tech)) return;
+        ++p->enabled;
 
         const int wrote = snprintf(p->names + p->used, sizeof p->names - p->used,
                                    "%s%s@%s", (p->used != 0) ? ", " : "", tn, en);
@@ -380,6 +430,40 @@ namespace
                      (p.enabled != 0) ? ": " : "",
                      (p.enabled != 0) ? p.names : "");
         mgpu::diag::info(line);
+
+        // ---- R137: THE LINE THE README HAS ALWAYS PROMISED ----
+        //
+        // Emitted per runtime, right after P1.6, from the same enumeration.
+        // The GAME runtime is the one that matters - the bridge runtime has no
+        // depth to tap - but both are printed, because a reader who finds only
+        // one of them cannot tell whether the other was checked and clean or
+        // never looked at.
+        const char *tap = p.tap_present ? (p.tap_enabled ? "ON" : "OFF")
+                                        : "ABSENT";
+        char t53[1800];   // R137: longest branch measured at ~1160 bytes with the prefix.
+        snprintf(t53, sizeof t53,
+                 "[MGPU][R53] TECHNIQUE LANE: %s runtime | %u technique(s) enumerated | "
+                 "TAP = %s. %s",
+                 tag, p.total, tap,
+                 p.tap_present
+                     ? (p.tap_enabled
+                            ? "mgpu_depth_tap.fx is compiled AND its technique is enabled, "
+                              "which is the state Depth=1 needs. THIS DOES NOT PROVE DEPTH IS "
+                              "BOUND: the tap keeps ReShade's depth buffer alive, and whether "
+                              "ReShade picked the right one is a separate question the [R63] "
+                              "line answers."
+                            : "mgpu_depth_tap.fx IS present and compiled, and its technique is "
+                              "SWITCHED OFF. This add-on enables it itself, so this is a bridge "
+                              "fault rather than an install fault - do not go looking for the "
+                              "file, it is where it should be. With Depth=1 the stream will "
+                              "wait for a depth buffer that nothing is keeping alive.")
+                     : "NO technique from mgpu_depth_tap.fx was enumerated on this runtime. "
+                       "Either the file is not in ReShade's Shaders folder, or it failed to "
+                       "compile - ReShade logs a compile error of its own in that case. With "
+                       "Depth=1 the stream will never arm. R137: this line did not exist "
+                       "before 0.2.3 even though the install guide described it, so a log "
+                       "without it is an older build and not a missing tap.");
+        mgpu::diag::info(t53);
     }
 }
 
@@ -1389,14 +1473,81 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 // L3. Fired after ReShade has submitted the effects list for this frame and
 // before the swapchain presents it - which is exactly the ordering the
 // next-frame signal in stream_on_finish_effects was working around.
+// ---- R138: THE GAME'S EFFECT RUNTIME NEVER RAN EFFECTS ----
+//
+// MEASURED on the issue 15 reporter's 007 First Light, eleven runs: no
+// [P1.6] GAME line, no [R63], no arm, and NOTHING IN THE LOG SAYING WHY.
+//
+// The cause is structural and it is ours. Everything on the game side - the
+// preset probe, the P9.1 frame tick, and the depth tap that keeps ReShade's
+// depth buffer alive - hangs off reshade_finish_effects. That event only
+// fires when ReShade actually runs an effect pass. On a runtime that loaded
+// no effects it never fires at all, so every one of those goes silent
+// together and the bridge waits for a depth buffer that nothing will ever
+// produce.
+//
+// His log is the proof: 14 effects compiled, "[P1.6] BRIDGE ... 0 of 14", and
+// no GAME line of any kind. The effects landed on the bridge runtime; the
+// game's runtime enumerated nothing, so it never finished effects, so the
+// add-on never heard from it.
+//
+// An absence cannot be seen by the code that the absence silences. So this
+// counts PRESENTS, which arrive whatever the effect runtime is doing, and
+// says so once when the game has presented plenty of frames and never once
+// finished an effect pass. 600 is AutoArm's own threshold, deliberately: if
+// the stream is about to try arming, this has already been decided.
+std::atomic<bool> g_game_fx_seen{false};
+std::atomic<unsigned long long> g_game_presents{0};
+std::atomic<bool> g_r138_said{false};
+
 static void on_present(reshade::api::command_queue *queue,
-                       reshade::api::swapchain *,
+                       reshade::api::swapchain *swapchain,
                        const reshade::api::rect *, const reshade::api::rect *,
                        uint32_t, const reshade::api::rect *)
 {
     if (queue == nullptr) return;
     mgpu::gpu1::stream_on_present(
         reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native())));
+
+    // R138. Log-only. Nothing below changes what the bridge does.
+    if (swapchain == nullptr || g_r138_said.load(std::memory_order_relaxed)) return;
+    if (g_game_fx_seen.load(std::memory_order_relaxed)) return;
+
+    reshade::api::device *sd = swapchain->get_device();
+    if (sd == nullptr || sd->get_api() != reshade::api::device_api::d3d12) return;
+
+    mgpu::adapter::selection_result sel;
+    mgpu::adapter::get_selection(sel);
+    if (!sel.game_luid_known) return;
+
+    auto *sd12 = reinterpret_cast<ID3D12Device *>(sd->get_native());
+    if (sd12 == nullptr) return;
+    const LUID l = sd12->GetAdapterLuid();
+    if (l.LowPart != sel.game_luid.LowPart || l.HighPart != sel.game_luid.HighPart)
+        return;
+
+    const unsigned long long n =
+        g_game_presents.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n < 600) return;
+    if (g_r138_said.exchange(true, std::memory_order_relaxed)) return;
+
+    char l138[1500];
+    snprintf(l138, sizeof l138,
+             "[MGPU][R138] THE GAME'S EFFECT RUNTIME HAS NEVER RUN AN EFFECT PASS - %llu "
+             "presents on the game's swapchain and not one reshade_finish_effects event. "
+             "THIS IS WHY NOTHING ELSE IS IN THIS LOG. The preset probe, the frame tick and "
+             "mgpu_depth_tap.fx all run from that event, so with Depth=1 the stream will "
+             "wait forever for a depth buffer that nothing is keeping alive, and it will do "
+             "it without an error because there is no failure - there is an absence. WHAT TO "
+             "CHECK, in order: (1) does the [MGPU][P1.6] GAME line appear anywhere above - if "
+             "only BRIDGE appears, the effects loaded on the wrong runtime; (2) the game's "
+             "ReShade.ini [GENERAL] EffectSearchPaths, which must point at the folder holding "
+             "mgpu_depth_tap.fx; (3) whether ReShade compiled the effects at all, and how "
+             "many - a BRIDGE line reading '0 of N' with no GAME line means all N went to the "
+             "bridge. Measured on 007 First Light, 2026-09-15: 14 effects compiled, all of "
+             "them enumerated by the BRIDGE runtime, none by the game's.",
+             n);
+    mgpu::diag::error(l138);
 }
 
 static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
@@ -1408,6 +1559,11 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     if (runtime == nullptr || cmd_list == nullptr) return;
 
     reshade::api::device *dev = runtime->get_device();
+
+    // R138. This event firing at all is the fact the R138 line reports the
+    // absence of. Set unconditionally and cheaply; the game/bridge split below
+    // refines it, but any finish_effects at all means the runtime is alive.
+    g_game_fx_seen.store(true, std::memory_order_relaxed);
 
     // P12.2/R63. Hoisted, because the depth barrier below is only legal on the
     // GAME runtime's command list while the stream call sits outside the block
@@ -1521,6 +1677,64 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     // Barrier, record, barrier back - all on one list, in order. A handle of 0
     // means ReShade has no depth this frame, and then nothing at all is issued.
     unsigned long long depth_h = rt_is_game ? mgpu::probe::depth_source() : 0ull;
+
+    // ---- R139: THE ENGINE'S OWN DEPTH, BESIDE THE ONE WE USE ----
+    //
+    // Depth today comes from ONE route and it is the fragile one: an effect's
+    // output texture, MGPU_DepthOutTex, which exists only if the game's
+    // ReShade runtime loaded effects, compiled the tap, enabled its technique,
+    // raised finish_effects, and had ReShade's own generic-depth heuristic
+    // pick something sensible to feed it. Six links we do not control, and the
+    // issue 15 reporter breaks at the first one - see R138.
+    //
+    // The engine, meanwhile, HANDS NGX ITS DEPTH BY POINTER on every DLSS
+    // evaluate, and the calibrator has been capturing it all along: the
+    // [R101] line prints it as "THE GAME'S OWN TABLE: ... depth=0x...". That
+    // is a declaration rather than a guess, and it is the same shape as the
+    // R103 route that solved the velocity address.
+    //
+    // THIS LINE COPIES NOTHING AND CHANGES NOTHING. It exists to answer the
+    // one question the transport work depends on: IS THE ENGINE'S DECLARED
+    // DEPTH THE SAME RESOURCE THE TAP HAS BEEN GIVING US?
+    //
+    //   SAME  - an evaluate-time route can reuse the depth slot exactly as the
+    //           arm already sized it, and lands outside the ring entirely.
+    //   NOT   - the slot is sized at arm from the tap's extent and format, so
+    //           the size guard in the copy path would reject every frame, and
+    //           making the route work means changing what the ARM sizes from.
+    //           That is ring work and it is not a hotfix.
+    //
+    // Said once, and again whenever either side changes, so a resolution
+    // change or a re-resolve is visible rather than averaged away.
+    if (rt_is_game)
+    {
+        static unsigned long long said_tap = ~0ull, said_tbl = ~0ull;
+        mgpu::calibrator::table ct{};
+        const bool have_tbl = mgpu::calibrator::read(ct);
+        const unsigned long long tbl = have_tbl ? ct.depth : 0ull;
+        if (tbl != said_tbl || depth_h != said_tap)
+        {
+            said_tbl = tbl; said_tap = depth_h;
+            char d139[1400];
+            snprintf(d139, sizeof d139,
+                     "[MGPU][R139] DEPTH SOURCES: tap MGPU_DepthOutTex -> 0x%llx | game's own "
+                     "NGX table depth -> 0x%llx | SAME RESOURCE: %s. WHY THIS LINE EXISTS: the "
+                     "tap is the only route depth has, and it needs the game's ReShade runtime "
+                     "to have loaded effects at all - which is exactly what fails on some "
+                     "installs (see R138). The engine declares its depth to NGX on every "
+                     "evaluate and the calibrator already reads it. SAME means an evaluate-time "
+                     "depth route can reuse the slot as the arm already sized it. DIFFERENT "
+                     "means the arm would have to be sized from the table instead, which is "
+                     "transport work rather than a fallback. A table depth of 0 means this "
+                     "title created no DLSS feature this run, so there is no declaration to "
+                     "read and the tap is the only route available here.",
+                     depth_h, tbl,
+                     (tbl != 0ull && tbl == depth_h) ? "yes"
+                         : (tbl == 0ull ? "no table" : "NO"));
+            mgpu::diag::info(d139);
+        }
+    }
+
     const reshade::api::resource depth_res = { depth_h };
 
     if (depth_h != 0)
