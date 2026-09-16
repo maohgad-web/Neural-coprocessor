@@ -1723,7 +1723,11 @@ static void on_present(reshade::api::command_queue *queue,
                      tap, have_tbl ? ct.depth : 0ull,
                      mv, have_tbl ? ct.mvec : 0ull,
                      (tap == 0ull && !fx)
-                         ? "THE GAME'S EFFECT RUNTIME HAS NEVER RUN - THAT IS THE FAULT."
+                         ? "ERROR 204 - THE GAME'S EFFECT RUNTIME HAS NEVER RUN, AND THAT IS "
+                           "THE FAULT. Same code as the bridge window is showing. [R138] above "
+                           "states it once with what to check, and "
+                           "github.com/maohgad-web/Neural-coprocessor/issues if that does not "
+                           "resolve it."
                          : ((tap == 0ull)
                                 ? "The effect pass runs; ReShade has no depth bound yet."
                                 : "Depth is available - the hold is elsewhere."));
@@ -1748,7 +1752,8 @@ static void on_present(reshade::api::command_queue *queue,
              "mgpu_depth_tap.fx; (3) whether ReShade compiled the effects at all, and how "
              "many - a BRIDGE line reading '0 of N' with no GAME line means all N went to the "
              "bridge. Measured on 007 First Light, 2026-09-15: 14 effects compiled, all of "
-             "them enumerated by the BRIDGE runtime, none by the game's.",
+             "them enumerated by the BRIDGE runtime, none by the game's. IF THAT DOES NOT "
+             "RESOLVE IT: github.com/maohgad-web/Neural-coprocessor/issues - attach this file.",
              n);
     mgpu::diag::error(l138);
 }
