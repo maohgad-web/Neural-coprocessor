@@ -24,12 +24,12 @@ Also in 0.2.0:
 
 **0.2.1** - `mgpu_depth_tap.fx` no longer needs ReShade's standard effects pack. It included `ReShade.fxh` from that pack, so skipping the pack in the installer made the tap fail to compile and the bridge never arm. Super Resolution on the second card also gained two named panel modes, `Native Upscaling` (the default, and the higher quality of the two) and `Experimental Upscaler`.
 
-**0.2.2** - fixes a startup crash on titles that ship NVIDIA Streamline, reported on Battlefield 6 SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. The same report turned up a limitation: the engine's motion vectors are only available while the game itself is running DLSS or DLAA - with TAA the model falls back to deriving motion from colour, which is what 0.1.0 ran on. See Limitations.
+**0.2.2** - fixes a startup crash on titles that ship NVIDIA Streamline, reported by [@Zonnery](https://github.com/Zonnery) on Battlefield 6 SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. The same report turned up a limitation: the engine's motion vectors are only available while the game itself is running DLSS or DLAA - with TAA the model falls back to deriving motion from colour, which is what 0.1.0 ran on. See Limitations.
 
 **0.2.3** - three fixes:
 
 - **iGPU detection is improved.** If you have an integrated GPU enabled alongside your two graphics cards, it no longer causes problems - and you do not have to disable it.
-- **Depth and motion vector support for 007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)). The same fix also covers Cyberpunk 2077, where depth would not bind if you had Ray Reconstruction enabled.
+- **Depth and motion vector support for 007 First Light**, reported by [@Zonnery](https://github.com/Zonnery) ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)). The same fix also covers Cyberpunk 2077, where depth would not bind if you had Ray Reconstruction enabled.
 - **The bridge window reports a bad install instead of waiting.** `ERROR 204` when the game's ReShade runtime never compiled the depth tap - almost always `EffectSearchPaths` - and `ERROR 205` for a missing `mgpu.ini`. Read-only: the add-on never writes your `ReShade.ini`.
 
 * * *
