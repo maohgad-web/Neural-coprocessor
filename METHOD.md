@@ -278,6 +278,104 @@ Rigour is a budget. Spend it on the claims that carry the conclusion.
 
 ---
 
+## 13 · A tool that summarises cannot report its own truncation
+
+A fetch of a GitHub issue returned the opening post, summarised it, and answered
+the question put to it - including *"no other participants contributed to this
+thread"* and, for the maintainer, *"no contributions visible"*. The thread held
+eighteen comments across four days. Nothing errored. The prose was clean, and it
+contained a conclusion.
+
+The failure is structural rather than a bug. A tool that reads a page and
+answers a question about it answers from what it received, and it cannot know
+what it did not receive. An absence in its answer is therefore not evidence of
+absence: it is indistinguishable from an absence in its input.
+
+So when an instrument returns prose rather than raw content, judge the SHAPE of
+what it retrieved before believing anything concluded from it. A summary naming
+one participant, of a page that visibly holds a conversation, is a retrieval
+failure and not a finding. The same two threads read through a second route - a
+browser on the page itself - returned all eighteen comments.
+
+This is rule 1 one step out. There the instrument was ours and a green log was
+not a passed task; here the instrument is somebody else's and a fluent answer is
+not a complete read.
+
+---
+
+## 14 · Log before the call, not after
+
+Every call into somebody else's library announces itself BEFORE it runs. Not
+the result afterwards - the intention beforehand, naming the call and its
+arguments, so a process that dies inside another vendor's code names its own
+last line.
+
+This is not a style preference. It is the only diagnostic that survives the
+failure mode these libraries actually have, and this project was killed twice by
+exactly that mode. `nvapi_QueryInterface` returns a raw pointer, so a wrong
+ordinal returns a pointer to a DIFFERENT function and calling it crashes with no
+return code to check; four builds died before every step announced itself.
+`CreateFeature` on a session whose `Init` reported stale does not return an
+error - it takes the process with it, and a comment in our own source asserted
+the opposite.
+
+The cost is one line per call, run once. The saving, twice measured, is several
+builds each time.
+
+Two corollaries, both earned:
+
+- **Never let a vendor call be the thing that reports its own precondition.**
+  Check the precondition yourself, before entering, and say what you checked.
+- **A comment asserting an equivalence the code does not have is worse than no
+  comment.** A log line claiming one arm path was "identical" to another while
+  arming from a different point stopped anyone looking there.
+
+---
+
+## 15 · A negative result is only evidence if the search could have succeeded
+
+A sweep of NvAPI structure sizes tried 12 through 40 and returned a clean
+negative at every step. The answers were 44 and 136. Every result was honest;
+the inference drawn from them was not, because the range never contained the
+answer.
+
+Before a null result is allowed to close a question, state the range or the
+condition under which it would have been positive, and check that the search
+covered it. A search that could not have succeeded has not failed - it has not
+run.
+
+This is rule 1 in the other direction. There, a green log was believed because
+nothing had checked; here, a red one is believed because something checked in
+the wrong place.
+
+---
+
+## 16 · The log is a database. Its schema is append-only.
+
+**Field names and tags are the schema. Prose is commentary. Commentary is
+editable; schema is not.**
+
+Every log this project has taken, every figure in `RESULTS.md`, every user
+issue, and every grep in the debug route keys on the same tokens - `[R78]`,
+`copies=`, `res=`, `valid=`, `gap=`. Rename one and every historical log stops
+being comparable, every note quoting it stops matching, and somebody pasting a
+line from last month gets a reply that does not fit it. That cost is silent, and
+it is paid by the person least able to see it.
+
+- **Never rename a field or a tag.** Not for accuracy, not for tidiness.
+- **Add rather than rename** when a name is wrong. A new field beside the old
+  one is backward compatible; a renamed one is not.
+- **A new tag is free.** Only renames and deletions cost anything.
+- **Correct prose freely.** It is not a grep key and nothing matches on it.
+- **When a correction replaces a MEASUREMENT, name the old figure as superseded
+  rather than deleting it** - rule 10, applied to log text.
+
+It is also a hard constraint on any refactor: moving a log line between
+translation units must not change its tag or its fields, or every figure taken
+before the move becomes incomparable with every figure taken after.
+
+---
+
 ## What this method does not cover
 
 Stated so it is not mistaken for complete.
