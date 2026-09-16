@@ -22,9 +22,15 @@ Also in 0.2.0:
 - **Both cards now have their own DLSS Super Resolution pass.** The second card can do its neural work at a smaller resolution and let DLSS scale the result back up to full resolution, which makes that work a lot cheaper. This is its own setting and does not depend on the game's DLSS, which can be set to anything, or turned off entirely. That gives a weaker second card a way to keep up with a stronger render card, and it is what makes DLSS 5 affordable on older titles where the card doing the neural rendering was struggling. It ships off, so neural rendering runs at full resolution out of the box.
 - **General optimization, and lower latency at higher resolutions.** The two cards now balance the load between them rather than each running at its own pace, in either direction, so a mismatch in speed no longer builds into a backlog. That is also what paid for depth and motion vectors: what they cost to move still fits inside the one frame window 0.1.0 ran on. **The latency improvement requires Reflex.**
 
-**0.2.1 is a hotfix on top of this.** `mgpu_depth_tap.fx` no longer needs ReShade's standard effects pack - it included `ReShade.fxh` from that pack, so skipping the pack in the installer made the tap fail to compile and the bridge never arm. Reported by a user after 0.2.0 shipped; the report was correct. Super Resolution on the second card also gained two named modes in the panel, `Native Upscaling` and `Experimental Upscaler`, with Native Upscaling as the default because it is the higher quality of the two.
+**0.2.1** - `mgpu_depth_tap.fx` no longer needs ReShade's standard effects pack. It included `ReShade.fxh` from that pack, so skipping the pack in the installer made the tap fail to compile and the bridge never arm. Super Resolution on the second card also gained two named panel modes, `Native Upscaling` (the default, and the higher quality of the two) and `Experimental Upscaler`.
 
-**0.2.2 is a second hotfix.** It fixes a startup crash on titles that ship NVIDIA Streamline, reported on Battlefield 6 SP Campaign ([issue #14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. It also turned up a limitation worth knowing before you rely on them: the second card can only be handed the engine's motion vectors when the game itself is running DLSS or DLAA. With TAA, there is nothing to take them from and the model falls back to deriving motion from colour, which is what 0.1.0 ran on throughout. Neural rendering itself is unaffected. See Limitations.
+**0.2.2** - fixes a startup crash on titles that ship NVIDIA Streamline, reported on Battlefield 6 SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. The same report turned up a limitation: the engine's motion vectors are only available while the game itself is running DLSS or DLAA - with TAA the model falls back to deriving motion from colour, which is what 0.1.0 ran on. See Limitations.
+
+**0.2.3** - three fixes:
+
+- **iGPU detection is improved.** If you have an integrated GPU enabled alongside your two graphics cards, it no longer causes problems - and you do not have to disable it.
+- **Depth and motion vector support for 007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)). The same fix also covers Cyberpunk 2077, where depth would not bind if you had Ray Reconstruction enabled.
+- **The bridge window reports a bad install instead of waiting.** `ERROR 204` when the game's ReShade runtime never compiled the depth tap - almost always `EffectSearchPaths` - and `ERROR 205` for a missing `mgpu.ini`. Read-only: the add-on never writes your `ReShade.ini`.
 
 * * *
 
@@ -83,6 +89,7 @@ I cannot test every game, so any report helps.
 | Title | Resolution | Reported in | State |
 | --- | --- | --- | --- |
 | Battlefield 6 (SP executable) | 3840x2160 | [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) | Runs clean on 0.2.2 |
+| 007 First Light | 3840x2160 | [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16) | Runs clean on 0.2.3 |
 
 **Battlefield 6** SP Campaign, anti-cheat: online games are at your own risk ([issue #14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On 0.2.0 and 0.2.1 this title crashed inside its own `sl.common.dll` on some machines every launch, and never delivered a motion vector frame on any of them. **Both are fixed in 0.2.2**, verified by the reporter on the machine that crashed every time.
 
@@ -98,13 +105,15 @@ The last row is a limitation rather than a fault - see Limitations. Neural rende
 
 **Not the add-on.** The reporter also saw `bf6.exe` crash on its own with `KERNELBASE.dll / 0x80070057`, reproduced with an empty game folder and no add-ons installed.
 
+**007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)), 3840x2160, path tracing with Ray Reconstruction - game on an RTX 5090, neural stage on an RTX 5070 Ti. On 0.2.2 it armed and then stopped, because the game's ReShade runtime was never compiling the depth tap. Fixed in 0.2.3.
+
 * * *
 
 ## System Requirements
 
 - **GeForce RTX 50-series cards** (primary requirement for DLSS Neural Rendering)
 - **GeForce RTX 40-series cards** (confirmed working with modded `nvngx_dlssnr.dll`)
-- **Two GPUs and two monitors** (one monitor per card; headless operation is slower). One monitor is not supported, but there is an unsupported workaround - see Display setup
+- **Two GPUs and two monitors** (one monitor per card). One monitor is not supported, but there is an unsupported workaround, and it is the other way round - the display goes on the neural card. See Display setup
 - **Add-on-enabled ReShade build, 6.8.0 or newer**
 - **DirectX 12 games only** (D3D11 and Vulkan unsupported)
 - **No shader packs required**
@@ -133,7 +142,8 @@ See `assets/README.txt` for complete installation instructions. Critical require
 - ReShade must support add-ons (effects-only build will not load `.addon64` files)
 - File name must contain the literal substring `nvngx.dll`
 - **`nvngx_dlssnr.dll` goes in a folder called `mgpu`, next to the add-on. NOT beside the game executable.** Beside the executable some titles load it themselves and the neural stage will crash. This changed in 0.2.0.
-- **`mgpu_depth_tap.fx` goes in ReShade's `Shaders` folder.** The add-on switches it on itself, so nothing needs enabling in the effects list. Without it ReShade never binds a depth buffer and the bridge waits instead of arming; `ReShade.log` says `TAP = ABSENT`. On 0.2.0 it also needs ReShade's standard effects pack installed - or upgrade to 0.2.1 or newer, which removes that requirement.
+- **`mgpu_depth_tap.fx` goes in ReShade's `Shaders` folder.** The add-on switches it on itself, so nothing needs enabling in the effects list. Without it ReShade never binds a depth buffer and the bridge waits instead of arming. On 0.2.0 it also needs ReShade's standard effects pack installed - or upgrade to 0.2.1 or newer, which removes that requirement.
+- **And check `EffectSearchPaths` in the game's `ReShade.ini`.** Putting the file in the right folder is not enough: ReShade only compiles effects it finds through that setting, so if it does not point at the folder you put the tap in, the file is in the right place and is still invisible. A ReShade install that skipped the effect packages can leave it pointing at the game folder instead of `.\reshade-shaders\Shaders\**`. Only the **game's** runtime matters here - the bridge window has its own config that ships correct, which is why every other line in the log can look healthy while nothing arms. 0.2.3 prints `[MGPU][R142]` with your path and ours side by side, and shows `ERROR 204` on the bridge window.
 
 * * *
 
