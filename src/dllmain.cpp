@@ -1528,6 +1528,69 @@ static void on_present(reshade::api::command_queue *queue,
 
     const unsigned long long n =
         g_game_presents.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // ---- R140: THE ARM-HELD REPORT, FROM A PATH THAT CANNOT GO SILENT ----
+    //
+    // THE DEFECT THIS FIXES IS THE LOG, NOT THE STREAM.
+    //
+    // Eleven runs of 007 First Light on one reporter's machine produced eleven
+    // identical non-answers: no arm, and nothing saying why. The reason is
+    // structural. EVERY depth diagnostic this project has - [P1.6], [R53],
+    // [R63] stream arm HELD, the P9.1 frame tick, the band line - is emitted
+    // from reshade_finish_effects. When the game's effect runtime never runs a
+    // pass, that event never fires, and all of them go quiet together. The log
+    // does not then say "depth is missing". It says NOTHING, which is
+    // indistinguishable from "the add-on never loaded".
+    //
+    // An absence cannot be reported by the code the absence silences. So this
+    // reports from on_present, which arrives whatever the effect runtime is
+    // doing, and states the WHOLE chain every time rather than the one link
+    // that happens to be reachable.
+    //
+    // Cadence, not spam: first at 600 presents (AutoArm's own threshold, so
+    // the first report lands as the stream starts trying), then every 1800.
+    // Stops the moment the stream is armed - a held report after the hold has
+    // cleared is noise, and noise is what trains people to skip the line that
+    // matters.
+    if (n >= 600 && (n == 600 || (n % 1800) == 0))
+    {
+        mgpu::gpu1::ui_state ust{};
+        mgpu::gpu1::ui_read(ust);
+        if (!ust.armed)
+        {
+            const unsigned long long tap = mgpu::probe::depth_source();
+            const unsigned long long mv  = mgpu::probe::mvec_source();
+            mgpu::calibrator::table ct{};
+            const bool have_tbl = mgpu::calibrator::read(ct);
+            const bool fx = g_game_fx_seen.load(std::memory_order_relaxed);
+
+            char h140[1900];
+            snprintf(h140, sizeof h140,
+                     "[MGPU][R140] ARM HELD at present %llu | game finish_effects seen: %s | "
+                     "depth: tap=0x%llx, game's NGX table=0x%llx | mvec: probe source=0x%llx, "
+                     "table=0x%llx. %s READ THE CHAIN LEFT TO RIGHT: a depth tap of 0 with "
+                     "finish_effects NO means the game's ReShade runtime has never run an "
+                     "effect pass, so mgpu_depth_tap.fx has never executed and nothing is "
+                     "keeping a depth buffer alive - that is an install or runtime problem and "
+                     "NOT the game. A depth tap of 0 with finish_effects YES means the pass "
+                     "runs but ReShade has bound no depth, which is the [R63] case and usually "
+                     "clears once a scene is on screen. A non-zero tap here means depth is "
+                     "available and something else is holding the arm - read [R78] for the "
+                     "velocity lane. This line is printed from the PRESENT path on purpose: "
+                     "every other depth line in this log comes from the effect event, and when "
+                     "that event is the thing that failed they all disappear together.",
+                     n, fx ? "YES" : "NO",
+                     tap, have_tbl ? ct.depth : 0ull,
+                     mv, have_tbl ? ct.mvec : 0ull,
+                     (tap == 0ull && !fx)
+                         ? "THE GAME'S EFFECT RUNTIME HAS NEVER RUN - THAT IS THE FAULT."
+                         : ((tap == 0ull)
+                                ? "The effect pass runs; ReShade has no depth bound yet."
+                                : "Depth is available - the hold is elsewhere."));
+            mgpu::diag::error(h140);
+        }
+    }
+
     if (n < 600) return;
     if (g_r138_said.exchange(true, std::memory_order_relaxed)) return;
 
