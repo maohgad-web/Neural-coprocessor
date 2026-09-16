@@ -69,6 +69,35 @@ enum state
 #define MGPU_E204_L1 "ERROR 204"
 #define MGPU_E204_L2 "GAME RESHADE IS NOT LOADING THE TAP - SEE ERROR 204 IN RESHADE.LOG"
 
+// ---- R145: THE TWO CODES FOR "LOADED, HEALTHY, AND DOING NOTHING" ----
+//
+// Both were measured on 2026-09-16, on two titles, and both spent a test
+// session each. In neither case was anything broken: the add-on had loaded,
+// passed every self-check, and was deliberately inert - and the screen said
+// "STARTING - THE GAME WILL APPEAR WHEN THE STREAM ARMS", which is a promise
+// it had no way to keep. A screen that cannot say "nothing is going to happen"
+// is worse than the cycling hue this file replaced, because at least the hue
+// did not claim to be fine.
+//
+// 205 IS AN ERROR AND 206 IS NOT, and the difference is intent. A missing
+// mgpu.ini is an install that did not finish - nobody chooses it, and every
+// key in the add-on is then at a code default that the shipped file overrides,
+// AutoArm and Depth included. AutoArm=0 with a file present is a decision
+// somebody made, so it gets the neutral field: stated plainly, not scolded.
+#define MGPU_E205_L1 "ERROR 205"
+#define MGPU_E205_L2 "NO MGPU.INI BESIDE THE ADD-ON - COPY IT FROM THE ZIP"
+
+#define MGPU_S206_L1 "MGPU BRIDGE"
+#define MGPU_S206_L2 "AUTOARM IS OFF IN MGPU.INI - NOTHING WILL ARM BY ITSELF"
+
+// R145. Not codes: the arm names the lane it is held on. "ARMING" for ninety
+// seconds is indistinguishable from a hang, and R63/R78 measured 20 to 35
+// seconds of real scene as NORMAL - so these stay on the waiting field and say
+// what they are waiting for rather than going red on a healthy startup.
+#define MGPU_WAIT_DEPTH_L2 "ARMING - WAITING FOR THE GAMES DEPTH BUFFER"
+#define MGPU_WAIT_MVEC_L2  "ARMING - WAITING FOR MOTION VECTORS"
+#define MGPU_WAIT_ARM_L2   "ARMING"
+
 #define MGPU_E301_L1 "ERROR 301"
 #define MGPU_E301_L2 "NO SECOND ADAPTER FOUND"
 

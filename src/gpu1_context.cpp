@@ -646,6 +646,16 @@ void ui_set_tap_state(int state)
     g_tap_state_game.store(state, std::memory_order_relaxed);
 }
 
+// R143. The GAME runtime has presented past AutoArm's threshold without ever
+// running an effect pass. Set from on_present, which is the only path that
+// still arrives when that is true - see the header, and R138/R140 in dllmain
+// for the log side of the same correction. A latch: set once, never cleared.
+static std::atomic<bool> g_game_fx_absent{false};
+void ui_set_game_fx_absent(bool absent)
+{
+    if (absent) g_game_fx_absent.store(true, std::memory_order_relaxed);
+}
+
 namespace
 {
     // P5.0. Defined with the stream, below. Returns the neural output texture
@@ -8238,6 +8248,21 @@ namespace
         unsigned long long depth_valid_frames = 0, depth_invalid_frames = 0;
         unsigned long long depth_size_rejects = 0;
         unsigned long long depth_arm_waits = 0;
+        // R146. WHICH LANE IS HOLDING THE ARM *RIGHT NOW*.
+        //
+        // depth_arm_waits and mvec_arm_waits above are CUMULATIVE and are never
+        // reset, so they answer "did this lane ever hold", not "is it holding".
+        // R145 read them as if they were the second question and got the first:
+        // measured on Resonance, depth clears at frame 252 and mvec runs to
+        // 1305, so for the last ~1050 frames of every arm the screen would have
+        // said WAITING FOR THE GAMES DEPTH BUFFER while the actual hold was the
+        // velocity lane. A counter that only goes up cannot express a state
+        // that goes away.
+        //
+        // 0 nothing holding   1 depth   2 velocity
+        // Written every frame by the two hold paths and cleared when the arm
+        // gets past them, so it is the live answer by construction.
+        int hold_lane = 0;
         bool   depth_arm_logged = false;
         // consumer side, read from the seal rather than from our own state, so
         // a producer/consumer disagreement shows up as a mismatch instead of
@@ -8769,14 +8794,45 @@ namespace
             if (!said)
             {
                 said = true;
-                char pl[900];
+                // R144. THIS LINE USED TO NAME THE FOUR DEFAULTS THAT DO NOT
+                // MATTER AND NEITHER OF THE TWO THAT DO.
+                //
+                // Measured 2026-09-16 on Resonance and again on Cyberpunk
+                // 2077: no mgpu.ini in the game folder, and the add-on did
+                // nothing at all for a full session. Not a fault, not an
+                // error, not a held arm - NOTHING, because with no file
+                // ini_read_autoarm_frames returns 0 and stream_request is
+                // never called, so stream_on_finish_effects returns at its
+                // first line every frame and every diagnostic downstream of
+                // the arm is silent by construction. The log then said "EVERY
+                // KEY IS AT ITS DEFAULT: 600 frames, Passes=1, Window=fit,
+                // Neural=ON, Profile=off", which reads as a working
+                // configuration and cost two test sessions.
+                //
+                // The shipped assets/mgpu.ini sets AutoArm=1 and Depth=1. The
+                // code defaults are 0 and 0. Those two keys are the entire
+                // difference between a run and an inert add-on, and they are
+                // the two the line omitted. Frames and Passes are not
+                // interesting and are gone.
+                //
+                // SEVERITY, not politeness: this is the one condition where
+                // the add-on is loaded, healthy, and deliberately doing
+                // nothing. It says so in the imperative.
+                char pl[1700];
                 if (f == nullptr)
                     snprintf(pl, sizeof pl,
                              "[MGPU][P7.2] NO mgpu.ini FOUND - not beside the add-on (\"%ls\") and "
-                             "not in the working directory. EVERY KEY IS AT ITS DEFAULT: 600 "
-                             "frames, Passes=1, Window=fit, Neural=ON, Profile=off. The arm line "
-                             "below will report those defaults and will look exactly like a file "
-                             "that asked for them. Put mgpu.ini beside the .addon64.",
+                             "not in the working directory. THE ADD-ON WILL DO NOTHING THIS RUN, "
+                             "AND THAT IS NOT A FAULT YOU WILL SEE REPORTED ANYWHERE ELSE IN THIS "
+                             "LOG. Two code defaults decide it and both are OFF: AutoArm=0, so "
+                             "the stream is never requested and never arms - no [R63], no [R78], "
+                             "no arm line, because all of them live behind the request - and "
+                             "Depth=0, so the depth tap is not consulted and the idle screen's "
+                             "ERROR 203/204 cannot fire either. The shipped assets/mgpu.ini sets "
+                             "AutoArm=1 and Depth=1; the file is what turns this add-on on. "
+                             "COPY assets/mgpu.ini FROM THE RELEASE ARCHIVE TO BESIDE THE "
+                             ".addon64 AND RELAUNCH. Everything below this line describes a "
+                             "process that is loaded, healthy and idle on purpose.",
                              (wp[0] != L'\0') ? wp : L"<path unknown>");
                 else if (beside)
                     snprintf(pl, sizeof pl,
@@ -11419,6 +11475,19 @@ unsigned autoarm_frames()
     return ini_read_autoarm_frames();
 }
 
+// R145. Does an mgpu.ini exist at all? ini_read_autoarm_frames returns 0 both
+// when the file is missing and when the file says AutoArm=0, and the idle
+// screen has to tell those apart: the first is an unfinished install and the
+// second is somebody's decision. This is the only question ini_slurp's return
+// value answers on its own, so it is asked directly.
+//
+// Called once, from a function-local static, and never from a hot path.
+static bool ini_file_present()
+{
+    char buf[INI_BYTES];
+    return ini_slurp(buf, sizeof buf);
+}
+
 // ---- P6.3: intensity on the hotkeys ----
 //
 // Until now Intensity was read from mgpu.ini once, at arm time. Finding the
@@ -11868,12 +11937,26 @@ int ui_install_layout()
 
 void present_screen_state(int &st_out, const char *&l1, const char *&l2)
 {
+    // ---- R145: THE TWO LATCHES, TAKEN BEFORE THE LOCK ----
+    //
+    // ini_file_present() opens a file. s.cs is the mutex the game's render
+    // thread takes EVERY FRAME, and DEFECT E is the standing rule that nothing
+    // which can block may be done while holding it. A function-local static
+    // initialises exactly once, on the first present, and every present after
+    // that reads a bool and an unsigned. Both answers are fixed for the
+    // process: the config is read once at startup and never re-read.
+    static const bool     ini_found  = ini_file_present();
+    static const unsigned autoarm_at = autoarm_frames();
+
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
 
     // R142. Read ONCE: the branch below tests it twice and the two tests must
     // not be able to disagree with each other across a store from dllmain.
     const int tap_state = g_tap_state_game.load(std::memory_order_relaxed);
+    // R143. The second half of the same question, from the path that survives
+    // when the effect runtime does not. Read here for the same reason.
+    const bool fx_absent = g_game_fx_absent.load(std::memory_order_relaxed);
 
     l1 = MGPU_IDLE_L1;
     // V43. FIRST, because it outranks everything else this screen can say.
@@ -11894,6 +11977,12 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
         st_out = mgpu::screen::st_idle;
         l2 = "RUN COMPLETE - RESTART THE GAME TO RUN AGAIN";
     }
+    // ---- THE STREAM IS ARMED. ONLY THE NEURAL STAGE CAN STILL FAIL. ----
+    //
+    // R145 HOISTED THESE TWO ABOVE EVERYTHING BELOW. Armed is the one state
+    // this function can read without inference: the resources exist and the
+    // ring is live. Every branch after it is an answer to "why is it NOT
+    // armed", and none of them can be right while it is.
     else if (s.armed && s.neural && s.nr_tried && !s.nr_ok)
     {
         // V30. THE FIRST CONDITION WORTH AN ERROR CODE, AND IT EARNED ONE THE
@@ -11909,50 +11998,118 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
         // carries the place to send the log rather than just the symptom.
         l2 = "DLSS DID NOT START - SEND RESHADE.LOG TO GITHUB.COM/MAOHGAD-WEB/NEURAL-COPROCESSOR";
     }
-    // ---- R142: THE TAP IS NOT THERE, AND THIS SCREEN IS WHERE THEY LOOK ----
-    //
-    // V30 above earned the first error code because a run sat on "WAITING FOR
-    // THE FIRST FRAME" for nine thousand frames while the log had already
-    // said, five seconds in, that nothing was coming. THIS IS THE SAME SHAPE
-    // ONE CONDITION OVER: with Depth=1 and no usable tap on the GAME runtime
-    // the arm holds forever by design - it is a chain of guarded early
-    // returns that never touches a game resource, so it cannot crash and
-    // cannot draw attention to itself. The screen said "ARMING" for days
-    // while the correct line sat in the log.
-    //
-    //   -1 -> 204, the GAME runtime never enumerated the tap. Its search path
-    //         does not reach the file. [R142] in the log prints their
-    //         EffectSearchPaths and ours side by side.
-    //    0 -> 203, enumerated but off, and the self-enable did not take.
-    //
-    // Depth=0 IS EXCLUDED DELIBERATELY: that run does not want depth, and an
-    // absent tap is not a fault in it. -2 is excluded too - the enumeration
-    // waits up to 900 frames to settle, and reporting a fault before it has
-    // is the "empty list recorded as a fact" mistake P1.6 exists to avoid.
-    else if (s.depth_mode != 0 && !s.armed && tap_state >= -1 && tap_state <= 0)
-    {
-        st_out = mgpu::screen::st_error;
-        if (tap_state < 0) { l1 = MGPU_E204_L1; l2 = MGPU_E204_L2; }
-        else               { l1 = MGPU_E203_L1; l2 = MGPU_E203_L2; }
-    }
     else if (s.armed)
     {
         st_out = mgpu::screen::st_waiting;
         l2 = MGPU_IDLE_L2;
     }
-    else if (s.requested)
+
+    // ================= NOT ARMED. THE REST OF THIS FUNCTION SAYS WHY. =======
+    //
+    // R145, AND THE WHOLE REASON IT EXISTS. Until this milestone the not-armed
+    // half of this chain had exactly two answers - "ARMING" if the stream had
+    // been requested and "STARTING - THE GAME WILL APPEAR WHEN THE STREAM
+    // ARMS" if it had not - and BOTH of them are promises. Measured
+    // 2026-09-16 on two titles: no mgpu.ini in the game folder, so AutoArm
+    // defaulted to 0, so stream_request() was never called, so
+    // stream_on_finish_effects returned at its first line every frame. The
+    // add-on was loaded, healthy, and never going to do anything, and the
+    // screen said the game would appear. Two test sessions were spent on it.
+    //
+    // The order below is deliberate: FURTHEST FROM WORKING FIRST. A missing
+    // config outranks a held arm, because an arm that was never requested
+    // cannot be held. Read top to bottom it is the sequence a run has to pass
+    // through, and wherever it stops is the thing to fix.
+
+    // ---- IT WAS NEVER ASKED FOR ----
+    //
+    // 205 IS AN ERROR AND 206 IS NOT. Nobody chooses to have no mgpu.ini: the
+    // shipped file sets AutoArm=1 and Depth=1 and the code defaults are 0 and
+    // 0, so a missing file silently disables both the stream and the depth
+    // path - and [P7.2] in the log now says so in the same words. AutoArm=0
+    // with a file present is a decision, usually a measurement one, so it gets
+    // the neutral field and a flat statement instead of a red screen.
+    else if (!s.requested && !ini_found)
+    {
+        st_out = mgpu::screen::st_error;
+        l1 = MGPU_E205_L1;
+        l2 = MGPU_E205_L2;
+    }
+    else if (!s.requested && autoarm_at == 0)
+    {
+        st_out = mgpu::screen::st_idle;
+        l1 = MGPU_S206_L1;
+        l2 = MGPU_S206_L2;
+    }
+    else if (!s.requested)
+    {
+        // AutoArm is on and has not counted out yet. This is the only state in
+        // the not-armed half that is genuinely just early, and it is the one
+        // the old default text was written for. It keeps that text.
+        st_out = mgpu::screen::st_idle;
+        l2 = "STARTING - THE GAME WILL APPEAR WHEN THE STREAM ARMS";
+    }
+
+    // ---- IT WAS ASKED FOR AND THE ARM IS HELD. ON WHAT? ----
+    //
+    // R142/R143: THE TAP, WHICH IS THE ONLY ONE OF THESE THAT IS PROVABLY A
+    // FAULT. With Depth on and no usable tap on the GAME runtime the arm holds
+    // forever by design - a chain of guarded early returns that never touches
+    // a game resource, so it cannot crash and cannot draw attention to itself.
+    //
+    //   fx_absent -> 204. The GAME runtime has presented past AutoArm's
+    //         threshold without ever running an effect pass, so the
+    //         enumeration that sets tap_state can never run. R138 wrote the
+    //         rule down a milestone before R142 ignored it: AN ABSENCE CANNOT
+    //         BE REPORTED BY THE CODE THE ABSENCE SILENCES.
+    //   -1 -> 204, enumerated nothing. The search path does not reach the
+    //         file. [R142] in the log prints their EffectSearchPaths and ours.
+    //    0 -> 203, enumerated but off, and the self-enable did not take.
+    //
+    // R145: tap_state IS NOW LIVE rather than latched at first settle - see
+    // probe::tap_state(). A latched 0 was a false 203 on a healthy run.
+    //
+    // Depth=0 IS EXCLUDED DELIBERATELY: that run does not want depth, and an
+    // absent tap is not a fault in it. -2 is excluded too - no scan has
+    // completed, and reporting a fault before one has is the "empty list
+    // recorded as a fact" mistake P1.6 exists to avoid.
+    else if (s.depth_mode != 0 &&
+             (fx_absent || (tap_state >= -1 && tap_state <= 0)))
+    {
+        st_out = mgpu::screen::st_error;
+        if (fx_absent || tap_state < 0) { l1 = MGPU_E204_L1; l2 = MGPU_E204_L2; }
+        else                            { l1 = MGPU_E203_L1; l2 = MGPU_E203_L2; }
+    }
+
+    // ---- HELD, AND NOT PROVABLY BROKEN. NAME THE LANE AND STAY GREY. ----
+    //
+    // R63 measured 20 seconds of real scene before ReShade bound a depth
+    // buffer and R56 measured 35, both from a menu; R78's velocity lane wants
+    // 240 consecutive frames of the same handle on top of that. So a held arm
+    // is NORMAL for the first half-minute of a launch and going red on it
+    // would train people to ignore the red. What was wrong was never the
+    // colour - it was that "ARMING" for ninety seconds is indistinguishable
+    // from a hang, and said nothing about which of the two lanes was holding
+    // while the log had the answer in [R63] and [R78].
+    //
+    // depth_arm_waits and mvec_arm_waits are incremented by the two arm-hold
+    // paths in stream_on_finish_effects and by nothing else, so a non-zero
+    // count IS that path having run. No new state, no inference.
+    else if (s.hold_lane == 1)
     {
         st_out = mgpu::screen::st_waiting;
-        l2 = "ARMING";
+        l2 = MGPU_WAIT_DEPTH_L2;
+    }
+    else if (s.hold_lane == 2)
+    {
+        st_out = mgpu::screen::st_waiting;
+        l2 = MGPU_WAIT_MVEC_L2;
     }
     else
     {
-        // Not armed. The quieter sweep, and the instruction rather than a
-        // status: this is the state a first-time user sees for ten seconds
-        // before AutoArm fires, and it is the whole reason the colours had to
-        // go - it looked broken while it was working correctly.
-        st_out = mgpu::screen::st_idle;
-        l2 = "STARTING - THE GAME WILL APPEAR WHEN THE STREAM ARMS";
+        // Requested, nothing reporting a hold. The arm is in flight.
+        st_out = mgpu::screen::st_waiting;
+        l2 = MGPU_WAIT_ARM_L2;
     }
 }
 
@@ -13599,6 +13756,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (s.depth_mode != 0 && depth_handle == 0)
         {
             ++s.depth_arm_waits;
+            s.hold_lane = 1;                      // R146: live, this frame
             if (!s.depth_arm_logged)
             {
                 s.depth_arm_logged = true;
@@ -13635,6 +13793,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (s.mvec_mode == 3 && (mvec_handle == 0 || s.mvec_stable < STABLE_NEED))
         {
             ++s.mvec_arm_waits;
+            s.hold_lane = 2;                      // R146: live, this frame
             if (!s.mvec_arm_logged)
             {
                 s.mvec_arm_logged = true;
@@ -13648,6 +13807,13 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             }
             return;
         }
+
+        // R146. Both holds are behind us this frame, so nothing is holding.
+        // Cleared HERE rather than at s.armed = true because the allocation
+        // below can fail and re-enter next frame - and during those attempts
+        // the honest answer is "arming", not "still waiting for a lane that
+        // already delivered".
+        s.hold_lane = 0;
 
         s.tried = true;
 

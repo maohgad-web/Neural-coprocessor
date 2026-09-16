@@ -618,6 +618,29 @@ void intensity_step(int dir);
 // screen. Any thread; a relaxed atomic store and nothing else.
 void ui_set_tap_state(int state);
 
+// ---- R143: THE GAME RUNTIME NEVER RAN AN EFFECT PASS ----
+//
+// ui_set_tap_state ABOVE CANNOT REPORT THE CASE IT WAS WRITTEN FOR, and this
+// exists because that was measured rather than reasoned about. The tap state
+// is pushed from log_preset_once, which runs from reshade_finish_effects -
+// and R138 already established, on the issue 15 reporter's machine, that the
+// event only fires when ReShade actually runs an effect pass. Remove the tap
+// from a GAME runtime that has no other effects and the event never arrives:
+// the enumeration never runs, the tap state stays at -2, and the screen that
+// was supposed to say ERROR 204 sits on "ARMING" forever. Reproduced on
+// Cyberpunk 2077 with mgpu_depth_tap.fx deliberately deleted.
+//
+// So this is pushed from the PRESENT path instead, which arrives whatever the
+// effect runtime is doing - the same correction R140 made to the log, applied
+// to the screen. True means: the game's swapchain has presented past AutoArm's
+// own threshold and reshade_finish_effects has never once fired on it.
+//
+// It is a latch. It is set once and never cleared, because the condition it
+// reports cannot un-happen within a process: the early return in on_present
+// stops the counter the moment an effect pass is seen, so the threshold can
+// only ever be crossed by a runtime that has already stayed silent past it.
+void ui_set_game_fx_absent(bool absent);
+
 // Bridge thread. Arms the stream; inert until called, one stream per process.
 // Reads Fault= from mgpu.ini beside the add-on - absent means no fault, so the
 // shipped default is a clean run and a missing file is never an error.

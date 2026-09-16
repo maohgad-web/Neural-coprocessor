@@ -496,10 +496,20 @@ namespace
         const char *tap = p.tap_present ? (p.tap_enabled ? "ON" : "OFF")
                                         : "ABSENT";
 
-        // R142. The idle screen needs this, and ONLY the GAME runtime's answer
-        // is a fault. See ui_set_tap_state in gpu1_context.hpp.
-        if (is_game_rt)
-            mgpu::gpu1::ui_set_tap_state(p.tap_present ? (p.tap_enabled ? 1 : 0) : -1);
+        // R145. THE PUSH THAT USED TO BE HERE IS GONE, AND THIS NOTE IS WHY.
+        //
+        // R142 sent the idle screen its tap state from this spot. It is the
+        // wrong spot: log_preset_once is one-shot on p.done and fires at the
+        // FIRST non-empty enumeration, which is before probe::tech_scan has
+        // had a chance to self-enable the technique. Measured 2026-09-16 on
+        // Resonance - [R53] below printed TAP = OFF for a tap that was
+        // present, compiled and working, and the screen would have shown
+        // ERROR 203 for the whole session on the strength of it.
+        //
+        // The live value is pushed every frame from on_finish_effects instead,
+        // beside the depth_source() call that maintains it. The R53 line here
+        // still reports this snapshot, because a snapshot is the honest thing
+        // for a line that says "at the moment the effects settled".
 
         char t53[2200];   // R142: longest branch measured at 743 with the prefix.
         snprintf(t53, sizeof t53,
@@ -1641,6 +1651,24 @@ static void on_present(reshade::api::command_queue *queue,
     const unsigned long long n =
         g_game_presents.fetch_add(1, std::memory_order_relaxed) + 1;
 
+    // ---- R143: TELL THE SCREEN, NOT ONLY THE LOG ----
+    //
+    // Everything below this line writes to ReShade.log. R142 added an idle
+    // screen for the missing tap so that the fault would be visible WITHOUT
+    // the log - and then fed that screen from log_preset_once, which hangs off
+    // reshade_finish_effects like every other depth diagnostic in this project
+    // and dies with it. Removing the tap from a runtime with no other effects
+    // silenced the enumeration, left the screen's tap state at "not determined
+    // yet", and put the screen back on ARMING: the exact failure R142 was
+    // written to end, reintroduced by R142's own plumbing.
+    //
+    // Reaching this line means the two early returns above have already
+    // established both halves: the swapchain is the GAME's, and
+    // reshade_finish_effects has never fired on it. 600 is R138's threshold
+    // and AutoArm's, so the screen changes as the stream starts trying rather
+    // than before there is anything to report.
+    if (n >= 600) mgpu::gpu1::ui_set_game_fx_absent(true);
+
     // ---- R140: THE ARM-HELD REPORT, FROM A PATH THAT CANNOT GO SILENT ----
     //
     // THE DEFECT THIS FIXES IS THE LOG, NOT THE STREAM.
@@ -1852,6 +1880,13 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     // Barrier, record, barrier back - all on one list, in order. A handle of 0
     // means ReShade has no depth this frame, and then nothing at all is issued.
     unsigned long long depth_h = rt_is_game ? mgpu::probe::depth_source() : 0ull;
+
+    // R145. The idle screen's copy of the tap state, refreshed from the value
+    // depth_source() has just maintained. GAME runtime only - the bridge
+    // runtime has no depth to tap and its tap state is not a fault. An int
+    // read and a relaxed store; tech_scan's own cost is throttled to one
+    // enumeration every 300 frames and is unchanged by this.
+    if (rt_is_game) mgpu::gpu1::ui_set_tap_state(mgpu::probe::tap_state());
 
     // ---- R139: THE ENGINE'S OWN DEPTH, BESIDE THE ONE WE USE ----
     //
