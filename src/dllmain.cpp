@@ -1229,6 +1229,99 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // seconds of the game presenting. Someone opening the panel with Home
         // on a title where SR was off found no quality or preset controls at
         // all, and no way to learn they existed.
+        // ---- V73: THE TWO RESTART-ONLY CONTROLS, MOVED UP HERE ----
+        //
+        // These used to sit in a second box further down, alongside a DUPLICATE
+        // set of preset and quality radios. Two boxes with the same radios, only
+        // one of which did anything in the running session, and the code knew:
+        // the old comment said "separate live Change quality or preset block
+        // further up". The duplicates are gone. What is left here is the two
+        // controls that genuinely cannot take effect until the game restarts,
+        // placed immediately above the live box so the order on screen matches
+        // the order you use them in: turn it on, restart once, then tune live.
+        {
+            static bool ini_loaded = false;
+            static bool want_sr = false;
+            static bool want_match = true;
+            static int  want_m = 2;
+            static bool wrote_any = false;
+            if (!ini_loaded)
+            {
+                ini_loaded = true;
+                want_sr    = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0);
+                want_m     = mgpu::gpu1::ui_ini_read("SRQuality", 2);
+                want_match = (mgpu::gpu1::ui_ini_read("SRScale", 0) == 0);
+            }
+
+            const auto write_sr_mode = [](int mode, bool match)
+            {
+                mgpu::gpu1::ui_ini_write("SRQuality", mode);
+                if (match)
+                {
+                    mgpu::gpu1::ui_ini_write("SRScale",    0);
+                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 0);
+                }
+                else
+                {
+                    const int sc = (mode == 2) ? 67 : ((mode == 1) ? 58 : 50);
+                    mgpu::gpu1::ui_ini_write("SRScale",    sc);
+                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
+                }
+                return true;
+            };
+
+            if (ImGui::Checkbox("DLSS Super Resolution on GPU 1", &want_sr))
+                wrote_any |= mgpu::gpu1::ui_ini_write("SRUpscale", want_sr ? 1 : 0);
+            ImGui::TextDisabled("Native Parameters ON");
+
+            ImGui::BeginDisabled(!want_sr);
+            if (ImGui::RadioButton("Native Upscaling", want_match))
+            { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
+            ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
+            if (ImGui::RadioButton("Experimental Upscaler", !want_match))
+            { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
+            ImGui::TextDisabled("Works from a downscaled resolution. More performance, possible");
+            ImGui::TextDisabled("cost in quality. Untested.");
+
+            // ---- V74: THE EXPERIMENTAL RATIO IS ITS OWN PRESET ----
+            //
+            // Shown only when Experimental is chosen, not greyed out beside
+            // it. Greying it left a dead control on screen for everyone on
+            // Native, which is most people, and said nothing about what it
+            // belonged to. Hidden, it reads as what it is: a setting that
+            // exists because Experimental exists.
+            //
+            // THE VALUE SURVIVES THE ROUND TRIP. Going back to Native calls
+            // write_sr_mode(want_m, true), which sets SRScale to 0 and leaves
+            // SRQuality at want_m - so the ratio they picked is still in the
+            // ini and still selected when they come back. Nothing is reset by
+            // changing your mind.
+            if (!want_match)
+            {
+                ImGui::Spacing();
+                ImGui::TextUnformatted("mode  ");
+                ImGui::SameLine();
+                if (ImGui::RadioButton("quality##xm", want_m == 2))
+                { want_m = 2; wrote_any |= write_sr_mode(2, false); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("balanced##xm", want_m == 1))
+                { want_m = 1; wrote_any |= write_sr_mode(1, false); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("performance##xm", want_m == 0))
+                { want_m = 0; wrote_any |= write_sr_mode(0, false); }
+                ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+            }
+            ImGui::EndDisabled();
+
+            ImGui::Spacing();
+            if (wrote_any)
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                                   "DLSS is on - restart the game once to apply the change.");
+            else
+                ImGui::TextDisabled("These two are read when the game starts. Everything below is live.");
+        }
+
+
         ImGui::SeparatorText("Change quality or preset");
         if (!st.sr_on)
         {
@@ -1241,10 +1334,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                     ? qn2[st.sr_quality] : "unknown");
             ImGui::TextDisabled("preset:  %s", pn2);
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                               "Super resolution is not running, so these cannot be changed now.");
-            ImGui::TextDisabled("Set SRUpscale=1 in mgpu.ini and restart. The Super resolution");
-            ImGui::TextDisabled("box above says whether it was off, or requested and refused.");
+            // V73. Yellow, and it names the action instead of a config key.
+            // "Set SRUpscale=1 in mgpu.ini" sent people to a text file for
+            // something the checkbox above now does for them, and reads as a
+            // warning about editing their install rather than as an
+            // instruction. The restart is stated once, plainly, as the one
+            // thing standing between them and the controls.
+            ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                               "Super Resolution is OFF - turn it ON to unlock the menu below.");
         }
         if (st.sr_on)
         {
@@ -1252,8 +1349,31 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // choice; nothing happens until APPLY. The first person to use
             // this panel clicked a preset, saw no change, and reasonably
             // concluded the control was broken.
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                               "Pick, then press APPLY. The buttons alone change nothing.");
+            // ---- V75: SAY WHAT GPU 1 IS ACTUALLY RENDERING WITH ----
+            //
+            // This line used to be advice - first "the buttons alone change
+            // nothing", then "pick, then press APPLY". Both were static, so
+            // the most prominent line in the box told you nothing about your
+            // own machine. The APPLY instruction is not lost: it appears
+            // beside the button, next to STAGED - NOT APPLIED YET, which is
+            // the moment it is actually needed.
+            //
+            // READ FROM st, NOT FROM want_q/want_p. Those are what you have
+            // CLICKED; st is what the second GPU is rendering with right now.
+            // While a change is staged the two differ, and the one worth
+            // putting at the top is the live one.
+            {
+                const char *pn3 = (st.sr_preset == 11) ? "K"
+                                : (st.sr_preset == 12) ? "L"
+                                : (st.sr_preset == 13) ? "M"
+                                : "title default";
+                static const char *qn3[] = { "Performance", "Balanced", "Quality" };
+                const char *qs3 = (st.sr_quality >= 0 && st.sr_quality <= 2)
+                                      ? qn3[st.sr_quality] : "unknown";
+                char sl[96];
+                snprintf(sl, sizeof sl, "DLSS ON  %s - %s", pn3, qs3);
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f), "%s", sl);
+            }
 
             static int  want_q = -1, want_p = -1;
             static bool init_done = false;
@@ -1344,140 +1464,6 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // V24: no longer headed "Experimental". The two experimental things
         // in it are gone and the only control left is the one the box above
         // reports on, so the old heading now warns about nothing.
-        ImGui::SeparatorText("Settings - restart to take effect");
-        {
-            // V24. Reflex and DLAA were here too - this is the ARMED view's
-            // copy of the same two controls the pre-arm menu had. Removing
-            // them from one place and leaving them in the other would be the
-            // worst of both: the trap still reachable, and now reachable only
-            // from the screen a user gets to AFTER something has gone right,
-            // which is the least likely place for anyone to look for it.
-            // Both go. The reasoning is written out in full at the pre-arm
-            // block above and is not repeated here.
-            static bool ini_loaded = false;
-            static bool want_sr = false;
-            // V32: the rest of the settings, which were never in this box.
-            // want_match is DERIVED from SRScale rather than stored in a key
-            // of its own - SRScale=0 already means "inherit R from the game's
-            // render extent" and has no second meaning, so a separate key
-            // would be a second source of truth for one fact.
-            static int  want_p = 0, want_m = 2;
-            static bool want_match = true;
-            if (!ini_loaded)
-            {
-                ini_loaded   = true;
-                want_sr      = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0);
-                want_p       = mgpu::gpu1::ui_ini_read("SRPreset", 0);
-                want_m       = mgpu::gpu1::ui_ini_read("SRQuality", 2);
-                want_match   = (mgpu::gpu1::ui_ini_read("SRScale", 0) == 0);
-            }
-
-            // SUPER RESOLUTION ITSELF, AND IT GOES FIRST BECAUSE IT GATES THE
-            // REST. With the shipped mgpu.ini, SRUpscale is absent and
-            // defaults to 0, so the whole box above read "Off - set it in
-            // mgpu.ini" and there was no way to turn it on from here at all.
-            // A panel that can only report a feature nobody can reach is not a
-            // panel. Arm-time key, so it is a restart like the others.
-            // Latched, not per-frame. The click lasts one frame and the
-            // message has to outlive it or nobody ever sees it.
-            static bool wrote_any = false;
-
-            if (ImGui::Checkbox("DLSS Super Resolution on GPU 1", &want_sr))
-            {
-                wrote_any |= mgpu::gpu1::ui_ini_write("SRUpscale", want_sr ? 1 : 0);
-            }
-            ImGui::TextDisabled("Neural rendering runs at R, then DLSS enlarges it back to");
-            ImGui::TextDisabled("the display. Everything else in this box needs it on.");
-
-            // ---- V32: THE REST OF THE SETTINGS, IN THE SETTINGS BOX ----
-            //
-            // This box held ONE checkbox. preset, upscaling and mode existed
-            // only in the pre-arm menu, which with AutoArm=1 is on screen for
-            // a couple of seconds and which almost nobody reaches. So ticking
-            // the box here appeared to reveal controls on the next launch,
-            // when what it actually did was let SR create, which uncovered the
-            // separate live "Change quality or preset" block further up.
-            //
-            // Everything that writes mgpu.ini now lives here, under the one
-            // restart line at the bottom. Greyed rather than hidden when SR is
-            // off, because a box that empties itself teaches nobody what it
-            // holds.
-            //
-            // SRMvLowRes RIDES WITH SRScale in both branches. The flag without
-            // the scale is what returned FAIL_PlatformError on 2026-09-12, and
-            // writing them together is what makes that combination unreachable
-            // from this panel.
-            const auto write_sr_mode = [](int mode, bool match)
-            {
-                mgpu::gpu1::ui_ini_write("SRQuality", mode);
-                if (match)
-                {
-                    mgpu::gpu1::ui_ini_write("SRScale",    0);
-                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 0);
-                }
-                else
-                {
-                    const int sc = (mode == 2) ? 67 : ((mode == 1) ? 58 : 50);
-                    mgpu::gpu1::ui_ini_write("SRScale",    sc);
-                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
-                }
-                return true;
-            };
-
-            ImGui::Spacing();
-            ImGui::BeginDisabled(!want_sr);
-
-            ImGui::TextUnformatted("preset");
-            ImGui::SameLine();
-            if (ImGui::RadioButton("title default##sp", want_p == 0))
-            { want_p = 0;  wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 0); }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("K##sp", want_p == 11))
-            { want_p = 11; wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 11); }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("L##sp", want_p == 12))
-            { want_p = 12; wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 12); }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("M##sp", want_p == 13))
-            { want_p = 13; wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 13); }
-            ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
-
-            ImGui::TextUnformatted("upscaling");
-            if (ImGui::RadioButton("Native Upscaling##su", want_match))
-            { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
-            ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
-
-            if (ImGui::RadioButton("Experimental Upscaler##su", !want_match))
-            { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
-            ImGui::TextDisabled("Works from a downscaled resolution. More performance, possible");
-            ImGui::TextDisabled("cost in quality. Untested.");
-
-            ImGui::BeginDisabled(want_match);
-            ImGui::TextUnformatted("mode  ");
-            ImGui::SameLine();
-            if (ImGui::RadioButton("quality##sm", want_m == 2))
-            { want_m = 2; wrote_any |= write_sr_mode(2, want_match); }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("balanced##sm", want_m == 1))
-            { want_m = 1; wrote_any |= write_sr_mode(1, want_match); }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("performance##sm", want_m == 0))
-            { want_m = 0; wrote_any |= write_sr_mode(0, want_match); }
-            ImGui::TextDisabled("Sets the resolution neural rendering runs at, the way DLSS does:");
-            ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
-            ImGui::EndDisabled();
-            if (want_match)
-                ImGui::TextDisabled("Native Upscaling is on.");
-
-            ImGui::EndDisabled();
-
-            ImGui::Spacing();
-            if (wrote_any)
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                                   "mgpu.ini written. RESTART THE GAME - this session is unchanged.");
-            else
-                ImGui::TextDisabled("Changes here edit mgpu.ini. The running session never changes.");
-        }
         }   // ---- end of the armed view ----
     }
     ImGui::EndChild();   // ---- end BOX 2 ----
