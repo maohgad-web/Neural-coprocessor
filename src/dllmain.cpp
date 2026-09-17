@@ -1047,15 +1047,38 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // shows what is there and why it is not doing anything, which is
             // the thing a hidden control can never say.
             ImGui::Spacing();
-            if (m_sr)
+            // ---- R167: "DLSS IS DISABLED" WAS A CLAIM ABOUT THE WRONG DLSS ----
+            //
+            // m_sr is OUR Super Resolution feature on GPU 1 - the thing the
+            // add-on creates - and nothing else. The old text read "DLSS on
+            // GPU 1 is DISABLED", which a person running the game at DLSS
+            // Quality reads as a statement that DLSS is off. It is not: their
+            // game's DLSS is running normally on GPU 0 and the add-on has no
+            // opinion about it. The only fact here is that this run did not
+            // ask for a second Super Resolution pass on the bridge, so none
+            // was created.
+            //
+            // The word DISABLED goes too. Nothing failed and nothing was
+            // turned off - it was never requested, which is a different
+            // sentence and the one the person can act on.
+            // ---- R170: THIS LINE REPORTS THE GAME, NOT OUR FEATURE ----
+            //
+            // It has carried the wrong subject through three rewrites. m_sr is
+            // the ini, st.sr_on is our feature on GPU 1, and neither belongs
+            // at the top of this box - the Super resolution section below
+            // already reports the feature, and saying it twice in different
+            // words is what turned one fact into a paragraph.
+            //
+            // What the person needs here is the one thing they cannot see from
+            // inside this panel and that everything else depends on: IS THE
+            // GAME AT DLSS OR AT DLAA. One line, read live from the game's own
+            // declaration, and silent when the game has not said yet.
             {
-                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f),
-                                   "DLSS on GPU 1 is ENABLED for this run.");
-            }
-            else
-            {
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                                   "DLSS on GPU 1 is DISABLED. CHANGES BELOW ONLY APPLY IF ENABLED.");
+                const int nat = mgpu_game_is_native();
+                if (nat == 1)
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Game is at DLAA.");
+                else if (nat == 0)
+                    ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "Game is at DLSS.");
             }
 
             ImGui::BeginDisabled(!m_sr);
@@ -1403,10 +1426,18 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 // strictly smaller than the display - the refusal in
                 // stream_sr_create cannot fire. DLAA plus Experimental is a
                 // working run, and a working run gets no yellow line.
+                //
+                // R169. BROKEN ACROSS TWO LINES ON PURPOSE. ImGui does not
+                // wrap TextColored, so on a narrow panel the tail of a long
+                // line is simply not drawn - and the tail was the restart,
+                // which is the only part with an instruction in it. Two short
+                // lines cannot lose their ending.
                 const ImVec4 y(1.0f, 0.92f, 0.23f, 1.0f);
                 if (st.sr_on)
-                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Change the game "
-                                          "to DLSS, or enable Experimental Upscaler.");
+                {
+                    ImGui::TextColored(y, "DLAA - Native Upscaling detected.");
+                    ImGui::TextColored(y, "Change the game to DLSS, or enable Experimental.");
+                }
                 else if (st.sr_requested)
                     // R164. "Enable DLSS in-game or Experimental" put both
                     // routes behind one verb and one place, so Experimental
@@ -1415,12 +1446,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                     // right shape - one verb per route, each naming where it
                     // lives - so this row now uses it verbatim and adds only
                     // the restart.
-                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Change the game "
-                                          "to DLSS or enable Experimental Upscaler, then "
-                                          "restart once.");
+                {
+                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Change the game");
+                    ImGui::TextColored(y, "to DLSS or enable Experimental - RESTART TO APPLY");
+                }
                 else
-                    ImGui::TextColored(y, "DLAA - Native Upscaling needs DLSS enabled "
-                                          "in the game.");
+                    ImGui::TextColored(y, "DLAA - Native Upscaling needs DLSS in the game.");
             }
             if (ImGui::RadioButton("Experimental Upscaler", !want_match))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
@@ -2047,6 +2078,64 @@ static void on_present(reshade::api::command_queue *queue,
     mgpu::gpu1::stream_on_present(
         reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native())));
 
+    // ---- R166: THE OVERLAY MIRROR APPLIES FROM PRESENT, NOT FROM EFFECTS ----
+    //
+    // MEASURED twice on The Blood of Dawnwalker. R158 put the apply in
+    // reshade_finish_effects and R160 proved the queue was being filled - its
+    // "mirror is live" line printed and the key still moved one panel. The
+    // remaining link is the one R160's own text named, and the log says why in
+    // a line that has been there all along:
+    //
+    //   [R53] TECHNIQUE LANE: BRIDGE runtime | 1 technique(s) enumerated
+    //   0 of 1 techniques ENABLED
+    //
+    // reshade_finish_effects fires when ReShade FINISHES AN EFFECT PASS. A
+    // runtime with no enabled technique has no pass to finish, so the bridge
+    // runtime simply stops delivering that event - and with it the apply. This
+    // is R138's rule for the third time in this file: DO NOT HANG WORK OFF THE
+    // EFFECT EVENT UNLESS THE WORK IS ABOUT EFFECTS.
+    //
+    // present arrives whatever the effect runtime is doing, once per
+    // swapchain, ON THE THREAD THAT PRESENTS IT - which is the game's render
+    // thread for the game's chain and the bridge thread for the bridge's. So
+    // this keeps the one property that made the deferral necessary (the call
+    // lands on the runtime's own thread) and drops the dependency that broke
+    // it. The runtime POINTER still comes from R160's re-latch and from
+    // init_effect_runtime; only the moment of the call moved.
+    if (swapchain != nullptr && mgpu::gpu1::dcomp_explicit_off_single_display())
+    {
+        reshade::api::device *pd = swapchain->get_device();
+        if (pd != nullptr && pd->get_api() == reshade::api::device_api::d3d12)
+        {
+            mgpu::adapter::selection_result psel;
+            mgpu::adapter::get_selection(psel);
+            auto *pd12 = reinterpret_cast<ID3D12Device *>(pd->get_native());
+            if (psel.game_luid_known && pd12 != nullptr)
+            {
+                const LUID pl = pd12->GetAdapterLuid();
+                const bool p_is_game = (pl.LowPart == psel.game_luid.LowPart &&
+                                        pl.HighPart == psel.game_luid.HighPart);
+
+                std::atomic<int>  &pend = p_is_game ? g_ov_pend_game : g_ov_pend_bridge;
+                std::atomic<bool> &echo = p_is_game ? g_ov_echo_game : g_ov_echo_bridge;
+                std::atomic<void *> &slot = p_is_game ? g_rt_game : g_rt_bridge;
+
+                auto *rt = (reshade::api::effect_runtime *)slot.load(std::memory_order_relaxed);
+                if (rt != nullptr)
+                {
+                    const int want = pend.exchange(-1, std::memory_order_relaxed);
+                    if (want >= 0)
+                    {
+                        echo.store(true, std::memory_order_relaxed);
+                        rt->open_overlay(want != 0,
+                                         (reshade::api::input_source)g_ov_source.load(
+                                             std::memory_order_relaxed));
+                    }
+                }
+            }
+        }
+    }
+
     // R138. Log-only. Nothing below changes what the bridge does.
     if (swapchain == nullptr || g_r138_said.load(std::memory_order_relaxed)) return;
     if (g_game_fx_seen.load(std::memory_order_relaxed)) return;
@@ -2288,32 +2377,12 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
             slot.store(runtime, std::memory_order_relaxed);
     }
 
-    // ---- R158: APPLY THIS RUNTIME'S PENDING OVERLAY STATE ----
-    //
-    // On this runtime's own thread, which is the whole point of deferring it.
-    // exchange, so a value is applied once and a second frame does not reopen
-    // a panel the person has just closed by hand. The echo flag is set BEFORE
-    // the call because open_overlay fires the event synchronously.
-    //
-    // PLACED ABOVE THE RETURNS BELOW, NOT BESIDE THE OTHER rt_is_game WORK.
-    // The first draft sat after `if (res.handle == 0) return`, which drops the
-    // toggle on any frame where ReShade has no view to hand us - and that is
-    // not a rare frame on the bridge runtime. A panel toggle that works on
-    // most frames is worse than one that does not work at all, because the
-    // failure is intermittent and gets blamed on the keyboard. This is the
-    // first point where rt_is_game is known, and nothing returns before it.
-    {
-        std::atomic<int>  &pend = rt_is_game ? g_ov_pend_game : g_ov_pend_bridge;
-        std::atomic<bool> &echo = rt_is_game ? g_ov_echo_game : g_ov_echo_bridge;
-        const int want = pend.exchange(-1, std::memory_order_relaxed);
-        if (want >= 0)
-        {
-            echo.store(true, std::memory_order_relaxed);
-            runtime->open_overlay(want != 0,
-                                  (reshade::api::input_source)g_ov_source.load(
-                                      std::memory_order_relaxed));
-        }
-    }
+    // R166. THE APPLY THAT USED TO BE HERE HAS MOVED TO on_present, and this
+    // note is so nobody moves it back. This event does not arrive on a runtime
+    // with no enabled technique, which is exactly the bridge runtime's normal
+    // state - measured as "0 of 1 techniques ENABLED" on every title so far.
+    // The identity re-latch above stays here, because a runtime running
+    // effects is the only cheap PROOF that a pointer is live.
 
     // The resource behind the view, not the view: the copy source has to be
     // the texture. Adapter filtering happens inside gpu1_context, which is
