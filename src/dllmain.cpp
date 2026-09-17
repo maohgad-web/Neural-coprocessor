@@ -1483,7 +1483,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (st.sr_on || st.sr_requested)
                 {
                     ImGui::TextColored(y, "DLAA - Native Upscaling detected. Enable DLSS "
-                                          "to Activate");
+                                          "in-game settings");
                     ImGui::TextColored(y, "Activate Experimental Upscaler to enable DLAA "
                                           "Super Resolution.");
                 }
@@ -1510,24 +1510,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // changing your mind.
             if (!want_match)
             {
-                ImGui::Spacing();
-                ImGui::TextUnformatted("mode  ");
-                ImGui::SameLine();
-                if (ImGui::RadioButton("quality##xm", want_m == 2))
-                { want_m = 2; wrote_any |= write_sr_mode(2, false); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("balanced##xm", want_m == 1))
-                { want_m = 1; wrote_any |= write_sr_mode(1, false); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("performance##xm", want_m == 0))
-                { want_m = 0; wrote_any |= write_sr_mode(0, false); }
-                ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
-
-                // R165. The Experimental half of what R163 did for Native:
-                // say which mode is detected and whether this state needs
-                // anything done about it. Dim when there is nothing to do -
-                // yellow is for a pending action, and spending it on "all
-                // good" is what trains people past it.
+                // R177. THE STATUS SITS UNDER THE CONTROL THAT CHANGED IT.
+                //
+                // R165 put it after the ratio radios, which made it look like
+                // a status for the RATIO: activate Experimental Upscaler and
+                // the restart notice was three controls further down, past a
+                // row of radios and a line of percentages. Reported as "no
+                // restart notice unless you change modes". It is the same
+                // check, moved to where the click was.
                 if (sr_live_matches)
                 {
                     char xl[120];
@@ -1544,6 +1534,19 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                              want_pct);
                     ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f), "%s", xl);
                 }
+
+                ImGui::Spacing();
+                ImGui::TextUnformatted("mode  ");
+                ImGui::SameLine();
+                if (ImGui::RadioButton("quality##xm", want_m == 2))
+                { want_m = 2; wrote_any |= write_sr_mode(2, false); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("balanced##xm", want_m == 1))
+                { want_m = 1; wrote_any |= write_sr_mode(1, false); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("performance##xm", want_m == 0))
+                { want_m = 0; wrote_any |= write_sr_mode(0, false); }
+                ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
             }
             ImGui::EndDisabled();
 
