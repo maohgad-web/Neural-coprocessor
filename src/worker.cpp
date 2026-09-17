@@ -145,7 +145,7 @@ namespace
     // failure in the log" true.
     LRESULT CALLBACK bridge_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
-        (void)lParam;   // R156: wParam is read by MGPU_WM_SET_VISIBLE below
+        (void)wParam; (void)lParam;
         switch (msg)
         {
         case WM_CLOSE:
@@ -157,19 +157,6 @@ namespace
             mgpu::diag::info("[MGPU][T4] WM_DESTROY - the bridge window was destroyed; "
                              "signalling bridge shutdown (the game is not affected)");
             stop();
-            return 0;
-
-        // R156. Posted by gpu1_context::bridge_window_set_visible from the
-        // game's render thread; executed HERE, on the thread that owns this
-        // window. wParam 1 shows, 0 hides. SW_SHOWNOACTIVATE rather than
-        // SW_SHOW, to match how the window was first shown: the bridge must
-        // never take focus from the game, which is the whole reason the
-        // NoActivate path exists.
-        //
-        // No logging. This fires on every overlay open and close, and a line
-        // per keypress is how a log stops being readable.
-        case MGPU_WM_SET_VISIBLE:
-            ShowWindow(hWnd, (wParam != 0) ? SW_SHOWNOACTIVATE : SW_HIDE);
             return 0;
         default:
             return DefWindowProcW(hWnd, msg, wParam, lParam);
