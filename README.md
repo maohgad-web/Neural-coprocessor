@@ -20,7 +20,7 @@ Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It 
 
 ## New in 0.2.4: one display
 
-**One monitor, one cable, no third-party tool and no controller.** Until 0.2.4 a second monitor was effectively required. It is not any more.
+**One monitor, one cable, no third-party tools. Mouse, keyboard and controller all work.** Until 0.2.4 a second monitor was effectively required. It is not any more.
 
 Set `DcompOverlay=1` in `mgpu.ini`. The bridge stops opening a window of its own and draws the neural output onto the game's own window instead, so the game keeps the mouse and the keyboard. The display goes on the neural card, and the card that renders the game has nothing plugged into it.
 
@@ -52,7 +52,7 @@ Also in 0.2.0:
 
 **0.2.4** - one display is supported, and Native Upscaling is improved.
 
-- **One display, one cable, no Special K.** `DcompOverlay=1` in `mgpu.ini` removes the bridge's own window, so the game keeps the mouse and the keyboard. See Display setup.
+- **One display, one cable, no third-party tools.** `DcompOverlay=1` in `mgpu.ini` removes the bridge's own window, so mouse, keyboard and controller all work. See Display setup.
 - **Native Upscaling is improved.** It now reads the render resolution the game declares to DLSS, which makes it available on more titles and improves stability in motion.
 - **The panel reports your game's setting.** It says DLAA or DLSS, and names the setting to change when Native Upscaling cannot run.
 
@@ -175,7 +175,7 @@ Both of these work. Pick the one that matches your hardware.
 
 **Two displays, extended, one per card.** The bridge presents the second card's output in its own window on the second screen. Every published figure was measured this way, and it is what I develop on - a window of its own is what lets the bridge's swapchain be isolated from the game's when I am debugging.
 
-**One display, one cable.** Set `DcompOverlay=1` in `mgpu.ini`. The bridge creates no window of its own and draws the neural output onto the game's window instead. The game keeps the mouse and the keyboard. No third-party tool, and no controller needed.
+**One display, one cable.** Set `DcompOverlay=1` in `mgpu.ini`. The bridge creates no window of its own and draws the neural output onto the game's window instead. The game keeps its input: mouse, keyboard and controller all work. No third-party tools.
 
 The display goes on the neural card, and the card that renders the game has nothing plugged into it.
 
