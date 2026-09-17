@@ -1,6 +1,10 @@
 # Single Display Guide
 
-Running MGPU Bridge with one monitor instead of two.
+**Superseded by 0.2.4.** One display is supported directly now: set
+`DcompOverlay=1` in `mgpu.ini`. No third-party tools, and mouse, keyboard and
+controller all work. This page is kept as history.
+
+Running MGPU Bridge with one monitor instead of two, before 0.2.4.
 
 **This is not supported.** Two displays, one per card, is the supported and
 measured configuration. What follows is something that worked here. It may work
