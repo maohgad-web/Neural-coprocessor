@@ -10582,10 +10582,17 @@ namespace
         // 2  DERIVE from whether the extents match. V7 through V19, and the
         //    configuration where the ghosting was noticed.
         //
-        // The default is 0. Correct-by-spec is not the same as better-looking,
-        // and the only two people who have watched this in motion both
-        // preferred the flag off. It stays a toggle precisely because that
-        // preference is one rig and one title.
+        // R180. THE DEFAULT IS NOW 2, AND IT WAS 0. The note that used to sit
+        // here said correct-by-spec was not the same as better-looking and that
+        // two people had preferred the flag off. That preference was recorded
+        // on builds where R was inherited from the motion vector BUFFER rather
+        // than the game's declared render extent, so "flag off" was being
+        // compared against a different R every time. Measured again on
+        // 2026-09-17 with R152/R179 in place, on Cyberpunk 2077 at DLSS
+        // Quality, three runs one variable: forced off smears, derived does
+        // not, and frame alignment was worse on the clean runs than on the
+        // smearing one. 0 remains available and is still the DLAA-only
+        // correct answer, which is what 2 computes on its own.
         if (s.sr_mv_mode == 0u)
         {
             s.sr_mv_lowres = false;
