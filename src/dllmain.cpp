@@ -1189,16 +1189,38 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // NOT a return above: this block sits inside BeginChild, and returning
         // from here would skip EndChild and leave ImGui's stack unbalanced for
         // the rest of the frame. An else costs one brace and cannot do that.
+        // ---- R159: THE THIRD SR STATUS BLOCK, AND IT WAS STILL GUESSING ----
+        //
+        // R153 stopped two places in this panel asserting DLAA without
+        // checking. This was the third and it was missed, so the readout kept
+        // saying "the game already renders at display resolution" whatever the
+        // reason - including after the person had changed the game to a DLSS
+        // preset, at which point it is simply false.
+        //
+        // MEASURED 2026-09-17: launch at a DLSS preset and switch to DLAA and
+        // the panel reads correctly; launch at DLAA and switch to a preset and
+        // it does not, because SR NEVER CREATED. That asymmetry is real and it
+        // is not a defect - stream_sr_create runs ONCE, at arm, and the
+        // refusal sets sr_on to 0 with no retry path. Nothing in this panel
+        // said so, which is why it read as the add-on losing track of DLSS.
+        // The restart is now stated where the state is, not left to be
+        // inferred from two launches.
         ImGui::SeparatorText("Super resolution");
         if (!st.sr_requested)
         {
-            ImGui::TextDisabled("Off. SRUpscale=1 in mgpu.ini turns it on.");
+            ImGui::TextDisabled("Off. Tick the box in the DLSS Super Resolution section above.");
         }
         else if (!st.sr_on)
         {
             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                                "Requested but not running - see [MGPU][C2-SR] in the log.");
-            ImGui::TextDisabled("The usual reason is that the game already renders at display resolution.");
+            if (mgpu_game_is_native() == 1)
+            {
+                ImGui::TextDisabled("The game is at DLAA, so it renders at display resolution and");
+                ImGui::TextDisabled("there is nothing to upscale.");
+            }
+            ImGui::TextDisabled("Created once, at arm. Restart to retry - changing the game's");
+            ImGui::TextDisabled("DLSS setting or the upscaler mode now will not start it.");
         }
         else
         {
@@ -1321,27 +1343,84 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 wrote_any |= mgpu::gpu1::ui_ini_write("SRUpscale", want_sr ? 1 : 0);
             ImGui::TextDisabled("Native Parameters ON");
 
+            // ---- R165: IS A RESTART ACTUALLY NEEDED? ASK, DO NOT ASSERT ----
+            //
+            // wrote_any is STATIC, so once anything in this box had been
+            // written the yellow "restart the game once" stayed on screen for
+            // the rest of the session - including after the restart, and
+            // including when the panel already matched what GPU 1 was
+            // running. A reminder that never clears is indistinguishable from
+            // a fault, and it is the same defect as V74's "turn it ON" shown
+            // to somebody who already had.
+            //
+            // The honest question is not "did we write the ini", it is
+            // "does the ini now disagree with the running feature". That is
+            // answerable: sr_scale_pct is what GPU 1 armed with - 0 for
+            // Native, the ratio for Experimental - and want_match/want_m are
+            // what the panel is asking for. Equal means live, and live means
+            // nothing to restart for.
+            const unsigned want_pct = (want_m == 2) ? 67u : ((want_m == 1) ? 58u : 50u);
+            const bool sr_live_matches =
+                st.sr_on && want_sr &&
+                (want_match ? (st.sr_scale_pct == 0u) : (st.sr_scale_pct == want_pct));
+
             ImGui::BeginDisabled(!want_sr);
             if (ImGui::RadioButton("Native Upscaling", want_match))
             { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
             ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
 
-            // R153. Only when the game itself says it is at native, and only
-            // while Native Upscaling is the selected mode - on Experimental
-            // this is already handled and the line would be noise.
+            // ---- R162: THREE STATES, NOT ONE RULE ----
+            //
+            // R157 and R161 grew this to three yellow lines that said the same
+            // thing to everybody, and one third of the people reading it did
+            // not need a restart at all. DLAA is not one situation:
+            //
+            //   SR RUNNING, game swapped to DLAA mid-run. Nothing is wrong. R
+            //     was fixed at arm and SR keeps upscaling from it; the game
+            //     rendering native now changes what it is fed, not whether it
+            //     works. Measured on 007 First Light. A restart is needed only
+            //     to move to Experimental, because the mode is an ini key.
+            //   SR REQUESTED AND REFUSED - they launched at DLAA. This is the
+            //     one where a restart is unavoidable, and the only one.
+            //   SR OFF. The box above has not been ticked, and ticking it
+            //     already prints its own restart line (V73). Saying it twice
+            //     here is what made the box three lines tall.
+            //
+            // One line each, read from st - what GPU 1 is doing - never from
+            // the checkbox, which is what they have clicked.
             if (want_match && mgpu_game_is_native() == 1)
             {
-                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
-                                   "Your game is at DLAA - there is nothing to upscale from.");
-                // R157. TWO ROUTES, BOTH NAMED. "Pick Experimental instead"
-                // offered one and read as the only one, which is wrong twice
-                // over: Experimental is what RUNS DLAA here rather than a
-                // consolation for it, and the other route - turning DLAA off
-                // in the game's own menu - is the one that makes Native
-                // Upscaling work and is not this panel's to perform.
-                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
-                                   "Pick Experimental Upscaler to run DLAA, or change the "
-                                   "in-game setting to DLSS.");
+                // R163. NAME THE MODE, because "nothing to upscale" without it
+                // is a complaint rather than a diagnosis. Reaching this line
+                // already means two things are true and the person can only
+                // see one of them: the GAME is at DLAA, and NATIVE UPSCALING
+                // is the selected mode. Saying both turns the line into a
+                // statement about their setup that they can check.
+                //
+                // EXPERIMENTAL NEEDS NO CASE HERE and that is structural, not
+                // an omission: this block is inside `want_match`, and with
+                // Experimental selected SRScale is 50 or 67, so R is ours and
+                // strictly smaller than the display - the refusal in
+                // stream_sr_create cannot fire. DLAA plus Experimental is a
+                // working run, and a working run gets no yellow line.
+                const ImVec4 y(1.0f, 0.92f, 0.23f, 1.0f);
+                if (st.sr_on)
+                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Change the game "
+                                          "to DLSS, or enable Experimental Upscaler.");
+                else if (st.sr_requested)
+                    // R164. "Enable DLSS in-game or Experimental" put both
+                    // routes behind one verb and one place, so Experimental
+                    // read as something to find in the GAME's menu. It is a
+                    // control in THIS panel. The row above already had the
+                    // right shape - one verb per route, each naming where it
+                    // lives - so this row now uses it verbatim and adds only
+                    // the restart.
+                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Change the game "
+                                          "to DLSS or enable Experimental Upscaler, then "
+                                          "restart once.");
+                else
+                    ImGui::TextColored(y, "DLAA - Native Upscaling needs DLSS enabled "
+                                          "in the game.");
             }
             if (ImGui::RadioButton("Experimental Upscaler", !want_match))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
@@ -1375,11 +1454,38 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 if (ImGui::RadioButton("performance##xm", want_m == 0))
                 { want_m = 0; wrote_any |= write_sr_mode(0, false); }
                 ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+
+                // R165. The Experimental half of what R163 did for Native:
+                // say which mode is detected and whether this state needs
+                // anything done about it. Dim when there is nothing to do -
+                // yellow is for a pending action, and spending it on "all
+                // good" is what trains people past it.
+                if (sr_live_matches)
+                {
+                    char xl[120];
+                    snprintf(xl, sizeof xl,
+                             "Experimental Upscaling detected. Running at %u%% - "
+                             "no restart needed.", want_pct);
+                    ImGui::TextDisabled("%s", xl);
+                }
+                else
+                {
+                    char xl[120];
+                    snprintf(xl, sizeof xl,
+                             "Experimental Upscaling detected. Restart once to apply %u%%.",
+                             want_pct);
+                    ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f), "%s", xl);
+                }
             }
             ImGui::EndDisabled();
 
             ImGui::Spacing();
-            if (wrote_any)
+            // R165. Three states, and the middle one is new: a write happened
+            // AND the running feature already matches, which is what every
+            // launch after the restart looks like.
+            if (sr_live_matches)
+                ImGui::TextDisabled("Running as selected - no restart needed.");
+            else if (wrote_any)
                 ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
                                    "DLSS is on - restart the game once to apply the change.");
             else
@@ -1438,11 +1544,16 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 const int nat = mgpu_game_is_native();
                 if (nat == 1)
                 {
-                    // R157. Same two routes as the line under the radios.
-                    ImGui::TextDisabled("Your game is at DLAA, so it already renders at display");
-                    ImGui::TextDisabled("resolution and there is nothing to upscale. Pick");
-                    ImGui::TextDisabled("Experimental Upscaler to run DLAA, or change the in-game");
-                    ImGui::TextDisabled("setting to DLSS.");
+                    // R162. This branch IS the refused case - sr_requested
+                    // with no handle - so there is one situation and it needs
+                    // one line. The state above it already said SR is not
+                    // running; this says why and what to do.
+                    // R163. Same words as the line under the radios, because
+                    // two different sentences for one state is how somebody
+                    // ends up believing they are two different problems.
+                    ImGui::TextDisabled("Change the game to DLSS or enable Experimental");
+                    ImGui::TextDisabled("Upscaler, then restart once. Changing either now");
+                    ImGui::TextDisabled("will not start it.");
                 }
                 else
                 {
@@ -1844,16 +1955,27 @@ static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 static void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
     if (runtime == nullptr) return;
+    // R160. The POINTER is left alone and only the pending state is dropped.
+    //
+    // Clearing the pointer here is what killed the mirror at arm: a recreate
+    // fires this, and nothing was guaranteed to put the pointer back. A stale
+    // pointer is not the hazard it looks like either, because the only use of
+    // it is an identity comparison against the runtime that just fired an
+    // event - a dead runtime never fires one, so it never matches, and
+    // R160's re-latch in on_reshade_finish_effects overwrites the slot with
+    // the live pointer on the next frame that runtime draws.
+    //
+    // What MUST be dropped is the pending toggle. A value queued for a runtime
+    // that is being torn down would otherwise be delivered to the recreated
+    // one, opening a panel nobody asked for after an arm or a resize.
     void *r = runtime;
     if (g_rt_game.load(std::memory_order_relaxed) == r)
     {
-        g_rt_game.store(nullptr, std::memory_order_relaxed);
         g_ov_pend_game.store(-1, std::memory_order_relaxed);
         g_ov_echo_game.store(false, std::memory_order_relaxed);
     }
     else if (g_rt_bridge.load(std::memory_order_relaxed) == r)
     {
-        g_rt_bridge.store(nullptr, std::memory_order_relaxed);
         g_ov_pend_bridge.store(-1, std::memory_order_relaxed);
         g_ov_echo_bridge.store(false, std::memory_order_relaxed);
     }
@@ -1897,6 +2019,21 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
     g_ov_source.store((int)source, std::memory_order_relaxed);
     if      (r == g) g_ov_pend_bridge.store(open ? 1 : 0, std::memory_order_relaxed);
     else if (r == b) g_ov_pend_game.store(open ? 1 : 0, std::memory_order_relaxed);
+    else             return false;   // neither: nothing to mirror to
+
+    // R160. SAID ONCE, because R158 shipped with no logging at all and a whole
+    // run came back as "it stopped working" with nothing in the file to say at
+    // which link. One line proves the mirror was reached; the absence of it
+    // now means the gate or the identity, not the apply.
+    {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true, std::memory_order_relaxed))
+            mgpu::diag::info("[MGPU][R160] overlay mirror is live - a keypress on one runtime is "
+                             "now queued for the other. Said once. IF THE KEY STOPS MOVING BOTH "
+                             "PANELS LATER IN THE RUN this line is still the last word on it: "
+                             "the queue is refilled from the runtime's own frame, so the link "
+                             "that can still fail is the apply, not the identity.");
+    }
 
     return false;   // never block the overlay that was actually asked for
 }
@@ -2117,6 +2254,38 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                 }
             }
         }
+    }
+
+    // ---- R160: RE-LATCH THIS RUNTIME'S IDENTITY, EVERY FRAME ----
+    //
+    // MEASURED, The Blood of Dawnwalker 2026-09-17: the global overlay key
+    // worked repeatedly BEFORE the stream armed and never again after. The log
+    // says why in one line -
+    //
+    //   [P4.0] stream REQUESTED
+    //   Recreated runtime environment on runtime ...22E0 ('ReShade2.ini')
+    //   [P5.0] the bridge window is now showing the NEURAL OUTPUT
+    //
+    // - the bridge's effect runtime is RECREATED at arm. R158 got its runtime
+    // pointers from init_effect_runtime and cleared them on
+    // destroy_effect_runtime, so the destroy half fired, the pointer went
+    // null, and the mirror hit its "both runtimes must be known" guard for the
+    // rest of the session. Silently, because nothing logged it.
+    //
+    // THE LESSON IS THE ONE THIS FILE KEEPS RELEARNING: do not hold state that
+    // depends on a lifecycle event firing in pairs. This handler already knows
+    // which runtime it is on, it runs every frame, and a runtime that is
+    // running effects is a runtime that is alive - so identity is re-asserted
+    // here from a fact rather than remembered from an event. A destroy and
+    // recreate now repairs itself on the next frame the runtime draws, whether
+    // or not init_effect_runtime fires. init_effect_runtime is KEPT because it
+    // is the only thing that names a runtime which never runs effects at all
+    // (R138's case); it is now the optimisation and this is the source of
+    // truth, which is the correct way round.
+    {
+        std::atomic<void *> &slot = rt_is_game ? g_rt_game : g_rt_bridge;
+        if (slot.load(std::memory_order_relaxed) != (void *)runtime)
+            slot.store(runtime, std::memory_order_relaxed);
     }
 
     // ---- R158: APPLY THIS RUNTIME'S PENDING OVERLAY STATE ----
