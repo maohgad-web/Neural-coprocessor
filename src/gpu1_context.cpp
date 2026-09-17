@@ -344,6 +344,8 @@ bool create_device(const adapter::selection_result &sel)
 // illusion for one panel and breaks for every ReShade window around it. So the
 // bridge STEPS ASIDE instead - see dcomp_set_visible.
 static HWND  g_game_hwnd    = nullptr;
+// R156. The bridge's own window, latched where it is already handed to us.
+static HWND  g_bridge_hwnd  = nullptr;
 static void *g_dcomp_device = nullptr;
 static void *g_dcomp_target = nullptr;
 static void *g_dcomp_visual = nullptr;
@@ -441,6 +443,10 @@ bool dcomp_peek_toggle()
 bool create_present_chain(HWND hwnd)
 {
     auto &S = st();
+
+    // R156. Latched here because this is the one place the bridge's HWND is
+    // handed across, and it is handed across before any overlay can open.
+    if (hwnd != nullptr) g_bridge_hwnd = hwnd;
 
     if (hwnd == nullptr)
     {
@@ -7772,6 +7778,28 @@ namespace
         // DEFECT C APPLIES. Two NGX consumers must not share one parameter
         // block. SR gets its own.
         unsigned sr_on = 0;                 // ini SRUpscale, default 0
+
+        // ---- R154: WHAT WAS ASKED FOR, KEPT SEPARATELY FROM WHAT IS RUNNING ----
+        //
+        // sr_on carries TWO facts and cannot hold both. It starts as the ini's
+        // SRUpscale - the request - and then every refusal path sets it to 0 so
+        // the rest of the run behaves as if SR were off: the failed create at
+        // arm, a failed rebuild, Subrect below 100, Passes above 1. That is
+        // correct for the STREAM and destroys the only record that the user
+        // asked.
+        //
+        // MEASURED CONSEQUENCE, reported twice. ui_read had
+        // out.sr_requested = (s.sr_on != 0u), so after any refusal the panel
+        // read "not requested" and printed "Super Resolution is OFF - turn it
+        // ON to unlock the menu below" to somebody who had ticked the box and
+        // restarted the game. V76 split that message into two cases and could
+        // not help, because the field it branched on had already been
+        // overwritten by the failure it was trying to describe.
+        //
+        // THIS ONE IS WRITE-ONCE AND NOTHING CLEARS IT. It answers "did they
+        // ask", never "is it running" - that question is sr_on with a non-null
+        // handle, which is what out.sr_on already is.
+        unsigned sr_asked = 0;
         int      sr_preset = 0;             // ini SRPreset, 0 = leave title default
         int      sr_quality = 1;            // ini SRQuality, 1 = Balanced
         unsigned sr_scale_pct = 0;          // ini SRScale, 0 = use the game's extent
@@ -10358,13 +10386,34 @@ namespace
         // the vectors were display-sized, the game "must be" rendering at
         // native, so there was nothing to upscale and SR turned itself off.
         //
-        // That inference is false, and 007 First Light is the title that says
-        // so. MEASURED 2026-09-17: display 2560x1440, velocity buffer
-        // ALLOCATED at 2560x1440, game rendering at 1280x720 - DLSS at 50%.
-        // R came out 2560, tripped the >= guard, and Native Upscaling refused
-        // itself on a title that was upscaling the whole time. The log then
-        // reported it as "the DLAA case", which is how this survived three
-        // releases: the message described the inference rather than the game.
+        // That inference is false, and The Blood of Dawnwalker is the title
+        // that says so. MEASURED 2026-09-17, from its own [R101] table:
+        //
+        //   quality=2                                   <- DLSS Quality
+        //   NGX Width/Height 1708x961, Out 2560x1440
+        //   subrect 1708x961
+        //   CreateFlags=0x49 -> MVLowRes=0              <- vectors at DISPLAY
+        //   velocity buffer ALLOCATED at 2560x1440
+        //
+        // The game declares a 1708x961 render extent and allocates its vectors
+        // at 2560x1440. R was inherited as 2560, tripped the >= guard, and
+        // Native Upscaling refused itself on a title running DLSS Quality. The
+        // log then reported it as "the DLAA case", which is how this survived
+        // three releases: the message described the inference rather than the
+        // game, so every reader - two agents and the author included - took
+        // the refusal for correct behaviour.
+        //
+        // 007 FIRST LIGHT IS NOT THIS DEFECT, and the distinction cost a wrong
+        // diagnosis on 2026-09-17 before its table was read properly. It
+        // reports quality=5 - DLAA - with Width == Out == subrect == 2560x1440:
+        // genuinely native, so the refusal there is correct and this branch
+        // will not fire on it. What made it look identical was MVecScale
+        // -1280.0000,720.0000, read as if it were a render extent. IT IS NOT
+        // AN EXTENT - it is DLSS's own vector-unit conversion, and the [R101]
+        // note has warned against exactly that reading since Battlefield 6.
+        // THE ONLY EXTENTS THAT ARE EXTENTS ARE Width/Height, Out*, AND THE
+        // SUBRECT. render_w/render_h come from the subrect; nothing in this
+        // function consults MVecScale.
         //
         // AN ALLOCATION IS A CEILING, NOT A MEASUREMENT. A buffer at display
         // size written only in a render-size corner is a shape this project
@@ -10427,9 +10476,11 @@ namespace
                          "declaration. WHY THIS LINE MATTERS: inheriting R from the buffer "
                          "would have given R=%ux%u here, which is not smaller than the display "
                          "and would have turned SRUpscale off on a title that is upscaling - "
-                         "the defect measured on 007 First Light on 2026-09-17 and present "
-                         "since at least 0.2.1. If the buffer and the declaration agree, this "
-                         "line changes nothing and you will not see it.",
+                         "the defect measured on The Blood of Dawnwalker on 2026-09-17 - DLSS "
+                         "Quality, declared render 1708x961, vectors allocated at 2560x1440 - "
+                         "and present since at least 0.2.1. If the buffer and the declaration "
+                         "agree this line changes nothing and you will not see it. IT IS NOT A "
+                         "FAULT: it means the declaration was available and was used.",
                          rt.render_w, rt.render_h, s.width, s.height,
                          s.mvec_w, s.mvec_h, s.sr_w, s.sr_h, s.mvec_w, s.mvec_h);
                 mgpu::diag::info(line);
@@ -10524,7 +10575,8 @@ namespace
                      "The vectors cover the whole frame and the flag says exactly that. "
                      "R152: THIS NO LONGER IMPLIES THE GAME IS AT NATIVE - a buffer allocated "
                      "at display size can still be written at a render-size subrect, which is "
-                     "what 007 First Light does. Whether the game is upscaling is settled by "
+                     "what The Blood of Dawnwalker does. Whether the game is upscaling is "
+                     "settled by "
                      "the R= extent in the CreateFeature line below and by its source, not by "
                      "this line.",
                      s.mvec_w, s.mvec_h);
@@ -12184,6 +12236,55 @@ bool dcomp_overlay_mode()
     return out != 0;
 }
 
+// ---- R156: HIDE THE BRIDGE WINDOW WHILE AN OVERLAY IS OPEN ----
+//
+// See the header for why. Two refusals, both structural rather than guards we
+// maintain: dcomp mode owns its own visibility through dcomp_set_visible, and
+// more than one active display path means the bridge is not over the game.
+//
+// THE DISPLAY COUNT IS LATCHED, for the reason V68 latched it: this is called
+// from ReShade's overlay event, and querying CCD there costs two
+// GetProcAddress lookups, two QueryDisplayConfig calls and two malloc/free
+// pairs. Once per process is enough - a person who replugs a monitor mid-run
+// is already outside what the bridge supports, and we tell them not to.
+//
+// POSTED, NOT CALLED. ShowWindow on another thread's window is legal, but V62
+// through V64 were spent learning that this project's window state belongs to
+// the thread that owns the window, and the escape from that lesson cost a
+// watchdog thread. The bridge's own message pump does the ShowWindow.
+void bridge_window_set_visible(bool on)
+{
+    if (dcomp_overlay_mode()) return;
+    if (g_bridge_hwnd == nullptr) return;
+
+    static std::atomic<int> single{-1};
+    int v = single.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        const unsigned paths = dispcfg::active_paths();
+        // UNKNOWN (0) REFUSES, like every other reader of this value: hiding
+        // the window on a guess is the one outcome nobody can undo from
+        // inside the game.
+        v = (paths == 1u) ? 1 : 0;
+        single.store(v, std::memory_order_relaxed);
+
+        char r1[520];
+        snprintf(r1, sizeof r1,
+                 "[MGPU][R156] overlay visibility handoff is %s for this run: %u active display "
+                 "path(s), DcompOverlay off. WHEN ON, the bridge window is hidden while a "
+                 "ReShade overlay is open and shown again when it closes, so the game underneath "
+                 "takes the clicks - the same move DcompOverlay=1 makes by unrooting its visual. "
+                 "WHEN OFF, nothing changes: with a second panel the bridge is not over the game, "
+                 "and 0 paths means the display count could not be read and this refuses rather "
+                 "than guesses.",
+                 (v == 1) ? "ON" : "OFF", paths);
+        mgpu::diag::info(r1);
+    }
+    if (v != 1) return;
+
+    PostMessageW(g_bridge_hwnd, MGPU_WM_SET_VISIBLE, on ? 1u : 0u, 0);
+}
+
 // V55. worker.cpp calls this once, at T4, with what pick_bridge_placement
 // already worked out. It also starts the hint clock, because the hint is on
 // screen from the frame after this returns.
@@ -13058,7 +13159,7 @@ void ui_read(ui_state &out)
 
     // ---- DLSS Super Resolution ----
     out.sr_on        = (s.sr_on != 0u && s.sr_handle != nullptr);
-    out.sr_requested = (s.sr_on != 0u);
+    out.sr_requested = (s.sr_asked != 0u);   // R154: the request, not the state
     out.sr_w         = s.sr_w;
     out.sr_h         = s.sr_h;
     out.out_w        = (unsigned)s.width;
@@ -13556,6 +13657,11 @@ void stream_request()
                                   "build does not accept. Valid values are 0 and 1. FALLING "
                                   "BACK TO 0 AND SAYING SO.");
             s.sr_on = (sr < 0) ? 0u : (unsigned)sr;
+
+            // R154. Latched HERE, before the two refusals below and long
+            // before the create can fail, because this is the only point in
+            // the run where sr_on still means "asked for".
+            s.sr_asked = s.sr_on;
 
             if (s.sr_on != 0u && s.subrect_pct != 100u)
             {

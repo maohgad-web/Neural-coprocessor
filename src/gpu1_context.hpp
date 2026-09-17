@@ -70,6 +70,28 @@ namespace mgpu::gpu1
     // an overlay that IS interactive instead of covering it with one that
     // cannot be. Bridge thread, or any thread the overlay callback runs on.
     void dcomp_set_visible(bool on);
+
+    // ---- R156: THE WINDOWED PATH'S VERSION OF dcomp_set_visible ----
+    //
+    // On one display with DcompOverlay=0 the bridge is a real window sized
+    // over the game, so opening a ReShade overlay leaves the panel they want
+    // behind a window that eats the clicks - measured on 007 First Light and
+    // The Blood of Dawnwalker, and the reason a first-time user cannot get
+    // back to the game to quit it. DcompOverlay=1 already solves this by
+    // unrooting the visual; this is the same move for a window.
+    //
+    // Refuses in dcomp mode (that path owns its own visibility) and on more
+    // than one active display path (the bridge is on its own panel there and
+    // blocks nothing, so hiding it would take away the thing you are looking
+    // at). Posts to the window's own thread - V64 established that touching
+    // another thread's window state from the game's render thread is how this
+    // area breaks.
+    void bridge_window_set_visible(bool on);
+
+    // R156. The message bridge_window_set_visible posts, handled in
+    // worker.cpp's bridge_wndproc. Declared here so the sender and the
+    // handler cannot drift apart. wParam: 1 show, 0 hide.
+    #define MGPU_WM_SET_VISIBLE (WM_APP + 0x51)
     bool dcomp_peek_toggle();
 
     void stream_shutdown();

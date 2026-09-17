@@ -1333,8 +1333,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             {
                 ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
                                    "Your game is at DLAA - there is nothing to upscale from.");
+                // R157. TWO ROUTES, BOTH NAMED. "Pick Experimental instead"
+                // offered one and read as the only one, which is wrong twice
+                // over: Experimental is what RUNS DLAA here rather than a
+                // consolation for it, and the other route - turning DLAA off
+                // in the game's own menu - is the one that makes Native
+                // Upscaling work and is not this panel's to perform.
                 ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
-                                   "Pick Experimental Upscaler instead.");
+                                   "Pick Experimental Upscaler to run DLAA, or change the "
+                                   "in-game setting to DLSS.");
             }
             if (ImGui::RadioButton("Experimental Upscaler", !want_match))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
@@ -1420,17 +1427,22 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 
                 // R153. THIS USED TO EXPLAIN ITSELF WITHOUT CHECKING.
                 // "The game already renders at display resolution" was stated
-                // whatever the reason, and on 007 First Light it was false -
-                // the game rendered at 1280x720 and the line said otherwise,
-                // because R152's defect made a display-sized velocity buffer
-                // look like a native render. The explanation is now only given
-                // when the game is the one saying it.
+                // whatever the reason, and on The Blood of Dawnwalker it was
+                // false - the game declared a 1708x961 render extent at DLSS
+                // Quality and the line said otherwise, because R152's defect
+                // made a display-sized velocity buffer look like a native
+                // render. The explanation is now only given when the game is
+                // the one saying it. On 007 First Light, which really is at
+                // DLAA - quality=5, Width == Out == subrect - the same
+                // sentence is true, and the DLAA branch below is what says it.
                 const int nat = mgpu_game_is_native();
                 if (nat == 1)
                 {
+                    // R157. Same two routes as the line under the radios.
                     ImGui::TextDisabled("Your game is at DLAA, so it already renders at display");
                     ImGui::TextDisabled("resolution and there is nothing to upscale. Pick");
-                    ImGui::TextDisabled("Experimental Upscaler to run Super Resolution anyway.");
+                    ImGui::TextDisabled("Experimental Upscaler to run DLAA, or change the in-game");
+                    ImGui::TextDisabled("setting to DLSS.");
                 }
                 else
                 {
@@ -1458,6 +1470,28 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // CLICKED; st is what the second GPU is rendering with right now.
             // While a change is staged the two differ, and the one worth
             // putting at the top is the live one.
+            // ---- R155: APPLY BELONGS ON THE STATE LINE ----
+            //
+            // The button sat at the bottom of the box, below the quality
+            // radios, the preset radios and two lines of small print about
+            // preset honouring. You click a preset at the top and the control
+            // that commits it is off the bottom of a scrolled panel - so the
+            // click appears to do nothing, which is the exact complaint this
+            // box has collected twice already.
+            //
+            // It now sits beside the live state, which is the line that has to
+            // change for the click to have meant anything. Staged and running
+            // are then one glance apart: "DLSS ON  K - Quality  [APPLY]".
+            //
+            // want_q/want_p are HOISTED ABOVE the state line for this, because
+            // `dirty` has to be known before the line is drawn. They are the
+            // same statics as before and keep the same first-frame seeding.
+            static int  want_q = -1, want_p = -1;
+            static bool init_done = false;
+            if (!init_done) { want_q = st.sr_quality; want_p = st.sr_preset; init_done = true; }
+
+            const bool dirty = (want_q != st.sr_quality) || (want_p != st.sr_preset);
+
             {
                 const char *pn3 = (st.sr_preset == 11) ? "K"
                                 : (st.sr_preset == 12) ? "L"
@@ -1469,11 +1503,24 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 char sl[96];
                 snprintf(sl, sizeof sl, "DLSS ON  %s - %s", pn3, qs3);
                 ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f), "%s", sl);
-            }
 
-            static int  want_q = -1, want_p = -1;
-            static bool init_done = false;
-            if (!init_done) { want_q = st.sr_quality; want_p = st.sr_preset; init_done = true; }
+                // R155. Only while something is staged. A permanently visible
+                // APPLY on a panel that matches what is running is a control
+                // with nothing to do, and pressing it would rebuild the
+                // feature for no change - 30 to 40 ms of stall for nothing.
+                if (dirty && !st.sr_rebuild_pending)
+                {
+                    ImGui::SameLine();
+                    if (ImGui::Button("  APPLY  "))
+                    {
+                        const int scale = (want_q == 2) ? 67 : ((want_q == 1) ? 58 : 50);
+                        mgpu::gpu1::ui_set_sr_request(want_q, want_p, scale);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("cancel"))
+                    { want_q = st.sr_quality; want_p = st.sr_preset; }
+                }
+            }
 
             ImGui::TextUnformatted("Quality");
             ImGui::SameLine();
@@ -1501,7 +1548,6 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextDisabled("A DLL that lacks the preset asked for silently uses its own.");
             ImGui::TextDisabled("Its nvngx_dlss_*.log says which one it HONOURED. That is the answer.");
 
-            const bool dirty = (want_q != st.sr_quality) || (want_p != st.sr_preset);
             ImGui::Separator();
             if (st.sr_rebuild_pending)
             {
@@ -1510,15 +1556,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             }
             else if (dirty)
             {
-                // Loud, and immediately under the thing that staged it.
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "STAGED - NOT APPLIED YET");
-                if (ImGui::Button("  APPLY  "))
-                {
-                    const int scale = (want_q == 2) ? 67 : ((want_q == 1) ? 58 : 50);
-                    mgpu::gpu1::ui_set_sr_request(want_q, want_p, scale);
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("cancel")) { want_q = st.sr_quality; want_p = st.sr_preset; }
+                // R155. The notice stays here; the BUTTON moved to the state
+                // line above. Two copies of one control is worse than a
+                // control in the wrong place - the second one gets clicked,
+                // and then nobody knows which one worked.
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "STAGED - NOT APPLIED YET. Press APPLY on the DLSS ON line above.");
                 ImGui::TextDisabled("One long frame, about 30-40 ms. Figures before and after");
                 ImGui::TextDisabled("are different pipelines - do not pool them.");
             }
@@ -1723,12 +1766,27 @@ std::atomic<bool> g_r138_said{false};
 // overlay from opening, which is the opposite of the point. Registered
 // unconditionally and inert when DcompOverlay=0, the same pattern the `present`
 // subscription below already uses.
+//
+// R156. NO LONGER INERT WHEN DcompOverlay=0. The two branches are the same
+// instruction - GET OUT OF THE WAY WHILE A PANEL IS OPEN - expressed in the
+// two things the bridge can be: a composed visual, which unroots, or a window,
+// which hides. Before R156 only the first existed, so a single-display user on
+// the default configuration opened a panel and then could not click the game
+// behind the bridge window, up to and including the game's own quit.
+//
+// NEITHER BRANCH CHECKS WHICH RUNTIME FIRED. Both overlays in this process
+// draw over the same screen area, so either one being open is reason enough to
+// step aside - and that is already how V65 has behaved on the dcomp path since
+// it shipped. bridge_window_set_visible refuses on its own when the bridge is
+// not over the game; the decision is not duplicated here.
 static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool open,
                                     reshade::api::input_source source)
 {
     (void)runtime; (void)source;
     if (mgpu::gpu1::dcomp_overlay_mode())
         mgpu::gpu1::dcomp_set_visible(!open);
+    else
+        mgpu::gpu1::bridge_window_set_visible(!open);
     return false;
 }
 
