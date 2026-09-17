@@ -10457,12 +10457,38 @@ namespace
 
             if (have_decl)
             {
-                // Same 8-pixel alignment the SRScale path uses, and for the
-                // same reason - the NR dispatch below is 8x8 tiles.
-                s.sr_w = (UINT)(rt.render_w & ~7u);
-                s.sr_h = (UINT)(rt.render_h & ~7u);
+                // ---- R178: NO ALIGNMENT MASK ON A DECLARED EXTENT ----
+                //
+                // R152 masked this with & ~7u, copied from the SRScale path
+                // without asking whether it belonged. It does not. SRScale
+                // COMPUTES an extent from a percentage, so rounding it to a
+                // tile boundary is free; this one is REPORTED by the game as
+                // the size it actually renders, and rounding it down invents a
+                // third number that matches neither the game nor the buffer.
+                //
+                // MEASURED, Cyberpunk 2077 2026-09-17, run 1 of the RR sweep:
+                // declared 1707x960 became R=1704x960, and because sr_w no
+                // longer equalled mvec_w the guard below stopped taking the
+                // "vectors are at R" branch and forced MVLowRes=1 with a
+                // 0.9982 MV_Scale correction - on a title that had been
+                // running with the flag off and no correction at all. A
+                // three-pixel rounding changed the motion vector contract.
+                //
+                // The dispatch never needed it either: the neural stage
+                // launches (sr_w + 7) / 8 groups, which is already the
+                // round-up form for a non-multiple.
+                s.sr_w = (UINT)rt.render_w;
+                s.sr_h = (UINT)rt.render_h;
                 r_from = "the game's declared render extent (R152)";
 
+                // R178. SAID ONLY WHEN IT MATTERS. The first draft printed
+                // this whenever a declaration was available, including every
+                // title where it equals the buffer extent and nothing changed
+                // - which is most of them, and it made the line read as a
+                // warning about a working run. The claim in its own text
+                // ("if they agree you will not see it") is now true.
+                if (s.sr_w != s.mvec_w || s.sr_h != s.mvec_h)
+                {
                 snprintf(line, sizeof line,
                          "[MGPU][R152] R IS THE GAME'S OWN DECLARATION, NOT THE BUFFER SIZE. "
                          "The game told NGX it renders at %ux%u into a %ux%u display, and its "
@@ -10478,6 +10504,7 @@ namespace
                          rt.render_w, rt.render_h, s.width, s.height,
                          s.mvec_w, s.mvec_h, s.sr_w, s.sr_h, s.mvec_w, s.mvec_h);
                 mgpu::diag::info(line);
+                }
             }
             else
             {
