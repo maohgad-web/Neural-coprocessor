@@ -1369,8 +1369,33 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 mgpu::gpu1::ui_ini_write("SRQuality", mode);
                 if (match)
                 {
+                    // ---- R180: NATIVE WRITES THE DERIVATION, NOT A FORCED OFF ----
+                    //
+                    // MEASURED, Cyberpunk 2077 2026-09-17, three runs one
+                    // variable: SR off was clean, Native with SRMvLowRes=0
+                    // smeared, Experimental with the flag on and a 1.003 scale
+                    // was clean. Frame alignment was WORSE on both clean runs
+                    // (57.3% and 53.6% at one frame, against 76.8% on the run
+                    // that smeared), so staleness was not the cause in either
+                    // direction - the vector space declaration was.
+                    //
+                    // Native inherits R from the game's render extent, so on a
+                    // title that is upscaling the vectors ARE at R. Writing 0
+                    // told DLSS they spanned the display, and it decoded every
+                    // vector about 1.5x too long - an over-projected history,
+                    // which is a smear. The code comment that justified the 0
+                    // read the flag as "lower than the input"; it means "at
+                    // input resolution rather than output resolution".
+                    //
+                    // 2 DERIVES it and is correct in all three cases: vectors
+                    // at R -> on with scale 1.0; vectors at neither -> on with
+                    // the R/mvec correction; vectors at the display extent ->
+                    // off and untouched, which is the DLAA case that returned
+                    // FAIL_PlatformError on 2026-09-12 when the flag was
+                    // forced on. Experimental still writes 1 explicitly, so
+                    // nothing about that pairing changes.
                     mgpu::gpu1::ui_ini_write("SRScale",    0);
-                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 0);
+                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 2);
                 }
                 else
                 {
