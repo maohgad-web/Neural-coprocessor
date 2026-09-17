@@ -344,8 +344,6 @@ bool create_device(const adapter::selection_result &sel)
 // illusion for one panel and breaks for every ReShade window around it. So the
 // bridge STEPS ASIDE instead - see dcomp_set_visible.
 static HWND  g_game_hwnd    = nullptr;
-// R156. The bridge's own window, latched where it is already handed to us.
-static HWND  g_bridge_hwnd  = nullptr;
 static void *g_dcomp_device = nullptr;
 static void *g_dcomp_target = nullptr;
 static void *g_dcomp_visual = nullptr;
@@ -443,10 +441,6 @@ bool dcomp_peek_toggle()
 bool create_present_chain(HWND hwnd)
 {
     auto &S = st();
-
-    // R156. Latched here because this is the one place the bridge's HWND is
-    // handed across, and it is handed across before any overlay can open.
-    if (hwnd != nullptr) g_bridge_hwnd = hwnd;
 
     if (hwnd == nullptr)
     {
@@ -12236,53 +12230,48 @@ bool dcomp_overlay_mode()
     return out != 0;
 }
 
-// ---- R156: HIDE THE BRIDGE WINDOW WHILE AN OVERLAY IS OPEN ----
-//
-// See the header for why. Two refusals, both structural rather than guards we
-// maintain: dcomp mode owns its own visibility through dcomp_set_visible, and
-// more than one active display path means the bridge is not over the game.
-//
-// THE DISPLAY COUNT IS LATCHED, for the reason V68 latched it: this is called
-// from ReShade's overlay event, and querying CCD there costs two
-// GetProcAddress lookups, two QueryDisplayConfig calls and two malloc/free
-// pairs. Once per process is enough - a person who replugs a monitor mid-run
-// is already outside what the bridge supports, and we tell them not to.
-//
-// POSTED, NOT CALLED. ShowWindow on another thread's window is legal, but V62
-// through V64 were spent learning that this project's window state belongs to
-// the thread that owns the window, and the escape from that lesson cost a
-// watchdog thread. The bridge's own message pump does the ShowWindow.
-void bridge_window_set_visible(bool on)
+// R158. See the header. dcomp_overlay_mode() is called first and its result
+// thrown away ON PURPOSE: it is what populates g_dcomp_setting, it is latched,
+// and reading the raw setting before anything has read the file would answer
+// -3 (not read yet) and resolve this to false for the whole run.
+bool dcomp_explicit_off_single_display()
 {
-    if (dcomp_overlay_mode()) return;
-    if (g_bridge_hwnd == nullptr) return;
+    static std::atomic<int> latched{-1};
+    const int seen = latched.load(std::memory_order_relaxed);
+    if (seen >= 0) return seen != 0;
 
-    static std::atomic<int> single{-1};
-    int v = single.load(std::memory_order_relaxed);
-    if (v < 0)
+    (void)dcomp_overlay_mode();
+    const int want = g_dcomp_setting.load(std::memory_order_relaxed);
+
+    int out = 0;
+    unsigned paths = 0u;
+    if (want == 0)
     {
-        const unsigned paths = dispcfg::active_paths();
-        // UNKNOWN (0) REFUSES, like every other reader of this value: hiding
-        // the window on a guess is the one outcome nobody can undo from
-        // inside the game.
-        v = (paths == 1u) ? 1 : 0;
-        single.store(v, std::memory_order_relaxed);
-
-        char r1[520];
-        snprintf(r1, sizeof r1,
-                 "[MGPU][R156] overlay visibility handoff is %s for this run: %u active display "
-                 "path(s), DcompOverlay off. WHEN ON, the bridge window is hidden while a "
-                 "ReShade overlay is open and shown again when it closes, so the game underneath "
-                 "takes the clicks - the same move DcompOverlay=1 makes by unrooting its visual. "
-                 "WHEN OFF, nothing changes: with a second panel the bridge is not over the game, "
-                 "and 0 paths means the display count could not be read and this refuses rather "
-                 "than guesses.",
-                 (v == 1) ? "ON" : "OFF", paths);
-        mgpu::diag::info(r1);
+        paths = dispcfg::active_paths();
+        out = (paths == 1u) ? 1 : 0;
     }
-    if (v != 1) return;
+    latched.store(out, std::memory_order_relaxed);
 
-    PostMessageW(g_bridge_hwnd, MGPU_WM_SET_VISIBLE, on ? 1u : 0u, 0);
+    char r158[700];
+    snprintf(r158, sizeof r158,
+             "[MGPU][R158] global overlay key is %s for this run: DcompOverlay setting %s, "
+             "%u active display path(s). WHEN ON, opening or closing a ReShade overlay on "
+             "either runtime opens or closes it on the other, so one keypress moves both and "
+             "the bridge's panel and the game's panel are never in disagreement. WHEN OFF, "
+             "nothing changes and each runtime keeps its own key. It is ON for exactly one "
+             "configuration - DcompOverlay written as 0 with a single display - because that "
+             "is the only one where the bridge's window sits over the game and the only one "
+             "the behaviour was measured against. The setting codes are: -3 not read, -2 the "
+             "key is absent, -1 auto, 0 explicitly off, 1 on.",
+             out ? "ON" : "OFF",
+             (want == -3) ? "-3 (not read)"
+                          : ((want == -2) ? "-2 (absent)"
+                                          : ((want == -1) ? "-1 (auto)"
+                                                          : ((want == 0) ? "0 (explicitly off)"
+                                                                         : "1 (on)"))),
+             paths);
+    mgpu::diag::info(r158);
+    return out != 0;
 }
 
 // V55. worker.cpp calls this once, at T4, with what pick_bridge_placement

@@ -1766,28 +1766,139 @@ std::atomic<bool> g_r138_said{false};
 // overlay from opening, which is the opposite of the point. Registered
 // unconditionally and inert when DcompOverlay=0, the same pattern the `present`
 // subscription below already uses.
+// ---- R158: ONE KEY, BOTH RUNTIMES ----
 //
-// R156. NO LONGER INERT WHEN DcompOverlay=0. The two branches are the same
-// instruction - GET OUT OF THE WAY WHILE A PANEL IS OPEN - expressed in the
-// two things the bridge can be: a composed visual, which unroots, or a window,
-// which hides. Before R156 only the first existed, so a single-display user on
-// the default configuration opened a panel and then could not click the game
-// behind the bridge window, up to and including the game's own quit.
+// THE DEFECT. With DcompOverlay 0 on one display the bridge is a real window
+// over the game, and its ReShade runtime has its own overlay with its own key
+// binding. Open the panel there and the bridge window holds the focus; the
+// game is behind it and does not get the clicks, up to and including its own
+// quit. R156 tried to solve it by removing the window while a panel was open
+// and that disturbed the game's overlay, so the window stays.
 //
-// NEITHER BRANCH CHECKS WHICH RUNTIME FIRED. Both overlays in this process
-// draw over the same screen area, so either one being open is reason enough to
-// step aside - and that is already how V65 has behaved on the dcomp path since
-// it shipped. bridge_window_set_visible refuses on its own when the bridge is
-// not over the game; the decision is not duplicated here.
+// What is left is to stop the two runtimes disagreeing. If one keypress opens
+// BOTH panels and the next closes both, then whichever window has the focus,
+// the panel in front of the person is open and the other one is not sitting
+// there holding a state nobody asked for.
+//
+// effect_runtime::open_overlay(bool, input_source) is API 20 and does exactly
+// this. Two things make it delicate and both are handled below.
+//
+// ONE: THREADS. reshade_open_overlay fires on the thread of the runtime that
+// fired it, and the two runtimes live on different threads - the game's render
+// thread and the bridge thread. Calling into the other runtime from here is
+// the same cross-thread move that V62 through V64 and then R156 were all spent
+// learning not to make. So nothing is called across: a pending value is
+// stored, and each runtime applies ITS OWN pending value from
+// on_reshade_finish_effects, which runs on its own thread. The cost is one
+// frame of skew on a panel toggle, which is not perceptible.
+//
+// TWO: THE ECHO. open_overlay fires reshade_open_overlay for the runtime it
+// was called on. Mirrored blindly that is a ping-pong between the two
+// runtimes that never settles. The echo flag below is set immediately before
+// the call and consumed by the event it causes, so a mirrored open produces
+// no further mirroring. It is PER RUNTIME rather than one global flag: a
+// single flag lives on both threads at once and would swallow a real keypress
+// on one runtime while the other was echoing.
+//
+// A runtime whose effect runtime never runs effects never applies its pending
+// value. That degrades to today's behaviour - each key works on its own
+// runtime - rather than to a stuck panel, which is the right direction.
+static std::atomic<void *> g_rt_game{nullptr};
+static std::atomic<void *> g_rt_bridge{nullptr};
+
+// -1 nothing pending, 0 close, 1 open.
+static std::atomic<int> g_ov_pend_game{-1};
+static std::atomic<int> g_ov_pend_bridge{-1};
+static std::atomic<int> g_ov_source{0};
+static std::atomic<bool> g_ov_echo_game{false};
+static std::atomic<bool> g_ov_echo_bridge{false};
+
+// R158. Classified here rather than in on_reshade_finish_effects because that
+// event never fires on a runtime that runs no effects - measured on 007 First
+// Light, where the GAME runtime enumerated nothing for a whole session (see
+// R138). init_effect_runtime fires for every runtime either way.
+static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
+{
+    if (runtime == nullptr) return;
+    reshade::api::device *dev = runtime->get_device();
+    if (dev == nullptr || dev->get_api() != reshade::api::device_api::d3d12) return;
+
+    mgpu::adapter::selection_result sel;
+    mgpu::adapter::get_selection(sel);
+    if (!sel.game_luid_known) return;
+
+    auto *d12 = reinterpret_cast<ID3D12Device *>(dev->get_native());
+    if (d12 == nullptr) return;
+    const LUID l = d12->GetAdapterLuid();
+    const bool is_game = (l.LowPart == sel.game_luid.LowPart &&
+                          l.HighPart == sel.game_luid.HighPart);
+
+    if (is_game) g_rt_game.store(runtime, std::memory_order_relaxed);
+    else         g_rt_bridge.store(runtime, std::memory_order_relaxed);
+}
+
+// R158. A runtime is reset on a swapchain resize, not only at shutdown, so a
+// stale pointer here is a real hazard rather than a tidiness question. Cleared
+// by identity: whichever slot holds this pointer loses it, and the pending
+// value goes with it so a resize cannot deliver a toggle to a dead runtime.
+static void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
+{
+    if (runtime == nullptr) return;
+    void *r = runtime;
+    if (g_rt_game.load(std::memory_order_relaxed) == r)
+    {
+        g_rt_game.store(nullptr, std::memory_order_relaxed);
+        g_ov_pend_game.store(-1, std::memory_order_relaxed);
+        g_ov_echo_game.store(false, std::memory_order_relaxed);
+    }
+    else if (g_rt_bridge.load(std::memory_order_relaxed) == r)
+    {
+        g_rt_bridge.store(nullptr, std::memory_order_relaxed);
+        g_ov_pend_bridge.store(-1, std::memory_order_relaxed);
+        g_ov_echo_bridge.store(false, std::memory_order_relaxed);
+    }
+}
+
+//
+// R156 WAS HERE AND WAS REVERTED. It added an `else` that hid the bridge
+// WINDOW while any overlay was open, mirroring what this function already does
+// to the composed visual. The hiding itself worked - the game took clicks
+// immediately - but with the window gone the GAME's own ReShade overlay
+// sizzled, measured 2026-09-17. Do not reintroduce it: the defect is not in
+// the trigger or the gating, both of which were correct, it is that removing
+// the bridge's window from the desktop while the game is presenting disturbs
+// the game's own overlay. DcompOverlay=1 does not have this problem because
+// unrooting a visual is not the same operation as hiding a window.
 static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool open,
                                     reshade::api::input_source source)
 {
-    (void)runtime; (void)source;
     if (mgpu::gpu1::dcomp_overlay_mode())
+    {
         mgpu::gpu1::dcomp_set_visible(!open);
-    else
-        mgpu::gpu1::bridge_window_set_visible(!open);
-    return false;
+        return false;   // dcomp mode has no window to disagree with
+    }
+
+    // R158. See above. Gated to the one measured configuration.
+    if (!mgpu::gpu1::dcomp_explicit_off_single_display()) return false;
+
+    void *g = g_rt_game.load(std::memory_order_relaxed);
+    void *b = g_rt_bridge.load(std::memory_order_relaxed);
+    void *r = runtime;
+
+    // Consume our own echo BEFORE deciding to mirror, or this open is
+    // attributed to the person and bounced back to where it came from.
+    if (r == g && g_ov_echo_game.exchange(false, std::memory_order_relaxed))   return false;
+    if (r == b && g_ov_echo_bridge.exchange(false, std::memory_order_relaxed)) return false;
+
+    // Both runtimes have to be known. Until the second one initialises this
+    // does nothing, which is today's behaviour rather than half of the new one.
+    if (g == nullptr || b == nullptr) return false;
+
+    g_ov_source.store((int)source, std::memory_order_relaxed);
+    if      (r == g) g_ov_pend_bridge.store(open ? 1 : 0, std::memory_order_relaxed);
+    else if (r == b) g_ov_pend_game.store(open ? 1 : 0, std::memory_order_relaxed);
+
+    return false;   // never block the overlay that was actually asked for
 }
 
 static void on_present(reshade::api::command_queue *queue,
@@ -2005,6 +2116,33 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                     }
                 }
             }
+        }
+    }
+
+    // ---- R158: APPLY THIS RUNTIME'S PENDING OVERLAY STATE ----
+    //
+    // On this runtime's own thread, which is the whole point of deferring it.
+    // exchange, so a value is applied once and a second frame does not reopen
+    // a panel the person has just closed by hand. The echo flag is set BEFORE
+    // the call because open_overlay fires the event synchronously.
+    //
+    // PLACED ABOVE THE RETURNS BELOW, NOT BESIDE THE OTHER rt_is_game WORK.
+    // The first draft sat after `if (res.handle == 0) return`, which drops the
+    // toggle on any frame where ReShade has no view to hand us - and that is
+    // not a rare frame on the bridge runtime. A panel toggle that works on
+    // most frames is worse than one that does not work at all, because the
+    // failure is intermittent and gets blamed on the keyboard. This is the
+    // first point where rt_is_game is known, and nothing returns before it.
+    {
+        std::atomic<int>  &pend = rt_is_game ? g_ov_pend_game : g_ov_pend_bridge;
+        std::atomic<bool> &echo = rt_is_game ? g_ov_echo_game : g_ov_echo_bridge;
+        const int want = pend.exchange(-1, std::memory_order_relaxed);
+        if (want >= 0)
+        {
+            echo.store(true, std::memory_order_relaxed);
+            runtime->open_overlay(want != 0,
+                                  (reshade::api::input_source)g_ov_source.load(
+                                      std::memory_order_relaxed));
         }
     }
 
@@ -2258,6 +2396,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // V65: the bridge steps aside while the game's overlay is open.
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(
             on_reshade_open_overlay);
+        // R158: which runtime is which, for the global overlay key. Registered
+        // unconditionally and inert unless dcomp_explicit_off_single_display()
+        // - these two only ever store and clear a pointer.
+        reshade::register_event<reshade::addon_event::init_effect_runtime>(
+            on_init_effect_runtime);
+        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(
+            on_destroy_effect_runtime);
         // P9.1. NOT initialised here. The probe reads mgpu.ini, and file I/O
         // inside DllMain runs under the loader lock, where the CRT is entitled
         // to load a locale DLL and deadlock against the lock we are already

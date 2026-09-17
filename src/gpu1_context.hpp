@@ -71,27 +71,24 @@ namespace mgpu::gpu1
     // cannot be. Bridge thread, or any thread the overlay callback runs on.
     void dcomp_set_visible(bool on);
 
-    // ---- R156: THE WINDOWED PATH'S VERSION OF dcomp_set_visible ----
+    // ---- R158: THE ONE CONFIGURATION THE GLOBAL OVERLAY KEY APPLIES TO ----
     //
-    // On one display with DcompOverlay=0 the bridge is a real window sized
-    // over the game, so opening a ReShade overlay leaves the panel they want
-    // behind a window that eats the clicks - measured on 007 First Light and
-    // The Blood of Dawnwalker, and the reason a first-time user cannot get
-    // back to the game to quit it. DcompOverlay=1 already solves this by
-    // unrooting the visual; this is the same move for a window.
+    // True only when mgpu.ini says DcompOverlay 0 EXPLICITLY and there is one
+    // active display path. Both halves are deliberate:
     //
-    // Refuses in dcomp mode (that path owns its own visibility) and on more
-    // than one active display path (the bridge is on its own panel there and
-    // blocks nothing, so hiding it would take away the thing you are looking
-    // at). Posts to the window's own thread - V64 established that touching
-    // another thread's window state from the game's render thread is how this
-    // area breaks.
-    void bridge_window_set_visible(bool on);
-
-    // R156. The message bridge_window_set_visible posts, handled in
-    // worker.cpp's bridge_wndproc. Declared here so the sender and the
-    // handler cannot drift apart. wParam: 1 show, 0 hide.
-    #define MGPU_WM_SET_VISIBLE (WM_APP + 0x51)
+    //   EXPLICITLY 0, not "resolved to off". An absent key and an `auto` that
+    //   resolved off both leave the bridge as a window too, but the reported
+    //   defect was measured with the key written as 0 and that is the blast
+    //   radius asked for. A behaviour that fires on configurations nobody
+    //   tested is how R156 got shipped and reverted.
+    //
+    //   ONE display. With a second panel the bridge overlay is on its own
+    //   screen, does not sit over the game, and mirroring the key would open a
+    //   panel the person cannot see.
+    //
+    // Latched on first call, like dcomp_overlay_mode() and for the same
+    // reason: it is read from an input event and must give one answer per run.
+    bool dcomp_explicit_off_single_display();
     bool dcomp_peek_toggle();
 
     void stream_shutdown();
