@@ -43,6 +43,35 @@ namespace mgpu::gpu1
     // foreground from the game - which is what stops input, pad included.
     bool window_no_activate();
 
+    // ---- V49 - V53: the ghost mode. All four are inert when DcompOverlay=0.
+    // mgpu.ini DcompOverlay=1. Read at present-chain creation and at window
+    // creation, nowhere else.
+    bool dcomp_overlay_mode();
+    // V55. Pushed from worker.cpp at T4: does the BRIDGE adapter drive any
+    // display? Also starts the hint clock.
+    void note_bridge_headless(bool headless);
+    // V55. One active path, bridge adapter headless, and the mode NOT already
+    // on - i.e. exactly the people who should be told about it. Advice only.
+    bool single_display_hint();
+    // V55. True while AutoArm should wait for the hint to be read. Ten
+    // seconds, wall clock, not frames.
+    bool autoarm_hint_holding();
+    // The GAME's HWND, pushed from dllmain once the swapchain is confirmed to
+    // be the game's by LUID. Only called when dcomp_overlay_mode() is true.
+    void set_game_hwnd(void *hwnd);
+    // V53. Roots the composition visual on the first frame carrying neural
+    // output, so the idle screen never blacks out the game. Bridge thread.
+    void dcomp_root_on_first_neural_frame();
+    // V52. CTRL+ALT+F6. Unroots the visual so the GAME's own ReShade overlay -
+    // which is behind it by construction - can be reached, and roots it again.
+    // Returns whether the bridge is on screen AFTER the call. Bridge thread.
+    // V65. Root or unroot the composition visual explicitly. Called when the
+    // game's ReShade overlay opens and closes, so the bridge steps aside for
+    // an overlay that IS interactive instead of covering it with one that
+    // cannot be. Bridge thread, or any thread the overlay callback runs on.
+    void dcomp_set_visible(bool on);
+    bool dcomp_peek_toggle();
+
     void stream_shutdown();
 
     void shutdown();

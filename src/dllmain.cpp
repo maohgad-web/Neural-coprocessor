@@ -245,6 +245,21 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
                 }
             }
             const reshade::api::resource bb = swapchain->get_back_buffer(0);
+            // V49. The GAME's HWND, for DirectComposition to bind a topmost
+            // visual to. Taken HERE because this is the one place that has
+            // already proved, by LUID, that this swapchain is the game's and
+            // not the bridge's own - so it is authoritative rather than a
+            // window we went looking for.
+            //
+            // GATED. In mode 0 not one instruction of this runs: the ini read
+            // is the whole cost of the ghost existing, and that read is the
+            // same one the present chain and the window creation already do.
+            if (sc_is_game && mgpu::gpu1::dcomp_overlay_mode())
+            {
+                if (void *ghwnd = (void *)swapchain->get_hwnd())
+                    mgpu::gpu1::set_game_hwnd(ghwnd);
+            }
+
             if (sc_is_game && bb.handle != 0)
             {
                 const reshade::api::resource_desc bd = sd->get_resource_desc(bb);
@@ -1622,6 +1637,19 @@ std::atomic<bool> g_game_fx_seen{false};
 std::atomic<unsigned long long> g_game_presents{0};
 std::atomic<bool> g_r138_said{false};
 
+// V65. See dcomp_set_visible. Returns false ALWAYS - true would block the
+// overlay from opening, which is the opposite of the point. Registered
+// unconditionally and inert when DcompOverlay=0, the same pattern the `present`
+// subscription below already uses.
+static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool open,
+                                    reshade::api::input_source source)
+{
+    (void)runtime; (void)source;
+    if (mgpu::gpu1::dcomp_overlay_mode())
+        mgpu::gpu1::dcomp_set_visible(!open);
+    return false;
+}
+
 static void on_present(reshade::api::command_queue *queue,
                        reshade::api::swapchain *swapchain,
                        const reshade::api::rect *, const reshade::api::rect *,
@@ -2087,6 +2115,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // side decides whether to act on it, so the ini can turn the behaviour
         // on and off without a rebuild.
         reshade::register_event<reshade::addon_event::present>(on_present);
+        // V65: the bridge steps aside while the game's overlay is open.
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(
+            on_reshade_open_overlay);
         // P9.1. NOT initialised here. The probe reads mgpu.ini, and file I/O
         // inside DllMain runs under the loader lock, where the CRT is entitled
         // to load a locale DLL and deadlock against the lock we are already

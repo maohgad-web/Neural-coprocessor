@@ -1,6 +1,18 @@
 // MGPU Bridge - the private D3D12 device on the selected adapter (T3;
 // the device-removal poll accessor arrives with T4)
 #include <windows.h>
+// ---- V49..V53: THE GHOST MODE ----
+// DirectComposition, and a D3D11 device used ONLY to name an adapter to it.
+// THE LINK DIRECTIVES LIVE IN THE SOURCE, NOT ONLY IN CMakeLists.txt.
+// CMakeLists.txt sits at the repository root while these files are often
+// copied as src/* alone - a build that took the sources and not the root file
+// compiled every DirectComposition call and then failed at link with an
+// unresolved DCompositionCreateDevice. A translation unit that needs a library
+// should say so itself; then it cannot be separated from it.
+#include <dcomp.h>
+#pragma comment(lib, "dcomp.lib")
+#include <d3d11.h>
+#pragma comment(lib, "d3d11.lib")
 #include <combaseapi.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>   // P1.3: ID3D12InfoQueue only. NOT ID3D12Debug -
@@ -281,6 +293,144 @@ bool create_device(const adapter::selection_result &sel)
     return true;
 }
 
+// ===========================================================================
+// ===========================================================================
+// V49 - V55, V65: THE GHOST. DcompOverlay, off by default.
+// ===========================================================================
+//
+// One monitor, render card headless. A second window on the desktop is
+// something a game engine can see, and seeing it, it decides it is no longer
+// on top and locks its own input. That lock - not input ROUTING - is what
+// Special K was working around. On, the bridge creates no visible window: the
+// present chain is a COMPOSITION swapchain, which takes no HWND and so cannot
+// be in anyone's Z-order, and it becomes the topmost DirectComposition visual
+// on the GAME's own window.
+//
+// FOUR THINGS THAT COST A BUILD EACH. Keep them; every one arrived as "it just
+// does not work":
+//   - DCompositionCreateDevice cannot take a D3D12 device. IDXGIDevice is a
+//     D3D10/11 interface, so that QueryInterface returns E_NOINTERFACE always.
+//   - Passing NULL instead is legal, returns S_OK for every call, and DRAWS
+//     NOTHING: the composition device lands on the default adapter while the
+//     swapchain is on GPU 1, and DirectComposition does not report a
+//     cross-adapter content binding as an error. Hence the throwaway D3D11
+//     device on GPU 1's own adapter below - it renders nothing and exists only
+//     to name an adapter to that API.
+//   - Commit is ASYNCHRONOUS. It returns S_OK for a tree the compositor has
+//     not looked at, which is how the above reported success while black.
+//     WaitForCommitCompletion and CheckDeviceState are the only questions it
+//     will answer about a tree it has already accepted.
+//   - A windowless swapchain behind a window that is still SHOWN is not
+//     windowless. worker.cpp must not show it.
+//
+// THE OVERLAY, AND WHY IT IS NOT A BUG. The visual is topmost, so the game's
+// ReShade overlay - drawn into the game's back buffer, layer 1 - is underneath
+// it. Nothing reorders that. The bridge runtime has an overlay of its own that
+// IS on top, and it can never be interactive.
+//
+// RESOLUTION CHANGES ARE NOT THIS MODE'S PROBLEM. The arm fixes source size,
+// row pitch, bands and the shared heap whatever the presentation path, and the
+// shipped ini has said so in capitals since long before any of this. The one
+// thing the ghost adds is that there is no window to watch go wrong, so a
+// stale arm reads as a subtly incorrect picture over a correct game rather
+// than as an obviously broken window. V69 commits the tree after a resize so
+// the compositor at least agrees about the size.
+//
+// THE OVERLAY, AND WHY IT IS NOT A BUG (continued). ReShade binds a runtime's
+// input to that runtime's WINDOW, and this one is hidden and unfocused by
+// construction. MEASURED, so nobody repeats it: posted window messages do not
+// reach it, AttachThreadInput plus SetFocus on the window's own thread does
+// not either, and mirroring the cursor while pinning both panels holds the
+// illusion for one panel and breaks for every ReShade window around it. So the
+// bridge STEPS ASIDE instead - see dcomp_set_visible.
+static HWND  g_game_hwnd    = nullptr;
+static void *g_dcomp_device = nullptr;
+static void *g_dcomp_target = nullptr;
+static void *g_dcomp_visual = nullptr;
+// The D3D11 device the composition device renders with. Owned here only so its
+// lifetime matches the composition device's; nothing ever draws with it.
+static void *g_dcomp_d3d11  = nullptr;
+// V53: whether the visual is currently the target's root. Starts FALSE - the
+// tree is built at chain creation but deliberately left unrooted.
+static bool  g_dcomp_rooted = false;
+
+// The game's HWND, pushed from dllmain's on_init_swapchain once the swapchain
+// has been confirmed to be the GAME's by LUID. Authoritative: it is the window
+// the game's own swapchain was created against, not a window we went looking
+// for. Only called when DcompOverlay=1, so mode 0 never reaches it.
+void set_game_hwnd(void *hwnd) { if (hwnd != nullptr) g_game_hwnd = (HWND)hwnd; }
+
+// Root or unroot the visual. ONE call plus a Commit, and that is the whole
+// mechanism: the swapchain keeps presenting into the visual either way and the
+// present loop never learns anything happened. Nothing is destroyed, resized,
+// re-armed or torn down, which is why this is safe to call mid-stream.
+// Bridge thread only - the device, target and visual are all created there and
+// WM_HOTKEY is thread-posted to the same thread.
+static bool dcomp_set_rooted(bool want, const char *why)
+{
+    if (g_dcomp_target == nullptr || g_dcomp_visual == nullptr || g_dcomp_device == nullptr)
+        return false;
+    if (want == g_dcomp_rooted)
+        return g_dcomp_rooted;
+
+    IDCompositionTarget *target = (IDCompositionTarget *)g_dcomp_target;
+    IDCompositionVisual *visual = (IDCompositionVisual *)g_dcomp_visual;
+    IDCompositionDevice *dcomp  = (IDCompositionDevice *)g_dcomp_device;
+
+    HRESULT hr = target->SetRoot(want ? visual : nullptr);
+    if (SUCCEEDED(hr)) hr = dcomp->Commit();
+    if (FAILED(hr))
+    {
+        char e[320];
+        snprintf(e, sizeof e,
+                 "[MGPU][V53] %s FAILED hr=0x%08X - the tree is unchanged and the bridge is "
+                 "still %s.",
+                 why, (unsigned)hr, g_dcomp_rooted ? "on screen" : "hidden");
+        mgpu::diag::error(e);
+        return g_dcomp_rooted;
+    }
+
+    g_dcomp_rooted = want;
+    char m[520];
+    snprintf(m, sizeof m,
+             "[MGPU][V53] %s: the bridge visual is now %s. The stream is UNTOUCHED - the "
+             "swapchain kept presenting throughout and nothing was destroyed, resized or "
+             "re-armed. %s",
+             why,
+             g_dcomp_rooted ? "ROOTED (on screen)" : "UNROOTED (hidden)",
+             g_dcomp_rooted ? "The game and its own ReShade overlay are behind it."
+                            : "The game and its ReShade overlay are visible; CTRL+ALT+F6 "
+                              "brings the neural output back.");
+    mgpu::diag::info(m);
+    return g_dcomp_rooted;
+}
+
+// V53. Called on the FIRST frame that carries neural output, from the same
+// one-shot the P5.0 line uses. Before this the operator sees the game.
+void dcomp_root_on_first_neural_frame()
+{
+    (void)dcomp_set_rooted(true, "first neural frame");
+}
+
+// V65. Overlay opens, the visual unroots and you get the GAME's overlay: real
+// cursor, real ReShade UI, the MGPU panel - none of which was ever broken.
+// Overlay closes, it roots again. The cost is not seeing the neural output
+// while the panel is open, and that is the mode's trade, not a defect. See the
+// header at the top of this file for what was tried instead.
+void dcomp_set_visible(bool on)
+{
+    (void)dcomp_set_rooted(on, on ? "overlay closed" : "overlay open");
+}
+
+// V52. CTRL+ALT+F6. Returns whether the bridge is on screen AFTER the call.
+bool dcomp_peek_toggle()
+{
+    if (g_dcomp_target == nullptr || g_dcomp_visual == nullptr || g_dcomp_device == nullptr)
+        return true;   // not composing: nothing is covering the overlay anyway
+    return dcomp_set_rooted(!g_dcomp_rooted, "peek");
+}
+
+
 // T5: the present chain (brief section 06). Bridge thread only.
 //
 // Creation order (shutdown() releases the reverse): command queue, DXGI
@@ -368,6 +518,30 @@ bool create_present_chain(HWND hwnd)
         if (sc1 != nullptr)       { sc1->Release(); sc1 = nullptr; }
         if (factory != nullptr)   { factory->Release(); factory = nullptr; }
         if (queue != nullptr)     { queue->Release(); queue = nullptr; }
+        // V51: the composition objects too, in reverse creation order. Without
+        // this a failed cycle leaves a TOPMOST COMPOSITION TARGET ALIVE ON THE
+        // GAME'S WINDOW, owned by a DLL that is about to unload. All null in
+        // mode 0, so this is a no-op there.
+        // V71. Unroot and commit BEFORE releasing, rather than trusting the
+        // target's release to clear the window's topmost slot. Commit is
+        // asynchronous - this file learned that the expensive way - and the
+        // note above is specifically worried about a topmost target outliving
+        // the DLL on the game's window. Make it deterministic.
+        if (g_dcomp_target != nullptr && g_dcomp_device != nullptr)
+        {
+            ((IDCompositionTarget *)g_dcomp_target)->SetRoot(nullptr);
+            ((IDCompositionDevice *)g_dcomp_device)->Commit();
+            ((IDCompositionDevice *)g_dcomp_device)->WaitForCommitCompletion();
+        }
+        if (g_dcomp_visual != nullptr)
+        { ((IDCompositionVisual *)g_dcomp_visual)->Release(); g_dcomp_visual = nullptr; }
+        if (g_dcomp_target != nullptr)
+        { ((IDCompositionTarget *)g_dcomp_target)->Release(); g_dcomp_target = nullptr; }
+        if (g_dcomp_device != nullptr)
+        { ((IDCompositionDevice *)g_dcomp_device)->Release(); g_dcomp_device = nullptr; }
+        if (g_dcomp_d3d11 != nullptr)
+        { ((ID3D11Device *)g_dcomp_d3d11)->Release(); g_dcomp_d3d11 = nullptr; }
+        g_dcomp_rooted = false;
     };
 
     // One error line per failure, with the failing call and its HRESULT -
@@ -452,10 +626,241 @@ bool create_present_chain(HWND hwnd)
         // device. It is named pDevice and typed IUnknown *, so passing
         // the device compiles, runs, and fails at runtime with an
         // unhelpful E_INVALIDARG.
+        // ---- V49: COMPOSITION SWAPCHAIN INSTEAD OF A WINDOW ONE ----
+        //
+        // CreateSwapChainForComposition takes NO HWND - that is the whole
+        // point. Width and Height must therefore be set explicitly, which they
+        // already are above from the client rect: the bridge covers the same
+        // area it always did, it simply is not a window while doing it.
+        //
+        // want_dcomp is false in mode 0 and the original CreateSwapChainForHwnd
+        // call below runs byte for byte as it always has.
+        // ---- V71: THE PUSH AND THE SPAWN ARE NOT ORDERED ----
+        //
+        // dllmain's on_init_swapchain calls worker::ensure_started() as its
+        // FIRST statement and pushes the game's HWND about sixty lines later,
+        // because the push is gated on the LUID comparison and that needs
+        // adapter::on_swapchain to have run. So this thread is alive before
+        // the HWND exists, and on a fast machine it can arrive here first.
+        //
+        // The failure is not subtle - it falls back to the bridge's own
+        // window, which is the mode this was built to avoid - but it is a
+        // RACE, so it would show up on someone else's machine and never on
+        // this one. Wait for it rather than sampling it once. Bounded, short,
+        // and only when the mode is actually on; the fallback below is still
+        // there for the case where the HWND genuinely never arrives.
+        if (dcomp_overlay_mode())
+        {
+            for (unsigned i = 0; i < 200u && g_game_hwnd == nullptr; ++i)
+                Sleep(10);   // up to 2 s
+        }
+
+        bool want_dcomp = dcomp_overlay_mode() && g_game_hwnd != nullptr;
+        if (dcomp_overlay_mode() && g_game_hwnd == nullptr)
+            mgpu::diag::error("[MGPU][V49] DcompOverlay=1 but the game's HWND was never seen, so "
+                              "there is nothing to compose into. Falling back to the bridge's own "
+                              "window. If this appears, the swapchain-init push in dllmain did "
+                              "not run before the present chain was created.");
+
+        if (want_dcomp)
+        {
+            swapchain_hr = factory->CreateSwapChainForComposition(
+                static_cast<IUnknown *>(queue), &scd, nullptr, &sc1);
+            if (FAILED(swapchain_hr))
+                return fail("CreateSwapChainForComposition", swapchain_hr);
+
+            // ---- V50 / V51: THE COMPOSITION DEVICE MUST BE ON GPU 1 ----
+            // See the long note at the top of this file. NULL here is legal,
+            // returns S_OK for everything, and draws nothing.
+            IDCompositionDevice *dcomp = nullptr;
+            ID3D11Device *d11 = nullptr;
+            bool on_gpu1 = false;
+            HRESULT hr = E_FAIL;
+            HRESULT adapter_hr = E_FAIL;
+            HRESULT d11_hr = E_FAIL;
+            {
+                IDXGIFactory4 *f4 = nullptr;
+                IDXGIAdapter *gpu1_adapter = nullptr;
+                const LUID want = dev->GetAdapterLuid();
+                adapter_hr = factory->QueryInterface(__uuidof(IDXGIFactory4),
+                                                     reinterpret_cast<void **>(&f4));
+                if (SUCCEEDED(adapter_hr) && f4 != nullptr)
+                {
+                    adapter_hr = f4->EnumAdapterByLuid(want, __uuidof(IDXGIAdapter),
+                                                       reinterpret_cast<void **>(&gpu1_adapter));
+                    f4->Release();
+                }
+                if (SUCCEEDED(adapter_hr) && gpu1_adapter != nullptr)
+                {
+                    D3D_FEATURE_LEVEL got{};
+                    d11_hr = D3D11CreateDevice(gpu1_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                               D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                               nullptr, 0, D3D11_SDK_VERSION,
+                                               &d11, &got, nullptr);
+                    gpu1_adapter->Release();
+                }
+                if (SUCCEEDED(d11_hr) && d11 != nullptr)
+                {
+                    IDXGIDevice *d11_dxgi = nullptr;
+                    if (SUCCEEDED(d11->QueryInterface(__uuidof(IDXGIDevice),
+                                                      reinterpret_cast<void **>(&d11_dxgi)))
+                        && d11_dxgi != nullptr)
+                    {
+                        hr = DCompositionCreateDevice(d11_dxgi, __uuidof(IDCompositionDevice),
+                                                      reinterpret_cast<void **>(&dcomp));
+                        d11_dxgi->Release();
+                        on_gpu1 = SUCCEEDED(hr) && dcomp != nullptr;
+                    }
+                }
+                // ---- V71: NEVER FALL BACK INTO THE BLACK CONFIGURATION ----
+                //
+                // This used to retry with DCompositionCreateDevice(nullptr).
+                // The header at the top of this file says what that does: it
+                // is legal, returns S_OK for every call, and DRAWS NOTHING,
+                // because the composition device lands on the default adapter
+                // while the swapchain is on GPU 1. Combined with a window that
+                // is never shown, the operator would get no bridge, no visual,
+                // a game that looks entirely normal, and one warn line.
+                //
+                // It also contradicted the rule stated three times elsewhere
+                // in this file: the fall-back direction is ALWAYS the shipped
+                // behaviour. Everywhere else an unknown falls back to the
+                // bridge's own window. Here it fell back to black.
+                //
+                // So it does not fall back here at all. want_dcomp is cleared
+                // and the ordinary CreateSwapChainForHwnd path below runs,
+                // which is the mode the user had before any of this existed.
+                if (!on_gpu1)
+                {
+                    if (d11 != nullptr)   { d11->Release();   d11 = nullptr; }
+                    if (dcomp != nullptr) { dcomp->Release(); dcomp = nullptr; }
+                    want_dcomp = false;
+                }
+            }
+            if (!want_dcomp)
+            {
+                // V71. Demoted above. Release the composition swapchain and
+                // let the window path below create an ordinary one.
+                if (sc1 != nullptr) { sc1->Release(); sc1 = nullptr; }
+                char v71[620];
+                snprintf(v71, sizeof v71,
+                         "[MGPU][V71] DcompOverlay is on but a composition device could not be "
+                         "created ON GPU 1 (EnumAdapterByLuid hr=0x%08X, D3D11CreateDevice "
+                         "hr=0x%08X). NOT falling back to a default-adapter composition device: "
+                         "that one succeeds at every call and draws nothing, so it would leave "
+                         "you with no bridge and a game that looks completely normal. Falling "
+                         "back to the bridge's OWN WINDOW instead - the shipped behaviour, the "
+                         "one that works, and the one Special K was written for.",
+                         (unsigned)adapter_hr, (unsigned)d11_hr);
+                mgpu::diag::error(v71);
+            }
+            else if (FAILED(hr) || dcomp == nullptr)
+                return fail("DCompositionCreateDevice", hr);
+            else
+            {
+            g_dcomp_d3d11 = d11;
+            {
+                char v51[780];
+                snprintf(v51, sizeof v51,
+                         "[MGPU][V51] composition rendering device: %s. gpu1 luid=0x%08X-0x%08X "
+                         "EnumAdapterByLuid hr=0x%08X D3D11CreateDevice hr=0x%08X "
+                         "DCompositionCreateDevice hr=0x%08X. ON GPU 1 is the one that can read a "
+                         "swapchain created on GPU 1's queue. FALLBACK means the composition "
+                         "device is on the default adapter and the content is cross-adapter - if "
+                         "there is no picture with this line saying ON GPU 1, the adapter was not "
+                         "the reason and DWM is not compositing the game's window at all.",
+                         on_gpu1 ? "ON GPU 1 (D3D11 on the bridge adapter)"
+                                 : "FALLBACK - NULL, default adapter",
+                         (unsigned)dev->GetAdapterLuid().HighPart,
+                         (unsigned)dev->GetAdapterLuid().LowPart,
+                         (unsigned)adapter_hr, (unsigned)d11_hr, (unsigned)hr);
+                if (on_gpu1) mgpu::diag::info(v51);
+                else         mgpu::diag::warn(v51);
+            }
+
+            // topmost = TRUE. Layer 4 of the documented four, above whatever
+            // the game presents directly to this window. At most two targets
+            // exist per window, one topmost and one not.
+            IDCompositionTarget *target = nullptr;
+            hr = dcomp->CreateTargetForHwnd(g_game_hwnd, TRUE, &target);
+            if (FAILED(hr))
+            {
+                char v49e[720];
+                snprintf(v49e, sizeof v49e,
+                         "[MGPU][V49] CreateTargetForHwnd(game hwnd=0x%p, topmost=TRUE) "
+                         "hr=0x%08X. If something else already holds the topmost slot this is "
+                         "what it looks like. DCOMPOSITION_ERROR_ACCESS_DENIED instead means the "
+                         "window does not belong to this process.",
+                         (void *)g_game_hwnd, (unsigned)hr);
+                mgpu::diag::error(v49e);
+                dcomp->Release();
+                if (d11 != nullptr) { d11->Release(); g_dcomp_d3d11 = nullptr; }
+                return fail("CreateTargetForHwnd", hr);
+            }
+
+            IDCompositionVisual *visual = nullptr;
+            hr = dcomp->CreateVisual(&visual);
+            if (SUCCEEDED(hr)) hr = visual->SetContent(sc1);
+            // V53: the root is NOT set here. The tree is built and committed
+            // empty, and the visual is rooted on the first neural frame.
+            if (SUCCEEDED(hr)) hr = dcomp->Commit();
+            if (FAILED(hr))
+            {
+                if (visual != nullptr) visual->Release();
+                target->Release(); dcomp->Release();
+                if (d11 != nullptr) { d11->Release(); g_dcomp_d3d11 = nullptr; }
+                return fail("DComp visual bind", hr);
+            }
+
+            // V51. Commit is asynchronous: it returns S_OK for a tree the
+            // compositor has not looked at yet. These two are the only
+            // questions DirectComposition will answer about a tree it has
+            // already accepted.
+            const HRESULT wait_hr = dcomp->WaitForCommitCompletion();
+            BOOL dev_ok = FALSE;
+            const HRESULT state_hr = dcomp->CheckDeviceState(&dev_ok);
+            {
+                char v51c[560];
+                snprintf(v51c, sizeof v51c,
+                         "[MGPU][V51] after Commit: WaitForCommitCompletion hr=0x%08X "
+                         "CheckDeviceState hr=0x%08X usable=%d. A commit that completes on a "
+                         "usable device means the compositor has the tree; if the panel is later "
+                         "black the tree is being drawn and something is in front of it, not "
+                         "behind a rejected visual.",
+                         (unsigned)wait_hr, (unsigned)state_hr, (int)dev_ok);
+                if (SUCCEEDED(wait_hr) && SUCCEEDED(state_hr) && dev_ok)
+                    mgpu::diag::info(v51c);
+                else
+                    mgpu::diag::warn(v51c);
+            }
+
+            g_dcomp_device = dcomp;
+            g_dcomp_target = target;
+            g_dcomp_visual = visual;
+            g_dcomp_rooted = false;
+
+            char v49[760];
+            snprintf(v49, sizeof v49,
+                     "[MGPU][V49] COMPOSING INTO THE GAME'S WINDOW. No bridge window is in the "
+                     "Z-order: the neural frame reaches the panel as the topmost "
+                     "DirectComposition visual on the game's own HWND 0x%p, above what the game "
+                     "presents to it. The game is therefore the only window on the desktop and is "
+                     "on top by construction - there is nothing for an engine to detect and "
+                     "nothing for it to lock its own input on. Chain %ux%u. V53: the visual is "
+                     "NOT on screen yet - it is rooted on the first frame carrying neural "
+                     "output, so until the stream arms you see the game.",
+                     (void *)g_game_hwnd, width, height);
+            mgpu::diag::info(v49);
+            }   // V71: end of the composition-succeeded branch
+        }
+
+        if (!want_dcomp)
+        {
         swapchain_hr = factory->CreateSwapChainForHwnd(
             static_cast<IUnknown *>(queue), hwnd, &scd, nullptr, nullptr, &sc1);
         if (FAILED(swapchain_hr))
             return fail("CreateSwapChainForHwnd", swapchain_hr);
+        }
 
         // SL4. The object a possibly-wrapped factory just handed us. A factory
         // hands out the objects it makes, so if the factory is a proxy this
@@ -467,7 +872,12 @@ bool create_present_chain(HWND hwnd)
         // display the game is using. A failure here does not break the
         // swapchain; the loss is the Alt+Enter protection. Log the input,
         // continue.
-        const HRESULT mhr = factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+        // V49: a composition swapchain has no window, so there is no message
+        // hook for DXGI to install and nothing to protect. Skipped, not
+        // failed. In mode 0 this is the original call, unchanged.
+        const HRESULT mhr = want_dcomp
+                                ? S_OK
+                                : factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
         if (FAILED(mhr))
         {
             snprintf(line, sizeof line,
@@ -1134,6 +1544,10 @@ bool present_frame(float r, float g, float b)
         }
         if (say)
         {
+            // V53. The first frame that actually carries neural output is the
+            // first moment the bridge has anything worth covering the game
+            // with. No-op in mode 0, where there is no visual.
+            dcomp_root_on_first_neural_frame();
             snprintf(line, sizeof line,
                      "[MGPU][P5.0] the bridge window is now showing the %s - %s of the %ux%u "
                      "frame at %ux%u, one CopyTextureRegion, no resampling in this add-on. The "
@@ -11200,6 +11614,36 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
 
     // want_fmt, not a constant. This is DEFECT H's actual repair.
     const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, 0);
+
+    // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
+    //
+    // The tree was committed once, in create_present_chain, against a
+    // swapchain of the size it had then. ResizeBuffers changes that size and
+    // DirectComposition does not learn about it on its own: the visual keeps
+    // the dimensions the compositor last accepted.
+    //
+    // This went unnoticed because the only resize in a normal run is the one
+    // at arm - early, on a tree committed seconds earlier, which is the case
+    // most likely to paper over it. A SECOND resize is what a mid-session
+    // resolution change produces, and that path has never run. Committing here
+    // costs one call on a path that already drained the GPU and rebuilt every
+    // backbuffer.
+    //
+    // Null in mode 0, where there is no tree, so this is a no-op there.
+    if (SUCCEEDED(rb) && g_dcomp_device != nullptr)
+    {
+        IDCompositionDevice *dc = (IDCompositionDevice *)g_dcomp_device;
+        const HRESULT ch = dc->Commit();
+        if (FAILED(ch))
+        {
+            char v69[300];
+            snprintf(v69, sizeof v69,
+                     "[MGPU][V69] Commit after ResizeBuffers hr=0x%08X - the swapchain resized "
+                     "but the compositor may still be drawing the previous size.",
+                     (unsigned)ch);
+            mgpu::diag::error(v69);
+        }
+    }
     bool ok = SUCCEEDED(rb);
 
     // Re-acquire the backbuffers and rebuild the two RTVs.
@@ -11405,6 +11849,32 @@ namespace dispcfg
         return false;
     }
 
+    // V55. How many display paths are ACTIVE. Not "how many monitors" and not
+    // a rect comparison - the same CCD query duplicated() uses, asked for the
+    // one number the ghost mode's safety guard needs. Returns 0 when the API
+    // is unavailable, and 0 is treated as UNKNOWN by every caller, never as
+    // "none".
+    unsigned active_paths()
+    {
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        pfn_sizes p_sizes = (u != nullptr)
+            ? (pfn_sizes)(void *)GetProcAddress(u, "GetDisplayConfigBufferSizes") : nullptr;
+        pfn_query p_query = (u != nullptr)
+            ? (pfn_query)(void *)GetProcAddress(u, "QueryDisplayConfig") : nullptr;
+        if (p_sizes == nullptr || p_query == nullptr) return 0u;
+
+        UINT32 np = 0, nm = 0;
+        if (p_sizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) return 0u;
+        DISPLAYCONFIG_PATH_INFO *paths =
+            (DISPLAYCONFIG_PATH_INFO *)malloc(np * sizeof(DISPLAYCONFIG_PATH_INFO));
+        DISPLAYCONFIG_MODE_INFO *modes =
+            (DISPLAYCONFIG_MODE_INFO *)malloc((nm ? nm : 1) * sizeof(DISPLAYCONFIG_MODE_INFO));
+        if (paths == nullptr || modes == nullptr) { free(paths); free(modes); return 0u; }
+        const LONG r = p_query(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, nullptr);
+        free(paths); free(modes);
+        return (r == ERROR_SUCCESS) ? (unsigned)np : 0u;
+    }
+
     bool duplicated()
     {
         HMODULE u = GetModuleHandleW(L"user32.dll");
@@ -11473,6 +11943,207 @@ namespace dispcfg
 // foreground - and with it the keyboard, the mouse and the pad. In extended
 // mode the two windows are on different screens and taking foreground is
 // normal, wanted behaviour, so nothing changes there.
+// V49. Defined HERE, beside window_no_activate(), and not next to the other
+// V-code near the top: ini_read_sr_int is declared far below that point, so a
+// definition up there does not compile. The declaration in gpu1_context.hpp is
+// what create_present_chain calls through.
+// V55. Bridge-adapter-drives-no-display, pushed from worker.cpp right after
+// pick_bridge_placement, which is the one place that already knows.
+static std::atomic<int>                g_bridge_headless{-1};   // -1 unknown
+static std::atomic<unsigned long long> g_hint_since_ms{0ull};
+
+// ---- V49 / V55: IS THE GHOST MODE ON? ----
+//
+// RESOLVED ONCE AND LATCHED. This is read from three places - dllmain's HWND
+// push on the GAME thread at swapchain init, the window creation at T4, and
+// the present chain at T5 - and they do not run in the order you would guess.
+// If it answered differently at different call sites the mode would come up
+// half armed: a composition swapchain with no HWND to bind it to, or a hidden
+// window with an ordinary swapchain behind it. So it answers once.
+//
+// THE MULTI-DISPLAY REFUSAL. DcompOverlay=1 is honoured ONLY on a desktop with
+// exactly one active display path. This mode exists for one monitor with the
+// render card headless; on anything else it has never been tested and the
+// bridge having its own window is not a hardship there - it is what every
+// released build does. Refusing caps the blast radius of this whole feature at
+// a configuration the operator has to physically be in.
+//
+// UNKNOWN REFUSES TOO. active_paths() returns 0 when the CCD API cannot be
+// reached, and 0 falls to OFF rather than ON: the fail-safe direction is the
+// shipped behaviour, always.
+// V66. The BRIDGE adapter's ATTACHED outputs - not the outputs it reports.
+// selection_result::selected_outputs counts everything EnumOutputs hands back,
+// which on a headless render card is its physical connectors, so it is not the
+// headless test and using it would make auto fire nowhere. Attached is
+// DXGI_OUTPUT_DESC::AttachedToDesktop and nothing else.
+//
+// Asked HERE rather than taken from worker.cpp's T4 answer, because this is
+// read from dllmain's swapchain-init push on the GAME thread, which runs long
+// before T4 exists. Adapter selection is settled by then - adapter::on_swapchain
+// runs immediately above it - so the LUID is available and the query is direct.
+static unsigned bridge_attached_outputs()
+{
+    mgpu::adapter::selection_result sel;
+    mgpu::adapter::get_selection(sel);
+    if (!sel.valid) return 0xFFFFFFFFu;   // unknown, and unknown must not mean zero
+
+    IDXGIFactory4 *f4 = nullptr;
+    if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4),
+                                  reinterpret_cast<void **>(&f4))) || f4 == nullptr)
+        return 0xFFFFFFFFu;
+
+    IDXGIAdapter *ad = nullptr;
+    unsigned attached = 0xFFFFFFFFu;
+    if (SUCCEEDED(f4->EnumAdapterByLuid(sel.selected_luid, __uuidof(IDXGIAdapter),
+                                        reinterpret_cast<void **>(&ad))) && ad != nullptr)
+    {
+        attached = 0u;
+        for (UINT i = 0; i < 32u; ++i)
+        {
+            IDXGIOutput *o = nullptr;
+            if (FAILED(ad->EnumOutputs(i, &o)) || o == nullptr) break;
+            DXGI_OUTPUT_DESC d{};
+            if (SUCCEEDED(o->GetDesc(&d)) && d.AttachedToDesktop) ++attached;
+            o->Release();
+        }
+        ad->Release();
+    }
+    f4->Release();
+    return attached;
+}
+
+// ---- V72: "NOT TOLD YET" AND "TOLD, AND SAID NO" ARE DIFFERENT ----
+//
+// Returns:  -2 absent   -1 auto   0 explicitly off   1 explicitly on
+//
+// Both -2 and 0 mean the mode is OFF and dcomp_overlay_mode treats them
+// identically. The distinction exists for the HINT. Someone who has never
+// heard of this mode should be told about it; someone who read the hint,
+// decided against it and wrote DcompOverlay=0 has answered, and showing them
+// the same screen plus ten seconds of AutoArm hold on every launch for the
+// rest of the product's life is a nag, not advice. A suggestion you cannot
+// decline is a defect.
+static int ini_read_dcomp_setting()
+{
+    char buf[INI_BYTES];
+    if (!ini_slurp(buf, sizeof buf)) return -2;   // unreadable is not a decision either
+    const char *k = ini_find(buf, "DcompOverlay");
+    if (k == nullptr) return -2;
+    if (*k == 'a' || *k == 'A') return -1;
+    const int v = atoi(k);
+    return (v == 1) ? 1 : 0;
+}
+
+// V72. The raw setting, latched alongside the resolved one, so the hint can
+// ask what the user SAID rather than what the mode resolved to.
+static std::atomic<int> g_dcomp_setting{-3};   // -3 = not read yet
+
+bool dcomp_overlay_mode()
+{
+    static std::atomic<int> latched{-1};
+    const int seen = latched.load(std::memory_order_relaxed);
+    if (seen >= 0) return seen != 0;
+
+    const int want = ini_read_dcomp_setting();
+    g_dcomp_setting.store(want, std::memory_order_relaxed);
+    int out = 0;
+    if (want == -1)
+    {
+        // V66: AUTO. On ONLY for the configuration the mode was built for, and
+        // every other answer - including every answer we could not read - is
+        // off, which is the shipped behaviour. One active display path, and a
+        // bridge adapter driving no display of its own.
+        const unsigned paths = dispcfg::active_paths();
+        const unsigned att   = bridge_attached_outputs();
+        out = (paths == 1u && att == 0u) ? 1 : 0;
+        char v66[620];
+        snprintf(v66, sizeof v66,
+                 "[MGPU][V66] DcompOverlay auto: %u active display path(s), bridge adapter has "
+                 "%s attached output(s) -> %s. Auto turns the composition mode ON only for one "
+                 "monitor with the render card headless, which is the only configuration it has "
+                 "ever been tested in. Anything else, and anything that could not be read, is "
+                 "OFF - the fall-back direction is always the shipped behaviour. Write "
+                 "DcompOverlay 0 or 1 to decide it by hand.",
+                 paths,
+                 (att == 0xFFFFFFFFu) ? "an unknown number of" : (att == 0u ? "no" : "some"),
+                 out ? "ON" : "off");
+        if (out) mgpu::diag::info(v66);
+        else     mgpu::diag::warn(v66);
+    }
+    else if (want == 1)
+    {
+        const unsigned paths = dispcfg::active_paths();
+        out = (paths == 1u) ? 1 : 0;
+        char v55[640];
+        snprintf(v55, sizeof v55,
+                 "[MGPU][V55] DcompOverlay 1 requested, %u active display path(s) -> %s. The "
+                 "composition mode is for ONE monitor with the render card headless and is "
+                 "refused anywhere else, tested or not. A count of 0 means the display "
+                 "configuration API could not be read, and unknown refuses exactly like "
+                 "multi-display does - the fall-back direction is always the shipped behaviour.",
+                 paths, out ? "ACCEPTED" : "REFUSED, the bridge opens its own window");
+        if (out) mgpu::diag::info(v55);
+        else     mgpu::diag::warn(v55);
+    }
+    latched.store(out, std::memory_order_relaxed);
+    return out != 0;
+}
+
+// V55. worker.cpp calls this once, at T4, with what pick_bridge_placement
+// already worked out. It also starts the hint clock, because the hint is on
+// screen from the frame after this returns.
+void note_bridge_headless(bool headless)
+{
+    g_bridge_headless.store(headless ? 1 : 0, std::memory_order_relaxed);
+    if (headless && g_hint_since_ms.load(std::memory_order_relaxed) == 0ull)
+        g_hint_since_ms.store((unsigned long long)GetTickCount64(), std::memory_order_relaxed);
+}
+
+// V55. SHOULD THE SCREEN TELL THEM ABOUT THE MODE? Advice only - this never
+// changes what the bridge does. True for exactly the people the mode is for
+// and who are not already using it: one active path, render card driving no
+// display, and DcompOverlay not on.
+bool single_display_hint()
+{
+    if (g_bridge_headless.load(std::memory_order_relaxed) != 1) return false;
+    if (dcomp_overlay_mode()) return false;          // already on, nothing to suggest
+    // V72. dcomp_overlay_mode() above has latched the raw setting by now.
+    // An explicit 0 is an answer; respect it and stay quiet. Absent, auto that
+    // declined, or an unreadable file are all "not answered", and those get
+    // the hint.
+    if (g_dcomp_setting.load(std::memory_order_relaxed) == 0) return false;
+
+    // V68. LATCHED. This is read from present_screen_state, which runs on
+    // EVERY PRESENTED FRAME while the stream is not armed, and from the
+    // AutoArm gate in the present loop. The first cut called active_paths()
+    // straight through, so a pre-arm frame cost two GetProcAddress lookups,
+    // two CCD queries and two malloc/free pairs - on the bridge's present
+    // path, for an answer that cannot change between one frame and the next.
+    // The display configuration is read once; a monitor plugged in mid-session
+    // does not retroactively make this advice wrong.
+    static std::atomic<int> latched{-1};
+    int v = latched.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        v = (dispcfg::active_paths() == 1u) ? 1 : 0;
+        latched.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+// V55. AutoArm waits while the hint is being read. TIME, not frames: 600
+// presented frames is about ten seconds at 60 Hz and about two and a half at
+// 240 Hz, and the whole point is that the line is readable on both. Ten
+// seconds because a machine that is still finishing its launch can spend the
+// first few with the bridge not yet on top.
+bool autoarm_hint_holding()
+{
+    if (!single_display_hint()) return false;
+    const unsigned long long t0 = g_hint_since_ms.load(std::memory_order_relaxed);
+    if (t0 == 0ull) return false;
+    return ((unsigned long long)GetTickCount64() - t0) < 10000ull;
+}
+
 bool window_no_activate()
 {
     const int m = ini_read_sr_int("NoActivate", 2, 0, 2);
@@ -12019,6 +12690,14 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
         // carries the place to send the log rather than just the symptom.
         l2 = "DLSS DID NOT START - SEND RESHADE.LOG TO GITHUB.COM/MAOHGAD-WEB/NEURAL-COPROCESSOR";
     }
+    // V67. Armed, and this run was never going to draw a frame. Said plainly
+    // instead of leaving the waiting state to imply a fault that is not there.
+    else if (s.armed && s.profile)
+    {
+        st_out = mgpu::screen::st_idle;
+        l1 = MGPU_S209_L1;
+        l2 = MGPU_S209_L2;
+    }
     else if (s.armed)
     {
         st_out = mgpu::screen::st_waiting;
@@ -12061,6 +12740,16 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
         st_out = mgpu::screen::st_idle;
         l1 = MGPU_S206_L1;
         l2 = MGPU_S206_L2;
+    }
+    // V55. The hint. Before the plain not-yet-armed state so it is what the
+    // pre-arm window actually shows, and neutral rather than red because
+    // nothing is wrong - the bridge works exactly as it always has and this is
+    // an offer, not a fault.
+    else if (!s.requested && single_display_hint())
+    {
+        st_out = mgpu::screen::st_idle;
+        l1 = MGPU_S208_L1;
+        l2 = MGPU_S208_L2;
     }
     else if (!s.requested)
     {

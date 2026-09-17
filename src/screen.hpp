@@ -95,6 +95,25 @@ enum state
 #define MGPU_H207_L2 \
     "IF YOU ARE IN GAMEPLAY " MGPU_REPORT_L2
 
+// V55. NOT an error and not a fault - the bridge is working normally and this
+// is an offer. EVERY GLYPH HERE IS IN THE FONT: A-Z, 0-9, space, '-', '.',
+// ':' and '/'. There is NO '=' in the font, which is why this says
+// "DCOMPOVERLAY TO 1" and not "DCOMPOVERLAY=1" - an undeclared glyph draws as
+// a blank, so the equals sign would have come out as a hole in the middle of
+// the one line that has to be copied correctly.
+// V67. A measurement run has NO ON-SCREEN OUTPUT by design - the copy into the
+// bridge's backbuffer is gated on !profile - so the armed screen would sit on
+// WAITING FOR THE FIRST FRAME for the whole run while the stream ran perfectly
+// underneath. That is an absence reporting itself as a wrong state, which is
+// the R138 shape, and it cost a run. Glyphs: A-Z 0-9 space - . : / only.
+#define MGPU_S209_L1 "PROFILE RUN"
+#define MGPU_S209_L2 \
+    "MEASURING - NO OUTPUT BY DESIGN. SET PROFILE TO 0 TO SEE THE NEURAL FRAME"
+
+#define MGPU_S208_L1 "ONE DISPLAY DETECTED"
+#define MGPU_S208_L2 \
+    "SET DCOMPOVERLAY TO 1 IN MGPU.INI - NO SPECIAL K NEEDED"
+
 #define MGPU_E201_L1 "ERROR 201"
 #define MGPU_E201_L2 "NVNGX-DLSSNR.DLL NOT FOUND - PUT IT BESIDE THE GAME EXE"
 

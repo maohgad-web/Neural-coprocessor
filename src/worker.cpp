@@ -71,6 +71,15 @@
 #define MGPU_HOTKEY_SEAM_R     0x4D4D   // CTRL+ALT+RIGHT
 #define MGPU_HOTKEY_SEAM_LC    0x4D4E   // CTRL+ALT+SHIFT+LEFT  (coarse)
 #define MGPU_HOTKEY_SEAM_RC    0x4D4F   // CTRL+ALT+SHIFT+RIGHT (coarse)
+// V52: CTRL+ALT+F6 unroots the composition visual and roots it again. With
+// DcompOverlay=1 the bridge is the TOPMOST visual on the game's window, so the
+// game's own ReShade overlay is drawn underneath it - correctly, and
+// invisibly. This gets out of its way without touching the stream. REGISTERED
+// ONLY IN THAT MODE: in mode 0 nothing is covering the overlay, and an add-on
+// that silently claims a process-wide hotkey for a key that does nothing is
+// not "no regression".
+// F6 and not F12 because Steam's screenshot key is F12.
+#define MGPU_HOTKEY_PEEK       0x4D50   // CTRL+ALT+F6
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -565,6 +574,18 @@ namespace
                 // that looks like a right one - the same reason the P1.3g
                 // hotkey message has a buffer of its own.
                 char pline[420];
+                // V55. Hand the one fact the hint needs to the side that draws
+                // the screen.
+                //
+                // outputs_ATTACHED, not outputs_total. total counts every
+                // output DXGI enumerates for the adapter; attached counts only
+                // those with DXGI_OUTPUT_DESC::AttachedToDesktop. A render card
+                // sitting headless still has physical connectors, so total can
+                // be non-zero on exactly the rig this hint is for - and the
+                // hint would then never appear for the people it was written
+                // for. Headless is attached == 0 and nothing else.
+                mgpu::gpu1::note_bridge_headless(place.outputs_attached == 0);
+
                 snprintf(pline, sizeof pline, "[MGPU][P7.10] window placement - %s", place.detail);
                 if (place.known) mgpu::diag::info(pline);
                 else             mgpu::diag::warn(pline);
@@ -660,7 +681,32 @@ namespace
                     // here, with GetLastError() == 0 - and an earlier version
                     // of this code logged that as an error on every single
                     // launch. There is nothing to check.
-                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    // ---- V49: A GHOST IS NEVER SHOWN ----
+                    //
+                    // The first cut of V49 replaced the bridge's SWAPCHAIN and
+                    // left this line alone - so there was still an HWND in the
+                    // Z-order for an engine to see, and still a window you
+                    // could swap to and find a cursor on. A windowless
+                    // swapchain behind a window that is still there is not
+                    // windowless.
+                    //
+                    // The window is not destroyed, only never shown: the
+                    // message pump, the resize path and the title updates all
+                    // still hang off it, and a hidden window costs nothing and
+                    // participates in nothing. In mode 0 this line runs exactly
+                    // as it always has.
+                    if (!mgpu::gpu1::dcomp_overlay_mode())
+                    {
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    }
+                    else
+                    {
+                        mgpu::diag::info("[MGPU][V49] the bridge window is created but NEVER "
+                                         "SHOWN - it exists only to own the message pump and the "
+                                         "resize path. Nothing of the bridge is in the Z-order. "
+                                         "If you can swap to a bridge window, this line did not "
+                                         "run.");
+                    }
 
                     // P7.10: say what it is doing straight away. The present
                     // loop refreshes this every half second, but if the present
@@ -698,6 +744,24 @@ namespace
                                                 MOD_CONTROL | MOD_ALT, VK_F9) != FALSE;
                             const bool k_u = RegisterHotKey(nullptr, MGPU_HOTKEY_INT_UP,
                                                 MOD_CONTROL | MOD_ALT, VK_F11) != FALSE;
+                            const bool k_p =
+                                mgpu::gpu1::dcomp_overlay_mode() &&
+                                RegisterHotKey(nullptr, MGPU_HOTKEY_PEEK,
+                                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F6) != FALSE;
+                            if (mgpu::gpu1::dcomp_overlay_mode())
+                            {
+                                char pk[440];
+                                snprintf(pk, sizeof pk,
+                                         "[MGPU][V52] peek hotkey: CTRL+ALT+F6 hides and restores "
+                                         "the bridge visual = %s. DcompOverlay=1 puts the bridge "
+                                         "ABOVE the game's own ReShade overlay, so this is how "
+                                         "you reach that overlay - and how you dismiss the "
+                                         "run-end screen. It unroots a visual and roots it again; "
+                                         "the stream is never touched.",
+                                         k_p ? "OK" : "FAILED");
+                                if (k_p) mgpu::diag::info(pk);
+                                else     mgpu::diag::warn(pk);
+                            }
                             const bool k_v = RegisterHotKey(nullptr, MGPU_HOTKEY_VIEW,
                                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F7) != FALSE;
                             const bool s_l  = RegisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L,
@@ -894,6 +958,13 @@ namespace
                     { --int_delta; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_INT_UP)
                     { ++int_delta; continue; }
+                    // V52. Acted on HERE rather than counted like the others:
+                    // it changes no stream state, so there is nothing for the
+                    // present loop to pick up, and it runs on the thread that
+                    // owns the composition objects. Unreachable in mode 0 -
+                    // the key is not registered there.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
+                    { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
                     { ++view_cycles; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_L)
@@ -1045,8 +1116,15 @@ namespace
                     mgpu::gpu1::stream_request();
                 }
 
+                // V55. Hold AutoArm while the one-display hint is on screen -
+                // ten seconds of wall clock, not a frame count, because 600
+                // frames is ten seconds at 60 Hz and under three at 240 Hz and
+                // the line has to be readable on both. Only ever true for a
+                // headless single-display rig that is NOT already using the
+                // mode, so nobody else's arm timing moves by a millisecond.
                 if (!autoarm_done && frame >= autoarm_at &&
-                    !mgpu::gpu1::ui_panel_is_open())
+                    !mgpu::gpu1::ui_panel_is_open() &&
+                    !mgpu::gpu1::autoarm_hint_holding())
                 {
                     const unsigned long long quiet =
                         mgpu::adapter::ms_since_last_swapchain_event();
@@ -1224,6 +1302,9 @@ namespace
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_DOWN);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_INT_UP);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_VIEW);
+            // V52: only ever registered in ghost mode.
+            if (mgpu::gpu1::dcomp_overlay_mode())
+                UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC);
