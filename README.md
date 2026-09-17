@@ -18,6 +18,16 @@ Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It 
 
 * * *
 
+## New in 0.2.4: one display
+
+**One monitor, one cable, no third-party tool and no controller.** Until 0.2.4 a second monitor was effectively required. It is not any more.
+
+Set `DcompOverlay=1` in `mgpu.ini`. The bridge stops opening a window of its own and draws the neural output onto the game's own window instead, so the game keeps the mouse and the keyboard. The display goes on the neural card, and the card that renders the game has nothing plugged into it.
+
+Two monitors, one per card, remains the arrangement every published measurement was taken on. See Display setup for both.
+
+* * *
+
 ## What changed in 0.2.0
 
 **`nvngx_dlssnr.dll` now goes in a folder called `mgpu`, next to the add-on, instead of beside the game executable.** Some titles load anything named `nvngx_*.dll` that sits next to their executable. Loading it from its own subfolder keeps it out of their way.
@@ -39,6 +49,12 @@ Also in 0.2.0:
 - **iGPU detection is improved.** If you have an integrated GPU enabled alongside your two graphics cards, it no longer causes problems - and you do not have to disable it. Verified on a rig with the iGPU monitor attached.
 - **Depth and motion vector support for 007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)). The same fix also covers Cyberpunk 2077, where depth would not bind if you had Ray Reconstruction enabled ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)).
 - **The bridge window reports a bad install instead of waiting.** `ERROR 204` when the game's ReShade runtime never compiled the depth tap - almost always `EffectSearchPaths` - and `ERROR 205` for a missing `mgpu.ini`. Read-only: the add-on never writes your `ReShade.ini`.
+
+**0.2.4** - one display is supported, and Native Upscaling is improved.
+
+- **One display, one cable, no Special K.** `DcompOverlay=1` in `mgpu.ini` removes the bridge's own window, so the game keeps the mouse and the keyboard. See Display setup.
+- **Native Upscaling is improved.** It now reads the render resolution the game declares to DLSS, which makes it available on more titles and improves stability in motion.
+- **The panel reports your game's setting.** It says DLAA or DLSS, and names the setting to change when Native Upscaling cannot run.
 
 * * *
 
@@ -119,9 +135,9 @@ The last row is a limitation rather than a fault - see Limitations. Neural rende
 
 - **GeForce RTX 50-series cards** (primary requirement for DLSS Neural Rendering)
 - **GeForce RTX 40-series cards** (confirmed working with modded `nvngx_dlssnr.dll`)
-- **Two GPUs and two monitors** (one monitor per card). One monitor is not supported, but there is an unsupported workaround, and it is the other way round - the display goes on the neural card. See Display setup
+- **Two GPUs.** Two monitors, one per card, or one monitor with `DcompOverlay=1` and the display on the neural card - see Display setup
 - **Add-on-enabled ReShade build, 6.8.0 or newer**
-- **DirectX 12 games only** (D3D11 and Vulkan unsupported)
+- **DirectX 12 games only** (D3D11 and Vulkan unsupported). Some Unity titles ship a D3D11 default and a working D3D12 path - see Forcing D3D12 on Unity titles
 - **No shader packs required**
 - **No other add-ons** (to avoid multiple NGX consumers)
 
@@ -155,11 +171,17 @@ The game's rendering is never touched; the bridge reads the finished frame and e
 
 ## Display setup
 
-**Two displays, extended, one per card.** That is the supported configuration and the only one measured.
+Both of these work. Pick the one that matches your hardware.
 
-Anything else is structural rather than a missing feature. The bridge presents the second card's output through its own swapchain, in its own window, so it needs somewhere to put that window. Sharing one screen with the game means presenting into the game's swapchain instead, which is a different architecture.
+**Two displays, extended, one per card.** The bridge presents the second card's output in its own window on the second screen. Every published figure was measured this way, and it is what I develop on - a window of its own is what lets the bridge's swapchain be isolated from the game's when I am debugging.
 
-**One display, only one card connected.** It can still be made to work, on one cable, one display, two GPUs \- with the card that renders the game the one that has nothing plugged into it. The display goes on the neural card, a third\-party tool handles input, and a controller is required, because with the bridge window on top the mouse cannot reach the game.  Write\-up in [workarounds/single\-display](https://github.com/maohgad-web/Neural-coprocessor/tree/main/workarounds/single-display).
+**One display, one cable.** Set `DcompOverlay=1` in `mgpu.ini`. The bridge creates no window of its own and draws the neural output onto the game's window instead. The game keeps the mouse and the keyboard. No third-party tool, and no controller needed.
+
+The display goes on the neural card, and the card that renders the game has nothing plugged into it.
+
+Open the ReShade overlay with its normal key and the neural output steps aside by itself, so the overlay is visible and usable. Close the overlay and the neural output comes back. `CTRL+ALT+F6` does the same by hand if you want it.
+
+The add-on refuses this mode if it finds more than one active display, and says so in the log.
 
 Two cables from two cards into one monitor was explored and did not reach anything worth shipping. A pull request is welcome if you find an arrangement that does.
 
@@ -205,6 +227,28 @@ Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after
 
 * * *
 
+## Forcing D3D12 on Unity titles
+
+A Unity game that launches in D3D11 does nothing here: the add-on finds no D3D12 render device, stands down, and says so in the ReShade overlay panel. Many Unity titles also ship a D3D12 renderer and simply do not pick it by default. Adding `-force-d3d12` to the launch arguments switches them over.
+
+**Steam.** Right-click the game, Properties, General, and put this in Launch Options:
+
+```
+-force-d3d12 %command%
+```
+
+**A desktop shortcut.** Right-click the shortcut, Properties, and add the flag at the end of the Target field, outside the quotes:
+
+```
+"C:\Games\<title>\<title>.exe" -force-d3d12
+```
+
+**Other launchers** take the same flag wherever they accept command-line arguments.
+
+This only works if the title actually carries a D3D12 renderer - there is nothing to force if it does not. Check `ReShade.log` after launching: if the add-on now finds a D3D12 device it proceeds normally, and if it still stands down, that title is D3D11 only.
+
+* * *
+
 ## Limitations
 
 - **Engine motion vectors can need the game to be running DLSS or DLAA.** Measured on Battlefield 6: 96-98% of frames with DLSS or DLAA, none with TAA.
@@ -213,8 +257,8 @@ Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after
 - **Frame generation:** Untested and not recommended
 - **Colour handling:** Not fully implemented; tone adjustment may be needed. Motion vectors for UI and HUD elements are still missing
 - **External overlays:** Tools like RivaTuner/MSI Afterburner misbehave; use ReShade's built-in FPS display instead
-- **D3D12 only:** No D3D11 or Vulkan support
-- **Keyboard focus:** Interacting with the bridge window removes focus from the game, so a controller is recommended. On a single display this stops being a recommendation - the bridge window covers the screen and the mouse cannot reach the game at all. See Display setup
+- **D3D12 only:** No D3D11 or Vulkan support. Some Unity titles can be forced to D3D12 - see Forcing D3D12 on Unity titles
+- **Keyboard focus:** Interacting with the bridge window removes focus from the game, so a controller is recommended. On a single display use `DcompOverlay=1` - there is then no bridge window to take focus. See Display setup
 
 * * *
 
