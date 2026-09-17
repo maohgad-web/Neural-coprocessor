@@ -137,6 +137,12 @@ target_compile_definitions(mgpu_bridge PRIVATE
 target_link_libraries(mgpu_bridge PRIVATE
     dxgi
     d3d12
+    # V49/V51: the ghost mode. DirectComposition, and D3D11 solely to name an
+    # adapter to it - nothing is ever drawn with the D3D11 device. Both are
+    # also declared with #pragma comment(lib, ...) inside gpu1_context.cpp, so
+    # a build made from src/* without this file still links.
+    dcomp
+    d3d11
 )
 
 # P0: warnings visible, not fatal. A compile error costs the same round
