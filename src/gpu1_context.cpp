@@ -10349,6 +10349,42 @@ namespace
         // available the moment the game itself renders at native - DLAA - since
         // there is no smaller extent to inherit. SRScale gives R directly, as a
         // percent per axis, and 67 is DLSS Quality's own ratio.
+        //
+        // ---- R152: A BUFFER'S SIZE IS NOT A RENDER EXTENT ----
+        //
+        // THE DEFECT, and it goes back at least to 0.2.1. R was inherited from
+        // the motion vector RESOURCE's dimensions, and then the guard below
+        // read those same dimensions as proof of what the game was doing: if
+        // the vectors were display-sized, the game "must be" rendering at
+        // native, so there was nothing to upscale and SR turned itself off.
+        //
+        // That inference is false, and 007 First Light is the title that says
+        // so. MEASURED 2026-09-17: display 2560x1440, velocity buffer
+        // ALLOCATED at 2560x1440, game rendering at 1280x720 - DLSS at 50%.
+        // R came out 2560, tripped the >= guard, and Native Upscaling refused
+        // itself on a title that was upscaling the whole time. The log then
+        // reported it as "the DLAA case", which is how this survived three
+        // releases: the message described the inference rather than the game.
+        //
+        // AN ALLOCATION IS A CEILING, NOT A MEASUREMENT. A buffer at display
+        // size written only in a render-size corner is a shape this project
+        // already knows - it is why table::mvec_x/sub_w exist - so sizing R
+        // from the resource was always reading the wrong quantity. It happened
+        // to be right on Cyberpunk and Dawnwalker because those engines
+        // allocate their vectors at render extent, and every sweep before this
+        // one was run on engines that do.
+        //
+        // THE GAME DECLARES THE ANSWER. DLSS.Render.Subrect.Dimensions.Width
+        // and .Height are on every EvaluateFeature, the calibrator has been
+        // capturing them into render_w/render_h behind KEY_RENDER_EXT since
+        // R101, and nothing has ever read them. R103 already hands this table
+        // to the transport on every game frame, so this is a read of a value
+        // in hand - no new hook, no new probe, nothing new to keep alive.
+        //
+        // Order: SRScale, then the game's declaration, then the resource.
+        // The resource stays as the fallback because Calib=0 is a supported
+        // configuration and there is then no table to read.
+        const char *r_from = "SRScale";
         if (s.sr_scale_pct != 0u)
         {
             s.sr_w = (UINT)(((unsigned long long)s.width  * s.sr_scale_pct) / 100ull) & ~7u;
@@ -10356,8 +10392,54 @@ namespace
         }
         else
         {
-            s.sr_w = s.mvec_w;
-            s.sr_h = s.mvec_h;
+            // STRICTLY SMALLER, on BOTH axes, or it is not a render extent we
+            // can upscale from. Equal means the game really is at native and
+            // the guard below is then telling the truth; larger means the
+            // table is describing a different swapchain than the one this
+            // stream armed against, and inheriting it would size R off the end.
+            //
+            // ORDERING IS ALREADY GUARANTEED and needs no new wait. The
+            // mvec_w==0 guard at the top of this function means a velocity
+            // buffer has been seen, which on a DLSS title means the game has
+            // called EvaluateFeature, which is the call the calibrator reads
+            // the subrect dimensions from. If mvec_w is non-zero the table is
+            // populated; if the calibrator is off there is no table and the
+            // fallback below is the only answer there ever was.
+            mgpu::calibrator::table rt{};
+            const bool have_decl =
+                mgpu::calibrator::read(rt) &&
+                (rt.have & mgpu::calibrator::KEY_RENDER_EXT) != 0u &&
+                rt.render_w != 0u && rt.render_h != 0u &&
+                rt.render_w < s.width && rt.render_h < s.height;
+
+            if (have_decl)
+            {
+                // Same 8-pixel alignment the SRScale path uses, and for the
+                // same reason - the NR dispatch below is 8x8 tiles.
+                s.sr_w = (UINT)(rt.render_w & ~7u);
+                s.sr_h = (UINT)(rt.render_h & ~7u);
+                r_from = "the game's declared render extent (R152)";
+
+                snprintf(line, sizeof line,
+                         "[MGPU][R152] R IS THE GAME'S OWN DECLARATION, NOT THE BUFFER SIZE. "
+                         "The game told NGX it renders at %ux%u into a %ux%u display, and its "
+                         "velocity buffer is allocated at %ux%u. R=%ux%u comes from the "
+                         "declaration. WHY THIS LINE MATTERS: inheriting R from the buffer "
+                         "would have given R=%ux%u here, which is not smaller than the display "
+                         "and would have turned SRUpscale off on a title that is upscaling - "
+                         "the defect measured on 007 First Light on 2026-09-17 and present "
+                         "since at least 0.2.1. If the buffer and the declaration agree, this "
+                         "line changes nothing and you will not see it.",
+                         rt.render_w, rt.render_h, s.width, s.height,
+                         s.mvec_w, s.mvec_h, s.sr_w, s.sr_h, s.mvec_w, s.mvec_h);
+                mgpu::diag::info(line);
+            }
+            else
+            {
+                s.sr_w = s.mvec_w;
+                s.sr_h = s.mvec_h;
+                r_from = "the motion vector buffer's own extent";
+            }
         }
 
         // ---- MVLowRes IS ALWAYS SET, AND THE SCALE CARRIES THE DIFFERENCE ----
@@ -10439,9 +10521,12 @@ namespace
             snprintf(line, sizeof line,
                      "[MGPU][C2-SR] motion vectors are at the DISPLAY extent (%ux%u), which is "
                      "what MVLowRes=0 means, so the flag stays OFF and MV_Scale is untouched. "
-                     "This is the DLAA / native-render case: the game is not upscaling, so its "
-                     "vectors cover the whole frame. R is ours from SRScale and the vectors are "
-                     "read as covering D, which is the truth.",
+                     "The vectors cover the whole frame and the flag says exactly that. "
+                     "R152: THIS NO LONGER IMPLIES THE GAME IS AT NATIVE - a buffer allocated "
+                     "at display size can still be written at a render-size subrect, which is "
+                     "what 007 First Light does. Whether the game is upscaling is settled by "
+                     "the R= extent in the CreateFeature line below and by its source, not by "
+                     "this line.",
                      s.mvec_w, s.mvec_h);
             mgpu::diag::info(line);
         }
@@ -10470,11 +10555,21 @@ namespace
                     "inherited, which is what makes DLAA work: NR runs small and SR puts it "
                     "back. That path needs the corrected MV scale and it is newer than the "
                     "rest, so treat it as experimental.");
+            // R152. THE SOURCE OF R IS NOW PART OF THE REFUSAL. This message
+            // spent three releases being read as a statement about the game
+            // when it was only ever a statement about where R came from, and
+            // that is what made a sizing defect look like correct behaviour.
             snprintf(line, sizeof line,
-                     "[MGPU][C2-SR] render extent %ux%u is not SMALLER than the display "
-                     "extent %ux%u, so there is nothing to upscale and nothing to save. "
-                     "SRUpscale off. This is what DLAA or a native-resolution preset looks "
-                     "like from here.", s.sr_w, s.sr_h, s.width, s.height);
+                     "[MGPU][C2-SR] R is %ux%u, taken from %s, and that is not SMALLER than "
+                     "the display extent %ux%u - so there is nothing to upscale and nothing to "
+                     "save. SRUpscale off. READ THE SOURCE OF R BEFORE CONCLUDING ANYTHING "
+                     "ABOUT THE GAME: from SRScale or the game's own declaration this really "
+                     "is a native-render or DLAA run, but from the motion vector buffer's "
+                     "extent it may only mean the buffer is allocated at display size, which "
+                     "says nothing about what the game renders at. If the calibrator is off "
+                     "(Calib=0) the declaration is not available and the buffer is all there "
+                     "is - turn Calib back on, or set SRScale.",
+                     s.sr_w, s.sr_h, r_from, s.width, s.height);
             mgpu::diag::warn(line);
             return false;
         }
@@ -10813,7 +10908,7 @@ namespace
                  (unsigned)cr, ngx_result_name(cr), (void *)s.sr_handle,
                  s.sr_w, s.sr_h, s.width, s.height, (unsigned)flags, s.depth_inverted,
                  s.sr_mv_lowres ? 1u : 0u,
-                 (s.sr_scale_pct != 0u) ? "SRScale" : "the game's render extent",
+                 r_from,
                  s.sr_mv_mode, s.sr_mv_fix_x, s.sr_mv_fix_y, s.sr_quality, s.sr_preset);
         if (cr != NVSDK_NGX_Result_Success || s.sr_handle == nullptr)
         {
@@ -12638,7 +12733,16 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
     // taste: a healthy arm on Resonance completes at 252 frames on the depth
     // lane and ~1305 on the velocity lane, so this is four times the slowest
     // lane of a known-good run.
-    const unsigned long long ARM_REPORT_FRAMES = 3600ull;
+    //
+    // R151. SPLIT, BECAUSE THE TWO LANES ARE BOUNDED BY DIFFERENT THINGS.
+    // The depth lane keeps R150's figure: ReShade binds depth in a menu, so a
+    // minute without it is worth reporting. The velocity lane is bounded by
+    // how long the player stays out of gameplay, which is not bounded at all -
+    // 007 First Light held 9921 frames on a run that was entirely healthy.
+    // This is three times that, and it does NOT turn the screen red when it is
+    // reached; see MGPU_S210_L2.
+    const unsigned long long ARM_REPORT_FRAMES      = 3600ull;
+    const unsigned long long ARM_REPORT_FRAMES_MVEC = 30000ull;
 
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
@@ -12813,14 +12917,24 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
     // information: the person has read it, it has not changed, and what they
     // need is somewhere to send the log.
     //
-    // ARM_REPORT_FRAMES is counted in GAME frames by the same two counters the
-    // hold paths increment, so a faster machine reaches it sooner in wall
+    // Both thresholds are counted in GAME frames by the same two counters the
+    // hold paths increment, so a faster machine reaches them sooner in wall
     // clock. That is the right direction - a 120 fps rig that has held for
     // 5400 frames has waited 45 seconds with twice the chances to succeed.
     //
-    // The screen does NOT claim a fault here. See MGPU_H207_L2: it states the
-    // condition under which this is one, and leaves the judgement with the
-    // person who can see whether a scene is on screen.
+    // R151. THE TWO LANES DIVERGE HERE AND THE REASON IS IN THE LANE, NOT THE
+    // MESSAGE. Depth is available in a menu, so a minute without it is a
+    // report worth making and the depth lane still turns red. Motion vectors
+    // are not: they exist only once the game is rendering a moving scene, so
+    // that hold is bounded by how long the player stays out of gameplay and
+    // this code has no business timing it. The velocity lane therefore keeps
+    // the waiting field at every length and only changes its wording - see
+    // MGPU_S210_L2 and the R151 note in screen.hpp, which carries the 007
+    // First Light measurement that forced the split.
+    //
+    // Neither screen claims a fault. Both state the condition under which
+    // there is one, and leave the judgement with the person who can see
+    // whether a scene is on screen.
     else if (s.hold_lane == 1)
     {
         if (s.depth_arm_waits > ARM_REPORT_FRAMES)
@@ -12837,15 +12951,16 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
     }
     else if (s.hold_lane == 2)
     {
-        if (s.mvec_arm_waits > ARM_REPORT_FRAMES)
+        // R151. Both arms of this are st_waiting. The long wait is a
+        // different SENTENCE, not a different severity - see MGPU_S210_L2.
+        st_out = mgpu::screen::st_waiting;
+        if (s.mvec_arm_waits > ARM_REPORT_FRAMES_MVEC)
         {
-            st_out = mgpu::screen::st_error;
-            l1 = MGPU_H207_MVEC_L1;
-            l2 = MGPU_H207_L2;
+            l1 = MGPU_S210_L1;
+            l2 = MGPU_S210_L2;
         }
         else
         {
-            st_out = mgpu::screen::st_waiting;
             l2 = MGPU_WAIT_MVEC_L2;
         }
     }

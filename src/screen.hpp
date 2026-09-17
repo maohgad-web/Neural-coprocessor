@@ -91,9 +91,35 @@ enum state
 // holding the controller decide, which is the one thing they can do that the
 // add-on cannot.
 #define MGPU_H207_DEPTH_L1 "NO DEPTH AFTER ONE MINUTE"
-#define MGPU_H207_MVEC_L1  "NO MOTION VECTORS AFTER ONE MINUTE"
 #define MGPU_H207_L2 \
     "IF YOU ARE IN GAMEPLAY " MGPU_REPORT_L2
+
+// ---- R151: THE VELOCITY LANE NEVER GOES RED ON TIME ALONE ----
+//
+// MEASURED, 007 First Light, 2026-09-17: the arm held 9921 GAME frames - 68
+// seconds - and then armed and ran correctly for the rest of the session.
+// Depth was perfect throughout ([R63] valid=2407 invalid=0), the calibrator
+// held the game's table, [R118] armed the evaluate route at frame 1, and
+// copies climbed from f=1204 onward. NOTHING WAS WRONG. The screen went red
+// at 3600 and told a tester the run had failed while it was working.
+//
+// The depth lane can be timed because ReShade binds a depth buffer in a menu -
+// R54 measured 20 seconds and R56 measured 35, both from a menu, so past a
+// minute there is something to report. THE VELOCITY LANE CANNOT. The game's
+// motion vectors only exist once it is rendering a moving scene, so the hold
+// is bounded by how long the player sits in a menu, an intro or a cutscene -
+// which is not a quantity this add-on gets to have an opinion about. A red
+// screen on an unbounded wait is a false fault, and a false fault on startup
+// is how a working build gets reported as broken.
+//
+// So the velocity lane keeps the waiting field and changes what it SAYS: the
+// lane name for the first stretch, then the same words plus somewhere to send
+// the log. Grey, both times. The condition that makes it a fault is still
+// stated - "IF YOU ARE IN GAMEPLAY" - and still left with the person who can
+// see whether a scene is on screen.
+#define MGPU_S210_L1 "WAITING FOR GAMEPLAY"
+#define MGPU_S210_L2 \
+    "NO MOTION VECTORS YET. IF YOU ARE IN GAMEPLAY " MGPU_REPORT_L2
 
 // V55. NOT an error and not a fault - the bridge is working normally and this
 // is an offer. EVERY GLYPH HERE IS IN THE FONT: A-Z, 0-9, space, '-', '.',
@@ -163,7 +189,7 @@ enum state
 // seconds of real scene as NORMAL - so these stay on the waiting field and say
 // what they are waiting for rather than going red on a healthy startup.
 #define MGPU_WAIT_DEPTH_L2 "ARMING - WAITING FOR THE GAMES DEPTH BUFFER"
-#define MGPU_WAIT_MVEC_L2  "ARMING - WAITING FOR MOTION VECTORS"
+#define MGPU_WAIT_MVEC_L2  "ARMING - WAITING FOR GAMEPLAY. MENUS HAVE NO MOTION VECTORS"
 #define MGPU_WAIT_ARM_L2   "ARMING"
 
 #define MGPU_E301_L1 "ERROR 301"

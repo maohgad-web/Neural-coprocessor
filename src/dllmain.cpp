@@ -615,6 +615,53 @@ namespace
 // Deliberately read-then-write, never read-modify-write across a frame: the
 // callback runs on the presenting thread, the stream runs on the bridge thread,
 // and holding a value across the gap is how a slider fights with a hotkey.
+// ---- R153: IS THE GAME AT DLAA? ASK IT, DO NOT TELL THE USER TO ----
+//
+// The panel used to be able to say only what the two upscaling modes ARE. It
+// could not say which one this title needs, so the honest options were a
+// static line of advice under the radios - "use Experimental if you have DLAA"
+// - or silence. Advice is the wrong instrument here for the same reason the
+// old [C2-SR] refusal was: it states a rule and leaves the user to apply it to
+// a fact only the add-on can see, and a rule that cannot be checked against
+// the run is a rule nobody reports as wrong.
+//
+// The game declares the fact on every EvaluateFeature.
+// DLSS.Render.Subrect.Dimensions against DLSS.Width/Height is render extent
+// against display extent, the calibrator captures both (KEY_RENDER_EXT and
+// KEY_DISPLAY_EXT), and R152 already decides whether R is inheritable from
+// exactly this comparison. So the panel reads the same fact from the same
+// table and CANNOT disagree with the refusal - one fact, two readers.
+//
+// THREE ANSWERS, AND THE THIRD IS NOT A GUESS:
+//    1  render == display. The game is at native or DLAA, Native Upscaling has
+//       nothing to inherit, and R152 will refuse it. Say so.
+//    0  render <  display. The game is upscaling; Native Upscaling is correct
+//       and the panel stays quiet. Silence is the right output here - a line
+//       that does not apply is what trains people past the coloured text.
+//   -1  NO ANSWER. Calib=0, or nothing captured yet because the game has not
+//       evaluated DLSS. Also the case on a title with no DLSS at all. The
+//       panel says nothing: reporting "not DLAA" from an absent table is the
+//       empty-list-recorded-as-a-fact mistake, and it would contradict the
+//       refusal on a Calib=0 run where the buffer extent is all R152 has.
+//
+// Called only while the panel is drawn, so the read costs nothing on the
+// present path. Live rather than latched on purpose: a preset change mid-run
+// moves render_w within a frame, and the header two boxes down already tracks
+// state that way.
+static int mgpu_game_is_native()
+{
+    mgpu::calibrator::table t{};
+    if (!mgpu::calibrator::read(t)) return -1;
+    if ((t.have & mgpu::calibrator::KEY_RENDER_EXT)  == 0u) return -1;
+    if ((t.have & mgpu::calibrator::KEY_DISPLAY_EXT) == 0u) return -1;
+    if (t.render_w == 0u || t.render_h == 0u ||
+        t.display_w == 0u || t.display_h == 0u) return -1;
+
+    // The same STRICTLY-SMALLER test R152 uses to decide inheritability, so
+    // the two can never answer differently on the same table.
+    return (t.render_w < t.display_w && t.render_h < t.display_h) ? 0 : 1;
+}
+
 static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 {
     // P7.10: THE UNSUPPORTED-API MESSAGE HAS TO LIVE HERE, and it is worth
@@ -1278,6 +1325,17 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (ImGui::RadioButton("Native Upscaling", want_match))
             { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
             ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
+
+            // R153. Only when the game itself says it is at native, and only
+            // while Native Upscaling is the selected mode - on Experimental
+            // this is already handled and the line would be noise.
+            if (want_match && mgpu_game_is_native() == 1)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                                   "Your game is at DLAA - there is nothing to upscale from.");
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                                   "Pick Experimental Upscaler instead.");
+            }
             if (ImGui::RadioButton("Experimental Upscaler", !want_match))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
             ImGui::TextDisabled("Works from a downscaled resolution. More performance, possible");
@@ -1340,8 +1398,46 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // warning about editing their install rather than as an
             // instruction. The restart is stated once, plainly, as the one
             // thing standing between them and the controls.
-            ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
-                               "Super Resolution is OFF - turn it ON to unlock the menu below.");
+            // ---- V76: OFF AND REFUSED ARE NOT THE SAME STATE ----
+            //
+            // V74 replaced a two-sentence message with one line and lost the
+            // distinction the old text was carrying. !sr_on covers BOTH "never
+            // asked for" and "asked for and refused", and the refusal is
+            // common: a game rendering at display resolution has nothing to
+            // upscale, which is what DLAA or a native preset looks like from
+            // here. Told to "turn it ON" after they already had, restarted,
+            // and come back to the same sentence, the only conclusion
+            // available is that the checkbox is broken. It was not.
+            if (!st.sr_requested)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                                   "Super Resolution is OFF - turn it ON to unlock the menu below.");
+            }
+            else
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                                   "Super Resolution is ON but not running on this title.");
+
+                // R153. THIS USED TO EXPLAIN ITSELF WITHOUT CHECKING.
+                // "The game already renders at display resolution" was stated
+                // whatever the reason, and on 007 First Light it was false -
+                // the game rendered at 1280x720 and the line said otherwise,
+                // because R152's defect made a display-sized velocity buffer
+                // look like a native render. The explanation is now only given
+                // when the game is the one saying it.
+                const int nat = mgpu_game_is_native();
+                if (nat == 1)
+                {
+                    ImGui::TextDisabled("Your game is at DLAA, so it already renders at display");
+                    ImGui::TextDisabled("resolution and there is nothing to upscale. Pick");
+                    ImGui::TextDisabled("Experimental Upscaler to run Super Resolution anyway.");
+                }
+                else
+                {
+                    ImGui::TextDisabled("The Super resolution box above says why. Look for the");
+                    ImGui::TextDisabled("C2-SR line in ReShade.log - it names where R came from.");
+                }
+            }
         }
         if (st.sr_on)
         {
