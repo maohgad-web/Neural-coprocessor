@@ -37,14 +37,20 @@ mgpu_depth_tap.fx IS NEW AND IS REQUIRED. It goes in ReShade's Shaders folder.
 It needs no effect packages - it is self-contained. Without it the bridge
 waits for a depth buffer that never arrives and never arms.
 
-IF YOU ARE UPGRADING FROM 0.2.0 OR 0.2.1
+IF YOU ARE UPGRADING FROM 0.2.0 OR LATER
 ----------------------------------------
 
 Replace the files and restart. Nothing moved.
 
-Take the new mgpu.ini as well. 0.2.2 adds two keys to it, MvecFromEval and
-CalibRung, and the commentary in that file is the current one. If you have
-edited yours, the two keys can be copied across by hand instead.
+TAKE THE NEW mgpu.ini. 0.2.4 changes a default that affects image quality:
+SRMvLowRes is now 2 instead of 0. With 0 the add-on described the game's
+motion vectors to DLSS without checking what the game was doing, which cost
+image stability in motion under Native Upscaling. If you keep an edited
+mgpu.ini, change that one key by hand.
+
+0.2.4 also adds DcompOverlay, which is how one display works now. 0.2.2 added
+MvecFromEval and CalibRung. The commentary in the shipped file is the current
+one.
 
 WHAT YOU NEED FIRST
 -------------------
@@ -84,41 +90,35 @@ already seen two independent NGX consumers sharing one parameter block produce
 a visibly wrong image while every transport counter stayed clean. One neural
 path at a time.
 
-TWO MONITORS - ONE ON EACH CARD. This is the supported and measured
-configuration, and everything published about this project was measured on it.
-The neural output is displayed by the card that produced it, so nothing has to
-travel back across the link. With both monitors on the render card, the same
-build measured 33% lower throughput and roughly double the latency on the
-development machine.
+A DISPLAY ARRANGEMENT. TWO WORK, AND YOU PICK BY YOUR HARDWARE.
 
-A SINGLE DISPLAY IS NOT SUPPORTED, BUT IT CAN BE MADE TO WORK. There is an
-unsupported workaround, and it is THE OTHER WAY ROUND FROM HEADLESS: the
-display goes on the NEURAL card - the second card, the one the bridge presents
-from - and the card that RENDERS the game is the one with nothing plugged into
-it. So nothing travels back across the link, which is why this costs far less
-than a headless neural card does.
+TWO MONITORS, ONE ON EACH CARD. Everything published about this project was
+measured this way. The neural output is displayed by the card that produced
+it, so nothing travels back across the link. With both monitors on the render
+card, the same build measured 33% lower throughput and roughly double the
+latency on the development machine.
 
-A CONTROLLER IS REQUIRED, not recommended. With one screen the bridge window
-shares glass with the game and sits on top, so mouse messages land on the
-bridge window and die there. Keyboard and gamepad reach the foreground window
-whatever is on top of it, so the game still gets them. No configuration change
-fixes the mouse.
+ONE MONITOR, ON THE NEURAL CARD. Set DcompOverlay=1 in mgpu.ini. The bridge
+then creates no window at all and draws the neural output onto the game's own
+window instead. The game keeps the mouse and the keyboard, so no controller
+and no third-party tool are needed.
 
-It also needs Special K, which is a separate project by other people and is
-neither bundled with this one nor affiliated with it. The cost measured here
-was about 7.5 percent higher median frame latency than a monitor per card -
-one comparison, on one title, between two runs that differed by more than
-topology alone, so treat it as an indication rather than a measurement.
+The display goes on the NEURAL card - the second card, the one the bridge
+presents from - and the card that RENDERS the game has nothing plugged into
+it. That is the arrangement this mode is built for, and the add-on refuses it
+if it finds more than one active display.
 
-The write-up, with the Special K settings and what each one fixes:
+OPEN THE RESHADE OVERLAY AS NORMAL AND THE NEURAL OUTPUT STEPS ASIDE BY
+ITSELF. It is drawn on top of the game's window, including on top of the
+overlay, so the add-on takes it off screen while the overlay is open and puts
+it back when you close it. You do not have to do anything. CTRL+ALT+F6 does
+the same by hand if you want it.
+
+0.2.4 replaced the old single-display route, which needed Special K and a
+controller. The write-up for that route is kept as history and is no longer
+the recommended way:
 
     https://github.com/maohgad-web/Neural-coprocessor/tree/main/workarounds/single-display
-
-A video walkthrough:
-
-    https://youtu.be/_K1H3mgcHy4
-
-Where the video and the write-up disagree, the write-up is the current one.
 
 A DIRECTX 12 GAME. D3D11 AND VULKAN TITLES DO NOTHING - the add-on loads,
 finds no D3D12 render device, stands down, and says so in the log and in the
@@ -294,6 +294,10 @@ Panel               the ReShade overlay (Home). The MGPU Bridge panel is
                     registered on both the game's overlay and the bridge
                     window's, so you can drive it without leaving the game.
 
+CTRL+ALT+F6         hide the neural output and bring it back. Registered
+                    only with DcompOverlay=1, and only needed if you want it
+                    by hand - opening the ReShade overlay does it for you.
+
 CTRL+ALT+F10        arm the stream by hand
 
 CTRL+ALT+F7         view: neural output -> input -> split
@@ -359,7 +363,12 @@ SRScale=0      Which resolution neural rendering runs at. 0 means the
 
                game's own - see the two upscalers below.
 
-SRMvLowRes=0   Rides with SRScale. Never set one without the other.
+SRMvLowRes=2   How the game's motion vectors are described to DLSS.
+
+               2 reads the answer from the game and is the shipped value. It
+               was 0 before 0.2.4, which asserted one answer whatever the
+               game was doing and cost image stability in motion where that
+               answer was wrong. Leave this at 2.
 
     With SRUpscale off, neural rendering runs at the full display
     resolution. That is the most expensive arrangement and the one every
@@ -369,12 +378,14 @@ SRMvLowRes=0   Rides with SRScale. Never set one without the other.
     weaker of the two. This is its own setting and does not depend on the
     game's DLSS, which can be set to anything, or turned off entirely.
     THERE ARE TWO WAYS TO DO THAT, and the panel calls them:
-      Native Upscaling      SRScale=0  SRMvLowRes=0   THE DEFAULT
-          Upscales from the game's own render resolution. The game's
-          motion vectors already describe that resolution, so they are
-          used exactly as reported with nothing rescaled. It does
-          nothing on a title that is not upscaling - there is no smaller
-          frame to start from, and the log says so.
+      Native Upscaling      SRScale=0  SRMvLowRes=2   THE DEFAULT
+          Upscales from the game's own render resolution, which it reads
+          from what the game declares to DLSS. The game's motion vectors
+          already describe that resolution, so they are used exactly as
+          reported with nothing rescaled. It does nothing on a title that
+          is not upscaling - at DLAA or native there is no smaller frame
+          to start from, and the log and the panel both say so. Use the
+          Experimental Upscaler on those.
       Experimental Upscaler SRScale=67 SRMvLowRes=1
           Works from a downscaled resolution chosen here instead, with
           the mode buttons, and rescales the game's motion vectors to
@@ -490,7 +501,8 @@ The bridge window's own frame rate falls as the pass count rises. The game's
 does not. That is the architecture working, not a fault.
 
 Interacting with the bridge window takes keyboard focus away from the game. A
-controller sidesteps this entirely.
+controller sidesteps this entirely, and with DcompOverlay=1 there is no bridge
+window to take focus in the first place.
 
 DO NOT CHANGE RESOLUTION, DLSS MODE OR GRAPHICS PRESETS WHILE THE STREAM IS
 ARMED. The stream is armed once, against the game's swapchain exactly as it
