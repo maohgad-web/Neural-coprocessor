@@ -10448,12 +10448,47 @@ namespace
             // the subrect dimensions from. If mvec_w is non-zero the table is
             // populated; if the calibrator is off there is no table and the
             // fallback below is the only answer there ever was.
+            // ---- R179: THE SUBRECT IS THE RENDER EXTENT, NOT Width/Height ----
+            //
+            // R152 read render_w/render_h, which come from
+            // NVSDK_NGX_Parameter_Width/Height - and the [R101] note in this
+            // project has said since Battlefield 6 that those two are NOT
+            // reliably the render extent: "Width/Height read 1920x1080 while
+            // the subrect, MVecScale and every candidate said the render
+            // extent was 1280x720. Trust the subrect and MVecScale over
+            // either pair until that is understood."
+            //
+            // On a title like that, R152 as first written would have taken
+            // R=1920x1080 on a game rendering 1280x720 - a larger R than the
+            // truth, with the motion vectors read against the wrong scale. The
+            // rule was already written down and I did not follow it.
+            //
+            // So the SUBRECT is tried first, and Width/Height only as a
+            // fallback for a producer that does not populate it. On Cyberpunk
+            // and The Blood of Dawnwalker the two agree (1707x960 and
+            // 1708x961), so this changes nothing there; it exists for the
+            // engines where they disagree.
             mgpu::calibrator::table rt{};
+            unsigned decl_w = 0u, decl_h = 0u;
+            const char *decl_src = "";
+            if (mgpu::calibrator::read(rt))
+            {
+                if ((rt.have & mgpu::calibrator::KEY_SUBRECTS) != 0u &&
+                    rt.sub_w != 0u && rt.sub_h != 0u)
+                {
+                    decl_w = rt.sub_w; decl_h = rt.sub_h;
+                    decl_src = "render subrect";
+                }
+                else if ((rt.have & mgpu::calibrator::KEY_RENDER_EXT) != 0u &&
+                         rt.render_w != 0u && rt.render_h != 0u)
+                {
+                    decl_w = rt.render_w; decl_h = rt.render_h;
+                    decl_src = "NGX Width/Height";
+                }
+            }
             const bool have_decl =
-                mgpu::calibrator::read(rt) &&
-                (rt.have & mgpu::calibrator::KEY_RENDER_EXT) != 0u &&
-                rt.render_w != 0u && rt.render_h != 0u &&
-                rt.render_w < s.width && rt.render_h < s.height;
+                decl_w != 0u && decl_h != 0u &&
+                decl_w < s.width && decl_h < s.height;
 
             if (have_decl)
             {
@@ -10477,8 +10512,8 @@ namespace
                 // The dispatch never needed it either: the neural stage
                 // launches (sr_w + 7) / 8 groups, which is already the
                 // round-up form for a non-multiple.
-                s.sr_w = (UINT)rt.render_w;
-                s.sr_h = (UINT)rt.render_h;
+                s.sr_w = (UINT)decl_w;
+                s.sr_h = (UINT)decl_h;
                 r_from = "the game's declared render extent (R152)";
 
                 // R178. SAID ONLY WHEN IT MATTERS. The first draft printed
@@ -10491,7 +10526,7 @@ namespace
                 {
                 snprintf(line, sizeof line,
                          "[MGPU][R152] R IS THE GAME'S OWN DECLARATION, NOT THE BUFFER SIZE. "
-                         "The game told NGX it renders at %ux%u into a %ux%u display, and its "
+                         "The game's %s says it renders at %ux%u into a %ux%u display, and its "
                          "velocity buffer is allocated at %ux%u. R=%ux%u comes from the "
                          "declaration. WHY THIS LINE MATTERS: inheriting R from the buffer "
                          "would have given R=%ux%u here, which is not smaller than the display "
@@ -10501,7 +10536,7 @@ namespace
                          "and present since at least 0.2.1. If the buffer and the declaration "
                          "agree this line changes nothing and you will not see it. IT IS NOT A "
                          "FAULT: it means the declaration was available and was used.",
-                         rt.render_w, rt.render_h, s.width, s.height,
+                         decl_src, decl_w, decl_h, s.width, s.height,
                          s.mvec_w, s.mvec_h, s.sr_w, s.sr_h, s.mvec_w, s.mvec_h);
                 mgpu::diag::info(line);
                 }
