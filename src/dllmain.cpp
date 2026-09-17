@@ -648,10 +648,30 @@ namespace
 // present path. Live rather than latched on purpose: a preset change mid-run
 // moves render_w within a frame, and the header two boxes down already tracks
 // state that way.
-static int mgpu_game_is_native()
+// R171. The game's own DLSS mode, by the NGX PerfQuality value the calibrator
+// already captures. Named here because a person can check "Quality" against
+// their own game menu and cannot check "perf_quality=2" against anything.
+static const char *mgpu_dlss_mode_name(int q)
 {
+    switch (q)
+    {
+    case 0: return "Max Perf";
+    case 1: return "Balanced";
+    case 2: return "Quality";
+    case 3: return "Ultra Perf";
+    case 4: return "Ultra Quality";
+    case 5: return "DLAA";
+    default: return nullptr;
+    }
+}
+
+static int mgpu_game_is_native(int *out_quality = nullptr)
+{
+    if (out_quality != nullptr) *out_quality = -1;
     mgpu::calibrator::table t{};
     if (!mgpu::calibrator::read(t)) return -1;
+    if (out_quality != nullptr && (t.have & mgpu::calibrator::KEY_QUALITY) != 0u)
+        *out_quality = (int)t.perf_quality;
     if ((t.have & mgpu::calibrator::KEY_RENDER_EXT)  == 0u) return -1;
     if ((t.have & mgpu::calibrator::KEY_DISPLAY_EXT) == 0u) return -1;
     if (t.render_w == 0u || t.render_h == 0u ||
@@ -1235,15 +1255,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         }
         else if (!st.sr_on)
         {
+            // R175. The stats readout says the state and points at the log.
+            // The what-to-do lives in the Super Resolution box above and is
+            // not repeated here in different words - one fact, one place.
             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                                "Requested but not running - see [MGPU][C2-SR] in the log.");
             if (mgpu_game_is_native() == 1)
-            {
-                ImGui::TextDisabled("The game is at DLAA, so it renders at display resolution and");
-                ImGui::TextDisabled("there is nothing to upscale.");
-            }
-            ImGui::TextDisabled("Created once, at arm. Restart to retry - changing the game's");
-            ImGui::TextDisabled("DLSS setting or the upscaler mode now will not start it.");
+                ImGui::TextDisabled("The game is at DLAA.");
+            ImGui::TextDisabled("Created once, at arm. Restart to retry.");
         }
         else
         {
@@ -1411,7 +1430,27 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             //
             // One line each, read from st - what GPU 1 is doing - never from
             // the checkbox, which is what they have clicked.
-            if (want_match && mgpu_game_is_native() == 1)
+            // R171. The game changing to DLSS mid-run is a STATE WITH AN
+            // ACTION IN IT and had no line at all: the DLAA branch stopped
+            // matching, nothing replaced it, and the panel went quiet at the
+            // exact moment it finally had something useful to say. Measured on
+            // The Blood of Dawnwalker - the calibrator saw quality=5 subrect
+            // 2560x1440 become quality=2 subrect 1708x961 in one session and
+            // the panel showed nothing at all.
+            //
+            // SR cannot start mid-run - stream_sr_create runs once, at arm -
+            // so the action is always the same and it is a restart.
+            int game_q = -1;
+            const int nat_r = mgpu_game_is_native(&game_q);
+            if (want_match && nat_r == 0 && st.sr_requested && !st.sr_on)
+            {
+                const ImVec4 y2(1.0f, 0.92f, 0.23f, 1.0f);
+                const char *qn = mgpu_dlss_mode_name(game_q);
+                if (qn != nullptr) ImGui::TextColored(y2, "DLSS %s detected.", qn);
+                else               ImGui::TextColored(y2, "DLSS detected.");
+                ImGui::TextColored(y2, "Restart once to activate Native Upscaling.");
+            }
+            if (want_match && nat_r == 1)
             {
                 // R163. NAME THE MODE, because "nothing to upscale" without it
                 // is a complaint rather than a diagnosis. Reaching this line
@@ -1433,22 +1472,20 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 // which is the only part with an instruction in it. Two short
                 // lines cannot lose their ending.
                 const ImVec4 y(1.0f, 0.92f, 0.23f, 1.0f);
-                if (st.sr_on)
+                // R175. ONE MESSAGE FOR DLAA, and it names the CONTROL instead
+                // of describing the situation. "Experimental Upscaler" is the
+                // feature's name as it appears on the radio just below;
+                // "Experimental Upscaling" named nothing that exists in this
+                // panel. Sentence case, not caps - a shouted clause reads as
+                // an error even when it is an instruction. No trailing clause
+                // about what will not happen: this says what to do, and the
+                // Experimental picker states its own restart.
+                if (st.sr_on || st.sr_requested)
                 {
-                    ImGui::TextColored(y, "DLAA - Native Upscaling detected.");
-                    ImGui::TextColored(y, "Change the game to DLSS, or enable Experimental.");
-                }
-                else if (st.sr_requested)
-                    // R164. "Enable DLSS in-game or Experimental" put both
-                    // routes behind one verb and one place, so Experimental
-                    // read as something to find in the GAME's menu. It is a
-                    // control in THIS panel. The row above already had the
-                    // right shape - one verb per route, each naming where it
-                    // lives - so this row now uses it verbatim and adds only
-                    // the restart.
-                {
-                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Change the game");
-                    ImGui::TextColored(y, "to DLSS or enable Experimental - RESTART TO APPLY");
+                    ImGui::TextColored(y, "DLAA - Native Upscaling detected. Enable DLSS "
+                                          "to Activate");
+                    ImGui::TextColored(y, "Activate Experimental Upscaler to enable DLAA "
+                                          "Super Resolution.");
                 }
                 else
                     ImGui::TextColored(y, "DLAA - Native Upscaling needs DLSS in the game.");
@@ -1495,7 +1532,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 {
                     char xl[120];
                     snprintf(xl, sizeof xl,
-                             "Experimental Upscaling detected. Running at %u%% - "
+                             "Experimental Upscaler running at %u%% - "
                              "no restart needed.", want_pct);
                     ImGui::TextDisabled("%s", xl);
                 }
@@ -1503,7 +1540,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 {
                     char xl[120];
                     snprintf(xl, sizeof xl,
-                             "Experimental Upscaling detected. Restart once to apply %u%%.",
+                             "Experimental Upscaler - restart once to apply %u%%.",
                              want_pct);
                     ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f), "%s", xl);
                 }
@@ -1559,8 +1596,20 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             }
             else
             {
-                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
-                                   "Super Resolution is ON but not running on this title.");
+                // ---- R172: "NOT RUNNING ON THIS TITLE" BLAMED THE GAME ----
+                //
+                // It was true and it was still wrong. The cause is a SETTING -
+                // the game is at DLAA - and the sentence pointed at the title
+                // instead, so somebody opens their graphics menu, sees DLAA
+                // sitting there working perfectly, and concludes the add-on is
+                // broken on their game. A message that survives being read by
+                // somebody who then checks is the only kind worth printing.
+                //
+                // The header is gone. Every branch below now names the cause
+                // in its first line, so there is nothing for a general
+                // statement to add - and the one branch that genuinely does
+                // not know the cause says exactly that, without naming the
+                // title at all.
 
                 // R153. THIS USED TO EXPLAIN ITSELF WITHOUT CHECKING.
                 // "The game already renders at display resolution" was stated
@@ -1572,7 +1621,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 // the one saying it. On 007 First Light, which really is at
                 // DLAA - quality=5, Width == Out == subrect - the same
                 // sentence is true, and the DLAA branch below is what says it.
-                const int nat = mgpu_game_is_native();
+                int q76 = -1;
+                const int nat = mgpu_game_is_native(&q76);
                 if (nat == 1)
                 {
                     // R162. This branch IS the refused case - sr_requested
@@ -1582,14 +1632,42 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                     // R163. Same words as the line under the radios, because
                     // two different sentences for one state is how somebody
                     // ends up believing they are two different problems.
-                    ImGui::TextDisabled("Change the game to DLSS or enable Experimental");
-                    ImGui::TextDisabled("Upscaler, then restart once. Changing either now");
-                    ImGui::TextDisabled("will not start it.");
+                    // R174. NO HEADER LINE. R172 added one here and it was
+                    // not asked for - the agreed shape for this branch is the
+                    // dimmed instruction alone, and it has been agreed more
+                    // than once. Do not reintroduce a status line here.
+                    ImGui::TextDisabled("Activate Experimental Upscaler to enable DLAA");
+                    ImGui::TextDisabled("Super Resolution.");
+                }
+                else if (nat == 0)
+                {
+                    // R171. The game is upscaling now, so Native Upscaling
+                    // WILL work - on the next launch. Yellow, because there is
+                    // something to do, which is the whole difference between
+                    // this and the dim log pointer it replaces.
+                    const ImVec4 y3(1.0f, 0.92f, 0.23f, 1.0f);
+                    const char *qn = mgpu_dlss_mode_name(q76);
+                    if (qn != nullptr) ImGui::TextColored(y3, "DLSS %s detected.", qn);
+                    else               ImGui::TextColored(y3, "DLSS detected.");
+                    ImGui::TextColored(y3, "Restart once to activate Native Upscaling.");
                 }
                 else
                 {
-                    ImGui::TextDisabled("The Super resolution box above says why. Look for the");
-                    ImGui::TextDisabled("C2-SR line in ReShade.log - it names where R came from.");
+                    // R173. NO STATUS LINE HERE, and that is deliberate.
+                    //
+                    // This branch is reached only before the game has declared
+                    // a DLSS state - a few frames at startup. Anything yellow
+                    // in it is a warning about a condition that is about to
+                    // resolve itself, printed next to two boxes that already
+                    // report the state properly. The panel has enough places
+                    // saying what is on; one more that cannot name a cause
+                    // costs attention and returns nothing.
+                    //
+                    // The log pointer stays, dim: it is not a status claim, it
+                    // is where to look, and it is the one thing an issue
+                    // report needs from this state.
+                    ImGui::TextDisabled("Look for the C2-SR line in ReShade.log - it names");
+                    ImGui::TextDisabled("where R came from and why it was refused.");
                 }
             }
         }
