@@ -8613,6 +8613,37 @@ namespace
         // and no other.
         std::atomic<unsigned long long> mvec_lock_skips{0};
         std::atomic<unsigned long long> mvec_size_rejects{0};
+
+        // ---- R169: WHY THE VELOCITY LANE WENT QUIET, WITH BOTH GEOMETRIES ----
+        //
+        // MEASURED on Starfield, 2026-09-18: copies stopped for two whole
+        // 300-frame windows and one burst of 70 size rejections fired around a
+        // swapchain recreation, and the log said neither. size-rejected has
+        // counted without naming a dimension since it was written - it is on
+        // the debt ledger as exactly that defect, ranked lowest of five, and
+        // this report is it being paid for. A number you cannot act on sends
+        // the reader to the install.
+        //
+        // Captured on the GAME's render thread and emitted from the BRIDGE's
+        // periodic report. Nothing is logged at the rejection site: that site
+        // is mid-scene on the game's thread inside mvec_cs, and a file write
+        // there is DEFECT E with a different name.
+        std::atomic<unsigned> mvec_rej_w{0}, mvec_rej_h{0}, mvec_rej_fmt{0};
+        // The handle the probe published this frame, whatever became of it.
+        std::atomic<unsigned long long> mvec_pub_handle{0};
+        // Bridge thread only, read and written inside the periodic block.
+        unsigned long long mvec_copies_last_report = 0;
+        unsigned long long mvec_rejects_last_report = 0;
+        bool mvec_stall_said = false;
+        // R169b. CONSECUTIVE silent report windows. See the gate below.
+        unsigned mvec_silent_windows = 0;
+        unsigned mvec_rej_said_w = 0, mvec_rej_said_h = 0, mvec_rej_said_fmt = 0;
+
+        // ---- R170: the producer pauses while a swapchain event is in flight ----
+        unsigned long long swapguard_paused_frames = 0;
+        unsigned long long swapguard_episodes = 0;
+        bool swapguard_in_episode = false;
+        bool swapguard_said = false;
         unsigned long long mvec_arm_waits = 0;
         bool   mvec_arm_logged = false;
         // ---- R99: the arm waits for the probe to STOP CHANGING ITS MIND ----
@@ -11947,14 +11978,181 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
 // lock, the lock is released, and only then does anything block.
 //
 // Returns true when the caller should present.
+// ---------------------------------------------------------------------------
+// R167 / R168 - THE PRESENT GATE'S SPLIT BRACKET, AND WHO HOLDS s.cs
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. A Starfield report measured stream_present_gate at 600-950
+// ms with timeout=4, and reasonably concluded that something around the wait
+// was consuming it. The reporter's own log refutes the conclusion while
+// confirming the measurement: about twenty calls per second return in 0-16 ms
+// and one takes ~0.9 s, and EVERY line reads result=0x00000102 - WAIT_TIMEOUT.
+// A four-millisecond timeout does not return WAIT_TIMEOUT after 875 ms. The
+// kernel can be late; it cannot be late by a factor of 225. So the time is
+// inside the bracket but not inside the wait, and the bracket holds three
+// operations with three different owners.
+//
+// ONE BRACKET REPORTING ONE NUMBER IS WHAT MADE THE WRONG READING THE OBVIOUS
+// ONE, and the word "timeout" in the line picked the suspect. Splitting it is
+// not narrowing a list - it PARTITIONS the time, and the four outcomes have
+// disjoint owners:
+//
+//   lock long                  -> the GAME thread holds s.cs. R168 says for
+//                                 how long, from the other side, with its own
+//                                 clock. Two instruments, and if they disagree
+//                                 the disagreement is the finding.
+//   SetEventOnCompletion long  -> the fence's registration path. THE ONLY
+//                                 bucket where a stale or overloaded fence is
+//                                 a live reading.
+//   wait long, WAIT_TIMEOUT    -> the thread was made runnable at 4 ms and did
+//                                 not run. Scheduling, not the bridge, and the
+//                                 fence is EXCLUDED rather than implicated.
+//   wait long, WAIT_OBJECT_0   -> the event was signalled late. The only
+//                                 genuinely fence-shaped outcome.
+//
+// LOG-ONLY. Nothing here changes what the bridge does. Every diag call is made
+// with s.cs RELEASED - a log write under the mutex the game's render thread
+// takes every frame would be this instrument becoming the fault it was sent to
+// find, which is the failure mode DEFECT E already cost this project once.
+//
+// No ini key, deliberately. A silent key that can be set wrong is the failure
+// shape section 4 of the debug guide is about, and an instrument that costs two
+// QueryPerformanceCounter calls per frame does not need one.
+namespace sfdiag
+{
+    enum { SITE_GAME = 0, SITE_POLL = 1, SITE_N = 2 };
+
+    inline LONGLONG qpc()
+    {
+        LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart;
+    }
+    inline double qpf()
+    {
+        static double f = []{ LARGE_INTEGER q; QueryPerformanceFrequency(&q);
+                              return (double)q.QuadPart; }();
+        return f;
+    }
+    inline double ms(LONGLONG a, LONGLONG b)
+    {
+        const double f = qpf();
+        return (f > 0.0) ? ((double)(b - a) * 1000.0 / f) : 0.0;
+    }
+
+    // R168 accumulators, per site. Relaxed atomics: these are counters read by
+    // one thread and written by another, and a torn read of a maximum costs a
+    // wrong microsecond in a log line, not a decision.
+    std::atomic<unsigned long long> hold_n[SITE_N];
+    std::atomic<unsigned long long> hold_us_sum[SITE_N];
+    std::atomic<unsigned long long> hold_us_max[SITE_N];
+
+    struct hold_timer
+    {
+        int site; LONGLONG t0;
+        explicit hold_timer(int s) : site(s), t0(qpc()) {}
+        ~hold_timer()
+        {
+            const unsigned long long us =
+                (unsigned long long)(ms(t0, qpc()) * 1000.0);
+            hold_n[site].fetch_add(1, std::memory_order_relaxed);
+            hold_us_sum[site].fetch_add(us, std::memory_order_relaxed);
+            unsigned long long m = hold_us_max[site].load(std::memory_order_relaxed);
+            while (us > m &&
+                   !hold_us_max[site].compare_exchange_weak(m, us,
+                                                            std::memory_order_relaxed))
+            { }
+        }
+    };
+
+    // R167 accumulators. Bridge thread only - the gate is the sole writer - so
+    // plain scalars would do; they are atomics so the periodic line and a
+    // future panel read cannot tear.
+    std::atomic<unsigned long long> g_calls{0};
+    std::atomic<unsigned long long> g_warns{0};
+    std::atomic<unsigned long long> b_n[3];        // 0 lock, 1 setevent, 2 wait
+    std::atomic<unsigned long long> b_us_sum[3];
+    std::atomic<unsigned long long> b_us_max[3];
+
+    // A single call over this is worth a line of its own. 50 ms is chosen
+    // against the reporter's own distribution rather than taste: his fast calls
+    // sit at 0-16 ms and the events of interest are at 600-950, so anything
+    // between is a gap with nothing in it and the threshold cannot be wrong by
+    // an order of magnitude in either direction.
+    const double WARN_MS = 50.0;
+
+    // D2's rule applied here: a fault line that fires every time costs the
+    // thread the time it needs to stop producing faults. First twenty, then
+    // every hundredth, and the counters stay complete either way.
+    inline bool warn_allowed(unsigned long long n)
+    {
+        return (n <= 20ull) || ((n % 100ull) == 0ull);
+    }
+
+    inline void bucket(int i, double milli)
+    {
+        const unsigned long long us = (unsigned long long)(milli * 1000.0);
+        b_n[i].fetch_add(1, std::memory_order_relaxed);
+        b_us_sum[i].fetch_add(us, std::memory_order_relaxed);
+        unsigned long long m = b_us_max[i].load(std::memory_order_relaxed);
+        while (us > m &&
+               !b_us_max[i].compare_exchange_weak(m, us, std::memory_order_relaxed))
+        { }
+    }
+
+    inline double mean_ms(const std::atomic<unsigned long long> &sum,
+                          const std::atomic<unsigned long long> &n)
+    {
+        const unsigned long long c = n.load(std::memory_order_relaxed);
+        if (c == 0ull) return 0.0;
+        return (double)sum.load(std::memory_order_relaxed) / (double)c / 1000.0;
+    }
+    inline double max_ms(const std::atomic<unsigned long long> &m)
+    {
+        return (double)m.load(std::memory_order_relaxed) / 1000.0;
+    }
+    inline void reset_window()
+    {
+        for (int i = 0; i < 3; ++i)
+        { b_n[i].store(0); b_us_sum[i].store(0); b_us_max[i].store(0); }
+        for (int i = 0; i < SITE_N; ++i)
+        { hold_n[i].store(0); hold_us_sum[i].store(0); hold_us_max[i].store(0); }
+    }
+
+    const char *wait_result_name(DWORD r)
+    {
+        switch (r)
+        {
+        case WAIT_OBJECT_0: return "WAIT_OBJECT_0 (the event was SIGNALLED - the only "
+                                   "genuinely fence-shaped outcome)";
+        case WAIT_TIMEOUT:  return "WAIT_TIMEOUT (the kernel made this thread runnable at the "
+                                   "timeout and it did not run - the fence is EXCLUDED, not "
+                                   "implicated)";
+        case WAIT_FAILED:   return "WAIT_FAILED";
+        default:            return "other";
+        }
+    }
+}
 bool stream_present_gate(unsigned long timeout_ms)
 {
     stream_state &s = str();
     ID3D12Fence *f = nullptr;
     UINT64 want = 0;
     HANDLE ev = nullptr;
+
+    // R167. Four timestamps, one bracket each. See the sfdiag block above for
+    // why the partition is the whole point.
+    const LONGLONG t0 = sfdiag::qpc();
+    LONGLONG t1 = t0, t2 = t0, t3 = t0;
+    DWORD wr = 0;
+    bool took_wait = false;
+    bool ret = false;
+
     {
         std::lock_guard<std::mutex> lk(s.cs);
+        t1 = sfdiag::qpc();          // R167: the LOCK bucket closes here, and it
+                                     // is measured on EVERY path - the early
+                                     // returns below queue behind the game's
+                                     // thread exactly as the idle path does.
+
         // Not streaming: behave exactly as the loop always has. The
         // cycling colour is T5's liveness proof and must not stop because
         // the stream is idle.
@@ -11969,25 +12167,122 @@ bool stream_present_gate(unsigned long timeout_ms)
         // intend to draw it: the cycling colour updating at the producer's
         // rate instead of the display's is still a live window.
         if (!s.armed || s.summarised)
-        { ++s.gate_presents; return true; }
-
-        if (s.consumed != s.presented)
+        { ++s.gate_presents; ret = true; }
+        else if (s.consumed != s.presented)
         {
             s.presented = s.consumed;
             ++s.gate_presents;
-            return true;
+            ret = true;
         }
-        f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
-        ++s.gate_idle;
+        else
+        {
+            f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
+            ++s.gate_idle;
+        }
     }
 
-    if (f != nullptr && ev != nullptr)
+    // R167. EVERYTHING BELOW RUNS WITH s.cs RELEASED, including every diag
+    // call. The two early returns above now fall through to here rather than
+    // returning from inside the lock; nothing else about them changed, and the
+    // value returned is the same value on the same condition.
+    if (!ret && f != nullptr && ev != nullptr)
     {
         ++str().gate_waits;
         f->SetEventOnCompletion(want, ev);
-        WaitForSingleObject(ev, timeout_ms);
+        t2 = sfdiag::qpc();          // R167: the SETEVENT bucket
+        wr = WaitForSingleObject(ev, timeout_ms);
+        t3 = sfdiag::qpc();          // R167: the WAIT bucket
+        took_wait = true;
     }
-    return false;
+    else
+    {
+        t2 = t1; t3 = t1;
+    }
+
+    const double d_lock = sfdiag::ms(t0, t1);
+    const double d_set  = sfdiag::ms(t1, t2);
+    const double d_wait = sfdiag::ms(t2, t3);
+    const double d_tot  = sfdiag::ms(t0, t3);
+
+    sfdiag::bucket(0, d_lock);
+    if (took_wait) { sfdiag::bucket(1, d_set); sfdiag::bucket(2, d_wait); }
+    const unsigned long long calls =
+        sfdiag::g_calls.fetch_add(1, std::memory_order_relaxed) + 1ull;
+
+    // ---- R167: the one-call WARN, which is the line that answers the report ----
+    if (d_tot > sfdiag::WARN_MS)
+    {
+        const unsigned long long w =
+            sfdiag::g_warns.fetch_add(1, std::memory_order_relaxed) + 1ull;
+        if (sfdiag::warn_allowed(w))
+        {
+            char l167[1200];
+            const char *owner =
+                (d_lock >= d_set && d_lock >= d_wait)
+                    ? "LOCK - the GAME thread is holding s.cs. Read the R168 figures on the "
+                      "next periodic line: they measure the same hold from the other side "
+                      "with their own clock."
+                    : ((d_set >= d_wait)
+                           ? "SETEVENTONCOMPLETION - the fence's own registration path. This is "
+                             "the only bucket in which a stale or overloaded fence is a live "
+                             "reading."
+                           : "WAIT - read the result code beside it before concluding anything.");
+            snprintf(l167, sizeof l167,
+                     "[MGPU][R167] GATE SLOW call=%llu total=%.1fms | lock=%.1f setevent=%.1f "
+                     "wait=%.1f | requested timeout=%lums result=0x%08lX %s | LONGEST BUCKET: %s "
+                     "WHY THIS LINE IS SPLIT: one bracket around three operations reports one "
+                     "number, and the word timeout in the old line made the wait the obvious "
+                     "suspect. A 4ms timeout cannot return WAIT_TIMEOUT after hundreds of "
+                     "milliseconds, so the bucket named above is where the time actually is. "
+                     "Warn %llu; first 20 then every 100th, counters stay complete.",
+                     calls, d_tot, d_lock, d_set, d_wait,
+                     timeout_ms, (unsigned long)wr,
+                     took_wait ? sfdiag::wait_result_name(wr) : "(no wait taken this call)",
+                     owner, w);
+            mgpu::diag::warn(l167);
+        }
+    }
+
+    // ---- R167/R168: the periodic line, because the summary never runs ----
+    //
+    // gate_presents / gate_idle / gate_waits have existed since P5.1 and print
+    // ONLY from the end-of-run summary - and Frames=0 ships, so that summary
+    // never runs. The one loop in this project that can spin indefinitely has
+    // had no periodic line at all, which is why a reporter had to build one.
+    if ((calls % 600ull) == 0ull)
+    {
+        char l168[1500];
+        snprintf(l168, sizeof l168,
+                 "[MGPU][R167] GATE WINDOW calls=%llu (last 600) | lock mean=%.2f max=%.1f | "
+                 "setevent mean=%.2f max=%.1f | wait mean=%.2f max=%.1f | slow calls over "
+                 "%.0fms this run=%llu || [R168] s.cs HELD BY: GAME finish_effects n=%llu "
+                 "mean=%.2f max=%.1f | BRIDGE poll scope n=%llu mean=%.2f max=%.1f. THE GAME "
+                 "FIGURE AND THE GATE'S LOCK BUCKET ARE THE SAME CONTENTION FROM TWO SIDES, "
+                 "measured on two threads with two clocks - if they disagree, THAT is the "
+                 "finding and neither should be corrected against the other. The BRIDGE poll "
+                 "figure is a SCOPE and not a strict hold: stream_poll releases the mutex "
+                 "around its fence wait by design and that released window is inside the "
+                 "bracket. It cannot block this gate - both are the bridge thread - so it "
+                 "answers only whether the bridge is holding s.cs long enough to stall the "
+                 "GAME's render thread.",
+                 calls,
+                 sfdiag::mean_ms(sfdiag::b_us_sum[0], sfdiag::b_n[0]), sfdiag::max_ms(sfdiag::b_us_max[0]),
+                 sfdiag::mean_ms(sfdiag::b_us_sum[1], sfdiag::b_n[1]), sfdiag::max_ms(sfdiag::b_us_max[1]),
+                 sfdiag::mean_ms(sfdiag::b_us_sum[2], sfdiag::b_n[2]), sfdiag::max_ms(sfdiag::b_us_max[2]),
+                 sfdiag::WARN_MS, sfdiag::g_warns.load(std::memory_order_relaxed),
+                 sfdiag::hold_n[sfdiag::SITE_GAME].load(std::memory_order_relaxed),
+                 sfdiag::mean_ms(sfdiag::hold_us_sum[sfdiag::SITE_GAME],
+                                 sfdiag::hold_n[sfdiag::SITE_GAME]),
+                 sfdiag::max_ms(sfdiag::hold_us_max[sfdiag::SITE_GAME]),
+                 sfdiag::hold_n[sfdiag::SITE_POLL].load(std::memory_order_relaxed),
+                 sfdiag::mean_ms(sfdiag::hold_us_sum[sfdiag::SITE_POLL],
+                                 sfdiag::hold_n[sfdiag::SITE_POLL]),
+                 sfdiag::max_ms(sfdiag::hold_us_max[sfdiag::SITE_POLL]));
+        mgpu::diag::info(l168);
+        sfdiag::reset_window();
+    }
+
+    return ret;
 }
 
 bool probes_enabled()
@@ -14726,6 +15021,20 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
+    // R168. THE MEASUREMENT THAT MATTERS FOR THE GATE'S LOCK BUCKET.
+    //
+    // This is the GAME'S RENDER THREAD holding s.cs, and it is the only other
+    // thread that can. Destruction order does the right thing without a
+    // comment being needed: locals unwind in reverse, so this timer stops
+    // before lk releases the mutex.
+    sfdiag::hold_timer r168_game(sfdiag::SITE_GAME);
+
+    // R169. The handle the probe published this frame, whatever the rest of
+    // this function does with it. One relaxed store; it is what lets the
+    // periodic report name the resource the lane was looking at when it went
+    // quiet, without this file ever including the probe's header.
+    s.mvec_pub_handle.store(mvec_handle, std::memory_order_relaxed);
+
     if (!s.requested || s.finished) return;
 
     ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
@@ -15219,6 +15528,89 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         return;    // record nothing on the arming frame
     }
 
+    // ---- R170: SwapGuard. OFF BY DEFAULT, and it is a BEHAVIOUR change ----
+    //
+    // MEASURED on Starfield: the title destroys and recreates its swapchain
+    // AND its D3D12 command queue on every inventory transition, and ReShade
+    // tears down and rebuilds its effect runtime inside that window. The
+    // reporter's own section 8 asks whether our per-frame callbacks are safe
+    // across that, and the honest answer is that nothing has ever stopped them
+    // running through it.
+    //
+    // At SwapGuard=1 the producer stands still while a GAME swapchain event is
+    // recent: no seal, no colour copy, no depth copy, no fence signal. It is
+    // BOUNDED and SELF-CLEARING and it resumes on its own rather than
+    // disarming.
+    //
+    // R174. THE WORD "GAME" IN THAT PARAGRAPH IS THE CORRECTION, AND THIS
+    // BLOCK USED TO BE WRONG IN TWO WAYS AT ONCE. As first written it said
+    // "the quiet window is the same signal AutoArm already waits on, so this
+    // adds no new state and no second clock" - and that reuse was the defect.
+    // ms_since_last_swapchain_event() is stamped for EVERY swapchain event
+    // before any filtering, so the bridge's OWN present-window resize fed it.
+    // On the Cyberpunk control run, where zero episodes was the stated pass,
+    // R170 fired twice: once on startup churn before arm, once 500 ms after
+    // the P7.1 resize of our own chain. It now reads a game-only clock.
+    //
+    // R174, SECOND: WHERE THIS BLOCK SITS. It used to sit above both the
+    // adapter LUID filter and the arm, which had two consequences I did not
+    // describe when I proposed it. It delayed ARMING, which is not what a
+    // producer guard is for, and swapguard_paused_frames counted events from
+    // the bridge's own runtime as "producer frames stood still", which is not
+    // what that counter claims to measure. It is now below both: every frame
+    // it pauses is a confirmed game frame on an armed stream.
+    //
+    // WHAT IT IS NOT. It is not a fix for the freeze and must not be described
+    // as one. It is a variable: if the freeze survives a producer that is not
+    // touching anything during the teardown, our per-frame work during the
+    // recreation is excluded, which is worth knowing either way. What justifies
+    // it independently of the freeze is that the bridge is currently sealing
+    // into a ring sized for a swapchain that has been destroyed three times.
+    //
+    // A generation counter was considered and rejected: a generation only ever
+    // increases, so a pause keyed on it could never clear, and "pause forever"
+    // is standing down - which is R171 and a different decision.
+    {
+        static const int swapguard =
+            ini_read_sr_int("SwapGuard", 0, 0, 2);
+        if (swapguard >= 1)
+        {
+            const unsigned long long SWAPGUARD_QUIET_MS = 500ull;
+            const unsigned long long since =
+                mgpu::adapter::ms_since_last_game_swapchain_event();
+            if (since < SWAPGUARD_QUIET_MS)
+            {
+                ++s.swapguard_paused_frames;
+                if (!s.swapguard_in_episode)
+                {
+                    s.swapguard_in_episode = true;
+                    ++s.swapguard_episodes;
+                }
+                return;
+            }
+            if (s.swapguard_in_episode)
+            {
+                s.swapguard_in_episode = false;
+                // Said from here because the episode ENDING is the cheap
+                // moment - the game's thread is past the teardown and this is
+                // one line per transition, not one per frame. Still under
+                // s.cs, so it is the one diag call in this function that is:
+                // kept because a line the operator needs on every transition
+                // is worth a few microseconds of a lock the consumer holds for
+                // longer than that every poll.
+                char sg[700];
+                snprintf(sg, sizeof sg,
+                         "[MGPU][R170] SWAPGUARD resumed after %llu ms of game swapchain quiet - "
+                         "episode %llu, %llu producer frame(s) stood still in total this run. "
+                         "While an episode is running the producer seals nothing, copies "
+                         "nothing and signals nothing: this is a VARIABLE, not a fix. If the "
+                         "freeze survives with this on, our per-frame work during the runtime "
+                         "teardown is excluded from it.",
+                         since, s.swapguard_episodes, s.swapguard_paused_frames);
+                mgpu::diag::info(sg);
+            }
+        }
+    }
     // ---- SIGNAL THE PREVIOUS FRAME, THEN RECORD THIS ONE ----
     //
     // The same ordering rule P2.0 established, now generalised to a stream.
@@ -15638,6 +16030,11 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     if ((unsigned)md.Width != s.mvec_w || (unsigned)md.Height != s.mvec_h ||
         (unsigned)md.Format != s.mvec_format)
     {
+        // R169. Record WHAT was refused, not only that something was. Stored
+        // rather than logged: see the note beside these fields.
+        s.mvec_rej_w.store((unsigned)md.Width, std::memory_order_relaxed);
+        s.mvec_rej_h.store((unsigned)md.Height, std::memory_order_relaxed);
+        s.mvec_rej_fmt.store((unsigned)md.Format, std::memory_order_relaxed);
         ++s.mvec_size_rejects;
         return;
     }
@@ -16484,6 +16881,128 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         (mtot != 0) ? (100.0 * (double)s.mvec_seen_valid / (double)mtot) : 0.0);
                     mgpu::diag::info(ml);
 
+                    // ---- R169: say WHY the lane went quiet, with dimensions ----
+                    //
+                    // Two different silences, and they have different causes,
+                    // so they get different sentences. Emitted here, on the
+                    // bridge thread, from values the game's thread stored.
+                    {
+                        const unsigned long long now_copies =
+                            s.mvec_copies.load(std::memory_order_relaxed);
+                        const unsigned long long now_rej =
+                            s.mvec_size_rejects.load(std::memory_order_relaxed);
+                        const unsigned rw = s.mvec_rej_w.load(std::memory_order_relaxed);
+                        const unsigned rh = s.mvec_rej_h.load(std::memory_order_relaxed);
+                        const unsigned rf = s.mvec_rej_fmt.load(std::memory_order_relaxed);
+
+                        // (a) REFUSED. The hook fired and the guard said no.
+                        // Said on the first rejection and again whenever the
+                        // refused geometry CHANGES, so a title that rescales
+                        // repeatedly names each one rather than the first.
+                        if (now_rej > s.mvec_rejects_last_report &&
+                            (rw != s.mvec_rej_said_w || rh != s.mvec_rej_said_h ||
+                             rf != s.mvec_rej_said_fmt))
+                        {
+                            s.mvec_rej_said_w = rw; s.mvec_rej_said_h = rh;
+                            s.mvec_rej_said_fmt = rf;
+                            char r169[1200];
+                            snprintf(r169, sizeof r169,
+                                "[MGPU][R169] MVEC REFUSED ON SIZE: armed %ux%u fmt=%u against a "
+                                "candidate of %ux%u fmt=%u - %llu refusal(s) so far, %llu in this "
+                                "window. THE SLOT IS SIZED ONCE, AT ARM, and a copy against a "
+                                "different footprint would write past the region and into the "
+                                "next slot, so this refusal is correct and the frame ships "
+                                "without vectors. What it means is that the probe is now "
+                                "publishing a DIFFERENT resource from the one the arm was sized "
+                                "from - a swapchain rebuild or a resolution change will do it. "
+                                "Until the two agree again the lane carries nothing, and the "
+                                "model falls back to deriving motion from colour. This line "
+                                "exists because size-rejected counted for months without naming "
+                                "a dimension, which sent readers to the install.",
+                                s.mvec_w, s.mvec_h, s.mvec_format, rw, rh, rf,
+                                now_rej, now_rej - s.mvec_rejects_last_report);
+                            mgpu::diag::warn(r169);
+                        }
+
+                        // (b) SILENT. The hook did not fire at all - nothing
+                        // was refused and nothing was copied. A different
+                        // fault: the probe published a handle nobody binds, or
+                        // published nothing.
+                        //
+                        // ---- R169b: TWO WINDOWS, AND ONLY A LANE THAT HAS
+                        //      ALREADY CARRIED. Corrected 2026-09-19. ----
+                        //
+                        // The first version of this fired on ONE silent window
+                        // and it produced three WARN lines on a completely
+                        // healthy Cyberpunk control run. The R78 progression
+                        // says why: copies ran 1:1 with frames to f=3001, went
+                        // flat for about four thousand frames, and then came
+                        // back to 1:1 - a menu, a pause or a cutscene, where a
+                        // velocity buffer does not exist.
+                        //
+                        // R151 ALREADY WROTE THIS RULE DOWN and it was applied
+                        // to the idle screen and not to this line: the velocity
+                        // lane is bounded by how long the player stays out of
+                        // gameplay, which is not bounded at all, so its silence
+                        // is not a fault and must not be reported as one. A
+                        // WARN on a healthy run is the failure R149 named - a
+                        // fault report manufactured by the fault reporter - and
+                        // it trains people to skip the line that matters.
+                        //
+                        // Two changes, both following R147's shape rather than
+                        // needing a new idea:
+                        //
+                        //   TWO CONSECUTIVE windows, because one is a menu and
+                        //   the pattern that matters is a lane that does not
+                        //   come back.
+                        //
+                        //   `now_copies > 0` - a lane that has NEVER copied is
+                        //   ARMING, not failing, and the first of the three
+                        //   false positives fired on exactly that, with
+                        //   "copies did not move from 0" while the arm was
+                        //   still holding.
+                        //
+                        // This still fires on the Starfield shape, where the
+                        // lane carried, stopped across a swapchain rebuild and
+                        // stayed stopped for whole windows.
+                        const bool silent_window =
+                            (now_copies == s.mvec_copies_last_report &&
+                             now_rej == s.mvec_rejects_last_report);
+                        if (silent_window) ++s.mvec_silent_windows;
+                        else               s.mvec_silent_windows = 0;
+
+                        if (silent_window && now_copies > 0ull &&
+                            s.mvec_silent_windows >= 2u &&
+                            !s.mvec_stall_said)
+                        {
+                            s.mvec_stall_said = true;
+                            char r169b[1100];
+                            snprintf(r169b, sizeof r169b,
+                                "[MGPU][R169] MVEC LANE SILENT for %u consecutive report windows: "
+                                "copies did not move from %llu and NOTHING was refused on size. "
+                                "The bind hook did not fire, so this is not the size guard - the "
+                                "probe's published handle is 0x%llx and either nobody binds it "
+                                "or nothing is published. Read the [R71] TRANSPORT SOURCE line "
+                                "above for what the probe currently holds. Every frame in this "
+                                "window was handed NO vectors and the model derived motion from "
+                                "colour, which is correct behaviour and is not a fault - it is "
+                                "just not what MVec=3 was asked for. TWO windows are required "
+                                "before this prints, and a lane that has never copied is treated "
+                                "as ARMING rather than silent - a single quiet window is what a "
+                                "menu or a cutscene looks like and firing on one produced three "
+                                "false WARNs on a healthy Cyberpunk run. Said once per silent "
+                                "spell; it re-arms the moment a copy lands.",
+                                s.mvec_silent_windows, now_copies,
+                                s.mvec_pub_handle.load(std::memory_order_relaxed));
+                            mgpu::diag::warn(r169b);
+                        }
+                        if (now_copies != s.mvec_copies_last_report)
+                            s.mvec_stall_said = false;
+
+                        s.mvec_copies_last_report  = now_copies;
+                        s.mvec_rejects_last_report = now_rej;
+                    }
+
                     // ---- R87: the alignment histogram ----
                     char el[900];
                     unsigned long long tot_ev = 0;
@@ -16622,6 +17141,13 @@ void stream_poll()
     //
     // unique_lock, not lock_guard, so the wait can happen with it released.
     std::unique_lock<std::mutex> lk(s.cs);
+    // R168. Bridge-side scope timer. See the sfdiag block above. This is the
+    // SCOPE, not the strict hold: the unique_lock above is released around the
+    // fence wait by design, and that released window is inside this bracket.
+    // It is reported under its own name for exactly that reason. It cannot
+    // block the gate - both run on the bridge thread - so it answers the other
+    // question: is the bridge holding s.cs long enough to stall the GAME.
+    sfdiag::hold_timer r168_poll(sfdiag::SITE_POLL);
     if (!s.armed || s.summarised) return;
 
     // ---- V28: THE INNER LOOP. Decide, then fall through to the commit. ----

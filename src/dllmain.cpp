@@ -54,7 +54,15 @@
 // system co-operation, and a timestamp cannot be stale in the way a version
 // constant that somebody forgot to bump can be. The version string beside it
 // is bumped by hand at release and the two disagreeing is itself information.
-#define MGPU_VERSION_STR "0.2.3"
+// R173. BUMPED 2026-09-19, and the comment above had already named this exact
+// hazard: "the version string beside it is bumped by hand at release and the
+// two disagreeing is itself information". It was not bumped when this tree
+// became 0.2.4, so the first Cyberpunk run of the R167 build reported
+// "MGPU Bridge 0.2.3 | built Sep 19 2026 14:44:47" - a correct timestamp under
+// a wrong name, on the one line whose entire job is to stop a report
+// misidentifying a build. Caught by a control run rather than by a reader,
+// which is the only reason it is not in somebody's issue thread.
+#define MGPU_VERSION_STR "0.2.4"
 
 
 // ---- P6.4: the overlay panel ----

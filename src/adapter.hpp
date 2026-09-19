@@ -103,6 +103,15 @@ namespace mgpu::adapter
     // later. Anything arming by itself waits for this to go quiet.
     unsigned long long ms_since_last_swapchain_event();
 
+    // R174. The same measurement, restricted to swapchain events whose
+    // device LUID is the game's. The one above counts the bridge's own
+    // present chain as well, which is right for AutoArm and wrong for any
+    // caller whose question is "is the GAME mid-teardown". SwapGuard (R170)
+    // is that caller. Returns ~0ull - QUIET - when no game swapchain event
+    // has been seen; the reason for the opposite default is at the
+    // definition.
+    unsigned long long ms_since_last_game_swapchain_event();
+
     // P7.10. How many swapchain events named a device that was not d3d12.
     // Nonzero with no selection means the title is D3D11 or Vulkan rather than
     // a D3D12 title that has not reached its swapchain yet - a distinction the

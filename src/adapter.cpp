@@ -110,6 +110,20 @@ namespace
         // D3D12 one that simply has not reached its swapchain yet. Without it
         // the only honest thing the UI can say is "waiting", forever.
         std::atomic<unsigned long long> last_sc_ms{0};
+        // R174. THE SECOND CLOCK, AND WHY THERE HAS TO BE ONE.
+        //
+        // last_sc_ms above is stamped for EVERY swapchain event, before any
+        // filtering, because AutoArm's question is "did the presentation
+        // setup change" and the bridge's own present chain changing counts.
+        // R170 asked a DIFFERENT question of the same value - "is the GAME
+        // mid-teardown" - and got a wrong answer for it on the Cyberpunk
+        // control run: the bridge's own P7.1 resize stamped the clock and
+        // stood the producer still for 500 ms immediately after arm. That is
+        // the R33 size-band defect again, a clock correct for the consumer
+        // that asked for it and reused by a second consumer with a different
+        // question. So the second consumer gets its own stamp, written only
+        // where the event's LUID is the game's.
+        std::atomic<unsigned long long> last_game_sc_ms{0};
         std::atomic<unsigned> non_d3d12_sc{0};
     };
 
@@ -593,6 +607,14 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
     auto &S = st();
     std::lock_guard<std::mutex> lk(S.cs);
 
+    // R174. The game-only stamp, and it is written HERE - after the d3d12
+    // filter, after the LUID is in hand, and before the early return below -
+    // so that a resize of the game's own chain still counts while the bridge's
+    // does not. The first swapchain event is the game's by definition: it is
+    // the one that establishes the value everything else is compared against.
+    if (!S.result.game_luid_from_swapchain || luid_eq(luid, S.result.game_luid))
+        S.last_game_sc_ms.store(GetTickCount64(), std::memory_order_relaxed);
+
     if (S.result.game_luid_from_swapchain)
     {
         // A subsequent swapchain event (a resize, a re-create, another
@@ -680,6 +702,24 @@ unsigned long long ms_since_last_swapchain_event()
     const unsigned long long t = st().last_sc_ms.load(std::memory_order_relaxed);
     if (t == 0)
         return 0;   // no swapchain event yet - "not quiet", which is the safe answer
+    const unsigned long long now = GetTickCount64();
+    return (now > t) ? (now - t) : 0;
+}
+
+// R174. The game-only clock. Note the sentinel: where the all-events clock
+// above answers "not quiet" when nothing has happened yet, this one answers
+// "quiet", and the difference is deliberate. AutoArm must not arm into an
+// unknown, so its safe answer is to wait. SwapGuard PAUSES THE PRODUCER, so
+// its safe answer is the opposite - a "not quiet" default on a title whose
+// game chain is never seen would stand the producer still for the whole run
+// with no event able to clear it. A guard that can never clear is standing
+// down, which is R171 and a different decision.
+unsigned long long ms_since_last_game_swapchain_event()
+{
+    ensure_init();
+    const unsigned long long t = st().last_game_sc_ms.load(std::memory_order_relaxed);
+    if (t == 0)
+        return ~0ull;   // no GAME swapchain event yet - quiet, see above
     const unsigned long long now = GetTickCount64();
     return (now > t) ? (now - t) : 0;
 }
