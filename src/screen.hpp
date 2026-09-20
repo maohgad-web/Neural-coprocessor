@@ -181,6 +181,13 @@ enum state
 #define MGPU_E205_L1 "ERROR 205"
 #define MGPU_E205_L2 "NO MGPU.INI BESIDE THE ADD-ON - COPY IT FROM THE ZIP"
 
+// R189-B. The neural stage and the game ended up on the SAME adapter. The
+// add-on refuses to arm rather than running both loads on one card, because
+// every measurement taken in that state is wrong and nothing downstream can
+// be trusted. 207 and not 206: this is an error, nobody chooses it.
+#define MGPU_E207_L1 "ERROR 207"
+#define MGPU_E207_L2 "NEURAL CARD AND GAME CARD ARE THE SAME CARD - SEE ERROR 207 IN RESHADE.LOG"
+
 #define MGPU_S206_L1 "MGPU BRIDGE"
 #define MGPU_S206_L2 "AUTOARM IS OFF IN MGPU.INI - NOTHING WILL ARM BY ITSELF"
 

@@ -8387,6 +8387,11 @@ namespace
         // Confirmed 2026-09-13: Neural=0, launch, quit, Neural=1, and the
         // next launch arms.
         bool recovery = false;
+        // R189-B. Latched at arm when the bridge's adapter and the game's own
+        // render adapter turn out to be the same card. Never cleared: the
+        // binding is settled once per launch, so if it is wrong it is wrong
+        // for the whole launch.
+        bool luid_collapse = false;
         bool recovery_cleared = false;
         unsigned recovery_frames = 0;
         // V44. recovery can now be entered two ways and they behave
@@ -13429,7 +13434,16 @@ void present_screen_state(int &st_out, const char *&l1, const char *&l2)
     // every other message on this screen would be a lie. The colour is the
     // error red, since this IS an error condition - it is simply one the
     // add-on is repairing by itself.
-    if (s.recovery)
+    if (s.luid_collapse)
+    {
+        // R189-B. Above everything except nothing: the binding is wrong, so
+        // every other line this screen could draw would be describing a run
+        // that is not happening.
+        st_out = mgpu::screen::st_error;
+        l1 = MGPU_E207_L1;
+        l2 = MGPU_E207_L2;
+    }
+    else if (s.recovery)
     {
         st_out = mgpu::screen::st_error;
         l1 = "FIXING RESIDUAL ERROR";
@@ -15388,6 +15402,69 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         ID3D12Device *gdev = nullptr;
         if (FAILED(src->GetDevice(IID_PPV_ARGS(&gdev))) || gdev == nullptr) return;
         s.gdev = gdev;
+
+        // ---- R189-B: THE GAME'S OWN DEVICE IS THE ONLY AUTHORITY ----
+        //
+        // Selection runs at init_swapchain against a LUID derived from the
+        // swapchain's device. This is the first moment the add-on holds the
+        // device that ACTUALLY produced the frame it is about to copy, and
+        // GetAdapterLuid on it cannot be provisional, inherited or guessed.
+        //
+        // If it matches the adapter the bridge built its own device on, then
+        // both stages are on one card. Nothing downstream is meaningful in
+        // that state - not the transport timings, not the thermals, not the
+        // frame rate - so the honest action is to refuse rather than to run
+        // and be measured. R138's rule applies: say it on the screen, because
+        // an absence cannot be reported by the code the absence silences.
+        {
+            mgpu::adapter::selection_result sel_now{};
+            mgpu::adapter::get_selection(sel_now);
+            const LUID gl = gdev->GetAdapterLuid();
+            if (sel_now.valid &&
+                gl.LowPart  == sel_now.selected_luid.LowPart &&
+                gl.HighPart == sel_now.selected_luid.HighPart)
+            {
+                if (!s.luid_collapse)
+                {
+                    char ln[768];
+                    snprintf(ln, sizeof ln,
+                             "[MGPU][R189] ERROR 207: REFUSING TO ARM - the game's render device "
+                             "reports adapter luid=0x%08X-0x%08X and the bridge built its device "
+                             "on that same adapter (\"%s\", rule=\"%s\"). Both stages would run "
+                             "on one card. The selection was made against the swapchain-derived "
+                             "luid; this line is the game's OWN device, read at arm, and it is "
+                             "the authority. If this machine has an integrated GPU enabled, the "
+                             "rule 4 tiebreak is live - see [MGPU][T2] for the adapter table.",
+                             (unsigned)gl.HighPart, (unsigned)gl.LowPart,
+                             sel_now.selected_desc, sel_now.rule);
+                    mgpu::diag::error(ln);
+                }
+                s.luid_collapse = true;
+                return;
+            }
+
+            // R189-B. The positive case, said once. The binding is the one
+            // fact every number downstream depends on, and until now no log
+            // stated it from the game's own device - only from the LUID the
+            // selection was made against. A run that is fine should say so
+            // in the same words a run that is broken would.
+            static bool said = false;
+            if (sel_now.valid && !said)
+            {
+                said = true;
+                char ok[512];
+                snprintf(ok, sizeof ok,
+                         "[MGPU][R189] BINDING CONFIRMED AT ARM: the game renders on adapter "
+                         "luid=0x%08X-0x%08X and the bridge is on luid=0x%08X-0x%08X (\"%s\"). "
+                         "Different adapters, read from the game's OWN device rather than from "
+                         "the luid the selection was made against.",
+                         (unsigned)gl.HighPart, (unsigned)gl.LowPart,
+                         (unsigned)sel_now.selected_luid.HighPart,
+                         (unsigned)sel_now.selected_luid.LowPart,
+                         sel_now.selected_desc);
+                mgpu::diag::info(ok);
+            }
+        }
 
         QueryPerformanceFrequency(&s.freq);
 

@@ -403,7 +403,7 @@ namespace
             degenerate = choice.degenerate;
             rule = degenerate
                        ? "exclusion + software filter + output-count tiebreak "
-                         "(display on target card)"
+                         "(R189-A: display-count aware)"
                        : "exclusion (luid != swapchain game luid) + software filter";
         }
         else if (cand.empty())
