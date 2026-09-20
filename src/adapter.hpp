@@ -117,6 +117,14 @@ namespace mgpu::adapter
     // a D3D12 title that has not reached its swapchain yet - a distinction the
     // panel cannot make any other way, and without which the only honest thing
     // it could display is "waiting", forever.
+    // R184. Swapchain events whose device LUID was the game's, this run.
+    unsigned game_swapchain_events();
+
+    // R182. Live budget and this process's usage on the adapter the GAME
+    // renders on. False until a game LUID exists. NOT to be called while
+    // holding the stream's s.cs - see the definition.
+    bool game_adapter_vmem(unsigned long long &budget, unsigned long long &usage);
+
     unsigned non_d3d12_swapchain_events();
 
     // T3 instrumentation: log the adapter LUID of any device event in the

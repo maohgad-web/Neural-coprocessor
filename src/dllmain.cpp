@@ -62,7 +62,7 @@
 // a wrong name, on the one line whose entire job is to stop a report
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
-#define MGPU_VERSION_STR "0.2.4"
+#define MGPU_VERSION_STR "0.2.5-dev"
 
 
 // ---- P6.4: the overlay panel ----

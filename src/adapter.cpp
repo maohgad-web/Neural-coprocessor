@@ -124,6 +124,13 @@ namespace
         // question. So the second consumer gets its own stamp, written only
         // where the event's LUID is the game's.
         std::atomic<unsigned long long> last_game_sc_ms{0};
+        // R182/R184. The GAME adapter, resolved once and held, plus a count of
+        // the swapchain events that were its own. Both exist because the only
+        // vmem numbers in any log today are from the T2 enumeration at startup
+        // and the only swapchain count is a grep. Neither is readable while a
+        // session is running, which is when the question is asked.
+        IDXGIAdapter3 *game_ad3 = nullptr;
+        std::atomic<unsigned> game_sc_events{0};
         std::atomic<unsigned> non_d3d12_sc{0};
     };
 
@@ -613,7 +620,10 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
     // does not. The first swapchain event is the game's by definition: it is
     // the one that establishes the value everything else is compared against.
     if (!S.result.game_luid_from_swapchain || luid_eq(luid, S.result.game_luid))
+    {
         S.last_game_sc_ms.store(GetTickCount64(), std::memory_order_relaxed);
+        S.game_sc_events.fetch_add(1, std::memory_order_relaxed);   // R184
+    }
 
     if (S.result.game_luid_from_swapchain)
     {
@@ -678,6 +688,7 @@ void shutdown()
     // cannot act on this run's stale selection.
     if (S.ready != nullptr)
         ResetEvent(S.ready);
+    if (S.game_ad3 != nullptr) { S.game_ad3->Release(); S.game_ad3 = nullptr; }   // R182
 }
 
 HANDLE ready_event()
@@ -722,6 +733,53 @@ unsigned long long ms_since_last_game_swapchain_event()
         return ~0ull;   // no GAME swapchain event yet - quiet, see above
     const unsigned long long now = GetTickCount64();
     return (now > t) ? (now - t) : 0;
+}
+
+// R184. How many swapchain events named the GAME's adapter. The count a triage
+// currently gets by grepping init_swapchain and reading timestamps by eye - and
+// which was read wrongly once already, from three long logs that showed only
+// startup churn while two short ones carried mid-session pairs.
+unsigned game_swapchain_events()
+{
+    ensure_init();
+    return st().game_sc_events.load(std::memory_order_relaxed);
+}
+
+// R182. Live occupancy of the adapter the GAME renders on. Returns false until
+// a game LUID is established or if the adapter refuses the query.
+//
+// MUST NOT BE CALLED WHILE HOLDING THE STREAM'S s.cs. It takes this module's
+// own lock and calls into DXGI; DEFECT E is the rule and the R167 round already
+// paid for breaking it. Callers compute here, print later.
+bool game_adapter_vmem(unsigned long long &budget, unsigned long long &usage)
+{
+    ensure_init();
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    if (!S.result.game_luid_known) return false;
+
+    if (S.game_ad3 == nullptr)
+    {
+        for (size_t i = 0; i < S.table.size(); ++i)
+        {
+            if (S.table[i].adapter == nullptr) continue;
+            if (!luid_eq(S.table[i].luid, S.result.game_luid)) continue;
+            IDXGIAdapter3 *a3 = nullptr;
+            if (SUCCEEDED(S.table[i].adapter->QueryInterface(
+                    __uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&a3))))
+                S.game_ad3 = a3;      // held; released in shutdown()
+            break;
+        }
+    }
+    if (S.game_ad3 == nullptr) return false;
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO vmem{};
+    if (FAILED(S.game_ad3->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmem)))
+        return false;
+    budget = vmem.Budget;
+    usage  = vmem.CurrentUsage;
+    return true;
 }
 
 unsigned non_d3d12_swapchain_events()

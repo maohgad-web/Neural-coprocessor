@@ -114,6 +114,10 @@ namespace
 // ---- The two entry points we care about, spelled exactly as resolved ----
 const char *const NAME_EVAL   = "NVSDK_NGX_D3D12_EvaluateFeature";
 const char *const NAME_CREATE = "NVSDK_NGX_D3D12_CreateFeature";
+// R183. The third entry point, and it is here for one reason: 86 CreateFeature
+// calls in one session could be 86 leaks or 86 matched pairs and nothing in any
+// log distinguishes them. Counting releases is what makes "live" a number.
+const char *const NAME_RELEASE = "NVSDK_NGX_D3D12_ReleaseFeature";
 
 typedef NVSDK_NGX_Result(NVSDK_CONV *pf_evaluate)(
     ID3D12GraphicsCommandList *InCmdList,
@@ -126,6 +130,8 @@ typedef NVSDK_NGX_Result(NVSDK_CONV *pf_create)(
     NVSDK_NGX_Feature InFeatureID,
     NVSDK_NGX_Parameter *InParameters,
     NVSDK_NGX_Handle **OutHandle);
+
+typedef NVSDK_NGX_Result(NVSDK_CONV *pf_release)(NVSDK_NGX_Handle *InHandle);
 
 typedef FARPROC(WINAPI *pf_gpa)(HMODULE, LPCSTR);
 
@@ -143,6 +149,7 @@ const char *g_site = "?";   // R101b: which event installed us
 pf_gpa      g_real_gpa   = nullptr;
 pf_evaluate g_real_eval  = nullptr;
 pf_create   g_real_create= nullptr;
+pf_release  g_real_release = nullptr;   // R183
 
 HMODULE g_self = nullptr;
 
@@ -153,6 +160,7 @@ std::atomic<unsigned long long> g_resolved{0};     // times NGX eval handed out
 std::atomic<unsigned long long> g_evals{0};        // evaluates intercepted
 std::atomic<unsigned long long> g_captures{0};     // evaluates we read
 std::atomic<unsigned long long> g_creates{0};      // CreateFeature seen
+std::atomic<unsigned long long> g_releases{0};     // R183: ReleaseFeature seen
 std::atomic<unsigned long long> g_slots{0};        // IAT slots patched
 std::atomic<unsigned long long> g_modules{0};      // modules walked
 std::atomic<unsigned long long> g_cost_ns{0};      // total ns inside capture
@@ -545,6 +553,38 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
     return g_real_eval(cl, h, p, cb);
 }
 
+// ---- R183: COUNT THE RELEASES, AND GET OUT OF THE WAY ----
+//
+// The mirror of R121's rule on the create side: this hook must call through
+// UNCONDITIONALLY and must never swallow a result. A feature the game believes
+// it released and we did not pass on is a leak WE caused while measuring one,
+// which would be the instrument becoming the fault it was built to find.
+//
+// The counter is incremented before the call, not after, so a release that
+// crashes inside NGX still shows up as attempted. That matters: a create/release
+// pair that never completes is a different shape from one that never started.
+NVSDK_NGX_Result NVSDK_CONV hook_release(NVSDK_NGX_Handle *h)
+{
+    g_releases.fetch_add(1, std::memory_order_relaxed);
+
+    if (g_real_release == nullptr)
+    {
+        HMODULE ngx = ngx_module();
+        if (ngx != nullptr)
+        {
+            void *late = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_RELEASE)
+                                             : GetProcAddress(ngx, NAME_RELEASE));
+            if (late != nullptr && late != (void *)&hook_release)
+                g_real_release = (pf_release)late;
+        }
+    }
+    // No real pointer means we must not pretend to have released anything.
+    // Fail is the honest answer and it is what the caller would have got had
+    // the export been missing.
+    if (g_real_release == nullptr) return NVSDK_NGX_Result_Fail;
+    return g_real_release(h);
+}
+
 NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
                                         NVSDK_NGX_Feature id,
                                         NVSDK_NGX_Parameter *p,
@@ -688,6 +728,11 @@ FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
     {
         g_real_create = (pf_create)real;
         return (FARPROC)&hook_create;
+    }
+    if (std::strcmp(name, NAME_RELEASE) == 0)          // R183
+    {
+        g_real_release = (pf_release)real;
+        return (FARPROC)&hook_release;
     }
     return real;
 }
@@ -914,6 +959,13 @@ unsigned scan_cached_pointers()
     if (ev == nullptr) return 0;
     void *cr = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_CREATE)
                                    : GetProcAddress(ngx, NAME_CREATE));
+    // R183. Same three routes as create, for symmetry - a release resolved by
+    // a route we do not watch is a release we do not count, and an uncounted
+    // release reads as a leak. NOTE FOR THE CRASH ENTRY: this adds a third
+    // symbol to the scan's write surface. That is a deliberate, stated increase
+    // and it belongs in STREAMLINE_LEDGER when that entry is worked.
+    void *rl = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_RELEASE)
+                                   : GetProcAddress(ngx, NAME_RELEASE));
 
     // Already ours: a previous scan took. Nothing to do.
     if (ev == (void *)&hook_evaluate) return 0;
@@ -945,6 +997,7 @@ unsigned scan_cached_pointers()
     // overwrite a good pointer with a stale one.
     if (g_real_eval == nullptr) g_real_eval = (pf_evaluate)ev;
     if (cr != nullptr && g_real_create == nullptr) g_real_create = (pf_create)cr;
+    if (rl != nullptr && g_real_release == nullptr) g_real_release = (pf_release)rl;   // R183
 
     unsigned hits = 0;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -972,6 +1025,8 @@ unsigned scan_cached_pointers()
             hits += patch_module_data(me.hModule, ngx, ev, (void *)&hook_evaluate);
             if (cr != nullptr)
                 hits += patch_module_data(me.hModule, ngx, cr, (void *)&hook_create);
+            if (rl != nullptr)
+                hits += patch_module_data(me.hModule, ngx, rl, (void *)&hook_release);   // R183
             if (hits != before)
             {
                 char ml[420];
@@ -1525,6 +1580,10 @@ void uninstall()
     scan_and_patch((void *)&hook_gpa, (void *)g_real_gpa);
     g_mode.store(0, std::memory_order_relaxed);
     g_installed.store(false, std::memory_order_relaxed);
+    // R183. The gpa restore above covers the dispatch route for all three
+    // symbols. Data-section slots are NOT restored here and were not before
+    // this change either - that gap belongs to the crash entry, not to this
+    // one, and it is named rather than quietly inherited.
     mgpu::diag::info("[MGPU][R101] CALIBRATOR REMOVED. Import slots restored.");
 }
 
@@ -1602,8 +1661,17 @@ void log_summary()
     char line[5600];
     int w = std::snprintf(line, sizeof line,
         "[MGPU][R101] CALIBRATOR mode=%d rung=%d site=%s | slots=%llu data-slots=%llu modules=%llu gpa-calls=%llu "
-        "| resolved=%llu creates=%llu sr-handle=%s | evaluates=%llu captured=%llu "
-        "| cost %.0f ns/frame | eval-copies=%llu eval-skips=%llu. ",
+        "| resolved=%llu creates=%llu releases=%llu live=%lld sr-handle=%s "
+        "| evaluates=%llu captured=%llu "
+        "| cost %.0f ns/frame | eval-copies=%llu eval-skips=%llu. "
+        "R183: LIVE IS CREATES MINUS RELEASES and it is the field to read. A live "
+        "count that climbs without bound means the title is not releasing what it "
+        "recreates - a leak on the GAME's adapter, which is the same adapter our "
+        "ring heap sits on. A live count that stays at one or two while creates "
+        "climbs means recreation is matched and the pressure is somewhere else. A "
+        "NEGATIVE live means we are missing creates rather than that releases "
+        "exceeded them: some route resolved ReleaseFeature past our hooks, and the "
+        "number is then a floor, not a count. ",
         g_mode.load(std::memory_order_relaxed),
         g_rung.load(std::memory_order_relaxed), g_site,
         g_slots.load(std::memory_order_relaxed),
@@ -1612,6 +1680,9 @@ void log_summary()
         g_gpa_calls.load(std::memory_order_relaxed),
         g_resolved.load(std::memory_order_relaxed),
         g_creates.load(std::memory_order_relaxed),
+        g_releases.load(std::memory_order_relaxed),
+        (long long)g_creates.load(std::memory_order_relaxed) -
+            (long long)g_releases.load(std::memory_order_relaxed),
         g_handle_known.load(std::memory_order_relaxed) ? "known" : "UNFILTERED",
         g_evals.load(std::memory_order_relaxed),
         g_captures.load(std::memory_order_relaxed),
