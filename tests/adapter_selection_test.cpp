@@ -109,6 +109,30 @@ int main()
     check_case("unique output tiebreak", unique_output, 3, luid(0, 50), true,
                1, true, true);
 
+    // R189-A. THE SAME TOPOLOGY WITH ONE DISPLAY INVERTS THE TIEBREAK.
+    // Extended desktop above: the bridge takes the card that owns the second
+    // screen, because that is where its window goes. One display below: the
+    // single display marks the card the game renders on, so the bridge takes
+    // the card with nothing plugged into it. Selecting the display card there
+    // would put both stages on one GPU.
+    const choice_input unique_output_single_display[] = {
+        {luid(0, 50), false, 1},   // game card, and the only display
+        {luid(0, 51), false, 0},
+        {luid(0, 52), false, 0},
+    };
+    check_case("single-display tiebreak refuses when both candidates are dark",
+               unique_output_single_display, 3, luid(0, 50), false,
+               static_cast<std::size_t>(-1), true, false);
+
+    const choice_input single_display_on_candidate[] = {
+        {luid(0, 55), false, 0},   // game card, nothing plugged in
+        {luid(0, 56), false, 1},   // candidate holding the only display
+        {luid(0, 57), false, 0},   // candidate with nothing plugged in
+    };
+    check_case("single display selects the dark candidate",
+               single_display_on_candidate, 3, luid(0, 55), true, 2, true,
+               true);
+
     const choice_input ambiguous_output[] = {
         {luid(0, 60), false, 1},
         {luid(0, 61), false, 1},
