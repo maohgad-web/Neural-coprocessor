@@ -454,6 +454,28 @@ namespace
         if (sel != static_cast<size_t>(-1))
         {
             const entry &e = S.table[sel];
+
+            // ---- R182: TAKE THE GAME ADAPTER BEFORE THE LOOP BELOW KILLS IT ----
+            //
+            // The loop releases every adapter except the SELECTED one, and the
+            // game's is by definition not selected - [rule 2] excludes it. So a
+            // later lookup by LUID finds a null pointer and returns nothing,
+            // which is exactly what R182 did on its first run: budget=0MB,
+            // usage=0MB, low water never sampled, for a whole 30,000-frame run.
+            //
+            // Resolved and AddRef'd here, released in shutdown(). This does not
+            // change the lifetime of anything the loop already owns.
+            for (size_t gi = 0; gi < S.table.size(); ++gi)
+            {
+                if (S.table[gi].adapter == nullptr) continue;
+                if (!luid_eq(S.table[gi].luid, game)) continue;
+                IDXGIAdapter3 *ga3 = nullptr;
+                if (SUCCEEDED(S.table[gi].adapter->QueryInterface(
+                        __uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&ga3))))
+                    S.game_ad3 = ga3;
+                break;
+            }
+
             // Release every adapter except the selected one, which stays
             // AddRef'd for T3's D3D12CreateDevice (it takes the pointer
             // directly - no LUID re-resolution); adapter::shutdown()
@@ -758,19 +780,9 @@ bool game_adapter_vmem(unsigned long long &budget, unsigned long long &usage)
     std::lock_guard<std::mutex> lk(S.cs);
     if (!S.result.game_luid_known) return false;
 
-    if (S.game_ad3 == nullptr)
-    {
-        for (size_t i = 0; i < S.table.size(); ++i)
-        {
-            if (S.table[i].adapter == nullptr) continue;
-            if (!luid_eq(S.table[i].luid, S.result.game_luid)) continue;
-            IDXGIAdapter3 *a3 = nullptr;
-            if (SUCCEEDED(S.table[i].adapter->QueryInterface(
-                    __uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&a3))))
-                S.game_ad3 = a3;      // held; released in shutdown()
-            break;
-        }
-    }
+    // R182. Captured at SELECTION - see try_select_locked. Looking it up here
+    // cannot work: the table's non-selected adapters are released the moment a
+    // selection is made, and the game's is always one of those.
     if (S.game_ad3 == nullptr) return false;
 
     DXGI_QUERY_VIDEO_MEMORY_INFO vmem{};

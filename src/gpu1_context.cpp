@@ -14,6 +14,7 @@
 #include <d3d11.h>
 #pragma comment(lib, "d3d11.lib")
 #include <combaseapi.h>
+#include <tlhelp32.h>   // R186: one module snapshot at startup, nothing else
 #include <d3d12.h>
 #include <d3d12sdklayers.h>   // P1.3: ID3D12InfoQueue only. NOT ID3D12Debug -
                               // see the comment above transit_drain_info_queue.
@@ -8651,6 +8652,11 @@ namespace
         std::atomic<int> sf_path{-2};       // R180/R182: -2 absent, 0 off, 1 on.
                                             // Read before the lock in stream_poll.
         unsigned sf_sc_last = 0;            // last game-swapchain count seen
+        // R187. Bus demand needs a window, not a total: the interesting shape
+        // is whether MB/s PLATEAUS while the frame rate falls (bus-limited) or
+        // falls with it (not bus-limited). One previous sample is all that takes.
+        unsigned long long sf_bus_last_f = 0;
+        unsigned long long sf_bus_last_ms = 0;
         unsigned mvec_rej_said_w = 0, mvec_rej_said_h = 0, mvec_rej_said_fmt = 0;
 
         // ---- R170: the producer pauses while a swapchain event is in flight ----
@@ -12394,6 +12400,94 @@ namespace dispcfg
         return (r == ERROR_SUCCESS) ? (unsigned)np : 0u;
     }
 
+    // ---- R185: SAY THE WHOLE TOPOLOGY, NOT JUST THE ONE BIT WE NEEDED ----
+    //
+    // duplicated() below asks QueryDisplayConfig for every active path and then
+    // frees the array having read one boolean out of it. active_paths() does
+    // the same for a count. The array already carries the answer to every
+    // question a confused report raises: WHICH ADAPTER drives each display,
+    // whether two targets share a source (clone), and - with one more CCD call
+    // - which connector each target is on, so two cables into one monitor stop
+    // looking like two monitors.
+    //
+    // This is not new information. It is information we fetch and discard,
+    // twice per launch, and the reason it is worth a line is that a growing
+    // share of reports arrive from people running their own add-on stack on a
+    // display arrangement nobody has asked them about.
+    //
+    // ONE SHOT, at the same site as R158. No hot path, no new API, no new
+    // dependency: user32 by GetProcAddress exactly as the two functions below.
+    void report_topology(unsigned long long game_luid_low, unsigned long long bridge_luid_low)
+    {
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        pfn_sizes p_sizes = (u != nullptr)
+            ? (pfn_sizes)(void *)GetProcAddress(u, "GetDisplayConfigBufferSizes") : nullptr;
+        pfn_query p_query = (u != nullptr)
+            ? (pfn_query)(void *)GetProcAddress(u, "QueryDisplayConfig") : nullptr;
+        if (p_sizes == nullptr || p_query == nullptr)
+        {
+            mgpu::diag::warn("[MGPU][R185] TOPOLOGY UNAVAILABLE: the CCD API did not resolve, so "
+                             "nothing below can be said about which card drives which display.");
+            return;
+        }
+
+        UINT32 np = 0, nm = 0;
+        if (p_sizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) return;
+        DISPLAYCONFIG_PATH_INFO *paths =
+            (DISPLAYCONFIG_PATH_INFO *)calloc(np, sizeof(DISPLAYCONFIG_PATH_INFO));
+        DISPLAYCONFIG_MODE_INFO *modes =
+            (DISPLAYCONFIG_MODE_INFO *)calloc(nm ? nm : 1, sizeof(DISPLAYCONFIG_MODE_INFO));
+        if (paths == nullptr || modes == nullptr) { free(paths); free(modes); return; }
+
+        if (p_query(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, nullptr) != ERROR_SUCCESS)
+        { free(paths); free(modes); return; }
+
+        char line[1600]; int w = 0;
+        w += snprintf(line + w, sizeof line - w,
+                      "[MGPU][R185] TOPOLOGY: %u active display path(s)", (unsigned)np);
+
+        unsigned on_game = 0, on_bridge = 0, on_other = 0, clones = 0;
+        for (UINT32 i = 0; i < np; ++i)
+        {
+            const unsigned long long alow =
+                (unsigned long long)paths[i].sourceInfo.adapterId.LowPart;
+            if      (alow == game_luid_low)   ++on_game;
+            else if (alow == bridge_luid_low) ++on_bridge;
+            else                              ++on_other;
+
+            for (UINT32 j = i + 1; j < np; ++j)
+                if (paths[i].sourceInfo.adapterId.LowPart ==
+                        paths[j].sourceInfo.adapterId.LowPart &&
+                    paths[i].sourceInfo.adapterId.HighPart ==
+                        paths[j].sourceInfo.adapterId.HighPart &&
+                    paths[i].sourceInfo.id == paths[j].sourceInfo.id &&
+                    paths[i].targetInfo.id != paths[j].targetInfo.id)
+                    ++clones;
+        }
+
+        w += snprintf(line + w, sizeof line - w,
+            " | driven by: GAME card %u, BRIDGE card %u, other/unmatched %u | mode=%s",
+            on_game, on_bridge, on_other,
+            (clones != 0) ? "DUPLICATE (one source, more than one target)" : "extended");
+
+        // The CCD adapterId is a LUID but it is the DISPLAY adapter's, which is
+        // not guaranteed to equal the DXGI LUID on every driver. "other" being
+        // non-zero is therefore a caveat, not a fault, and the line says so
+        // rather than letting a reader conclude a third card exists.
+        snprintf(line + w, sizeof line - w,
+            ". HOW TO READ IT. BRIDGE card 0 means no monitor is attached to the second card - "
+            "it works, and [P7.10] records that a monitor there was worth +33%% throughput on "
+            "the rig that was measured. DUPLICATE is the arrangement [V55] refuses DcompOverlay "
+            "for. \"other/unmatched\" is not a third GPU: the CCD adapter id is the display "
+            "adapter's and does not have to equal the DXGI LUID on every driver, so a non-zero "
+            "count there means the match failed, not that a card appeared. TWO CABLES INTO ONE "
+            "MONITOR show up here as two paths with different target ids, which reads as two "
+            "displays - if this count disagrees with what the user says they have, that is the "
+            "first thing to ask about.");
+        mgpu::diag::info(line);
+        free(paths); free(modes);
+    }
+
     bool duplicated()
     {
         HMODULE u = GetModuleHandleW(L"user32.dll");
@@ -12649,7 +12743,88 @@ bool dcomp_explicit_off_single_display()
                                                                          : "1 (on)"))),
              paths);
     mgpu::diag::info(r158);
+
+    // R186 is defined below this function; one declaration rather than moving
+    // a block of text around it.
+    void report_resident_addons();
+
+    // ---- R185 / R186: the two lines a confusing report needs, said once ----
+    //
+    // Here rather than at arm, because a report that never arms is exactly the
+    // kind this pair exists for.
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            mgpu::adapter::selection_result sr{};
+            mgpu::adapter::get_selection(sr);
+            dispcfg::report_topology(
+                (unsigned long long)sr.game_luid.LowPart,
+                (unsigned long long)sr.selected_luid.LowPart);
+            report_resident_addons();
+        }
+    }
     return out != 0;
+}
+
+// ---- R186: WHAT ELSE IS IN THIS PROCESS ----
+//
+// A growing share of reports come from people running their own add-on stack -
+// RenoDX and friends - on top of, or instead of, the documented install. The
+// log today says nothing about it: [P1.6] names the PRESET and [R53] the
+// technique lane, so the shader side is partly visible, and the MODULE side is
+// not visible at all.
+//
+// This is a module walk we already perform elsewhere (the calibrator crosses
+// 150+ modules every launch); this is one snapshot, at startup, naming only
+// what ends in .addon64 plus ReShade itself. It reads nothing, patches nothing
+// and is not on any hot path.
+//
+// IT IS NOT A JUDGEMENT. Another add-on being present is not a fault and the
+// line must not be written as though it were - the point is that a triage
+// should not have to ASK what else was loaded.
+void report_resident_addons()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE)
+    {
+        mgpu::diag::warn("[MGPU][R186] could not snapshot the module list - nothing can be said "
+                         "about what else is loaded in this process.");
+        return;
+    }
+
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof me;
+    char line[1400]; int w = 0;
+    w += snprintf(line + w, sizeof line - w, "[MGPU][R186] RESIDENT ADD-ONS:");
+    unsigned n = 0, total = 0;
+    if (Module32FirstW(snap, &me))
+    {
+        do
+        {
+            ++total;
+            const wchar_t *dot = wcsrchr(me.szModule, L'.');
+            const bool is_addon = (dot != nullptr) && (_wcsicmp(dot, L".addon64") == 0
+                                                    || _wcsicmp(dot, L".addon") == 0);
+            if (!is_addon) continue;
+            ++n;
+            if (w < (int)sizeof line - 160)
+                w += snprintf(line + w, sizeof line - w, " %ls", me.szModule);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+
+    if (n == 0)
+        w += snprintf(line + w, sizeof line - w, " none besides this one");
+    snprintf(line + w, sizeof line - w,
+             " | %u add-on module(s) of %u modules in the process. HOW TO READ IT. This is NOT a "
+             "fault report - another add-on being loaded is allowed and is usually harmless. It "
+             "is here because a log that does not say what else was in the process makes every "
+             "odd result ambiguous, and asking the reporter afterwards costs a round trip. Our "
+             "own module is listed too, so a count of 1 means we are alone.",
+             n, total);
+    mgpu::diag::info(line);
 }
 
 // V55. worker.cpp calls this once, at T4, with what pick_bridge_placement
@@ -14315,7 +14490,7 @@ void stream_request()
 
     snprintf(l, sizeof l,
              "[MGPU][P4.0] stream REQUESTED - ring depth %u, %s, fault=\"%s\", "
-             "neural=%s, profile=%s, present=%s, passes=%u, window=%s%s, SFPath=%u. "
+             "neural=%s, profile=%s, present=%s, passes=%u, window=%s%s, SFPath=%d. "
              "R175: SFPath IS ECHOED HERE BECAUSE A KEY THAT CHANGES WHAT THE LOG "
              "CONTAINS MUST BE READABLE FROM THE LOG. SwapGuard was not, and one "
              "whole A/B pair was read as a pass when the arm had simply never seen "
@@ -16968,16 +17143,40 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         const unsigned long long vl = s.vm_headroom_low.load(std::memory_order_relaxed);
                         const unsigned long long ours = (unsigned long long)s.slot_bytes *
                                                         (unsigned long long)stream_state::RING;
+                        // ---- R187: BUS DEMAND, DERIVED AND NOT ESTIMATED ----
+                        //
+                        // bytes we chose to move, over a clock. No API, no
+                        // guess. The CAPACITY is deliberately not quoted: the
+                        // only figure we have is [P1.3]'s startup probe, which
+                        // says of itself that it is CPU-serialised with no
+                        // pipelining and that the RATIO is the signal rather
+                        // than the absolute. Reporting a percentage of that
+                        // would be inventing a denominator.
+                        const unsigned long long now_bus = GetTickCount64();
+                        double bus_mb_s = -1.0;
+                        if (s.sf_bus_last_ms != 0ull && now_bus > s.sf_bus_last_ms &&
+                            f > s.sf_bus_last_f)
+                            bus_mb_s = (double)(f - s.sf_bus_last_f) *
+                                       (double)s.slot_bytes /
+                                       ((double)(now_bus - s.sf_bus_last_ms) / 1000.0) /
+                                       (1024.0 * 1024.0);
+                        s.sf_bus_last_f  = f;
+                        s.sf_bus_last_ms = now_bus;
+
                         const unsigned sc_now = mgpu::adapter::game_swapchain_events();
                         const unsigned sc_new = (sc_now > s.sf_sc_last) ? (sc_now - s.sf_sc_last) : 0u;
                         s.sf_sc_last = sc_now;
 
-                        char vm[1500];
+                        char bus_s[64];
+                        if (bus_mb_s < 0.0) snprintf(bus_s, sizeof bus_s, "(first window)");
+                        else                snprintf(bus_s, sizeof bus_s, "%.0f MB/s", bus_mb_s);
+
+                        char vm[1700];
                         snprintf(vm, sizeof vm,
-                            "[MGPU][R182] GAME ADAPTER f=%llu | budget=%lluMB usage=%lluMB "
+                            "[MGPU][R182] GAME ADAPTER f=%llu | %s budget=%lluMB usage=%lluMB "
                             "headroom=%lluMB (low water %s) | OURS: colour=%lluB depth=%lluB "
                             "mvec=%lluB seal=%u -> slot=%lluB x ring %u = %lluMB, which is "
-                            "%.1f%% of budget | [R184] game swapchain events=%u (+%u this "
+                            "%.1f%% of budget | [R187] bus demand %s | [R184] game swapchain events=%u (+%u this "
                             "window). HOW TO READ IT. usage is THIS PROCESS on THIS adapter, "
                             "not the whole card - the same caveat the [T2] startup line "
                             "carries. The number that travels between rigs is the low water "
@@ -16986,8 +17185,20 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                             "does not scale with pixels. +N swapchain events in a window on a "
                             "title that is not changing resolution is the transition shape - "
                             "and two captures that died within 100 ms of one are why this "
-                            "field exists.",
-                            f, vb >> 20, vu >> 20,
+                            "field exists. R187 is slot bytes times frames over "
+                            "wall clock - what WE chose to move, not what the link "
+                            "can carry. READ THE SHAPE: demand that PLATEAUS while "
+                            "the frame rate falls is bus-limited; demand that falls "
+                            "with the frame rate is not. At 4K the slot is 66MB, so "
+                            "100 fps is about 6.6 GB/s and a second card on four "
+                            "lanes is in that neighbourhood.",
+                            f,
+                            // R182. A sensor that returns nothing has to say so
+                            // rather than print a convincing zero.
+                            (vb == 0ull) ? "NO ADAPTER QUERY (the game adapter was not "
+                                           "captured at selection - this is our defect, not "
+                                           "a card with no memory):" : "",
+                            vb >> 20, vu >> 20,
                             (vb > vu) ? ((vb - vu) >> 20) : 0ull,
                             (vl == ~0ull) ? "not sampled yet" : "see MB below",
                             (unsigned long long)s.payload_bytes,
@@ -16998,6 +17209,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                             (unsigned)stream_state::RING,
                             ours >> 20,
                             (vb != 0ull) ? (100.0 * (double)ours / (double)vb) : 0.0,
+                            bus_s,
                             sc_now, sc_new);
                         mgpu::diag::info(vm);
 
