@@ -322,6 +322,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             // instead of being two different pieces of code.
             mgpu::calibrator::set_mvec_hook(&mgpu_mvec_transport_hook);
             mgpu::calibrator::set_eval_copy(mgpu::probe::eval_copy_mode());
+            mgpu::calibrator::set_sf_path(mgpu::probe::sf_path_mode());   // R180
         }
     }
 }

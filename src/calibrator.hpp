@@ -262,6 +262,21 @@ void set_eval_copy(int mode);
 int eval_copy_mode();
 
 void set_jitter_mode(int mode);
+
+// ---- R180: the scene-latch repair, and its key ----
+//
+// -2 absent (AUTO), 0 explicitly off, 1 on. See the definition for why absent
+// and zero are different.
+void set_sf_path(int mode);
+
+// How many scene features the latch set had no room for. NON-ZERO MEANS THE
+// VELOCITY LANE IS DEAD for the rest of this run on every feature after the
+// fourth. The detector runs whatever the key says; only the repair is gated.
+unsigned long long latch_refused();
+
+// True once, on the first call after an overflow is seen with the key ABSENT.
+// The caller writes the key and logs it; this only decides when.
+bool sf_path_should_promote();
 void apply_jitter_offset(void *nr_params, float mvec_scale_x, float mvec_scale_y);
 
 } // namespace calibrator

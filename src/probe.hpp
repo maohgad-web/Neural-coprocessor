@@ -121,6 +121,9 @@ int jitter_mode();
 // the DLSS evaluate call instead - once per frame, guaranteed.
 int eval_copy_mode();
 
+// R180/R182. The Starfield path key: -2 absent (AUTO), 0 off, 1 on.
+int sf_path_mode();
+
 // Called from on_reshade_finish_effects on the GAME runtime only. Ticks the
 // frame counter and dumps the table every ProbeLogSeconds. Doing the dump here
 // rather than from a callback keeps every logging call off the hot path.

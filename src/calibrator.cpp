@@ -161,6 +161,19 @@ std::atomic<unsigned long long> g_evals{0};        // evaluates intercepted
 std::atomic<unsigned long long> g_captures{0};     // evaluates we read
 std::atomic<unsigned long long> g_creates{0};      // CreateFeature seen
 std::atomic<unsigned long long> g_releases{0};     // R183: ReleaseFeature seen
+std::atomic<unsigned long long> g_unlatches{0};    // R180: latched handles freed
+std::atomic<unsigned long long> g_relatches{0};    // R180: freed slots reused
+std::atomic<unsigned long long> g_latch_refused{0};// R180: set full, handle dropped
+// R180. The key's three states, and ABSENT is not the same as OFF.
+//   -2  absent   AUTO: the detector runs, the repair does not, and the first
+//                 overflow promotes the key to 1 for the next launch.
+//    0  explicit OFF: the operator said no. Never promoted, never written.
+//    1  ON       the repair is live.
+// Same shape as DcompOverlay's -2/-1/0/1, for the same reason: a key nobody
+// set and a key somebody set to zero are different facts and the second one
+// has to be respected.
+std::atomic<int> g_sf_path{-2};
+std::atomic<bool> g_sf_promoted{false};
 std::atomic<unsigned long long> g_slots{0};        // IAT slots patched
 std::atomic<unsigned long long> g_modules{0};      // modules walked
 std::atomic<unsigned long long> g_cost_ns{0};      // total ns inside capture
@@ -236,12 +249,49 @@ bool is_scene_feature(unsigned int idv)
 
 // Latch, if it is not already in the set. Create is rare - a handful of calls
 // per launch - so a linear scan is the right shape and no lock is needed.
+// ---- R180: THE SET HAS TO FORGET, AND UNTIL NOW IT COULD NOT ----
+//
+// MEASURED on Starfield, 2026-09-20, operator's rig:
+//
+//   creates=1   eval-copies=0      eval-skips=0
+//   creates=5   eval-copies=1157   eval-skips=49      <- copies freeze here
+//   creates=12  eval-copies=1157   eval-skips=4937    <- and never resume
+//
+// SCENE_FEATURE_SLOTS is 4. This function was append-only: four handles went
+// in, `n >= SCENE_FEATURE_SLOTS` refused the fifth SILENTLY, and from that
+// frame on the live handle was never in the set. Every evaluate failed the
+// test and was skipped - correctly, by a guard doing exactly what it was
+// written to do, against a set that could no longer be updated.
+//
+// The title was not leaking: releases tracked creates (live=0 or 1 all run),
+// so the four handles held here were all DEAD. We were comparing the live
+// feature against four corpses.
+//
+// WHY IT DOES NOT HAPPEN ON EVERY RIG. If the allocator hands back an address
+// already in the set, the early return above finds it and no slot is consumed.
+// The reporter's machine survived 86 creates with 122 skips; this one died at
+// the fifth. Same code, different allocator behaviour - which is why this read
+// as title-specific for two days and is not.
+//
+// THE REPAIR IS TO FREE THE SLOT ON RELEASE, not to grow the array. A bigger
+// array postpones the same failure and hides it behind a longer session.
 void latch_scene_handle(unsigned long long hv)
 {
+    if (hv == 0ull) return;                       // 0 is the free marker
     const unsigned int n = g_scene_handle_n.load(std::memory_order_relaxed);
     for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
         if (g_scene_handles[i].load(std::memory_order_relaxed) == hv) return;
-    if (n >= SCENE_FEATURE_SLOTS) return;
+    // R180. Reuse a slot a release has freed before considering the set full.
+    // BEHIND THE KEY: with it off this loop finds nothing, because nothing ever
+    // frees a slot, and the function behaves exactly as it did in 0.2.4.
+    for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
+        if (g_scene_handles[i].load(std::memory_order_relaxed) == 0ull)
+        {
+            g_scene_handles[i].store(hv, std::memory_order_relaxed);
+            g_relatches.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    if (n >= SCENE_FEATURE_SLOTS) { g_latch_refused.fetch_add(1, std::memory_order_relaxed); return; }
     g_scene_handles[n].store(hv, std::memory_order_relaxed);
     // RELEASE, paired with the acquire in is_latched_scene_handle: the handle
     // has to be visible before the count that makes it readable. Writers are
@@ -253,10 +303,34 @@ void latch_scene_handle(unsigned long long hv)
 // The evaluate-side test. Replaces a single == against g_sr_handle.
 bool is_latched_scene_handle(unsigned long long hv)
 {
+    if (hv == 0ull) return false;                 // R180: never match the free marker
     const unsigned int n = g_scene_handle_n.load(std::memory_order_acquire);
     for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
         if (g_scene_handles[i].load(std::memory_order_relaxed) == hv) return true;
     return false;
+}
+
+// R180. Free the slot when the GAME releases the feature. Called from
+// hook_release, on the game's own thread, before the real release runs.
+//
+// A slot is zeroed rather than compacted. Compacting would have to move a
+// handle and shrink the count while is_latched_scene_handle may be walking the
+// array, and the failure mode of that race is the bad one: a reader matching a
+// stale entry and COPYING from a feature that has been released. Zeroing is a
+// single 64-bit store, the reader rejects 0 explicitly, and a lost race costs
+// one skipped evaluate - which the counters already report.
+void unlatch_scene_handle(unsigned long long hv)
+{
+    if (g_sf_path.load(std::memory_order_relaxed) != 1) return;   // R180: gated
+    if (hv == 0ull) return;
+    const unsigned int n = g_scene_handle_n.load(std::memory_order_acquire);
+    for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
+        if (g_scene_handles[i].load(std::memory_order_relaxed) == hv)
+        {
+            g_scene_handles[i].store(0ull, std::memory_order_relaxed);
+            g_unlatches.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
 }
 
 // The create flags, latched at CreateFeature. They are a CREATE-time fact, so
@@ -566,6 +640,11 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
 NVSDK_NGX_Result NVSDK_CONV hook_release(NVSDK_NGX_Handle *h)
 {
     g_releases.fetch_add(1, std::memory_order_relaxed);
+
+    // R180. BEFORE the real release, while the handle value is still the one
+    // the evaluate filter is comparing against. Afterwards the pointer may be
+    // reused by the next create and unlatching it would free the wrong slot.
+    unlatch_scene_handle((unsigned long long)(uintptr_t)h);
 
     if (g_real_release == nullptr)
     {
@@ -1361,6 +1440,29 @@ void set_jitter_mode(int mode)
     g_jmode.store(mode, std::memory_order_relaxed);
 }
 
+// ---- R180 ----
+void set_sf_path(int mode)
+{
+    g_sf_path.store(mode, std::memory_order_relaxed);
+}
+
+unsigned long long latch_refused()
+{
+    return g_latch_refused.load(std::memory_order_relaxed);
+}
+
+bool sf_path_should_promote()
+{
+    // Only from ABSENT. An explicit 0 is the operator's answer and is not
+    // second-guessed by a heuristic; an explicit 1 has nothing to promote.
+    if (g_sf_path.load(std::memory_order_relaxed) != -2) return false;
+    if (g_latch_refused.load(std::memory_order_relaxed) == 0ull) return false;
+    bool expected = false;
+    // Once per process, whoever asks first.
+    return g_sf_promoted.compare_exchange_strong(expected, true,
+                                                 std::memory_order_relaxed);
+}
+
 void apply_jitter_offset(void *nr_params, float sx, float sy)
 {
     const int m = g_jmode.load(std::memory_order_relaxed);
@@ -1662,6 +1764,7 @@ void log_summary()
     int w = std::snprintf(line, sizeof line,
         "[MGPU][R101] CALIBRATOR mode=%d rung=%d site=%s | slots=%llu data-slots=%llu modules=%llu gpa-calls=%llu "
         "| resolved=%llu creates=%llu releases=%llu live=%lld sr-handle=%s "
+        "| latch: freed=%llu reused=%llu REFUSED=%llu "
         "| evaluates=%llu captured=%llu "
         "| cost %.0f ns/frame | eval-copies=%llu eval-skips=%llu. "
         "R183: LIVE IS CREATES MINUS RELEASES and it is the field to read. A live "
@@ -1671,7 +1774,7 @@ void log_summary()
         "climbs means recreation is matched and the pressure is somewhere else. A "
         "NEGATIVE live means we are missing creates rather than that releases "
         "exceeded them: some route resolved ReleaseFeature past our hooks, and the "
-        "number is then a floor, not a count. ",
+        "number is then a floor, not a count. R180: REFUSED is the one that must stay at zero. It counts scene features the latch set had no room for, and every one of them is a feature whose evaluates are skipped for the rest of the run. Four slots, freed on release since 0.2.5-dev; before that the set was append-only and a fifth create killed the velocity lane permanently. ",
         g_mode.load(std::memory_order_relaxed),
         g_rung.load(std::memory_order_relaxed), g_site,
         g_slots.load(std::memory_order_relaxed),
@@ -1684,6 +1787,9 @@ void log_summary()
         (long long)g_creates.load(std::memory_order_relaxed) -
             (long long)g_releases.load(std::memory_order_relaxed),
         g_handle_known.load(std::memory_order_relaxed) ? "known" : "UNFILTERED",
+        g_unlatches.load(std::memory_order_relaxed),
+        g_relatches.load(std::memory_order_relaxed),
+        g_latch_refused.load(std::memory_order_relaxed),
         g_evals.load(std::memory_order_relaxed),
         g_captures.load(std::memory_order_relaxed),
         per_frame, g_eval_copies.load(std::memory_order_relaxed),

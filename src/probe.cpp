@@ -232,6 +232,8 @@ std::atomic<int> g_calib_rung{0};
 // changes nothing about what is patched.
 std::atomic<int> g_calib_probe{0};
 
+std::atomic<int> g_sfpath{-2};   // R180/R182: see the read below
+
 // SLT1. The Streamline tag tap's mode, from mgpu.ini's SLTags= key. Parsed
 // here with every other key, and OFF by default: this one installs an import
 // hook, and an instrument that hooks must be asked for.
@@ -2931,6 +2933,12 @@ int eval_copy_mode()
     return g_evalcopy.load(std::memory_order_relaxed);
 }
 
+// R180/R182. -2 absent (AUTO), 0 explicitly off, 1 on.
+int sf_path_mode()
+{
+    return g_sfpath.load(std::memory_order_relaxed);
+}
+
 // ---- R103: THE CALIBRATOR WINS ----
 //
 // MEASURED, Dragon Sword: EVICTIONS: 52. The game cycles a POOL of velocity
@@ -3026,6 +3034,16 @@ mode mode_from_ini()
         int sv = 0;
         if (sk != nullptr) sv = atoi(sk);
         g_sltags.store((sv < 0 || sv > 2) ? 0 : sv, std::memory_order_relaxed);
+    }
+    {
+        // R180/R182. SFPath: the Starfield path. ABSENT IS NOT OFF.
+        //   -2 absent  AUTO - detector on, repair off, promoted on overflow
+        //    0 off     the operator said no; never promoted
+        //    1 on
+        const char *fk = mgpu::config::find(buf, strlen(buf), "SFPath");
+        int fv = -2;
+        if (fk != nullptr) fv = (atoi(fk) == 1) ? 1 : 0;
+        g_sfpath.store(fv, std::memory_order_relaxed);
     }
     {
         // R104. Two keys because the sign is the ONE thing worth settling on

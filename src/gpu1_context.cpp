@@ -8637,6 +8637,20 @@ namespace
         bool mvec_stall_said = false;
         // R169b. CONSECUTIVE silent report windows. See the gate below.
         unsigned mvec_silent_windows = 0;
+
+        // ---- R182 / R184: the Starfield path's sensors ----
+        //
+        // Sampled on the BRIDGE thread with s.cs RELEASED and read back here,
+        // because QueryVideoMemoryInfo calls into DXGI and DEFECT E is the rule:
+        // nothing that can block may be done while holding s.cs. The R167 round
+        // already paid for breaking it once.
+        std::atomic<unsigned long long> vm_budget{0};
+        std::atomic<unsigned long long> vm_usage{0};
+        std::atomic<unsigned long long> vm_headroom_low{~0ull};
+        std::atomic<unsigned long long> vm_sampled_ms{0};
+        std::atomic<int> sf_path{-2};       // R180/R182: -2 absent, 0 off, 1 on.
+                                            // Read before the lock in stream_poll.
+        unsigned sf_sc_last = 0;            // last game-swapchain count seen
         unsigned mvec_rej_said_w = 0, mvec_rej_said_h = 0, mvec_rej_said_fmt = 0;
 
         // ---- R170: the producer pauses while a swapchain event is in flight ----
@@ -14042,6 +14056,23 @@ void stream_request()
             s.auto_budget_ms  = 1000.0 / (double)s.auto_target_fps;
             s.sr_preset    = ini_read_sr_int("SRPreset", 0, 0, 20);
             s.sr_quality   = ini_read_sr_int("SRQuality", 1, 0, 5);
+            // R182/R183/R184. THE STARFIELD PATH, AND THE WHOLE OF ITS BLAST
+            // RADIUS. Absent or 0 and none of the code behind it executes, so
+            // every other title is byte-identical to 0.2.4. It is a SENSOR
+            // path: with it on, a title that never recreates anything still
+            // reports occupancy and footprint, and one that does also reports
+            // what it recreated and when. It changes no behaviour.
+            // R180/R182. Three states, and ABSENT IS NOT OFF: -2 absent
+            // (AUTO - sensors off, detector on, key promoted on the first
+            // overflow), 0 explicitly off and never promoted, 1 on. Read from
+            // probe rather than parsed here so one file owns the spelling.
+            // dflt -2 with range [0,1]: an absent key returns the default and
+            // an explicit 0 or 1 passes the check, so the three states fall out
+            // of the existing reader with no new include in this file. The
+            // calibrator reads the same key at INSTALL, which is earlier than
+            // this - two readers because they need it at two different times.
+            s.sf_path.store(ini_read_sr_int("SFPath", -2, 0, 1),
+                            std::memory_order_relaxed);
             s.sr_scale_pct = (unsigned)ini_read_sr_int("SRScale", 0, 0, 99);
 
             if (s.sr_on != 0u && s.passes != 1u)
@@ -14284,7 +14315,11 @@ void stream_request()
 
     snprintf(l, sizeof l,
              "[MGPU][P4.0] stream REQUESTED - ring depth %u, %s, fault=\"%s\", "
-             "neural=%s, profile=%s, present=%s, passes=%u, window=%s%s. "
+             "neural=%s, profile=%s, present=%s, passes=%u, window=%s%s, SFPath=%u. "
+             "R175: SFPath IS ECHOED HERE BECAUSE A KEY THAT CHANGES WHAT THE LOG "
+             "CONTAINS MUST BE READABLE FROM THE LOG. SwapGuard was not, and one "
+             "whole A/B pair was read as a pass when the arm had simply never seen "
+             "the event. Zero detections with the key at 0 means the path never ran. "
              "Every game frame from the next one is sealed and transited until the bound is "
              "reached, then a summary is printed. Stay in gameplay: a stream of menu frames "
              "measures identity and ordering correctly and tells you nothing about anything "
@@ -14304,7 +14339,7 @@ void stream_request()
              (s.window_mode == 0) ? "crop (1280x720, the P5 behaviour)"
                                   : ((s.window_mode == 1) ? "match (borderless at the source size)"
                                                           : "fit (borderless full screen)"),
-             subr);
+             subr, s.sf_path.load(std::memory_order_relaxed));
     mgpu::diag::info(l);
 }
 
@@ -15530,12 +15565,46 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 
     // ---- R170: SwapGuard. OFF BY DEFAULT, and it is a BEHAVIOUR change ----
     //
-    // MEASURED on Starfield: the title destroys and recreates its swapchain
-    // AND its D3D12 command queue on every inventory transition, and ReShade
-    // tears down and rebuilds its effect runtime inside that window. The
-    // reporter's own section 8 asks whether our per-frame callbacks are safe
-    // across that, and the honest answer is that nothing has ever stopped them
-    // running through it.
+    // RETRACTION WITHDRAWN 2026-09-20 (late). The sentence below is CORRECT for
+    // the sessions it was measured on, and the retraction that stood here for
+    // part of one day was itself the error - written after reading three long
+    // logs and missing two short ones. Both readings are kept so the next
+    // person sees the shape of the mistake rather than only its repair.
+    //
+    //   "MEASURED on Starfield: the title destroys and recreates its swapchain
+    //    AND its D3D12 command queue on every inventory transition."
+    //
+    // WHAT IS ACTUALLY TRUE, from every Starfield log in the folder rather than
+    // the newest three:
+    //
+    //   2m05 session, 0.2.3   11 events, 4 mid-session pairs   immediate inventory freeze
+    //   2m13 session, 0.2.3    9 events, 3 mid-session pairs   immediate inventory freeze
+    //   36m session,  0.2.3    5 events, startup only          no freeze, slow decay
+    //   42m session,  0.2.4    5 events, startup only          no freeze, slow decay
+    //   34m session,  0.2.4    5 events, startup only          froze in a different UI
+    //
+    // Both short sessions die within 100 ms of a swapchain pair, on the same
+    // last line - ReShade recompiling mgpu_depth_tap after rebuilding its
+    // effect runtime. So the title DOES recreate its swapchain on transitions,
+    // in the sessions that fail that way, and does not in the ones that do not.
+    //
+    // THE CONSEQUENCE FOR THIS BLOCK IS UNCHANGED AND IT IS NOT ABOUT THE
+    // PREMISE. Run 2 armed SwapGuard on a session that never presented the
+    // event, so the A/B tested nothing. Zero R170 lines means the clock never
+    // moved, not that the guard worked. Read it that way.
+    //
+    // WHAT THE TITLE ACTUALLY CHURNS IS THE NGX FEATURE, NOT THE SWAPCHAIN.
+    // 86 CreateFeature calls in run 1 against Cyberpunk's 1, with 92% of the
+    // [R139] depth-pointer changes landing within ten seconds of one. We
+    // already hook that call - R134, and the calibrator's own creates counter -
+    // so a guard keyed on it would be watching the event that happens rather
+    // than the one this block waits for.
+    //
+    // The consequence for SwapGuard is not that it misbehaves. It is that on
+    // this title it CANNOT FIRE, which is exactly what run 2 showed: the A/B
+    // ran with the guard inert in both arms and tested nothing. Do not read
+    // "zero R170 lines" as a pass until the clock it waits on is one that
+    // moves on the title under test.
     //
     // At SwapGuard=1 the producer stands still while a GAME swapchain event is
     // recent: no seal, no colour copy, no depth copy, no fence signal. It is
@@ -16881,6 +16950,102 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         (mtot != 0) ? (100.0 * (double)s.mvec_seen_valid / (double)mtot) : 0.0);
                     mgpu::diag::info(ml);
 
+                    // ---- R182 / R184: OCCUPANCY, FOOTPRINT, AND RECREATION ----
+                    //
+                    // Behind SFPath. Reads atomics the bridge thread filled
+                    // with s.cs released; nothing here calls DXGI.
+                    //
+                    // PER REGION, NOT ONE TOTAL. The footprint does not scale
+                    // with pixels: measured 1440p against 4K, colour goes 2.25x
+                    // and the slot only 1.84x, because the velocity region sits
+                    // at display extent while colour may not. A single total
+                    // taken at 1440p does not project to 4K and this line is
+                    // written so the projection is arithmetic.
+                    if (s.sf_path.load(std::memory_order_relaxed) == 1)
+                    {
+                        const unsigned long long vb = s.vm_budget.load(std::memory_order_relaxed);
+                        const unsigned long long vu = s.vm_usage.load(std::memory_order_relaxed);
+                        const unsigned long long vl = s.vm_headroom_low.load(std::memory_order_relaxed);
+                        const unsigned long long ours = (unsigned long long)s.slot_bytes *
+                                                        (unsigned long long)stream_state::RING;
+                        const unsigned sc_now = mgpu::adapter::game_swapchain_events();
+                        const unsigned sc_new = (sc_now > s.sf_sc_last) ? (sc_now - s.sf_sc_last) : 0u;
+                        s.sf_sc_last = sc_now;
+
+                        char vm[1500];
+                        snprintf(vm, sizeof vm,
+                            "[MGPU][R182] GAME ADAPTER f=%llu | budget=%lluMB usage=%lluMB "
+                            "headroom=%lluMB (low water %s) | OURS: colour=%lluB depth=%lluB "
+                            "mvec=%lluB seal=%u -> slot=%lluB x ring %u = %lluMB, which is "
+                            "%.1f%% of budget | [R184] game swapchain events=%u (+%u this "
+                            "window). HOW TO READ IT. usage is THIS PROCESS on THIS adapter, "
+                            "not the whole card - the same caveat the [T2] startup line "
+                            "carries. The number that travels between rigs is the low water "
+                            "mark: it survives a skim and it is what a 1440p run can say "
+                            "about a 4K one. OURS is broken out per region because the total "
+                            "does not scale with pixels. +N swapchain events in a window on a "
+                            "title that is not changing resolution is the transition shape - "
+                            "and two captures that died within 100 ms of one are why this "
+                            "field exists.",
+                            f, vb >> 20, vu >> 20,
+                            (vb > vu) ? ((vb - vu) >> 20) : 0ull,
+                            (vl == ~0ull) ? "not sampled yet" : "see MB below",
+                            (unsigned long long)s.payload_bytes,
+                            (unsigned long long)s.depth_bytes,
+                            (unsigned long long)s.mvec_bytes2,
+                            (unsigned)SEAL_STRIDE,
+                            (unsigned long long)s.slot_bytes,
+                            (unsigned)stream_state::RING,
+                            ours >> 20,
+                            (vb != 0ull) ? (100.0 * (double)ours / (double)vb) : 0.0,
+                            sc_now, sc_new);
+                        mgpu::diag::info(vm);
+
+                        if (vl != ~0ull)
+                        {
+                            char vl2[220];
+                            snprintf(vl2, sizeof vl2,
+                                "[MGPU][R182] headroom low water this run: %lluMB.", vl >> 20);
+                            mgpu::diag::info(vl2);
+                        }
+                    }
+
+                    // ---- R180: PROMOTE THE KEY WHEN THE ENGINE ASKS FOR IT ----
+                    //
+                    // NOT behind SFPath. The DETECTOR has to run everywhere or
+                    // the only titles that ever get the repair are the ones we
+                    // already knew about, and this whole path exists because we
+                    // found the fourth-slot overflow by accident on one rig.
+                    //
+                    // Promotes ONLY from absent. An explicit 0 is the operator's
+                    // answer and a heuristic does not overrule it.
+                    //
+                    // The key is read at arm, so this changes nothing about the
+                    // session that detected it - the same contract [P7.2] states
+                    // for ArmCrashed. One session is lost and the next one is
+                    // repaired, which is the honest trade for not shipping a
+                    // behaviour change to titles that never needed it.
+                    if (mgpu::calibrator::sf_path_should_promote())
+                    {
+                        const bool wrote = mgpu::gpu1::ui_ini_write("SFPath", 1);
+                        char pr[1000];
+                        snprintf(pr, sizeof pr,
+                            "[MGPU][R180] SCENE-LATCH OVERFLOW on this title: %llu scene "
+                            "feature(s) could not be latched because the set holds four and "
+                            "nothing freed a slot. EVERY EVALUATE AFTER THE FOURTH HANDLE IS "
+                            "BEING SKIPPED, so the velocity lane is dead for the rest of this "
+                            "run and the model is deriving motion from colour. mgpu.ini "
+                            "SFPath=1 %s - it is read at ARM, so restart the game and this "
+                            "title repairs itself. If you do not want that, write SFPath=0 by "
+                            "hand and it will never be promoted again. THIS IS OUR DEFECT, not "
+                            "the engine's: the title recreates its scene feature more than four "
+                            "times with a fresh handle each time, which is unusual and is not "
+                            "wrong.",
+                            mgpu::calibrator::latch_refused(),
+                            wrote ? "has been written" : "COULD NOT BE WRITTEN (read-only?)");
+                        mgpu::diag::warn(pr);
+                    }
+
                     // ---- R169: say WHY the lane went quiet, with dimensions ----
                     //
                     // Two different silences, and they have different causes,
@@ -17139,6 +17304,34 @@ void stream_poll()
     // over the edge. THE ARCHITECTURE'S CLAIM - that neural work is free to the
     // game - was true of the design and false of this build.
     //
+    // ---- R182: SAMPLE BEFORE THE LOCK, ALWAYS ----
+    //
+    // This is the only place the game adapter's occupancy can be read without
+    // holding s.cs, and holding s.cs across a DXGI call is DEFECT E. Once a
+    // second is enough for a curve that moves over minutes, and it costs one
+    // call in 24 to 60.
+    if (s.sf_path.load(std::memory_order_relaxed) == 1)
+    {
+        const unsigned long long now_ms = GetTickCount64();
+        if (now_ms - s.vm_sampled_ms.load(std::memory_order_relaxed) >= 1000ull)
+        {
+            unsigned long long b = 0, u = 0;
+            if (mgpu::adapter::game_adapter_vmem(b, u))
+            {
+                s.vm_budget.store(b, std::memory_order_relaxed);
+                s.vm_usage.store(u, std::memory_order_relaxed);
+                const unsigned long long head = (b > u) ? (b - u) : 0ull;
+                unsigned long long lo = s.vm_headroom_low.load(std::memory_order_relaxed);
+                while (head < lo &&
+                       !s.vm_headroom_low.compare_exchange_weak(lo, head,
+                                                                std::memory_order_relaxed))
+                {
+                }
+            }
+            s.vm_sampled_ms.store(now_ms, std::memory_order_relaxed);
+        }
+    }
+
     // unique_lock, not lock_guard, so the wait can happen with it released.
     std::unique_lock<std::mutex> lk(s.cs);
     // R168. Bridge-side scope timer. See the sfdiag block above. This is the
