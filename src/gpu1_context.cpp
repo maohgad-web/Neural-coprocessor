@@ -12417,7 +12417,8 @@ namespace dispcfg
     //
     // ONE SHOT, at the same site as R158. No hot path, no new API, no new
     // dependency: user32 by GetProcAddress exactly as the two functions below.
-    void report_topology(unsigned long long game_luid_low, unsigned long long bridge_luid_low)
+    void report_topology(unsigned long long game_luid_low, unsigned long long bridge_luid_low,
+                         unsigned dxgi_game_outputs, unsigned dxgi_bridge_outputs)
     {
         HMODULE u = GetModuleHandleW(L"user32.dll");
         pfn_sizes p_sizes = (u != nullptr)
@@ -12466,9 +12467,30 @@ namespace dispcfg
         }
 
         w += snprintf(line + w, sizeof line - w,
-            " | driven by: GAME card %u, BRIDGE card %u, other/unmatched %u | mode=%s",
+            " | CCD adapterId matched: GAME %u, BRIDGE %u, neither %u | mode=%s",
             on_game, on_bridge, on_other,
             (clones != 0) ? "DUPLICATE (one source, more than one target)" : "extended");
+
+        // MEASURED 2026-09-20 and this is why the line no longer says "driven
+        // by". On a two-identical-GPU rig, DXGI reported outputs=1 on the GAME
+        // adapter and outputs=0 on the bridge, while the CCD adapterId of the
+        // single active path matched the BRIDGE LUID. The first version of
+        // this line read that as "the display is on the bridge card", which is
+        // the opposite of what DXGI says and of what [P7.10] reports.
+        //
+        // The two namespaces are not guaranteed to agree, which this function's
+        // own comment already said - and then it asserted an answer anyway.
+        // So: print BOTH and name the disagreement. DXGI's output count is the
+        // one the rest of this add-on already acts on.
+        w += snprintf(line + w, sizeof line - w,
+            " | DXGI outputs: GAME %u, BRIDGE %u%s",
+            dxgi_game_outputs, dxgi_bridge_outputs,
+            ((on_game != 0) != (dxgi_game_outputs != 0) ||
+             (on_bridge != 0) != (dxgi_bridge_outputs != 0))
+                ? "  <- CCD AND DXGI DISAGREE. Trust the DXGI count: it is what "
+                  "[P7.10] and the window placement already act on. A mismatch "
+                  "here is a LUID-namespace difference, not a second display."
+                : "");
 
         // The CCD adapterId is a LUID but it is the DISPLAY adapter's, which is
         // not guaranteed to equal the DXGI LUID on every driver. "other" being
@@ -12764,7 +12786,8 @@ bool dcomp_explicit_off_single_display()
             mgpu::adapter::get_selection(sr);
             dispcfg::report_topology(
                 (unsigned long long)sr.game_luid.LowPart,
-                (unsigned long long)sr.selected_luid.LowPart);
+                (unsigned long long)sr.selected_luid.LowPart,
+                sr.game_outputs, sr.selected_outputs);
             report_resident_addons();
         }
     }

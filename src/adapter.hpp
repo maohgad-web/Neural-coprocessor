@@ -57,6 +57,11 @@ namespace mgpu::adapter
         LUID selected_luid{};
         UINT selected_index = 0;          // log only - never used for binding
         UINT selected_outputs = 0;
+        // R185. The GAME adapter's DXGI output count, beside the selected
+        // one. Needed because the CCD display namespace and the DXGI LUID
+        // namespace do not have to agree, and a topology line that trusts
+        // only one of them can say the display is on the wrong card.
+        UINT game_outputs = 0;
         char selected_desc[128]{};
         const char *rule = "none";
         // AddRef'd IDXGIAdapter1 for T3's D3D12CreateDevice; released by

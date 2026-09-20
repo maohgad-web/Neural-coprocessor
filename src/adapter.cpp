@@ -493,6 +493,11 @@ namespace
             S.result.selected_luid = e.luid;
             S.result.selected_index = static_cast<UINT>(sel);
             S.result.selected_outputs = e.outputs;
+            // R185. Same table, the game's row this time.
+            S.result.game_outputs = 0;
+            for (size_t gj = 0; gj < S.table.size(); ++gj)
+                if (luid_eq(S.table[gj].luid, game))
+                { S.result.game_outputs = S.table[gj].outputs; break; }
             strncpy(S.result.selected_desc, e.desc, sizeof S.result.selected_desc - 1);
             S.result.selected_desc[sizeof S.result.selected_desc - 1] = '\0';
             S.result.rule = rule;

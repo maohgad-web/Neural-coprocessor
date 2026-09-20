@@ -2593,8 +2593,59 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
         mgpu::calibrator::table ct{};
         const bool have_tbl = mgpu::calibrator::read(ct);
         const unsigned long long tbl = have_tbl ? ct.depth : 0ull;
-        if (tbl != said_tbl || depth_h != said_tap)
+        const bool changed = (tbl != said_tbl || depth_h != said_tap);
+
+        // ---- R188: RATE LIMIT. MEASURED 2026-09-20 ----
+        //
+        // "Said once, and again whenever either side changes" was written for a
+        // title that changes it rarely. Starfield changes the declared depth
+        // pointer about 27 TIMES A SECOND: one 11-minute capture is 17,703
+        // R139 lines out of 20,699 - 86% of the log is this one line. On a 4K
+        // rig with more transitions it is worse, and a log a tester cannot
+        // read is a log that does not come back.
+        //
+        // The full line still fires for the FIRST FEW changes, because the
+        // first ones are the informative ones - they say whether the tap and
+        // the engine's declared depth are the same resource at all. After that
+        // it collapses to a count, carried on the periodic line below, which
+        // is the same information at 1% of the volume.
+        //
+        // NOT a filter on the CONDITION - the comparison is unchanged and
+        // every change is still counted. Only the printing is limited.
+        static unsigned long long r139_changes = 0ull;
+        static unsigned long long r139_said = 0ull;
+        static unsigned long long r139_last_report_ms = 0ull;
+        const unsigned long long R139_FULL_LINES = 6ull;
+        const unsigned long long R139_REPORT_MS  = 30000ull;
+
+        if (changed) ++r139_changes;
+
+        if (changed && r139_said >= R139_FULL_LINES)
         {
+            said_tbl = tbl; said_tap = depth_h;
+            const unsigned long long now139 = GetTickCount64();
+            if (r139_last_report_ms == 0ull) r139_last_report_ms = now139;
+            else if (now139 - r139_last_report_ms >= R139_REPORT_MS)
+            {
+                r139_last_report_ms = now139;
+                char p139[700];
+                snprintf(p139, sizeof p139,
+                         "[MGPU][R188] DEPTH SOURCE CHURN: the declared depth pointer has changed "
+                         "%llu time(s) this run - currently tap 0x%llx | table 0x%llx | SAME: %s. "
+                         "The full [R139] line is printed for the first %llu changes and then "
+                         "collapsed to this one, because on a title that rotates depth buffers "
+                         "every frame it was 86%% of the log. THE COUNT IS COMPLETE; only the "
+                         "printing is limited. A count in the thousands is NORMAL on such a "
+                         "title and is not a fault - what matters is the SAME answer above.",
+                         r139_changes, depth_h, tbl,
+                         (have_tbl && tbl != 0ull && tbl == depth_h) ? "YES" : "NO",
+                         R139_FULL_LINES);
+                mgpu::diag::info(p139);
+            }
+        }
+        else if (changed)
+        {
+            ++r139_said;
             said_tbl = tbl; said_tap = depth_h;
             char d139[1400];
             snprintf(d139, sizeof d139,
