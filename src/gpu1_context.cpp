@@ -12651,6 +12651,13 @@ static int ini_read_dcomp_setting()
 // ask what the user SAID rather than what the mode resolved to.
 static std::atomic<int> g_dcomp_setting{-3};   // -3 = not read yet
 
+// R186, defined further down. DECLARED HERE, AT NAMESPACE SCOPE, AND NOT INSIDE
+// THE CALLER: a function declaration written in a block declares the name in
+// the GLOBAL namespace, not in the enclosing one, so the call resolved to
+// ::report_resident_addons and the definition is mgpu::gpu1::report_resident_addons.
+// That is LNK2019, and the linker's own hint named both symbols side by side.
+void report_resident_addons();
+
 bool dcomp_overlay_mode()
 {
     static std::atomic<int> latched{-1};
@@ -12743,10 +12750,6 @@ bool dcomp_explicit_off_single_display()
                                                                          : "1 (on)"))),
              paths);
     mgpu::diag::info(r158);
-
-    // R186 is defined below this function; one declaration rather than moving
-    // a block of text around it.
-    void report_resident_addons();
 
     // ---- R185 / R186: the two lines a confusing report needs, said once ----
     //
