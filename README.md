@@ -16,17 +16,17 @@ Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It 
 
 **This is a ReShade add-on.** It is called **MGPU Bridge**, it is a `.addon64` file that ReShade loads into a D3D12 game, and every log line it writes is prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a replacement for anything, and it needs an **add-on-enabled** ReShade build to load at all. There is no game modification of any kind: the add-on reads each finished frame and does its work elsewhere.
 
-### Which card should do which job
+### Which card should run DLSS 5
 
-**This is not lossless scaling, and the second card is not free.** There, the second GPU generates frames and the cost barely touches the game. Here the second card runs a stage that costs real tensor time and scales with output resolution - the render card gets faster precisely because that work left it, and the second card has to be able to afford what it picked up.
+The second card runs DLSS 5. That work uses its tensor cores, and above 1440p the cost is high.
 
-Which card does which job is decided before the add-on loads. Windows renders the game on the card driving its display, or on whichever card you set as the high-performance GPU for that executable in Display settings, Graphics. The add-on takes the other one - it cannot choose, and no setting in `mgpu.ini` can change it.
+Which card does which job is decided before the add-on loads. Windows renders the game on the card that drives its display, or on the card set under **Display settings > Graphics > Advanced graphics > Default high performance GPU**. The add-on takes the other card. It cannot choose, and no setting in `mgpu.ini` changes it.
 
-At 1440p and above the neural pass gets expensive, which is what the Super Resolution options in the add-on's panel are for. They create a **second** DLSS Super Resolution feature on the neural card - separate from the one you set in the game - so that card can do its work at a lower resolution and let DLSS enlarge the result. Both are off by default. `Native Upscaling` works from the game's own render extent, so it needs the game to be running DLSS - at DLAA, or with TSR or any other upscaler, there is no render extent to inherit. `Experimental Upscaler` picks its own scale instead, which is what makes it the one that works at DLAA.
+**If your two cards are not evenly matched, experiment with inverting the setup.** Putting the stronger card on the DLSS 5 workload can give surprising results.
 
-Turn it on in the add-on's panel, or start from one of the example configurations in [reference](https://github.com/maohgad-web/Neural-coprocessor/tree/main/reference) - `mgpuQUALITY.ini` and `mgpuPERFORMANCE.ini` are both Native Upscaling, at the two ends of the quality range.
+The Super Resolution options in the panel reduce that cost. They create a second DLSS Super Resolution feature on the neural card, separate from the one you set in the game, so it can do its work at a lower resolution. Both are off by default. `Native Upscaling` needs the game to be running DLSS. `Experimental Upscaler` chooses its own resolution, and is the one that works at DLAA.
 
-If your two cards are not evenly matched, experiment - putting the stronger card on the DLSS 5 workload can give surprising results at those resolutions.
+Turn it on in the panel, or edit `mgpu.ini` yourself. You can find example `mgpu.ini` files [here](https://github.com/maohgad-web/Neural-coprocessor/tree/main/reference) - [DLSS Quality](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuQUALITY.ini) and [DLSS Performance](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuPERFORMANCE.ini).
 
 * * *
 
