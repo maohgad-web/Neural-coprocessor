@@ -18,7 +18,7 @@ Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It 
 
 ### Which card should run DLSS 5
 
-The second card runs DLSS 5. That work uses its tensor cores, and above 1440p the cost is high.
+Only the second card runs DLSS 5. That work uses its tensor cores, and above 1440p the cost is high.
 
 Which card does which job is decided before the add-on loads. Windows renders the game on the card that drives its display, or on the card set under **Display settings > Graphics > Advanced graphics > Default high performance GPU**. The add-on takes the other card. It cannot choose, and no setting in `mgpu.ini` changes it.
 
