@@ -2145,7 +2145,10 @@ void dump()
     // "READ THE [R82] LINE BELOW INSTEAD" and that sentence has never once
     // reached a log file - the pointer to the line that actually answers the
     // question was the part being cut off.
-    char line[4400];
+    // R191: 4400 -> 5120. The candidate loop below stops once it is within 330
+    // bytes of the end, and the tail literal is now ~2.4k, so a run with many
+    // candidates could truncate the explanation the tail exists to carry.
+    char line[5120];
 
     if (g_depth_on.load(std::memory_order_relaxed))
     {
@@ -2309,14 +2312,21 @@ void dump()
             }
             int v = snprintf(line, sizeof line,
                 "[MGPU][R71] MVEC SIZES over ALL %u candidate(s): ", tot);
-            for (unsigned i = 0; i < sn && v > 0 && v < (int)sizeof line - 330; ++i)
+            for (unsigned i = 0; i < sn && v > 0 && v < (int)sizeof line - 2600; ++i)
                 v += snprintf(line + v, sizeof line - (size_t)v, "%ux%u x%u | ",
                               sw[i], sh[i], sc[i]);
             const size_t at = (v > 0) ? (size_t)v : 0;
             snprintf(line + at, sizeof line - at,
                 "|| TRANSPORT SOURCE res=0x%llx (0 means nothing has supplied one yet - "
-                "either R103 from the calibrator's own table, or a ranked candidate), handed to the transport "
-                "%llu times, %llu second-binds-in-a-frame skipped. || EVICTIONS: %llu resources destroyed and removed from the tables (R76 - a "
+                "either R103 from the calibrator's own table, or a ranked candidate), handed over BY THE "
+                "BARRIER HOOK %llu times, %llu second-binds-in-a-frame skipped. "
+                "R191: THIS COUNTER IS ONE ROUTE, NOT THE LANE. It counts fire_mvec_hook only. A title "
+                "whose vectors move by the EVALUATE route instead transports perfectly with this reading "
+                "ZERO for an entire run - measured on RoboCop Rogue City 2026-09-21, where this said 0 in "
+                "all 29 samples while the lane carried 2665 frames. ZERO HERE IS NOT EVIDENCE THAT NO "
+                "VECTORS REACHED GPU 1, and it was read that way by two separate readers in one week. "
+                "[R78] is the line that answers whether vectors reached the neural card; its producer "
+                "copies= is a DIFFERENT counter with a similar name. || EVICTIONS: %llu resources destroyed and removed from the tables (R76 - a "
                 "resolution change destroys every render target, and a stale entry is a copy "
                 "from freed memory). RTV BINDS SEEN IN TOTAL: %llu. THE RANK ABOVE IS NOW RENDER TARGET BINDS, "
                 "NOT SRV CREATIONS. R25 ranked by SRVs created, got 6/5/3/3, and called it \"a "
