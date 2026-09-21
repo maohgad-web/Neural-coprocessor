@@ -56,6 +56,15 @@ Also in 0.2.0:
 - **Native Upscaling is improved.** It now reads the render resolution the game declares to DLSS, which makes it available on more titles and improves stability in motion.
 - **The panel reports your game's setting.** It says DLAA or DLSS, and names the setting to change when Native Upscaling cannot run.
 
+**0.2.5** - the log now says which card is doing what, and refuses to run when that answer is wrong.
+
+- **The binding is printed at arm**, read from the game's own device. Until now which card ran the neural stage had to be worked out from GPU utilisation, and more than one report was diagnosed backwards because of it.
+- **`ERROR 207` when both stages land on one card.** Earlier versions ran that way in silence, where no measurement means anything.
+- **Adapter selection is fixed for machines with three or more GPUs.** With an integrated GPU enabled and a single display, the bridge could pick the card the game renders on. Two-GPU machines are unaffected.
+- **Display topology is reported** - how many display paths are active, which card owns them, and whether Windows' two APIs agree. They do not always.
+- **Starfield support behind `SFPath`**, experimental. The game recreates its DLSS feature often and the add-on stopped following it. The detector runs on every title, and where it sees the fault the add-on sets the key itself - `SFPath=0` stops that.
+- **Two log lines that read as faults no longer do.** `TAP = OFF` and the motion vector hand-off count were both stating true things that readers took as failures.
+
 * * *
 
 ## Performance Results
@@ -106,12 +115,13 @@ A launch and transport check, not a benchmark. The counters in those logs are cu
 
 ### Reported by users
 
-I cannot test every game, so any report helps. Both entries below came from [@Zonnery](https://github.com/Zonnery), who found them and tested the fixes before either release shipped. Thank you.
+I cannot test every game, so any report helps. The first two came from [@Zonnery](https://github.com/Zonnery), who found them and tested the fixes before either release shipped. Thank you.
 
 | Title | Resolution | Reported in | State |
 | --- | --- | --- | --- |
 | Battlefield 6 (SP executable) | 3840x2160 | [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) | Runs clean on 0.2.2 |
 | 007 First Light | 3840x2160 | [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16) | Runs clean on 0.2.3 |
+| RoboCop Rogue City - Unfinished Business | 2560x1440 | [#29](https://github.com/maohgad-web/Neural-coprocessor/issues/29) | Runs clean on 0.2.5 |
 
 **Battlefield 6** SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On 0.2.0 and 0.2.1 this title crashed inside its own `sl.common.dll` on some machines every launch, and never delivered a motion vector frame on any of them. **Both are fixed in 0.2.2**, verified on the machine that crashed every time. Anti-cheat: online games are at your own risk.
 
@@ -128,6 +138,12 @@ The last row is a limitation rather than a fault - see Limitations. Neural rende
 **Not the add-on.** The same rig also saw `bf6.exe` crash on its own with `KERNELBASE.dll / 0x80070057`, reproduced with an empty game folder and no add-ons installed.
 
 **007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)), 3840x2160, path tracing with Ray Reconstruction - game on an RTX 5090, neural stage on an RTX 5070 Ti. On 0.2.2 it armed and then stopped, because the game's ReShade runtime was never compiling the depth tap. Fixed in 0.2.3.
+
+**RoboCop Rogue City - Unfinished Business** ([#29](https://github.com/maohgad-web/Neural-coprocessor/issues/29)), 2560x1440, on an RTX 3080 Ti with an RTX 5060 Ti. Reported as depth and motion vectors going silent after a reboot, on a machine where display ownership kept moving between the two cards. It did not reproduce on 0.2.5, in either a single- or a dual-display arrangement, and that build is what settled which card was doing what.
+
+### Starfield, experimental
+
+Behind `SFPath=1`, and tested on one machine only. The game destroys and recreates its DLSS feature often, and the add-on stopped copying from the one actually in use once its slot list filled. Measured here at 2560x1440 over 7,803 frames: depth transported and bound on every frame with zero contract mismatches, and the engine's motion vectors carried 4,501 of them. The vector lane goes quiet in places - partly menus and cutscenes, where the game produces none, and partly not. Without the key the add-on behaves on this title as 0.2.4 does.
 
 * * *
 
@@ -179,7 +195,9 @@ Both of these work. Pick the one that matches your hardware.
 
 The display goes on the neural card, and the card that renders the game has nothing plugged into it.
 
-Open the ReShade overlay with its normal key and the neural output steps aside by itself, so the overlay is visible and usable. Close the overlay and the neural output comes back. `CTRL+ALT+F6` does the same by hand if you want it.
+In this mode the neural output is the topmost composition visual on the game's window, so it sits above the game's own ReShade overlay. You do not have to do anything about that: open the overlay with its normal key and the neural output steps aside by itself, then comes back when you close it.
+
+`CTRL+ALT+F6` does that by hand - it unroots the visual and roots it again, and never touches the stream. It is registered only in this mode, and most people will never need it.
 
 The add-on refuses this mode if it finds more than one active display, and says so in the log.
 
@@ -197,6 +215,7 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `CTRL+ALT+left` / `right` | Move split seam (`SHIFT` for coarse step) |
 | `CTRL+ALT+F8` | Choose which pass the intensity keys affect |
 | `CTRL+ALT+F9` / `F11` | Intensity down / up |
+| `CTRL+ALT+F6` | Unroot the neural output and root it again. `DcompOverlay=1` only, and rarely needed - see Display setup |
 | `Home` | ReShade overlay with control panel |
 
 * * *
@@ -212,14 +231,16 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `SRUpscale=0` | DLSS Super Resolution on the second card. Off by default, so neural rendering runs at full resolution |
 | `SRQuality=2` | 2 quality, 1 balanced, 0 performance |
 | `SRScale=0` | Which resolution neural rendering runs at. `0` is Native Upscaling - the game's own render extent. `67`/`58`/`50` is Experimental Upscaler, chosen by the panel's mode buttons |
-| `SRMvLowRes=0` | Rides with `SRScale` and is written with it. Never set one without the other |
+| `SRMvLowRes=2` | Rides with `SRScale` and is written with it. Never set one without the other. Changed from `0` in 0.2.4 |
 | `Depth=1` | Send the game's depth to the second card and bind it. Needs `mgpu_depth_tap.fx` |
 | `MVec=3` | Send the game's motion vectors and bind them. `0` leaves the model to its own derivation |
 | `MvecFromEval=2` | Where the vectors are taken from. `2` is automatic: the usual route, falling back to the DLSS pass on engines where it never fires. New in 0.2.2 |
 | `Calib=2` | How the add-on reads the game's own DLSS calls. `0` turns the whole tap off |
 | `CalibRung=0` | Which install route the calibrator may use. `0` both, `1` the import table alone, `2` the cached-pointer scan alone. Leave at `0` unless a title faults at startup. New in 0.2.2 |
 | `SRPreset=0` | 0 title default, 11 K, 12 L, 13 M |
-| `Frames=0` | Stop after this many frames. `0` runs until you quit |
+| `DcompOverlay=0` | `1` draws the neural output onto the game's own window instead of opening one. Single display only - see Display setup |
+| `SFPath` | Absent by default, and absent is not off: the detector runs, the repair does not, and the add-on sets `1` itself if it sees the fault. `0` stops that. New in 0.2.5 |
+| `Frames=0` | Stop after this many frames. `0` runs until you quit. A bounded run is what prints a summary |
 
 Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after editing it.** The same applies to changing resolution or DLSS mode in the game's own settings while the bridge is running.
 
