@@ -63,7 +63,6 @@ Also in 0.2.0:
 - **Adapter selection is fixed for machines with three or more GPUs.** With an integrated GPU enabled and a single display, the bridge could pick the card the game renders on. Two-GPU machines are unaffected.
 - **Display topology is reported** - how many display paths are active, which card owns them, and whether Windows' two APIs agree. They do not always.
 - **Starfield support behind `SFPath`**, experimental. The game recreates its DLSS feature often and the add-on stopped following it. The detector runs on every title, and where it sees the fault the add-on sets the key itself - `SFPath=0` stops that.
-- **Two log lines that read as faults no longer do.** `TAP = OFF` and the motion vector hand-off count were both stating true things that readers took as failures.
 
 * * *
 
