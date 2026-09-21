@@ -16,6 +16,18 @@ Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It 
 
 **This is a ReShade add-on.** It is called **MGPU Bridge**, it is a `.addon64` file that ReShade loads into a D3D12 game, and every log line it writes is prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a replacement for anything, and it needs an **add-on-enabled** ReShade build to load at all. There is no game modification of any kind: the add-on reads each finished frame and does its work elsewhere.
 
+### Which card should do which job
+
+**This is not lossless scaling, and the second card is not free.** There, the second GPU generates frames and the cost barely touches the game. Here the second card runs a stage that costs real tensor time and scales with output resolution - the render card gets faster precisely because that work left it, and the second card has to be able to afford what it picked up.
+
+Which card does which job is decided before the add-on loads. Windows renders the game on the card driving its display, or on whichever card you set as the high-performance GPU for that executable in Display settings, Graphics. The add-on takes the other one - it cannot choose, and no setting in `mgpu.ini` can change it.
+
+At 1440p and above the neural pass gets expensive, which is what the Super Resolution options in the add-on's panel are for. They create a **second** DLSS Super Resolution feature on the neural card - separate from the one you set in the game - so that card can do its work at a lower resolution and let DLSS enlarge the result. Both are off by default. `Native Upscaling` works from the game's own render extent, so it needs the game to be running DLSS - at DLAA, or with TSR or any other upscaler, there is no render extent to inherit. `Experimental Upscaler` picks its own scale instead, which is what makes it the one that works at DLAA.
+
+Turn it on in the add-on's panel, or start from one of the example configurations in [reference](https://github.com/maohgad-web/Neural-coprocessor/tree/main/reference) - `mgpuQUALITY.ini` and `mgpuPERFORMANCE.ini` are both Native Upscaling, at the two ends of the quality range.
+
+If your two cards are not evenly matched, experiment - putting the stronger card on the DLSS 5 workload can give surprising results at those resolutions.
+
 * * *
 
 ## New in 0.2.4: one display
@@ -63,6 +75,7 @@ Also in 0.2.0:
 - **Adapter selection is fixed for machines with three or more GPUs.** With an integrated GPU enabled and a single display, the bridge could pick the card the game renders on. Two-GPU machines are unaffected.
 - **Display topology is reported** - how many display paths are active, which card owns them, and whether Windows' two APIs agree. They do not always.
 - **Starfield support behind `SFPath`**, experimental. The game recreates its DLSS feature often and the add-on stopped following it. The detector runs on every title, and where it sees the fault the add-on sets the key itself - `SFPath=0` stops that.
+- **Two log lines that read as faults no longer do.** `TAP = OFF` and the motion vector hand-off count were both stating true things that readers took as failures.
 
 * * *
 
@@ -304,7 +317,7 @@ This only works if the title actually carries a D3D12 renderer - there is nothin
 | `CONTRIBUTORS.md` | Code contributed by others |
 | `THIRD_PARTY.md` | Licenses and provenance |
 | `docs/` | Run logs from the titles listed above |
-| `reference/` | Sample `ReShade.ini` and complete `ReShade.log` |
+| `reference/` | Sample `ReShade.ini`, a complete `ReShade.log`, and two example `mgpu.ini` configurations with Super Resolution on |
 | `history/` | Milestone record and instrument design |
 | `workarounds/` | Unsupported arrangements that worked here. Not part of the add-on |
 
