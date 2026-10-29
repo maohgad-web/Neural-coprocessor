@@ -9686,6 +9686,12 @@ namespace
     static const unsigned MAX_PASSES = 2;
         unsigned passes = 1;
         NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
+        // R419: the DLSS-NR model preset is a CREATE-TIME hint. 0 = the title /
+        // snippet default, 1 = Legacy/HT, 2 = Small FP8/CC. It is read per pass
+        // before CreateFeature and never changes a running feature: a different
+        // preset needs a new feature, and rebuilding one in place is the leak
+        // this project already measured (1.5-2.4 GB per rebuild).
+        int nr_preset_pass[MAX_PASSES] = {};
         // R212: the foveated pass 2, read at arm. p2r_on false = the 0.2.5
         // chain, untouched. The region is in output pixels, multiples of 8.
         bool p2r_on = false;
@@ -14947,6 +14953,12 @@ namespace
             }
             mgpu::residual::bind_create(s.nr_params);   // R316: no-op unless the module is on
             arm_sentinel_set();
+            // R419: if no key named a preset, do not write the hint at all - that
+            // keeps an ini without NRPreset* byte-identical to 0.4.0, including
+            // whatever default the snippet itself uses.
+            bool any_preset = false;
+            for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+                if (s.nr_preset_pass[i] != 0) any_preset = true;
             for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
             {
                 // R212: pass 2's own feature at the region's size, when asked.
@@ -14964,6 +14976,10 @@ namespace
                     mgpu::residual::work_extent(cw, chh);
                 s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
                 s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
+                // R419: the preset is a create-time hint. Set it per feature, before
+                // CreateFeature, and never expect a later evaluate to change it.
+                if (any_preset)
+                    s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned)s.nr_preset_pass[i]);
                 const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
                 {
                     char am[200];
@@ -14992,9 +15008,10 @@ namespace
                 LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
                 snprintf(line, sizeof line,
                          "[MGPU][P4.1] CreateFeature(Reserved18) handle %u/%u %ux%u fmt=%d: "
-                         "result=0x%08X (%s) handle=0x%p elapsed=%.0fms",
+                         "result=0x%08X (%s) handle=0x%p preset=%d elapsed=%.0fms",
                          i + 1, stream_state::MAX_PASSES, cw, chh, (int)s.format,
                          (unsigned)r, ngx_result_name(r), (void *)s.nr_handle[i],
+                         (int)s.nr_preset_pass[i],
                          (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
                 mgpu::diag::info(line);
                 if (r != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
@@ -15006,6 +15023,8 @@ namespace
             // foveated pass 1 off; it never fails the arm.
             for (unsigned i = 0; i < s.p1f_n && r == NVSDK_NGX_Result_Success; ++i)
             {
+                if (any_preset)
+                    s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned)s.nr_preset_pass[0]);
                 unsigned long seh_p1 = 0ul;
                 const NVSDK_NGX_Result rp =
                     ngx_create_guarded((ngx_pf_create_seh_fn)p_cre, s.nl,
@@ -15034,6 +15053,8 @@ namespace
             // alternating strips off (pass 2 is then the band alone, R212).
             for (unsigned i = 0; s.p2f_mode != 0u && i < 2u && r == NVSDK_NGX_Result_Success; ++i)
             {
+                if (any_preset)
+                    s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned)s.nr_preset_pass[1]);
                 unsigned long seh_p2 = 0ul;
                 const NVSDK_NGX_Result rp =
                     ngx_create_guarded((ngx_pf_create_seh_fn)p_cre, s.nl,
@@ -15058,6 +15079,9 @@ namespace
                     break;
                 }
             }
+            // The hint has done its work (all features are built). Put it back to
+            // Auto so an evaluate cannot inherit a stale preset.
+            if (any_preset) s.nr_params->Set("DLSSNR.Hint.Render.Preset", 0u);
             // Survived NGX. Whether the RESULT was a success does not matter
             // here - a returned error code means the process is alive, which
             // is the only thing this key claims.
@@ -19391,6 +19415,33 @@ void stream_request()
                      asked, s.passes, stream_state::MAX_PASSES, s.passes, asked);
             mgpu::diag::warn(pl);
         }
+    }
+
+    // R419: per-pass DLSS-NR model preset. NRPreset is the fallback; NRPresetN
+    // overrides pass N. This is deliberately ARM-TIME ONLY: the preset chooses
+    // which weights CreateFeature builds, so changing it means a new feature.
+    // The old attempt to rebuild one feature mid-run produced a blurred picture
+    // and violated the snippet's retire-all rule; it is not repeated here.
+    {
+        int fallback = (int)ini_read_float("NRPreset", 0.0f);
+        if (fallback < 0) fallback = 0;
+        if (fallback > 2) fallback = 2;
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+        {
+            char key[32];
+            snprintf(key, sizeof key, "NRPreset%u", i + 1u);
+            int v = fallback;
+            if (ini_has_key(key)) v = (int)ini_read_float(key, (float)fallback);
+            if (v < 0) v = 0;
+            if (v > 2) v = 2;
+            s.nr_preset_pass[i] = v;
+        }
+        char pl[260];
+        snprintf(pl, sizeof pl,
+                 "[MGPU][R419] per-pass model preset: p1=%d p2=%d (0=Auto 1=Legacy/HT "
+                 "2=Small FP8/CC), create-time only - change needs a relaunch",
+                 s.nr_preset_pass[0], s.nr_preset_pass[1]);
+        mgpu::diag::info(pl);
     }
 
     // P6.2. Read after `passes`, because the per-pass overrides only make

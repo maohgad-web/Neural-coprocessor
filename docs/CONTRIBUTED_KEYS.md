@@ -51,6 +51,8 @@ the bridge thread spun on a frame that had already arrived. No new key: it is pa
 | `NRScaleCap` | default `1.00` | How far the panel's scale slider may go | With `NRScale` |
 | `NRScaleX`, `NRScaleY`, `NRSharpness`, `NRDetailGain`, `NRMode`, `NRColorStrength` | | Tuning of the `NRScale` path. Read only when the `NRScale` line is present | With `NRScale` |
 | `NRProbe` | `1` | Measures the neural effect in the log (R299c). Works with or without `NRScale` | No |
+| `NRPreset` | `0`, `1`, `2` | DLSS-NR model preset used when each feature is created: `0` = the title/snippet default, `1` = Legacy/HT, `2` = Small FP8/CC. **Create-time only** - change it and relaunch; it is not a live knob | Yes: a different network |
+| `NRPreset1` … `NRPreset4` | `0`, `1`, `2` | Per-pass override of `NRPreset`. With `Passes=2`, `NRPreset1=1` and `NRPreset2=2` build pass 1 on Legacy/HT and pass 2 on Small FP8/CC. Missing = the `NRPreset` value | Yes: a different network per pass |
 | `NRSetAtCreate` | `1` | Applies the `Set.*` lines of `mgpu.ini` to DLSS-NR before its CreateFeature as well as at each evaluate (P6.2c), for keys that size the network. Does nothing without `Set.*` lines. Separate from `NRScale` | Only through the `Set.*` keys |
 | `PanelSimple` | `1` | Shows the simple panel (Chinese labels, layout in `panel_simple.txt` beside the add-on) instead of the full panel. CTRL+ALT+F4 flips this key in game. Without `panel_simple.txt` the simple panel shows nothing and the full panel stays (R330) | Panel only |
 
