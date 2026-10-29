@@ -281,7 +281,7 @@ window's own output rate falls as the count climbs. That is the architecture
 working, and it is the one thing about the demo that reliably reads as a bug to
 someone who has not been told.
 
-#### The maximum is two, and it is a power decision
+#### The default maximum is two, and it is a power decision
 
 Measured on the development rig at 1080p, against a ~16.7 ms frame period:
 
@@ -307,9 +307,10 @@ which a marginally seated power connector fails.
 **The failure was observed, not hypothesised.** One development session ended
 with the game rendering black on both displays after several minutes, with no
 fault in any log. It went unexplained for two days and was briefly blamed on the
-title's engine. It was a six-pass run. `MAX_PASSES` is 2, enforced in
-`gpu1_context.cpp`; a larger value in `mgpu.ini` is clamped and the log names the
-value that was asked for.
+title's engine. It was a six-pass run. `MAX_PASSES` is 4 as an opt-in bound;
+`Passes=3/4` is not the default and the shipped file still runs one pass. The
+default two-pass recommendation above is unchanged; a larger value in `mgpu.ini`
+is now accepted up to 4 and the log names the value that was asked for.
 
 The multi-pass ghosting hypothesis that motivated six passes is **not settled by
 any of this** - it was never tested, because no ghosting scene was ever captured.

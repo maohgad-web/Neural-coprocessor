@@ -9681,9 +9681,9 @@ namespace
     //
     // The ghosting experiment that motivated six passes is NOT settled by any
     // of this - it was never run, because no ghosting scene was ever captured.
-    // If it is run later, raise this constant in a local build. It does not
-    // ship raised.
-    static const unsigned MAX_PASSES = 2;
+    // Passes=3/4 is opt-in; the shipped default remains 1. Raising the bound is
+    // what lets a user test a deeper stack, not a claim that it is free.
+    static const unsigned MAX_PASSES = 4;
         unsigned passes = 1;
         NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
         // R212: the foveated pass 2, read at arm. p2r_on false = the 0.2.5
@@ -9770,6 +9770,9 @@ namespace
         // Absent or >= 1.0 = every published run unchanged.
         bool  nrs_on = false;
         bool  nrs_ready = false;
+        // NRSPass=2: every pass the frame runs uses the NRS path, at the same
+        // global NRScale. 1 (default) keeps the published pass-1-only behaviour.
+        bool  nrs_all = false;
         float nrs_scale = 1.0f;
         float nrs_gain = 1.0f;
         unsigned nrs_mode = 1u;      // resolve mode: 1 = residual composite (default), 0 = the model output directly
@@ -14193,6 +14196,9 @@ namespace
             s.nrs_color_strength = ini_read_float("NRColorStrength", 0.90f);
             s.nrs_res_depth = !ini_has_key("NRScaleResolveDepth") ||
                               ini_read_flag("NRScaleResolveDepth");   // absent = unchanged
+            // NRSPass=2: apply the NRS path to every pass the frame runs, at the
+            // same global NRScale. Default 1 keeps pass-1-only.
+            s.nrs_all = ini_read_float("NRSPass", 1.0f) >= 2.0f;
             // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
             // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
             const bool nrs_want = ini_has_key("NRScale") &&
@@ -14955,7 +14961,7 @@ namespace
                 // tells the snippet how big a network to run, and it is the whole
                 // point of the port. Pass 2's region feature keeps its own size.
                 const bool p2f = (i > 0u && s.p2r_on && s.p2r_feature_region);
-                const bool nrs1 = s.nrs_on && i == 0u;
+                const bool nrs1 = s.nrs_on && (i == 0u || s.nrs_all);
                 UINT cw  = nrs1 ? s.nrs_cap_w : (p2f ? s.p2r_w : s.width);
                 UINT chh = nrs1 ? s.nrs_cap_h : (p2f ? s.p2r_h : s.height);
                 // R316: the residual pass's feature at the work extent (the module is off
@@ -25681,7 +25687,8 @@ void stream_poll()
                     // untouched - those are exactly the cases whose extents this
                     // code does not own, and guessing there would be how a working
                     // feature gets broken.
-                    bool nrs_here = s.nrs_on && pi == 0u && sk == 0u && !p2f && !p1f_here &&
+                    bool nrs_here = s.nrs_on && (pi == 0u || (s.nrs_all && pi < s.passes)) &&
+                                    sk == 0u && !p2f && !p1f_here &&
                                     !vr_c && !vr_wh && !nr16_on &&
                                     ew == s.width && eh == s.height &&
                                     s.nrs_color != nullptr && s.nrs_out != nullptr;
@@ -25690,6 +25697,21 @@ void stream_poll()
                     if (nrs_here)
                     {
                         nrs_anchor = nr_color;   // the untouched native frame: the 1:1 anchor
+                        // R421: one line per pass, once. Four lines with
+                        // NRSPass=2 prove the global NRScale is applied to the
+                        // whole stack, not only pass 1.
+                        {
+                            static unsigned seen = 0u;
+                            if (pi < 32u && (seen & (1u << pi)) == 0u)
+                            {
+                                seen |= (1u << pi);
+                                char nl[200];
+                                snprintf(nl, sizeof nl,
+                                         "[MGPU][R421] NRS pass %u/%u work=%ux%u (NRSPass=2, global NRScale)",
+                                         pi + 1u, s.passes, s.nrs_w, s.nrs_h);
+                                mgpu::diag::info(nl);
+                            }
+                        }
                         nrs_to(s, s.nrs_color, &s.nrs_color_state,
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, false);
                         nrs_dispatch_down(s, nrs_anchor);

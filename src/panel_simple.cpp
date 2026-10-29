@@ -1,4 +1,4 @@
-﻿// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
+// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
 //
 // WHAT THIS IS. A second view of the SAME controls the full panel has, with the log lines, the
 // counters and the timing readouts stripped out, so a player who does not care about any of that can
@@ -519,6 +519,10 @@ namespace mgpu::psimple
             if (ImGui::RadioButton("×1##passes", p == 1)) mgpu::gpu1::ui_set_passes(1);
             ImGui::SameLine();
             if (ImGui::RadioButton("×2##passes", p == 2)) mgpu::gpu1::ui_set_passes(2);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("×3##passes", p == 3)) mgpu::gpu1::ui_set_passes(3);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("×4##passes", p == 4)) mgpu::gpu1::ui_set_passes(4);
         }
 
         void row_intensity()

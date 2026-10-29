@@ -481,8 +481,8 @@ struct ui_state
     // ui_read() fails the build if the two ever disagree, because this header
     // cannot see the constant and a silently smaller array would truncate the
     // copy rather than error.
-    unsigned passes = 1, max_passes = 2;
-    float intensity[2] = {};
+    unsigned passes = 1, max_passes = 4;
+    float intensity[4] = {};
     // P7.9: the guide's tuning parameters. tuning_on false = none of them are
     // set, which is what every published measurement ran under.
     bool  tuning_on = false, auto_mask = false;

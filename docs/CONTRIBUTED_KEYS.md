@@ -49,6 +49,7 @@ the bridge thread spun on a frame that had already arrived. No new key: it is pa
 | `PanelOverPicture` | `1` | Opens the panel on the GPU 1 runtime, over the live neural picture, instead of on the game's runtime. Composition mode (`DcompOverlay=1`) | Panel only |
 | `NRScale` | `0.30` to `NRScaleCap` | Residual neural rendering at a reduced scale: DLSS-NR runs at this fraction of native and its difference is added back onto the native frame. `1` is on, at 1:1. Changed live from the panel (R299) | Yes |
 | `NRScaleCap` | default `1.00` | How far the panel's scale slider may go | With `NRScale` |
+| `NRSPass` | `1` (default), `2` | `2`: every pass the frame runs takes the NRS path at the same global `NRScale`. `1`: pass 1 only, the published behaviour. Requires `NRScale` | Yes, via the NRS stage |
 | `NRScaleX`, `NRScaleY`, `NRSharpness`, `NRDetailGain`, `NRMode`, `NRColorStrength` | | Tuning of the `NRScale` path. Read only when the `NRScale` line is present | With `NRScale` |
 | `NRProbe` | `1` | Measures the neural effect in the log (R299c). Works with or without `NRScale` | No |
 | `NRSetAtCreate` | `1` | Applies the `Set.*` lines of `mgpu.ini` to DLSS-NR before its CreateFeature as well as at each evaluate (P6.2c), for keys that size the network. Does nothing without `Set.*` lines. Separate from `NRScale` | Only through the `Set.*` keys |
