@@ -116,7 +116,10 @@ namespace
         ID3D12CommandQueue *queue = nullptr;
         IDXGISwapChain3 *swapchain = nullptr;
         ID3D12DescriptorHeap *rtv_heap = nullptr;
-        ID3D12Resource *backbuffer[2] = {};
+        // BB1: PresentBuffers decides how many of these exist (create_present_chain).
+        static const unsigned MAX_BACKBUFFERS = 6;
+        ID3D12Resource *backbuffer[MAX_BACKBUFFERS] = {};
+        unsigned present_buffers = 2;
         // ---- D6: an allocator RING, not a single allocator ----
         //
         // This used to be one allocator and one list, and the thing that made
@@ -869,8 +872,8 @@ bool create_present_chain(HWND hwnd)
     IDXGISwapChain1 *sc1 = nullptr;
     IDXGISwapChain3 *sc3 = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *back0 = nullptr;
-    ID3D12Resource *back1 = nullptr;
+    ID3D12Resource *back[state::MAX_BACKBUFFERS] = {};   // BB1
+    UINT bb_count = 2u;
     // D6: one per ring slot. Created together, released together, published
     // together - so a partial failure cannot leave the state holding two of
     // three and nothing saying so.
@@ -892,8 +895,8 @@ bool create_present_chain(HWND hwnd)
             if (cl[i] != nullptr)        { cl[i]->Release();        cl[i] = nullptr; }
             if (allocator[i] != nullptr) { allocator[i]->Release(); allocator[i] = nullptr; }
         }
-        if (back1 != nullptr)     { back1->Release(); back1 = nullptr; }
-        if (back0 != nullptr)     { back0->Release(); back0 = nullptr; }
+        for (unsigned i = state::MAX_BACKBUFFERS; i-- > 0u; )   // BB1
+            if (back[i] != nullptr) { back[i]->Release(); back[i] = nullptr; }
         if (heap != nullptr)      { heap->Release(); heap = nullptr; }
         if (sc3 != nullptr)       { sc3->Release(); sc3 = nullptr; }
         if (sc1 != nullptr)       { sc1->Release(); sc1 = nullptr; }
@@ -989,7 +992,7 @@ bool create_present_chain(HWND hwnd)
         // Windowed member - the HWND is a parameter of
         // CreateSwapChainForHwnd and pFullscreenDesc == nullptr is what
         // makes it windowed. Flip model (gotcha 3): FLIP_DISCARD,
-        // BufferCount 2, SampleDesc.Count 1, R8G8B8A8_UNORM (no SRGB, no
+        // BufferCount PresentBuffers (BB1), SampleDesc.Count 1, R8G8B8A8_UNORM (no SRGB, no
         // MSAA - the older DISCARD/SEQUENTIAL effects fail outright).
         DXGI_SWAP_CHAIN_DESC1 scd{};
         scd.Width = width;
@@ -1007,7 +1010,23 @@ bool create_present_chain(HWND hwnd)
         scd.SampleDesc.Count = 1;
         scd.SampleDesc.Quality = 0;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        scd.BufferCount = 2;
+        // ---- BB1: HOW MANY BUFFERS THE PICTURE ROTATES THROUGH ----
+        //
+        // present_frame writes the current back buffer step by step: the copy,
+        // then ReShade's overlay inside Present. With two buffers the buffer being
+        // written is the one the previous flip has just replaced. In Independent
+        // Flip with immediate flips (what a focused game's window gets, measured:
+        // PresentMon "Hardware: Independent Flip", AllowsTearing 1, flips under
+        // 4 ms apart) the screen was caught reading that buffer mid-write, as a
+        // horizontal band of whichever stage had been reached. More buffers put
+        // more flips between "last on screen" and "being written". Measured with
+        // PresentRaceProbe=1 at 4K, on davidm71's fork: 2 buffers bands at 2X; 3
+        // and 4 clean or nearly clean at 2X, a few at 4X; 6 clean at both. Absent
+        // or 2: unchanged. Read when the chain is made: changing it needs a restart.
+        bb_count = (UINT)ui_ini_read("PresentBuffers", 2);
+        if (bb_count < 2u) bb_count = 2u;
+        if (bb_count > state::MAX_BACKBUFFERS) bb_count = state::MAX_BACKBUFFERS;
+        scd.BufferCount = bb_count;
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
@@ -1350,7 +1369,7 @@ bool create_present_chain(HWND hwnd)
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 2;
+        hd.NumDescriptors = state::MAX_BACKBUFFERS;   // BB1
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         const HRESULT hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap));
         if (FAILED(hr))
@@ -1364,21 +1383,18 @@ bool create_present_chain(HWND hwnd)
     {
         const UINT rtv_size =
             dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        const HRESULT hr0 = sc3->GetBuffer(0, __uuidof(ID3D12Resource),
-                                           reinterpret_cast<void **>(&back0));
-        if (FAILED(hr0))
-            return fail("GetBuffer(0)", hr0);
-        // CreateRenderTargetView returns void - there is no HRESULT to
-        // check. A bad argument surfaces on the debug layer, not here.
-        dev->CreateRenderTargetView(
-            back0, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
-        const HRESULT hr1 = sc3->GetBuffer(1, __uuidof(ID3D12Resource),
-                                           reinterpret_cast<void **>(&back1));
-        if (FAILED(hr1))
-            return fail("GetBuffer(1)", hr1);
-        D3D12_CPU_DESCRIPTOR_HANDLE h1{};
-        h1.ptr = heap->GetCPUDescriptorHandleForHeapStart().ptr + rtv_size;
-        dev->CreateRenderTargetView(back1, nullptr, h1);
+        D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < bb_count; ++i)   // BB1
+        {
+            const HRESULT hr = sc3->GetBuffer(i, __uuidof(ID3D12Resource),
+                                              reinterpret_cast<void **>(&back[i]));
+            if (FAILED(hr))
+                return fail("GetBuffer", hr);
+            // CreateRenderTargetView returns void - there is no HRESULT to
+            // check. A bad argument surfaces on the debug layer, not here.
+            dev->CreateRenderTargetView(back[i], nullptr, h);
+            h.ptr += rtv_size;
+        }
     }
 
     // 4. Command allocators + command lists, PRESENT_SLOTS of each (D6).
@@ -1432,8 +1448,9 @@ bool create_present_chain(HWND hwnd)
         S.chain_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;   // must match scd.Format above
         S.swapchain = sc3;
         S.rtv_heap = heap;
-        S.backbuffer[0] = back0;
-        S.backbuffer[1] = back1;
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            S.backbuffer[i] = back[i];
+        S.present_buffers = bb_count;
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         {
             S.allocator[i] = allocator[i];
@@ -1456,8 +1473,8 @@ bool create_present_chain(HWND hwnd)
         queue = nullptr;
         sc3 = nullptr;
         heap = nullptr;
-        back0 = nullptr;
-        back1 = nullptr;
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            back[i] = nullptr;
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         { allocator[i] = nullptr; cl[i] = nullptr; }
         fence = nullptr;
@@ -1471,10 +1488,10 @@ bool create_present_chain(HWND hwnd)
              // created R10G10B10A2 - the string was never updated when P5.0
              // changed scd.Format. A log line that contradicts the code is worse
              // than no log line: it is evidence pointing the wrong way.
-             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=2 "
+             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=%u "
              "swapeffect=FLIP_DISCARD queue=DIRECT client=%ux%u CreateSwapChainForHwnd "
              "hr=0x%08X hwnd=0x%p (vsync present, non-resizable window - no ResizeBuffers at P0)",
-             width, height, (unsigned)swapchain_hr, (void *)hwnd);
+             bb_count, width, height, (unsigned)swapchain_hr, (void *)hwnd);
     mgpu::diag::info(line);
     if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "create-present-chain-exit", "published", (unsigned)swapchain_hr);
     return true;
@@ -1603,7 +1620,8 @@ bool present_frame(float r, float g, float b)
     ID3D12CommandQueue *queue = nullptr;
     IDXGISwapChain3 *sc = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *backbuffer[2] = {};
+    ID3D12Resource *backbuffer[state::MAX_BACKBUFFERS] = {};   // BB1
+    UINT bb_count = 2u;
     // D6: the slot this call will use, and the fence value that slot last
     // carried. slot is derived from fence_value, so it advances with the
     // submissions rather than with a counter that could drift from them.
@@ -1623,8 +1641,9 @@ bool present_frame(float r, float g, float b)
         queue = S.queue;
         sc = S.swapchain;
         heap = S.rtv_heap;
-        backbuffer[0] = S.backbuffer[0];
-        backbuffer[1] = S.backbuffer[1];
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            backbuffer[i] = S.backbuffer[i];
+        bb_count = S.present_buffers;
         fence = S.fence;
         event = S.fence_event;
         fence_value = S.fence_value;
@@ -1674,9 +1693,9 @@ bool present_frame(float r, float g, float b)
     // GetCurrentBackBufferIndex takes NO parameters and returns UINT
     // directly; it is not an HRESULT call.
     const UINT index = sc->GetCurrentBackBufferIndex();
-    if (index >= 2)
+    if (index >= bb_count)
     {
-        // Cannot happen with BufferCount 2. Guarded because the index
+        // Cannot happen: the chain was made with bb_count. Guarded because the index
         // feeds both a descriptor offset and backbuffer[], and a wrong
         // one would be a silent out-of-bounds read.
         return fail("GetCurrentBackBufferIndex (index out of range)", index);
@@ -1914,9 +1933,9 @@ bool present_frame(float r, float g, float b)
         const UINT top  = (nh - ch) / 2u;
 
         // The backbuffer went PRESENT -> RENDER_TARGET above for the clear.
-        // Take it on to COPY_DEST. The clear still happens first, so a crop
-        // smaller than the backbuffer leaves the cycling colour as a border
-        // rather than undefined pixels.
+        // Take it on to COPY_DEST. A crop smaller than the backbuffer is still
+        // cleared first, so it leaves a colour as a border rather than
+        // undefined pixels (BB1: only then).
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         // R108 / V26. The border behind a crop smaller than the backbuffer.
@@ -1924,7 +1943,24 @@ bool present_frame(float r, float g, float b)
         // saturated hue that changed every frame and read as a fault. Same
         // dark neutral the idle screen uses, so the two never disagree.
         const float color_pre[4] = { 0.030f, 0.032f, 0.035f, 1.0f };
-        cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
+        // ---- BB1: CLEAR ONLY WHAT THE PICTURE WILL NOT COVER ----
+        //
+        // This ran on every frame, so every frame's back buffer spent a moment
+        // holding this colour. A full-size copy overwrites all of it, and on a
+        // screen caught reading a buffer mid-write (see BufferCount) that moment
+        // was a dark horizontal band with frame generation on.
+        //
+        // PresentRaceProbe=1 is the instrument that showed it, kept because it
+        // needs no special build: magenta instead of the colour above, every
+        // frame, so any such read shows as a magenta band. Diagnostic only.
+        static const bool race_probe = ui_ini_read("PresentRaceProbe", 0) == 1;
+        if (race_probe)
+        {
+            const float color_probe[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+            cl->ClearRenderTargetView(rtv, color_probe, 0, nullptr);
+        }
+        else if (cw != bw || ch != bh)
+            cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
         cl->ResourceBarrier(1, &barrier);
 
         D3D12_RESOURCE_BARRIER nb{};
@@ -2265,7 +2301,7 @@ void shutdown()
     ID3D12CommandQueue *queue = nullptr;
     IDXGISwapChain3 *sc = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *backbuffer[2] = {};
+    ID3D12Resource *backbuffer[state::MAX_BACKBUFFERS] = {};   // BB1
     ID3D12CommandAllocator *allocator[state::PRESENT_SLOTS] = {};   // D6
     ID3D12GraphicsCommandList *cl[state::PRESENT_SLOTS] = {};
     ID3D12Fence *fence = nullptr;
@@ -2276,8 +2312,8 @@ void shutdown()
         queue = S.queue;
         sc = S.swapchain;
         heap = S.rtv_heap;
-        backbuffer[0] = S.backbuffer[0];
-        backbuffer[1] = S.backbuffer[1];
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            backbuffer[i] = S.backbuffer[i];
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         {
             allocator[i] = S.allocator[i];
@@ -2292,8 +2328,8 @@ void shutdown()
         S.queue = nullptr;
         S.swapchain = nullptr;
         S.rtv_heap = nullptr;
-        S.backbuffer[0] = nullptr;
-        S.backbuffer[1] = nullptr;
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            S.backbuffer[i] = nullptr;
         S.fence = nullptr;
         S.fence_event = nullptr;
         S.fence_value = 0;
@@ -2342,10 +2378,9 @@ void shutdown()
             if (cl[i] != nullptr)        cl[i]->Release();
             if (allocator[i] != nullptr) allocator[i]->Release();
         }
-        if (backbuffer[1] != nullptr)
-            backbuffer[1]->Release();
-        if (backbuffer[0] != nullptr)
-            backbuffer[0]->Release();
+        for (unsigned i = state::MAX_BACKBUFFERS; i-- > 0u; )   // BB1
+            if (backbuffer[i] != nullptr)
+                backbuffer[i]->Release();
         heap->Release();
         sc->Release();
         queue->Release();
@@ -15320,7 +15355,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
 
     {
         std::lock_guard<std::mutex> lk(S.cs);
-        for (int i = 0; i < 2; ++i)
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
             if (S.backbuffer[i] != nullptr) { S.backbuffer[i]->Release(); S.backbuffer[i] = nullptr; }
     }
 
@@ -15342,7 +15377,9 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
 
     // want_fmt, not a constant. This is DEFECT H's actual repair.
     const double r313_rb0 = mgpu::strace::now_ms();
-    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, 0);
+    UINT rcount = 2u;   // BB1: the count the chain was made with
+    { std::lock_guard<std::mutex> lk(S.cs); rcount = S.present_buffers; }
+    const HRESULT rb = sc->ResizeBuffers(rcount, buf_w, buf_h, want_fmt, 0);
     if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "%ux%u fmt=%d, %.2f ms", buf_w, buf_h, (int)want_fmt, mgpu::strace::now_ms() - r313_rb0); mgpu::strace::ev(mgpu::strace::R_BT, "ResizeBuffers", d, (unsigned)rb); }
 
     // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
@@ -15381,22 +15418,25 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     }
     bool ok = SUCCEEDED(rb);
 
-    // Re-acquire the backbuffers and rebuild the two RTVs.
+    // Re-acquire the backbuffers and rebuild their RTVs.
     if (ok)
     {
-        ID3D12Resource *b0 = nullptr, *b1 = nullptr;
-        HRESULT h0 = sc->GetBuffer(0, IID_PPV_ARGS(&b0));
-        HRESULT h1 = SUCCEEDED(h0) ? sc->GetBuffer(1, IID_PPV_ARGS(&b1)) : h0;
-        if (SUCCEEDED(h1) && heap != nullptr)
+        ID3D12Resource *b[state::MAX_BACKBUFFERS] = {};   // BB1
+        HRESULT hb = S_OK;
+        for (UINT i = 0; i < rcount && SUCCEEDED(hb); ++i)
+            hb = sc->GetBuffer(i, IID_PPV_ARGS(&b[i]));
+        if (SUCCEEDED(hb) && heap != nullptr)
         {
             const UINT rs = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-            D3D12_CPU_DESCRIPTOR_HANDLE d0 = heap->GetCPUDescriptorHandleForHeapStart();
-            D3D12_CPU_DESCRIPTOR_HANDLE d1 = d0; d1.ptr += rs;
-            dev->CreateRenderTargetView(b0, nullptr, d0);
-            dev->CreateRenderTargetView(b1, nullptr, d1);
+            D3D12_CPU_DESCRIPTOR_HANDLE d = heap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT i = 0; i < rcount; ++i)
+            {
+                dev->CreateRenderTargetView(b[i], nullptr, d);
+                d.ptr += rs;
+            }
             std::lock_guard<std::mutex> lk(S.cs);
-            S.backbuffer[0] = b0;
-            S.backbuffer[1] = b1;
+            for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)
+                S.backbuffer[i] = b[i];
             S.chain_w = buf_w;
             S.chain_h = buf_h;
             S.chain_fmt = want_fmt;
@@ -15404,8 +15444,8 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
         }
         else
         {
-            if (b0 != nullptr) b0->Release();
-            if (b1 != nullptr) b1->Release();
+            for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)
+                if (b[i] != nullptr) b[i]->Release();
             ok = false;
         }
     }
