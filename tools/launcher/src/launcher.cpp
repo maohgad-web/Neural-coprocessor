@@ -89,7 +89,13 @@ namespace
         ID_ADV_CROP_OFF, ID_ADV_CROP_ON, ID_ADV_CROP_AUTO,
         ID_ADV_N16_OFF, ID_ADV_N16_ON, ID_ADV_N16P_M, ID_ADV_N16P_P,
         ID_ADV_P2_MED, ID_ADV_P2_LIGHT, ID_ADV_P2_FULL,  // R320: the 2nd pass (the panel's R319 choice)
-        ID_ADV_NRS_OFF, ID_ADV_NRS_ON                    // R321: pass 1 scale (NRS, R299) - the panel's switch
+        ID_ADV_NRS_OFF, ID_ADV_NRS_ON,                   // R321: pass 1 scale (NRS, R299) - the panel's switch
+        // R356 (0.5.0): the panel's "Pass settings" - network and resolution per pass, FG on the DLSS 5 card,
+        // and the restore button. Green = the FPS+ choice, red = the FPS- one (draw_button).
+        ID_ADV_P1N_LIGHT, ID_ADV_P1N_FULL, ID_ADV_P1R_RES, ID_ADV_P1R_NATIVE,
+        ID_ADV_P2N_LIGHT, ID_ADV_P2N_FULL, ID_ADV_P2R_RES, ID_ADV_P2R_NATIVE,
+        ID_ADV_FG1_OFF, ID_ADV_FG1_ON, ID_ADV_BEST,
+        ID_ADV_P1X2_LIGHT, ID_ADV_P1X2_FULL   // R361: pass 1's network while x2+ runs (NRPreset1x2)
     };
     const UINT_PTR TIMER_SWEEP = 1;
 
@@ -102,6 +108,8 @@ namespace
     const COLORREF C_RED  = RGB(199, 87, 82);    // 0.78 0.34 0.32 - error only
     const COLORREF C_LIT  = RGB(214, 218, 226);  // the chosen display and its cable
     const COLORREF C_GRN  = RGB(104, 176, 112);  // R329: OPTIMIZATION's state (QUALITY MAX / ON / FPS MAX)
+    const COLORREF C_GRN_D = RGB(52, 88, 56);    // R356: an unselected FPS+ button
+    const COLORREF C_RED_D = RGB(100, 44, 41);   // R356: an unselected FPS- button
 
     HINSTANCE g_hinst = nullptr;
     HWND g_main = nullptr, g_list = nullptr,
@@ -368,6 +376,19 @@ namespace
         { L"The backup could not be written - mgpu.ini was not replaced.", { L"N\u00E3o foi poss\u00EDvel gravar a c\u00F3pia - o mgpu.ini n\u00E3o foi substitu\u00EDdo.", L"No se pudo escribir la copia - mgpu.ini no se reemplaz\u00F3.", L"\u65E0\u6CD5\u5199\u5165\u5907\u4EFD - mgpu.ini \u672A\u88AB\u66FF\u6362\u3002", L"\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u3092\u66F8\u304D\u8FBC\u3081\u307E\u305B\u3093\u3067\u3057\u305F - mgpu.ini \u306F\u7F6E\u304D\u63DB\u3048\u3089\u308C\u3066\u3044\u307E\u305B\u3093\u3002", L"\uBC31\uC5C5\uC744 \uC4F8 \uC218 \uC5C6\uC5B4 mgpu.ini\uB97C \uBC14\uAFB8\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4." } },
         { L"mgpu.ini replaced with the release's.", { L"mgpu.ini substitu\u00EDdo pelo desta vers\u00E3o.", L"mgpu.ini reemplazado por el de esta versi\u00F3n.", L"mgpu.ini \u5DF2\u66FF\u6362\u4E3A\u672C\u7248\u672C\u7684\u6587\u4EF6\u3002", L"mgpu.ini \u3092\u3053\u306E\u30EA\u30EA\u30FC\u30B9\u306E\u3082\u306E\u306B\u7F6E\u304D\u63DB\u3048\u307E\u3057\u305F\u3002", L"mgpu.ini\uB97C \uC774 \uBC84\uC804\uC758 \uD30C\uC77C\uB85C \uBC14\uAFE8\uC2B5\uB2C8\uB2E4." } },
         { L"Kept: ", { L"Mantido: ", L"Conservado: ", L"\u4FDD\u7559\uFF1A", L"\u4FDD\u6301\uFF1A", L"\uC720\uC9C0: " } },
+        // R356: the pass settings
+        { L"PASS 1 NETWORK AT X2", { L"REDE DA 1\u00AA PASSAGEM EM X2", L"RED DE LA 1\u00AA PASADA EN X2", L"x2 \u65F6\u7684\u7B2C\u4E00\u904D\u7F51\u7EDC", L"x2 \u6642\u306E\u7B2C1\u30D1\u30B9\u306E\u30CD\u30C3\u30C8\u30EF\u30FC\u30AF", L"x2 \uC2DC 1\uCC28 \uD328\uC2A4 \uB124\uD2B8\uC6CC\uD06C" } },
+        { L"DLSS ON GPU 1 (OLD)", { L"DLSS NA GPU 1 (ANTIGO)", L"DLSS EN LA GPU 1 (ANTIGUO)", L"GPU 1 \u4E0A\u7684 DLSS\uFF08\u65E7\uFF09", L"GPU 1 \u306E DLSS\uFF08\u65E7\uFF09", L"GPU 1\uC758 DLSS (\uC774\uC804)" } },
+        { L"PASS 1 NETWORK", { L"REDE DA 1\u00AA PASSAGEM", L"RED DE LA 1\u00AA PASADA", L"\u7B2C\u4E00\u904D\u7F51\u7EDC", L"\u7B2C1\u30D1\u30B9\u306E\u30CD\u30C3\u30C8\u30EF\u30FC\u30AF", L"1\uCC28 \uD328\uC2A4 \uB124\uD2B8\uC6CC\uD06C" } },
+        { L"PASS 2 NETWORK", { L"REDE DA 2\u00AA PASSAGEM", L"RED DE LA 2\u00AA PASADA", L"\u7B2C\u4E8C\u904D\u7F51\u7EDC", L"\u7B2C2\u30D1\u30B9\u306E\u30CD\u30C3\u30C8\u30EF\u30FC\u30AF", L"2\uCC28 \uD328\uC2A4 \uB124\uD2B8\uC6CC\uD06C" } },
+        { L"PASS 1 RESOLUTION", { L"RESOLU\u00C7\u00C3O DA 1\u00AA PASSAGEM", L"RESOLUCI\u00D3N DE LA 1\u00AA PASADA", L"\u7B2C\u4E00\u904D\u5206\u8FA8\u7387", L"\u7B2C1\u30D1\u30B9\u306E\u89E3\u50CF\u5EA6", L"1\uCC28 \uD328\uC2A4 \uD574\uC0C1\uB3C4" } },
+        { L"PASS 2 RESOLUTION", { L"RESOLU\u00C7\u00C3O DA 2\u00AA PASSAGEM", L"RESOLUCI\u00D3N DE LA 2\u00AA PASADA", L"\u7B2C\u4E8C\u904D\u5206\u8FA8\u7387", L"\u7B2C2\u30D1\u30B9\u306E\u89E3\u50CF\u5EA6", L"2\uCC28 \uD328\uC2A4 \uD574\uC0C1\uB3C4" } },
+        { L"DLSS 5 CARD FRAME GEN", { L"GERA\u00C7\u00C3O DE QUADROS (PLACA DLSS 5)", L"GENERACI\u00D3N DE FOTOGRAMAS (TARJETA DLSS 5)", L"DLSS 5 \u663E\u5361\u5E27\u751F\u6210", L"DLSS 5 \u30AB\u30FC\u30C9\u3067\u30D5\u30EC\u30FC\u30E0\u751F\u6210", L"DLSS 5 \uCE74\uB4DC \uD504\uB808\uC784 \uC0DD\uC131" } },
+        { L"DEFAULTS", { L"PADR\u00C3O", L"PREDETERMINADO", L"\u9ED8\u8BA4", L"\u65E2\u5B9A", L"\uAE30\uBCF8\uAC12" } },
+        { L"RESIDUAL NEURAL FPS+", { L"NEURAL RESIDUAL FPS+", L"NEURAL RESIDUAL FPS+", L"\u6B8B\u5DEE\u795E\u7ECF FPS+", L"\u6B8B\u5DEE\u30CB\u30E5\u30FC\u30E9\u30EB FPS+", L"\uC794\uCC28 \uB274\uB7F4 FPS+" } },
+        { L"NATIVE FPS-", { L"NATIVA FPS-", L"NATIVA FPS-", L"\u539F\u751F FPS-", L"\u30CD\u30A4\u30C6\u30A3\u30D6 FPS-", L"\uB124\uC774\uD2F0\uBE0C FPS-" } },
+        { L"BEST QUALITY-PERFORMANCE", { L"MELHOR QUALIDADE-DESEMPENHO", L"MEJOR CALIDAD-RENDIMIENTO", L"\u6700\u4F73\u753B\u8D28-\u6027\u80FD", L"\u6700\u9AD8\u753B\u8CEA-\u30D1\u30D5\u30A9\u30FC\u30DE\u30F3\u30B9", L"\uCD5C\uACE0 \uD654\uC9C8-\uC131\uB2A5" } },
+        { L"FULL-FP8 ON THE LAST PASS REMOVES THE STROBING WHEN STRUCTURE IS HIGH.", { L"FULL-FP8 NA \u00DALTIMA PASSAGEM REMOVE A CINTILA\u00C7\u00C3O COM ESTRUTURA ALTA.", L"FULL-FP8 EN LA \u00DALTIMA PASADA ELIMINA EL PARPADEO CON ESTRUCTURA ALTA.", L"\u6700\u540E\u4E00\u904D\u4F7F\u7528 FULL-FP8\uFF0C\u53EF\u4EE5\u6D88\u9664\u7ED3\u6784\u8C03\u9AD8\u65F6\u7684\u95EA\u70C1\u3002", L"\u6700\u5F8C\u306E\u30D1\u30B9\u3092 FULL-FP8 \u306B\u3059\u308B\u3068\u3001\u69CB\u9020\u304C\u9AD8\u3044\u3068\u304D\u306E\u3061\u3089\u3064\u304D\u304C\u6D88\u3048\u307E\u3059\u3002", L"\uB9C8\uC9C0\uB9C9 \uD328\uC2A4\uB97C FULL-FP8\uB85C \uD558\uBA74 \uAD6C\uC870 \uAC12\uC774 \uB192\uC744 \uB54C\uC758 \uAE5C\uBE61\uC784\uC774 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4." } },
         { L" (2ND PASS ", { L" (2\u00AA PASSAGEM ", L" (2\u00AA PASADA ", L" (\u7B2C\u4E8C\u904D ", L" (\u7B2C2\u30D1\u30B9 ", L" (2\uCC28 \uD328\uC2A4 " } },
     };
     const wchar_t *tr_lookup(const wchar_t *s)
@@ -1216,6 +1237,11 @@ namespace
         bool n16 = false; double n16_power = 2.2;
         int pass2 = 2;              // R320: 0 Medium, 1 Light, 2 Full (no ResidualPass=2 line)
         bool nrs = false;           // R321: NRScale present and above 0.05 (R299's own test)
+        // R356: the pass settings, read the way the panel reads them
+        int net1 = 0, net2 = 0;     // 0 Light-FP8 (NRPreset<n> absent/0/2), 1 Full-FP8 (NRPreset<n>=1)
+        int res1 = 0, res2 = 0;     // 1 Residual Neural, 0 Native
+        bool fg1 = false;           // FrameGen=4
+        int net1x2 = 0;             // R361: NRPreset1x2 (absent = net1)
     };
     adv_view g_adv;
 
@@ -1248,7 +1274,18 @@ namespace
         a.n16_power = gf("NRInput16Power", 2.2);
         // R320: read the way the panel reads it (R319)
         a.pass2 = (gi("ResidualPass", -1) == 2) ? ((gi("ResidualRender", 0) == 1) ? 1 : 0) : 2;
-        a.nrs = gf("NRScale", 0.0) > 0.05;   // R321
+        a.nrs = gi("NRS", 0) == 1;   // R357: our residual on pass 1 (was NRScale, R321)
+        {   // R356
+            const int fb = gi("NRPreset", 0);
+            a.net1 = (gi("NRPreset1", fb) == 1) ? 1 : 0;
+            a.net2 = (gi("NRPreset2", fb) == 1) ? 1 : 0;
+            const bool nrs1 = gi("NRS", 0) == 1;
+            a.res1 = nrs1 ? 1 : 0;
+            const std::string p2 = g("Pass2");
+            a.res2 = (nrs1 && !p2.empty()) ? ((p2[0] == 'n' || p2[0] == 'N') ? 1 : 0) : ((gi("ResidualPass", -1) == 2) ? 1 : 0);
+            a.fg1 = gi("FrameGen", 0) == 4;
+            a.net1x2 = (gi("NRPreset1x2", a.net1) == 1) ? 1 : 0;   // R361
+        }
         g_adv = a;
     }
 
@@ -1319,10 +1356,12 @@ namespace
         case ID_ADV_FG_THIN: kv.push_back({ "NRFrameFilter", "3" }); break;
         case ID_ADV_KEEP_M: kv.push_back({ "NRFrameKeep", std::to_string(a.keep > 2 ? a.keep - 1 : 2) }); break;
         case ID_ADV_KEEP_P: kv.push_back({ "NRFrameKeep", std::to_string(a.keep < 8 ? a.keep + 1 : 8) }); break;
-        case ID_ADV_SR_OFF: kv.push_back({ "SRUpscale", "0" }); kv.push_back({ "NRScale", "0" }); break;   // R329: OPTIMIZATION off
-        case ID_ADV_SR_ON:  kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, a.sr_native); break;
-        case ID_ADV_SR_NATIVE: kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, true);  kv.push_back({ "NRScale", "0" }); break;   // R329
-        case ID_ADV_SR_EXP:    kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, false); kv.push_back({ "NRScale", "0" }); break;   // R329
+        // R357: OPTIMIZATION's NRS is OUR residual on pass 1 (NRS=1, Marcelo 23:54), not NRScale. One choice at a
+        // time stays: OFF and the two upscaling choices also write NRS=0 (the residual refuses SRUpscale anyway).
+        case ID_ADV_SR_OFF: kv.push_back({ "SRUpscale", "0" }); break;   // R358: DLSS ON GPU 1 (OLD) off - NRS untouched
+        case ID_ADV_SR_ON:  kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, a.sr_native); kv.push_back({ "NRS", "0" }); break;
+        case ID_ADV_SR_NATIVE: kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, true);  kv.push_back({ "NRScale", "0" }); kv.push_back({ "NRS", "0" }); break;   // R329
+        case ID_ADV_SR_EXP:    kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, false); kv.push_back({ "NRScale", "0" }); kv.push_back({ "NRS", "0" }); break;   // R329
         case ID_ADV_SRQ_Q: adv_sr_mode_pairs(kv, 2, a.sr_native); break;
         case ID_ADV_SRQ_B: adv_sr_mode_pairs(kv, 1, a.sr_native); break;
         case ID_ADV_SRQ_P: adv_sr_mode_pairs(kv, 0, a.sr_native); break;
@@ -1342,8 +1381,32 @@ namespace
         case ID_ADV_P2_LIGHT: kv.push_back({ "ResidualPass", "2" }); kv.push_back({ "ResidualScale", "0.75" }); kv.push_back({ "ResidualRender", "1" }); break;
         case ID_ADV_P2_FULL:  kv.push_back({ "ResidualPass", "0" }); break;
         // R321: the panel's "Pass 1 scale (NRS)" switch, same keys
-        case ID_ADV_NRS_ON:  kv.push_back({ "NRScale", "0.75" }); kv.push_back({ "NRScaleResolveDepth", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R329: one at a time
-        case ID_ADV_NRS_OFF: kv.push_back({ "NRScale", "0" }); break;
+        case ID_ADV_NRS_ON:  kv.push_back({ "NRS", "1" }); kv.push_back({ "NRScale", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R357: our path; R329: one at a time
+        case ID_ADV_NRS_OFF: kv.push_back({ "NRS", "0" }); kv.push_back({ "NRScale", "0" }); break;   // R358: OPTIMIZATION OFF
+        // R356: the same keys the panel's "Pass settings" writes
+        case ID_ADV_P1N_LIGHT: kv.push_back({ "NRPreset1", "0" }); break;
+        case ID_ADV_P1N_FULL:  kv.push_back({ "NRPreset1", "1" }); break;
+        case ID_ADV_P2N_LIGHT: kv.push_back({ "NRPreset2", "0" }); break;
+        case ID_ADV_P2N_FULL:  kv.push_back({ "NRPreset2", "1" }); break;
+        case ID_ADV_P1R_RES:    kv.push_back({ "NRS", "1" }); kv.push_back({ "NRScale", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R357: = OPTIMIZATION's NRS
+        case ID_ADV_P1R_NATIVE: kv.push_back({ "NRS", "0" }); break;
+        case ID_ADV_P2R_RES:
+            if (a.res1) kv.push_back({ "Pass2", "nrs" });
+            else { kv.push_back({ "ResidualPass", "2" }); kv.push_back({ "ResidualScale", "0.75" }); kv.push_back({ "ResidualRender", "0" }); }
+            break;
+        case ID_ADV_P2R_NATIVE:
+            if (a.res1) kv.push_back({ "Pass2", "full" });
+            else kv.push_back({ "ResidualPass", "0" });
+            break;
+        case ID_ADV_FG1_OFF: kv.push_back({ "FrameGen", "0" }); break;
+        case ID_ADV_FG1_ON:  kv.push_back({ "FrameGen", "4" }); break;
+        case ID_ADV_P1X2_LIGHT: kv.push_back({ "NRPreset1x2", "0" }); break;   // R361
+        case ID_ADV_P1X2_FULL:  kv.push_back({ "NRPreset1x2", "1" }); break;
+        case ID_ADV_BEST:    // Marcelo's default (R360/R361): Full-FP8 + Residual on pass 1 at x1 and on the last pass; Light-FP8 on pass 1 at x2+
+            kv.push_back({ "NRS", "1" }); kv.push_back({ "NRPreset1", "1" }); kv.push_back({ "NRPreset1x2", "0" }); kv.push_back({ "NRPreset2", "1" });
+            kv.push_back({ "Pass2", "nrs" }); kv.push_back({ "FrameGen", "0" });
+            kv.push_back({ "NRScale", "0" }); kv.push_back({ "SRUpscale", "0" });   // R357: one optimization at a time
+            break;
         default: return;
         }
         adv_write(kv);
@@ -1984,10 +2047,18 @@ namespace
         { L"TUNING", 2, AV_TEXT },     { L"MODEL STYLE", 3, AV_NONE },   { L"TONE", 2, AV_NUM },
         { L"STRUCTURE", 2, AV_NUM },   { L"SKIN", 2, AV_NUM },           { L"AUTO MASK", 2, AV_NONE },
         { L"INTENSITY", 2, AV_NUM },   { L"PASSES", 2, AV_NONE },
+        // R356 (rows 8-13): the panel's "Pass settings"
+        { L"PASS 1 NETWORK", 2, AV_NONE },  { L"PASS 1 RESOLUTION", 2, AV_NONE },   // R362: no "AT X2" row (noisy); Best writes NRPreset1x2
+        { L"PASS 2 NETWORK", 2, AV_NONE },  { L"PASS 2 RESOLUTION", 2, AV_NONE },
+        { L"DLSS 5 CARD FRAME GEN", 2, AV_NONE }, { L"DEFAULTS", 1, AV_NONE },
         { L"FRAME GENERATION", 4, AV_NONE },
-        // R329: the 2nd pass choice is the panel's Experimental setting only; NRS joins the
-        // upscaling choices in one row (one of them at a time), which replaces DLSS ON GPU 1.
-        { L"KEEP 1 GENERATED FRAME IN", 2, AV_NUM },  { L"OPTIMIZATION", 4, AV_NONE },
+        // R329: the 2nd pass choice is the panel's Experimental setting only. R358: OPTIMIZATION = our NRS pass;
+        // DLSS ON GPU 1 (OLD) is its own row again. Picking one of the DLSS choices writes NRS=0 (the residual
+        // refuses SRUpscale), PERFORMANCE writes SRUpscale=0: one optimization at a time, as R329.
+        // R358 (Marcelo 00:02): OPTIMIZATION is OFF | PERFORMANCE (our NRS pass, NRS=1); the old DLSS-on-GPU-1
+        // choices are their own row, DLSS ON GPU 1 (OLD).
+        { L"KEEP 1 GENERATED FRAME IN", 2, AV_NUM },  { L"OPTIMIZATION", 2, AV_NONE },
+        { L"DLSS ON GPU 1 (OLD)", 3, AV_NONE },
         { L"DLSS MODE", 3, AV_NONE },  { L"DLSS PRESET", 4, AV_NONE },   { L"CROP", 3, AV_NONE },
         { L"16-BIT COLOUR", 2, AV_NONE }, { L"16-BIT POWER", 2, AV_NUM },
     };
@@ -2007,8 +2078,8 @@ namespace
         case 3:  return { wf2(a.structure), a.tuning ? C_FG : C_DIM };
         case 4:  return { wf2(a.skin), a.tuning ? C_FG : C_DIM };
         case 6:  return { wf2(a.intensity), C_FG };
-        case 9:  return { std::to_wstring(a.keep), (a.fg == 3) ? C_FG : C_DIM };   // R329: rows renumbered
-        case 15: return { wf2(a.n16_power), a.n16 ? C_FG : C_DIM };
+        case 15: return { std::to_wstring(a.keep), (a.fg == 3) ? C_FG : C_DIM };   // R329: rows renumbered; R356: +6 (R362: the R361 row is gone)
+        case 22: return { wf2(a.n16_power), a.n16 ? C_FG : C_DIM };   // R358: +1 (DLSS ON GPU 1 (OLD))
         default: return { L"", C_DIM };
         }
     }
@@ -2023,6 +2094,7 @@ namespace
             if (!v.text.empty()) textf(dc, ADV_VX, g_adv_y[i] + 5, g_adv_vw[i], v.text, 2, v.col);
         }
         int y = g_adv_end + 6;
+        y = guide_para(dc, PX, y, PW, L"FULL-FP8 ON THE LAST PASS REMOVES THE STROBING WHEN STRUCTURE IS HIGH.", C_DIM);   // R356
         y = guide_para(dc, PX, y, PW, L"FRAME GENERATION NEEDS MVEC=3 (THE GAME'S OWN VECTORS).", C_DIM);
         y = guide_para(dc, PX, y, PW, L"FRAME GENERATION SETTINGS MAY CRASH THE GAME AT STARTUP.", C_RED);
         {   // R329: OPTIMIZATION's state in words and colour: OFF (red) QUALITY MAX (green), or ON FPS MAX (green)
@@ -2293,6 +2365,16 @@ namespace
         bool active = false;
         for (int a : g_active_ids) if (a == id) active = true;
         fill(dc, r.left, r.top, w, h, (down || active) ? C_SEL : C_BASE);
+        // R356: the pass settings' choices carry their colour - green FPS+, red FPS-; bright when selected
+        const bool grn = (id == ID_ADV_P1N_LIGHT || id == ID_ADV_P2N_LIGHT || id == ID_ADV_P1R_RES || id == ID_ADV_P2R_RES || id == ID_ADV_P1X2_LIGHT);
+        const bool red = (id == ID_ADV_P1N_FULL || id == ID_ADV_P2N_FULL || id == ID_ADV_P1R_NATIVE || id == ID_ADV_P2R_NATIVE || id == ID_ADV_P1X2_FULL);
+        if ((grn || red) && !off)
+        {
+            const COLORREF c = active ? (grn ? C_GRN : C_RED) : (grn ? C_GRN_D : C_RED_D);
+            frame(dc, r.left, r.top, w, h, active ? 2 : 1, c);
+            text_cf(dc, r.left + w / 2, text_y_centred(r.top + h / 2, 2), w - 8, t, 2, active ? c : (grn ? C_GRN_D : C_RED_D));
+            return;
+        }
         frame(dc, r.left, r.top, w, h, 1, off ? C_RULE : (active ? C_LIT : ((di->itemState & ODS_FOCUS) ? C_FG : C_DIM)));
         text_cf(dc, r.left + w / 2, text_y_centred(r.top + h / 2, 2), w - 8, t, 2, off ? C_RULE : (active ? C_LIT : C_FG));
     }
@@ -2521,9 +2603,17 @@ namespace
             grp({ { L"OFF", ID_ADV_MASK_OFF }, { L"ON", ID_ADV_MASK_ON } }, ADV_VX);
             pm(ID_ADV_INT_M, ID_ADV_INT_P);
             grp({ { L"1", ID_ADV_PASSES_1 }, { L"2", ID_ADV_PASSES_2 } }, ADV_VX);
+            // R356
+            grp({ { L"LIGHT-FP8 FPS+", ID_ADV_P1N_LIGHT }, { L"FULL-FP8 FPS-", ID_ADV_P1N_FULL } }, ADV_VX);
+            grp({ { L"RESIDUAL NEURAL FPS+", ID_ADV_P1R_RES }, { L"NATIVE FPS-", ID_ADV_P1R_NATIVE } }, ADV_VX);
+            grp({ { L"LIGHT-FP8 FPS+", ID_ADV_P2N_LIGHT }, { L"FULL-FP8 FPS-", ID_ADV_P2N_FULL } }, ADV_VX);
+            grp({ { L"RESIDUAL NEURAL FPS+", ID_ADV_P2R_RES }, { L"NATIVE FPS-", ID_ADV_P2R_NATIVE } }, ADV_VX);
+            grp({ { L"OFF", ID_ADV_FG1_OFF }, { L"ON", ID_ADV_FG1_ON } }, ADV_VX);
+            grp({ { L"BEST QUALITY-PERFORMANCE", ID_ADV_BEST } }, ADV_VX);
             grp({ { L"OFF", ID_ADV_FG_OFF }, { L"MAP ONLY", ID_ADV_FG_MAP }, { L"FIX VECTORS", ID_ADV_FG_FIX }, { L"FIX + THIN", ID_ADV_FG_THIN } }, ADV_VX);
             pm(ID_ADV_KEEP_M, ID_ADV_KEEP_P);
-            grp({ { L"OFF", ID_ADV_SR_OFF }, { L"PASS 1 SCALE (NRS)", ID_ADV_NRS_ON }, { L"NATIVE UPSCALING", ID_ADV_SR_NATIVE }, { L"EXPERIMENTAL", ID_ADV_SR_EXP } }, ADV_VX);   // R329
+            grp({ { L"OFF", ID_ADV_NRS_OFF }, { L"PERFORMANCE", ID_ADV_NRS_ON } }, ADV_VX);   // R358: OPTIMIZATION = our NRS pass
+            grp({ { L"OFF", ID_ADV_SR_OFF }, { L"NATIVE UPSCALING", ID_ADV_SR_NATIVE }, { L"EXPERIMENTAL", ID_ADV_SR_EXP } }, ADV_VX);   // R358: DLSS ON GPU 1 (OLD)
             grp({ { L"QUALITY", ID_ADV_SRQ_Q }, { L"BALANCED", ID_ADV_SRQ_B }, { L"PERFORMANCE", ID_ADV_SRQ_P } }, ADV_VX);
             grp({ { L"TITLE DEFAULT", ID_ADV_PRESET_0 }, { L"K", ID_ADV_PRESET_K }, { L"L", ID_ADV_PRESET_L }, { L"M", ID_ADV_PRESET_M } }, ADV_VX);
             grp({ { L"OFF", ID_ADV_CROP_OFF }, { L"ON", ID_ADV_CROP_ON }, { L"AUTO CROP", ID_ADV_CROP_AUTO } }, ADV_VX);
@@ -2578,9 +2668,15 @@ namespace
             g_active_ids.push_back(a.style == 0 ? ID_ADV_STYLE_A : a.style == 1 ? ID_ADV_STYLE_B : ID_ADV_STYLE_C);
             g_active_ids.push_back(a.mask ? ID_ADV_MASK_ON : ID_ADV_MASK_OFF);
             g_active_ids.push_back(a.passes == 2 ? ID_ADV_PASSES_2 : ID_ADV_PASSES_1);
+            g_active_ids.push_back(a.net1 ? ID_ADV_P1N_FULL : ID_ADV_P1N_LIGHT);   // R356
+            g_active_ids.push_back(a.res1 ? ID_ADV_P1R_RES : ID_ADV_P1R_NATIVE);
+            g_active_ids.push_back(a.net2 ? ID_ADV_P2N_FULL : ID_ADV_P2N_LIGHT);
+            g_active_ids.push_back(a.res2 ? ID_ADV_P2R_RES : ID_ADV_P2R_NATIVE);
+            g_active_ids.push_back(a.fg1 ? ID_ADV_FG1_ON : ID_ADV_FG1_OFF);
             g_active_ids.push_back(a.fg == 0 ? ID_ADV_FG_OFF : a.fg == 1 ? ID_ADV_FG_MAP : a.fg == 2 ? ID_ADV_FG_FIX : ID_ADV_FG_THIN);
             // R329: one choice in OPTIMIZATION - NRS, an upscaling option, or off
-            g_active_ids.push_back(a.nrs ? ID_ADV_NRS_ON : !a.sr ? ID_ADV_SR_OFF : a.sr_native ? ID_ADV_SR_NATIVE : ID_ADV_SR_EXP);
+            g_active_ids.push_back(a.nrs ? ID_ADV_NRS_ON : ID_ADV_NRS_OFF);                                   // R358: OPTIMIZATION
+            g_active_ids.push_back(!a.sr ? ID_ADV_SR_OFF : a.sr_native ? ID_ADV_SR_NATIVE : ID_ADV_SR_EXP);    // R358: DLSS ON GPU 1 (OLD)
             g_active_ids.push_back(a.sr_mode == 2 ? ID_ADV_SRQ_Q : a.sr_mode == 1 ? ID_ADV_SRQ_B : ID_ADV_SRQ_P);
             g_active_ids.push_back(a.sr_preset == 11 ? ID_ADV_PRESET_K : a.sr_preset == 12 ? ID_ADV_PRESET_L : a.sr_preset == 13 ? ID_ADV_PRESET_M : ID_ADV_PRESET_0);
             g_active_ids.push_back(a.crop == 0 ? ID_ADV_CROP_OFF : a.crop == 1 ? ID_ADV_CROP_ON : ID_ADV_CROP_AUTO);
