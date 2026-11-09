@@ -31,6 +31,14 @@ and the overlay could not be used at the same time:
   The feature is created once and the scale changes live without rebuilding it.
   Uses the shaders from xenmods/DLSSNR-Cost-Scaler (MIT). Opt-in via `NRScale`.
 
+- **The DLSS-NR network per pass (R349, his R419).** A hint at feature creation picks which network each pass
+  runs. It is how the big network on the last pass was found to remove the strobing at high structure, which is
+  the 0.5.0 default. Opt-in via `NRPreset1` / `NRPreset2`.
+
+- **More passes and his NRScale path on every pass (R350 / R354, his #71).** Up to four passes, and `NRScale`
+  applied to each of them. Implemented here from his design with one change: each pass gets its own descriptor
+  range, without which the picture went black. Opt-in via `Passes=3` / `4` and `NRSPass=2`.
+
 ## [grtninja](https://github.com/grtninja)
 
 Two fixes to the add-on's own code, reviewed and merged from external pull
@@ -115,6 +123,32 @@ Test system: two RTX 5080s, 3840x2160 at 120 Hz, Stellar Blade. Tested on davidm
 ([write-up](https://github.com/ZhizhenS/mgpu-bridge-fg-flicker-fix)):
 
 - **The bands with frame generation (BB1, `PresentBuffers`, `PresentRaceProbe`).** Traced dark horizontal
-  bands to the per-frame clear reaching the screen in Independent Flip, shown by dyeing the clear magenta.
-  The clear now runs only when the picture will not cover the back buffer, and the buffer count is a key.
+bands to the per-frame clear reaching the screen in Independent Flip, shown by dyeing the clear magenta.
+The clear now runs only when the picture will not cover the back buffer, and the buffer count is a key.
 - **The stray panel pointer (PP4).** The pointer stayed on the picture after the panel closed.
+
+## [davidm71](https://github.com/davidm71)
+
+His test system: RTX 3080 Ti (game) and RTX 5060 Ti (DLSS-NR), 2560x1440.
+
+His fork explored frame generation on the neural card, faster transport and a HUD-less path. Four of his designs
+are in 0.5.0, written here from his fork with his permission:
+
+- **GPU 0 staging (R333, `StageCopy`).** The copies to the neural card leave the game's queue for a copy queue on
+  GPU 0. On by default in 0.5.0.
+- **Frame generation on the neural card (R341, `FrameGen=4`).** DLSS Frame Generation runs on the DLSS 5 card.
+- **Vector validity by the frame tag (R331, `MVecSealValid`).** Optional.
+- **Late latch (R343, `LateLatch`).** The neural card takes the newest frame that has arrived. Optional.
+
+The multi-display composition behaviour (`DcompMultiDisplay=1`) also came from his fork.
+
+## Knowmind
+
+His test system: an AMD card renders the game, an RTX card runs DLSS-NR, HDR10 display.
+
+- **A present-path barrier defect (R346).** He found and documented a barrier that stopped the present loop when
+  the picture was already in the state it asked for, with a reproduction and the fix.
+- **The swap chain colour space (R345, `ChainColorSpace`).** His module tells Windows how to read the bridge's
+  picture on HDR displays. In 0.5.0 it also follows the game's own colour space (`ChainColorSpace=auto`).
+- **`tools/flicker-probe.ps1` (R347).** Measures flicker from a desktop capture, frame by frame.
+

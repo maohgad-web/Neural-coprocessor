@@ -39,6 +39,14 @@ intensity.preset | 强度曲线     | manual = 手动；front / back = 前/后�
 nrs1.on          | 第一遍缩放   | 与「神经缩放」是同一个控件（作者面板里的 Pass 1 scale）；用哪个 id 都一样。
 x2.mode          | 第二遍强度   | x2 时第二遍走多重的处理。【重启】
 
+==== 每一遍的网络与分辨率 ====
+
+pass1.network    | 第一遍网络   | Light-FP8 = 小网络，更快（FPS+）；Full-FP8 = 大网络，更慢（FPS-）。【重启】
+pass1.resolution | 第一遍分辨率 | 残差神经 = 神经卡在较低分辨率运行，再把细节叠回原生画面，更快（FPS+）；原生 = 全分辨率完整一遍，更慢（FPS-）。【重启】
+pass2.network    | 第二遍网络   | x2 时生效。最后一遍用 Full-FP8，可以消除"结构"调高时的闪烁。【重启】
+pass2.resolution | 第二遍分辨率 | x2 时生效。【重启】
+pass.best        | 默认         | 最佳画质-性能：第一遍和最后一遍都用 Full-FP8 + 残差神经。【重启】
+
 #==== 视图 ====
 
 # view           | 视图         | output = 看神经结果；input = 看喂给模型的原始帧；split = 左右对比（可拖分割线）。
@@ -53,6 +61,7 @@ sr.preset        | 超分预设     | 游戏默认 / K / L / M，换一套 DLSS 
 
 fg.mode          | 帧生成       | 修正向量（修正生成帧的向量）/ 修正+抽帧（每 N 帧只评估 1 张）。实时，可能不稳。
 fg.keep          | 生成帧窗口   | 修正+抽帧 时"每 N 帧保留 1 张"的 N，2–8。实时。
+fg.gpu1          | 神经卡帧生成 | 实验性，默认关闭：由神经卡生成中间帧（DLSS 帧生成）。【重启】
 
 #==== 诊断（一般不用动）====
 
@@ -93,5 +102,10 @@ ui.fg_keep_hint     | 每 N 帧保留 1 张
 ui.medium           | 中等
 ui.light            | 轻量
 ui.full             | 完整
+ui.light_fp8        | Light-FP8  FPS+
+ui.full_fp8         | Full-FP8  FPS-
+ui.residual_neural  | 残差神经  FPS+
+ui.native           | 原生  FPS-
+ui.best_qp          | 最佳画质-性能
 ui.advanced         | 高级  >>
 ui.reload           | 重新加载

@@ -59,6 +59,9 @@ add_library(mgpu_bridge SHARED
     # gpu1_context hands it D3D12 objects and the NGX parameter block. OFF
     # unless ResidualPass=1|2 is in mgpu.ini: no texture, no kernel, no extra pass.
     src/residual.cpp
+    src/gpu0_stage.cpp
+    src/chain_colour_space.cpp
+    src/fg_gpu1.cpp
     # D1 (0.3.0 R&D): the discovery calibrator. OFF unless Discovery=1 in
     # mgpu.ini. Holds no ReShade type and no gpu1_context type.
     src/discovery.cpp

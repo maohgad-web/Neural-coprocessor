@@ -11,17 +11,6 @@ already running (`DrainGpu0` below); it says so.
 All keys go in `mgpu.ini`, next to the add-on. Changes are read when the bridge arms: restart the game after
 editing.
 
-## ZhizhenS - BB1
-
-Bands over the picture and the panel with frame generation on and the game focused. Evidence and test results:
-[issue #75](https://github.com/maohgad-web/Neural-coprocessor/issues/75). The same change also clears the back
-buffer only when the picture will not cover it. That repairs code that was already running, so it has no key.
-
-| Key | Values | What it does | Changes the picture |
-|---|---|---|---|
-| `PresentBuffers` | `2`-`6` (absent or `2`: unchanged) | How many buffers the bridge's swap chain rotates through. Measured clean at `6`, with frame generation at 2X and 4X | Yes: removes the bands |
-| `PresentRaceProbe` | `1` | Diagnostic. Every frame's back buffer is cleared to magenta first, so a screen reading a buffer mid-write shows a magenta band | Yes, on purpose |
-
 ## lordzaxxon555-art - R300 (T1.19)
 
 Full description, log tags and how each part was checked: [`docs/R300_T119.md`](R300_T119.md). With at least one
@@ -61,15 +50,10 @@ the bridge thread spun on a frame that had already arrived. No new key: it is pa
 | `NRScale` | `0.30` to `NRScaleCap` | Residual neural rendering at a reduced scale: DLSS-NR runs at this fraction of native and its difference is added back onto the native frame. `1` is on, at 1:1. Changed live from the panel (R299) | Yes |
 | `NRScaleCap` | default `1.00` | How far the panel's scale slider may go | With `NRScale` |
 | `NRScaleX`, `NRScaleY`, `NRSharpness`, `NRDetailGain`, `NRMode`, `NRColorStrength` | | Tuning of the `NRScale` path. Read only when the `NRScale` line is present | With `NRScale` |
+| `NRPreset1`, `NRPreset2` (`NRPreset3`, `NRPreset4`) | `0`, `1`, `2` | The DLSS-NR network each pass is created with: `0` the DLL's default (the small network on `nvngx_dlssnr.dll` 310.9.16 or newer), `1` the big network, `2` the small network by name. Older DLLs carry the big network only. The panel switches it live (R349) | Yes: a different network |
+| `NRSPass` | `2` (absent or `1`: pass 1 only) | With `NRScale`, every pass runs the `NRScale` path, at the same scale (R354) | Yes |
 | `NRProbe` | `1` | Measures the neural effect in the log (R299c). Works with or without `NRScale` | No |
-| `NRPreset` | `0`, `1`, `2` | DLSS-NR model preset used when each feature is created: `0` = the title/snippet default, `1` = Legacy/HT, `2` = Small FP8/CC. **Create-time only** - change it and relaunch; it is not a live knob | Yes: a different network |
-| `NRPreset1` … `NRPreset4` | `0`, `1`, `2` | Per-pass override of `NRPreset`. With `Passes=2`, `NRPreset1=1` and `NRPreset2=2` build pass 1 on Legacy/HT and pass 2 on Small FP8/CC. Missing = the `NRPreset` value | Yes: a different network per pass |
 | `NRSetAtCreate` | `1` | Applies the `Set.*` lines of `mgpu.ini` to DLSS-NR before its CreateFeature as well as at each evaluate (P6.2c), for keys that size the network. Does nothing without `Set.*` lines. Separate from `NRScale` | Only through the `Set.*` keys |
-| `PanelSimple` | `1` | Shows the simple panel (Chinese labels, layout in `panel_simple.txt` beside the add-on) instead of the full panel. CTRL+ALT+F4 flips this key in game. Without `panel_simple.txt` the simple panel shows nothing and the full panel stays (R330) | Panel only |
-
-The simple panel is R330 (`src/panel_simple.cpp`, `src/panel_simple.hpp`, `assets/panel_simple.txt`, the hotkey in
-`src/worker.cpp`). Every later commit on it takes the next letter, one letter per squashed commit: R330a, R330b, ...
-Labels inside the controls are `ui.<name> | label` lines in `panel_simple.txt`; a missing line shows the English text.
 
 ## MoHasan9505
 
@@ -83,3 +67,29 @@ failed with `FAIL_OutOfDate`.
 ## grtninja
 
 No keys. Both contributions (adapter selection, `mgpu.ini` parsing) are fixes to code that always runs.
+
+## ZhizhenS
+
+| Key | Values | What it does | Changes the picture |
+|---|---|---|---|
+| `PresentBuffers` | `2`-`6` (absent or `2`: unchanged) | How many buffers the bridge's swap chain rotates through. Measured clean at `6`, with frame generation at 2X and 4X | Yes: removes the bands |
+| `PresentRaceProbe` | `1` | Diagnostic. Every frame's back buffer is cleared to magenta first, so a screen reading a buffer mid-write shows a magenta band | Yes, on purpose |
+
+## davidm71
+
+Written here from his designs. Absent = off, except `StageCopy`, which is on in the shipped `mgpu.ini` from 0.5.0.
+
+| Key | Values | What it does | Changes the picture |
+|---|---|---|---|
+| `StageCopy` | `1` (shipped `mgpu.ini`: `1`) | The copies to the neural card go through a staging ring on GPU 0 and a GPU 0 copy queue instead of the game's queue (R333) | No |
+| `FrameGen` | `4` | DLSS Frame Generation on the neural card (R341) | Yes: generated frames |
+| `MVecSealValid` | `1` | Vector and depth validity decided by the frame tag written with the frame (R331) | No |
+| `LateLatch`, `LateLatchAge` | `1`; age `2` | The neural card evaluates the newest frame that has arrived (R343) | Frame timing only |
+| `DcompMultiDisplay` | `1` | The multi-display composition behaviour from his fork (R267 / R273) | No |
+
+## Knowmind
+
+| Key | Values | What it does | Changes the picture |
+|---|---|---|---|
+| `ChainColorSpace` | `auto`, `0`, `12` (absent: never set) | The colour space of the bridge's swap chain: `auto` follows the game, `0` sRGB, `12` HDR10 (R345 / R353). The shipped `mgpu.ini` has `auto` | On HDR displays |
+
