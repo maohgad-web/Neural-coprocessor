@@ -11,6 +11,17 @@ already running (`DrainGpu0` below); it says so.
 All keys go in `mgpu.ini`, next to the add-on. Changes are read when the bridge arms: restart the game after
 editing.
 
+## ZhizhenS - BB1
+
+Bands over the picture and the panel with frame generation on and the game focused. Evidence and test results:
+[issue #75](https://github.com/maohgad-web/Neural-coprocessor/issues/75). The same change also clears the back
+buffer only when the picture will not cover it. That repairs code that was already running, so it has no key.
+
+| Key | Values | What it does | Changes the picture |
+|---|---|---|---|
+| `PresentBuffers` | `2`-`6` (absent or `2`: unchanged) | How many buffers the bridge's swap chain rotates through. Measured clean at `6`, with frame generation at 2X and 4X | Yes: removes the bands |
+| `PresentRaceProbe` | `1` | Diagnostic. Every frame's back buffer is cleared to magenta first, so a screen reading a buffer mid-write shows a magenta band | Yes, on purpose |
+
 ## lordzaxxon555-art - R300 (T1.19)
 
 Full description, log tags and how each part was checked: [`docs/R300_T119.md`](R300_T119.md). With at least one

@@ -108,3 +108,13 @@ Work from an iterative Starfield development branch (T1.1 to T1.19), merged as o
   (`BetterConsoleGuard`), and panel additions (`PanelAutoHeight`, `PanelStats`, `PanelPersist`, `FrameCap`).
 
 Thank you - in particular for R300b, which corrected a filter the add-on's own comment said was already right.
+
+## [ZhizhenS](https://github.com/ZhizhenS)
+
+Test system: two RTX 5080s, 3840x2160 at 120 Hz, Stellar Blade. Tested on davidm71's fork and ported here
+([write-up](https://github.com/ZhizhenS/mgpu-bridge-fg-flicker-fix)):
+
+- **The bands with frame generation (BB1, `PresentBuffers`, `PresentRaceProbe`).** Traced dark horizontal
+  bands to the per-frame clear reaching the screen in Independent Flip, shown by dyeing the clear magenta.
+  The clear now runs only when the picture will not cover the back buffer, and the buffer count is a key.
+- **The stray panel pointer (PP4).** The pointer stayed on the picture after the panel closed.

@@ -115,7 +115,15 @@ void feed_input(reshade::api::effect_runtime *runtime)
     {
         if (runtime == nullptr) { why = "no runtime"; break; }
         if (!mgpu::gpu1::dcomp_overlay_mode()) { why = "DcompOverlay off"; break; }
-        if (g_live.load(std::memory_order_relaxed) == 0) { why = "panel not live"; break; }
+        if (g_live.load(std::memory_order_relaxed) == 0)
+        {
+            // PP4: nothing else writes this runtime's io, and this event keeps its
+            // ImGui frames running with the panel closed, so ImGui's pointer stayed
+            // on the picture where the panel last had it.
+            if (is_host((void *)runtime)) ImGui::GetIO().MouseDrawCursor = false;
+            why = "panel not live";
+            break;
+        }
 
         void *host = g_host.load(std::memory_order_relaxed);
         if (host == nullptr) host = g_windowless.load(std::memory_order_relaxed);
