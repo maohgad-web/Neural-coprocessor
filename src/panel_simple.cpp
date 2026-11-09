@@ -54,6 +54,7 @@
 
 #include <reshade.hpp>          // the ImGui wrappers (function table), as everywhere else
 #include "gpu1_context.hpp"     // ui_ini_read / ui_ini_write / ui_nrs_* / ui_read
+#include "residual.hpp"         // R364: residual::carries for the live Residual / Native row
 #include "fg_map.hpp"           // R330: frame-generation mode/keep are live only through fgmap
 #include "diag.hpp"
 
@@ -808,6 +809,101 @@ namespace mgpu::psimple
             ImGui::TextDisabled("pass 1 at 0.75, detail added back at full size (restart)");
         }
 
+        // ---- R356 (0.5.0, Marcelo's shape, the same keys the full panel's "Pass settings" writes) ----
+        // Network: Light-FP8 (the small network, NRPreset<n>=0, green, FPS+) | Full-FP8 (the big one,
+        // NRPreset<n>=1, red, FPS-). Resolution: Residual Neural (green, FPS+) | Native (red, FPS-) -
+        // pass 1 is NRS 1|0; pass 2 is Pass2 nrs|full with NRS=1, ResidualPass 2|0 without it.
+        // All read at arm: the restart line is the full panel's.
+        bool ps_pick(const std::string &label, bool selected, bool green)
+        {
+            const ImVec4 on  = green ? ImVec4(0.18f, 0.62f, 0.30f, 1.0f) : ImVec4(0.72f, 0.24f, 0.24f, 1.0f);
+            const ImVec4 off = green ? ImVec4(0.18f, 0.62f, 0.30f, 0.28f) : ImVec4(0.72f, 0.24f, 0.24f, 0.28f);
+            ImGui::PushStyleColor(ImGuiCol_Button, selected ? on : off);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, on);
+            const bool c = ImGui::Button(label.c_str(), ImVec2(140.0f, 0.0f));
+            ImGui::PopStyleColor(3);
+            return c;
+        }
+        void ps_net(unsigned i)
+        {
+            static const char *const key[2] = { "NRPreset1", "NRPreset2" };   // literals: the mirror keeps the pointer
+            // R363: live. The row shows the network the pass runs now; a click rebuilds it (ui_set_network) and
+            // writes the key for the next launch (pass 1 at x2+ -> NRPreset1x2).
+            mgpu::gpu1::ui_state stn; mgpu::gpu1::ui_read(stn);
+            const bool live = stn.armed && stn.nr_ok;
+            const char *key_now = (i == 0u && stn.passes >= 2u) ? "NRPreset1x2" : key[i];
+            const int cur = live ? ((stn.nr_preset_pass[i] == 1) ? 1 : 0)
+                                 : ((mgpu::gpu1::ui_ini_read(key[i], mgpu::gpu1::ui_ini_read("NRPreset", 0)) == 1) ? 1 : 0);
+            char id[16];
+            snprintf(id, sizeof id, "psn%u0", i);
+            if (ps_pick(L("ui.light_fp8", "Light-FP8  FPS+", id), cur == 0, true) && cur != 0)
+            { (void)mgpu::gpu1::ui_ini_write(key_now, 0); if (live) mgpu::gpu1::ui_set_network(i, 0); }   // R364: ini first
+            ImGui::SameLine();
+            snprintf(id, sizeof id, "psn%u1", i);
+            if (ps_pick(L("ui.full_fp8", "Full-FP8  FPS-", id), cur == 1, false) && cur != 1)
+            { (void)mgpu::gpu1::ui_ini_write(key_now, 1); if (live) mgpu::gpu1::ui_set_network(i, 1); }
+            ImGui::SameLine();
+        }
+        void ps_res(unsigned i)
+        {
+            const bool nrs1 = (mgpu::gpu1::ui_ini_read("NRS", 0) == 1);
+            const int rp = mgpu::gpu1::ui_ini_read("ResidualPass", 0);
+            mgpu::gpu1::ui_state stn; mgpu::gpu1::ui_read(stn);
+            const bool live = stn.armed && stn.nr_ok;   // R364: the row shows and switches what the pass runs now
+            int cur;
+            if (live) cur = mgpu::residual::carries(i) ? 1 : 0;
+            else if (i == 0u) cur = nrs1 ? 1 : 0;
+            else
+            {
+                char w[16] = {};
+                mgpu::gpu1::ui_ini_read_word("Pass2", w, sizeof w);
+                cur = (nrs1 && w[0] != 0) ? ((w[0] == 'n' || w[0] == 'N') ? 1 : 0) : (rp == 2 ? 1 : 0);
+            }
+            auto write = [&](int v)
+            {
+                if (i == 0u) (void)mgpu::gpu1::ui_ini_write("NRS", v);
+                else if (nrs1) (void)mgpu::gpu1::ui_ini_write_word("Pass2", v ? "nrs" : "full");
+                else           (void)mgpu::gpu1::ui_ini_write("ResidualPass", v ? 2 : 0);
+                if (live) mgpu::gpu1::ui_set_resolution(i, v == 1);   // R364: after the ini write
+            };
+            char id[16];
+            snprintf(id, sizeof id, "psr%u1", i);
+            if (ps_pick(L("ui.residual_neural", "Residual Neural  FPS+", id), cur == 1, true) && cur != 1) write(1);
+            ImGui::SameLine();
+            snprintf(id, sizeof id, "psr%u0", i);
+            if (ps_pick(L("ui.native", "Native  FPS-", id), cur == 0, false) && cur != 0) write(0);
+            ImGui::SameLine();
+        }
+        void row_pass1_net() { ps_net(0u); }
+        void row_pass1_res() { ps_res(0u); }
+        void row_pass2_net() { ps_net(1u); }
+        void row_pass2_res() { ps_res(1u); }
+        void row_fg_gpu1()
+        {
+            const bool on = (mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4);
+            if (ImGui::RadioButton(L("ui.off", "off", "fg1_0").c_str(), !on) && on)
+                (void)mgpu::gpu1::ui_ini_write("FrameGen", 0);
+            ImGui::SameLine();
+            if (ImGui::RadioButton(L("ui.on", "on", "fg1_1").c_str(), on) && !on)
+                (void)mgpu::gpu1::ui_ini_write("FrameGen", 4);
+            ImGui::SameLine();
+        }
+        void row_pass_best()
+        {
+            if (ImGui::Button(L("ui.best_qp", "Best Quality-Performance", "psbest").c_str()))
+            {
+                // Marcelo's default (R360): Full-FP8 + Residual on pass 1 and on the last (2nd) pass.
+                (void)mgpu::gpu1::ui_ini_write("NRS", 1);
+                (void)mgpu::gpu1::ui_ini_write("NRPreset1", 1);
+                (void)mgpu::gpu1::ui_ini_write("NRPreset1x2", 0);   // R361: Light-FP8 on pass 1 while x2 runs
+                (void)mgpu::gpu1::ui_ini_write("NRPreset2", 1);
+                (void)mgpu::gpu1::ui_ini_write_word("Pass2", "nrs");
+                (void)mgpu::gpu1::ui_ini_write("FrameGen", 0);
+            }
+            ImGui::SameLine();
+        }
+
         void register_rows()
         {
             row("nrs.scale",  "NRScale",        &row_nrs_scale);
@@ -837,6 +933,12 @@ namespace mgpu::psimple
             // R330: these seven were written but never registered, so the DLSS / frame-generation /
             // x2 sections came up empty. A row has to be BOTH drawn and registered.
             row("x2.mode",         "2nd pass (x2)",&row_x2_mode);
+            row("pass1.network",   "pass 1 network",    &row_pass1_net);   // R356
+            row("pass1.resolution","pass 1 resolution", &row_pass1_res);
+            row("pass2.network",   "pass 2 network",    &row_pass2_net);
+            row("pass2.resolution","pass 2 resolution", &row_pass2_res);
+            row("fg.gpu1",         "frame generation on the neural card", &row_fg_gpu1);
+            row("pass.best",       "defaults",          &row_pass_best);
             row("sr.enable",       "DLSS on GPU 1",&row_sr_enable);
             row("sr.quality",      "DLSS quality", &row_sr_quality);
             row("sr.preset",       "DLSS preset",  &row_sr_preset);

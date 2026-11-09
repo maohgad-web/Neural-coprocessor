@@ -54,6 +54,26 @@
 //     (ResidualPass=1 only) SrgbInput off. Any of those set: OFF, one line naming
 //     it, and every feature is created at its usual size. The per-evaluate gate
 //     stays as a second guard.
+//   - R332 (0.5.0): the module is PER PASS. Keys, read at arm:
+//       NRS                 absent or 0: everything above, unchanged (R316).
+//                           1: PASS 1 carries our residual (the 0.5.0 path). The
+//                           module exists with NRS=1 even when ResidualPass is
+//                           absent. The sRGB refusal above becomes a path: NR
+//                           reads our linear-typed scratch and one line says the
+//                           P7.8b free-decode experiment does not apply to pass 1.
+//       Pass2               with NRS=1 only. full: pass 2 (at x2) is a full NR
+//                           pass. nrs: pass 2 carries our residual too, anchored
+//                           on pass 1's resolved native output. Absent: nrs when
+//                           ResidualPass=2 (the panel's Medium / Light keep their
+//                           meaning for the 2nd pass), full otherwise.
+//       Pass3 / Pass4       (R350, Experimental) with Passes=3 / 4, any pass-1 setting
+//                           (R366): full | nrs for that pass, as Pass2. Absent: full. The
+//                           capacity is 4 sets; a set is allocated only for a pass
+//                           that carries AND is built, so Passes 1 / 2 cost what
+//                           they did.
+//     Each carrying pass owns its scratch pair, work extent (one recipe for both),
+//     tracked states and counters; kernels, root signature and heap are shared.
+//     "One residual path at a time" stands: NRScale set = NRScale wins.
 //   - OFF COSTS: one file read at arm, then one relaxed load per evaluate.
 //   - Holds no gpu1_context type: gpu1_context hands it D3D12 objects, the
 //     NGX parameter block and plain values. Everything runs on the bridge
@@ -84,29 +104,40 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
 // One relaxed load.
 bool active();
 
-// 0-based index of the pass that carries the residual (valid when active()).
+// R332: true when 0-based pass `pi` carries the residual and is live (one array read).
+bool carries(unsigned pi);
+
+// R332: true when the NRS key is 1 (pass 1 carries; read at arm).
+bool nrs_on();
+
+// 0-based index of the LOWEST pass that carries the residual (valid when active()).
+// R316 callers; with NRS absent it is the ResidualPass pass, as before.
 unsigned pass();
 
-// The work extent (valid when active()). The feature of pass() is created at
-// this size; every other pass keeps its own size.
+// The work extent (valid when active()). The feature of a carrying pass is
+// created at this size; every other pass keeps its own size. The pass form (R332)
+// leaves w/h untouched when `pi` does not carry.
 void work_extent(unsigned &w, unsigned &h);
+void work_extent(unsigned pi, unsigned &w, unsigned &h);
 
 // Before CreateFeature: binds Color/Output and the subrects to the scratch pair,
-// as the proxy does at create time. The caller sets Width/Height per pass.
+// as the proxy does at create time. The caller sets Width/Height per pass. The
+// pass form (R332) binds that pass's own pair; no-op when `pi` does not carry.
 void bind_create(NVSDK_NGX_Parameter *p);
+void bind_create(NVSDK_NGX_Parameter *p, unsigned pi);
 
-// Before the evaluate of pass(). `anchor` is the pass's input, in
+// Before the evaluate of carrying pass `pi`. `anchor` is the pass's input, in
 // NON_PIXEL_SHADER_RESOURCE. Records the downsample on `cl`, binds the scratch
 // pair, the work extent and the scaled vector scale on `p`. `parity` picks the
 // descriptor set.
-void before(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *p,
+void before(ID3D12GraphicsCommandList *cl, unsigned pi, unsigned parity, NVSDK_NGX_Parameter *p,
             ID3D12Resource *anchor);
 
 // After the evaluate. `dst` is the pass's output, in UNORDERED_ACCESS. Records
 // the resolve into `dst` (or skips it when the evaluate failed) and puts the
 // caller's bindings back: Color/Output, Width/Height, the subrects
 // (base/size as the caller had them) and the vector scale.
-void after(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *p,
+void after(ID3D12GraphicsCommandList *cl, unsigned pi, unsigned parity, NVSDK_NGX_Parameter *p,
            ID3D12Resource *anchor, ID3D12Resource *dst, bool evaluate_ok,
            ID3D12Resource *nr_color, ID3D12Resource *nr_output,
            unsigned native_w, unsigned native_h,
@@ -114,4 +145,9 @@ void after(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *
 
 // From stream_release, when the GPU no longer uses the stream's resources.
 void release();
+
+// R364: live Residual (on) / Native (off) for one pass, on the bridge thread between frames; the caller then
+// recreates that pass's feature at the new extent. `line` receives the one log line to print (info on success,
+// warn on refusal). Returns false and leaves the pass as it was when the switch is refused.
+bool set_pass_live(unsigned pi, bool on, char *line, size_t cap);
 }

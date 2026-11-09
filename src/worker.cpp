@@ -42,6 +42,7 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "fg_gpu1.hpp"   // R341
 #include "panel_simple.hpp"   // the simple-panel hotkey below
 #include "startup_trace.hpp"   // R313
 #include "worker.hpp"
@@ -1463,7 +1464,11 @@ namespace
                 if (!mgpu::gpu1::stream_present_gate(4))
                     continue;
 
-                if (!mgpu::gpu1::present_frame(cr, cg, cb))
+                // R341 (FrameGen=4): the pacing thread presents this frame (generated first, real half an
+                // interval later). False = not on, or not started yet: present as today.
+                const bool r341_paced = mgpu::fg::handoff(cr, cg, cb);
+
+                if (!r341_paced && !mgpu::gpu1::present_frame(cr, cg, cb))
                 {
                     // The first failure is already logged with its step,
                     // HRESULT and removal reason (one-shot, in

@@ -108,6 +108,7 @@
 #include "gpu1_context.hpp"
 #include "nr16.hpp"       // R219-2: the panel reads the 16-bit keys with nr16's reader
 #include "residual.hpp"   // R319a: one relaxed load, to word the x2 line
+#include "chain_colour_space.hpp"   // R353: ChainColorSpace=auto follows the game chain's colour space
 #include "discovery.hpp"  // D1 (0.3.0 R&D): the discovery calibrator, off unless Discovery=1
 #include "live_panel.hpp"     // PanelOverPicture (N01950): own file, off unless PanelOverPicture=1
 #include "panel_simple.hpp"   // the player-facing panel; its layout is panel_simple.txt
@@ -346,6 +347,26 @@ static bool on_set_fullscreen_state(reshade::api::swapchain *swapchain, bool ful
     return false;   // observe only
 }
 
+// R353: the GAME chain's colour space, as ReShade reports it, handed to the colour-space module as a
+// small code of our own (no ReShade type crosses the file boundary). Game chain only: the bridge's own
+// chain raises init_swapchain on the bridge thread, and its present never comes through on_present
+// with the game chain's native. One relaxed store; nothing else.
+static std::atomic<void *> g_r353_game_chain{nullptr};
+static void r353_note_colour_space(reshade::api::swapchain *swapchain)
+{
+    if (swapchain == nullptr) return;
+    int code = 0;
+    switch (swapchain->get_color_space())
+    {
+    case reshade::api::color_space::srgb_nonlinear:       code = 1; break;
+    case reshade::api::color_space::extended_srgb_linear: code = 2; break;
+    case reshade::api::color_space::hdr10_st2084:         code = 3; break;
+    case reshade::api::color_space::hdr10_hlg:            code = 4; break;
+    default:                                              code = 0; break;
+    }
+    mgpu::chain::note_game_colour_space(code);
+}
+
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
     // D2.0: journal and stall watch read their keys once, here (never in
@@ -369,6 +390,11 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     mgpu::gpu1::set_build_string(MGPU_VERSION_STR);   // R267
     mgpu::stallwatch::init();
     mgpu::fgmap::init();   // D2.0 NR step one: reads NRFrameFilter once; off = nothing
+    if (swapchain != nullptr && !mgpu::strace::is_bridge_thread())   // R353: the game's chain, not ours
+    {
+        g_r353_game_chain.store(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())), std::memory_order_relaxed);
+        r353_note_colour_space(swapchain);
+    }
     // DX11 probe: a D3D11 game swap chain only (the bridge's own chain is
     // D3D12). Reads Dx11Probe once; off = one ini read, then one load.
     if (swapchain != nullptr)
@@ -1308,7 +1334,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // finishes reading is not a warning. The reasoning is in mgpu.ini.
     // R319a: with the residual 2nd pass armed (Light / Medium) the second pass is
     // lighter, so the line says what is true for it; Full keeps the original line.
-    if (passes >= 2 && mgpu::residual::active())
+    if (passes >= 2 && mgpu::residual::carries(1u))   // R332: pass 2 itself, not "any pass" (NRS=1 + Pass2=full)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
                            "x2 adds a lighter second pass on the second GPU. "
                            "It uses more power than x1.");
@@ -1318,6 +1344,242 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                            "limit. x1 recommended.");
     else
         ImGui::TextDisabled("x1 leaves the second GPU about half idle.");
+
+    // ---- R352 / R355 (0.5.0, Marcelo): the pass settings and what is running, at the top level ----
+    // Marcelo's shape (23:43): per pass, "Network" with two buttons - Light-FP8 (the small network,
+    // NRPreset<i>=0) in GREEN with "FPS+" under it, Full-FP8 (the big network, NRPreset<i>=1) in RED with
+    // "FPS-" under it; below, "Resolution" with two buttons - Residual Neural (our residual on that pass)
+    // GREEN / FPS+, Native (a full pass) RED / FPS-. The selected button is drawn solid, the other dimmed.
+    // To the right, one button "Best Quality-Performance" restores Marcelo's default: every pass Light-FP8 +
+    // Residual, the LAST pass Full-FP8 + Residual (the big network on the final pass is what removes the
+    // structure strobe; N2b).
+    // Keys (all read at arm; the file is written, the restart line shows while it differs from what loaded):
+    //   network: NRPreset<i> 0 | 1 (R349)
+    //   pass 1 resolution: NRS 1 | 0 (R332)
+    //   pass 2 resolution: with NRS=1 -> Pass2 nrs | full; with NRS=0 -> ResidualPass 2 | 0 (the 0.4.0 keys,
+    //            Medium / Full), so pass 2 can be Residual whatever pass 1 is
+    //   pass 3 / 4 resolution: Pass3 / Pass4 nrs | full (R350; the module reads them with NRS=1 only, so
+    //            they are enabled while pass 1 is Residual)
+    //   frame generation on the neural card: FrameGen 4 | 0 (R341)
+    {
+        static bool pm_loaded = false;
+        static int  pm_net_file[4] = {}, pm_net_want[4] = {};   // 0 Light-FP8 (small), 1 Full-FP8 (big)
+        static int  pm_res_file[4] = {}, pm_res_want[4] = {};   // 1 Residual Neural, 0 Native
+        static bool pm_fg_file = false, pm_fg_want = false;
+        static int  pm_x2_file = 0, pm_x2_want = 0;              // R361: pass 1's network at x2+ (NRPreset1x2; absent = NRPreset1)
+        // Literals, not stack buffers: ui_ini_read / ui_ini_write keep the key POINTER in their mirror.
+        static const char *const pm_net_key[4]  = { "NRPreset1", "NRPreset2", "NRPreset3", "NRPreset4" };
+        static const char *const pm_pass_key[4] = { "NRS", "Pass2", "Pass3", "Pass4" };
+        auto load_file = [&]()
+        {
+            const int fb = mgpu::gpu1::ui_ini_read("NRPreset", 0);
+            const bool nrs1 = (mgpu::gpu1::ui_ini_read("NRS", 0) == 1);
+            const int rp = mgpu::gpu1::ui_ini_read("ResidualPass", 0);
+            for (unsigned i = 0; i < 4u; ++i)
+            {
+                const int v = mgpu::gpu1::ui_ini_read(pm_net_key[i], fb);
+                pm_net_file[i] = (v == 1) ? 1 : 0;   // 2 (small, explicit) shows as Light-FP8
+                if (i == 0u) pm_res_file[i] = nrs1 ? 1 : 0;
+                else
+                {
+                    char w[16] = {};
+                    mgpu::gpu1::ui_ini_read_word(pm_pass_key[i], w, sizeof w);
+                    if (i == 1u)
+                        pm_res_file[i] = nrs1 ? ((w[0] != 0) ? ((w[0] == 'n' || w[0] == 'N') ? 1 : 0) : (rp == 2 ? 1 : 0))
+                                              : (rp == 2 ? 1 : 0);
+                    else
+                        pm_res_file[i] = (nrs1 && (w[0] == 'n' || w[0] == 'N')) ? 1 : 0;
+                }
+                pm_net_want[i] = pm_net_file[i];
+                pm_res_want[i] = pm_res_file[i];
+            }
+            pm_fg_file = (mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4);
+            pm_fg_want = pm_fg_file;
+            {
+                char w[16] = {};
+                mgpu::gpu1::ui_ini_read_word("NRPreset1x2", w, sizeof w);   // R361
+                pm_x2_file = (w[0] == 0) ? pm_net_file[0] : ((atoi(w) == 1) ? 1 : 0);
+                pm_x2_want = pm_x2_file;
+            }
+        };
+        if (!pm_loaded) { pm_loaded = true; load_file(); }
+        // write one pass's resolution choice; returns whether the file took it
+        auto write_res = [&](unsigned i, int res) -> bool
+        {
+            if (i == 0u) return mgpu::gpu1::ui_ini_write("NRS", res);
+            if (i == 1u)
+            {
+                if (pm_res_want[0] == 1) return mgpu::gpu1::ui_ini_write_word("Pass2", res ? "nrs" : "full");
+                return mgpu::gpu1::ui_ini_write("ResidualPass", res ? 2 : 0);
+            }
+            return mgpu::gpu1::ui_ini_write_word(pm_pass_key[i], res ? "nrs" : "full");
+        };
+        // one choice button: solid in its colour when selected, dimmed when not
+        auto pick = [&](const char *label, bool selected, bool green, float w) -> bool
+        {
+            const ImVec4 on  = green ? ImVec4(0.18f, 0.62f, 0.30f, 1.0f) : ImVec4(0.72f, 0.24f, 0.24f, 1.0f);
+            const ImVec4 off = green ? ImVec4(0.18f, 0.62f, 0.30f, 0.28f) : ImVec4(0.72f, 0.24f, 0.24f, 0.28f);
+            ImGui::PushStyleColor(ImGuiCol_Button, selected ? on : off);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, on);
+            const bool clicked = ImGui::Button(label, ImVec2(w, 0.0f));
+            ImGui::PopStyleColor(3);
+            return clicked;
+        };
+        const float bw = 150.0f, x0 = 110.0f, gap = 8.0f;
+
+        ImGui::SeparatorText("Pass settings");
+        bool differs = false;
+        const unsigned np = (st.max_passes < 4u) ? st.max_passes : 4u;
+        // the restore button, right-aligned on the header row
+        {
+            const float rw = 215.0f;
+            const float avail = ImGui::GetContentRegionAvail().x;
+            if (avail > rw) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - rw);
+            if (ImGui::Button("Best Quality-Performance", ImVec2(rw, 0.0f)))
+            {
+                // Marcelo's default (R360): Residual on every pass; Full-FP8 on pass 1 AND the last pass, Light-FP8
+                // on the passes between (3 / 4 only).
+                // Each write that lands moves the panel's choice; what loaded at panel start stays as
+                // the reference, so the restart line still says whether this session differs.
+                if (mgpu::gpu1::ui_ini_write("NRS", 1)) pm_res_want[0] = 1;
+                const bool live_b = st.armed && st.nr_ok;
+                for (unsigned i = 0; i < np; ++i)   // the ini first (R364), every key
+                {
+                    const int net = (i == 0u || i + 1u == np) ? 1 : 0;   // R360
+                    if (mgpu::gpu1::ui_ini_write(pm_net_key[i], net)) { pm_net_want[i] = net; pm_net_file[i] = net; }
+                    if (i >= 1u && mgpu::gpu1::ui_ini_write_word(pm_pass_key[i], "nrs")) { pm_res_want[i] = 1; if (live_b) pm_res_file[i] = 1; }
+                }
+                if (mgpu::gpu1::ui_ini_write("NRPreset1x2", 0)) pm_x2_want = 0;   // R361: Light-FP8 on pass 1 while x2+ runs
+                if (live_b)   // then the live requests (R363 / R364)
+                {
+                    for (unsigned i = 0; i < np; ++i)
+                    {
+                        const int net = (i == 0u || i + 1u == np) ? 1 : 0;
+                        mgpu::gpu1::ui_set_network(i, (i == 0u && st.passes >= 2u) ? 0 : net);
+                        mgpu::gpu1::ui_set_resolution(i, true);
+                    }
+                }
+                if (mgpu::gpu1::ui_ini_write("FrameGen", 0)) pm_fg_want = false;
+            }
+            ImGui::TextDisabled("Restores the default: Residual on every pass; Full-FP8 on pass 1 at x1 and on the last pass at x2+.");
+            ImGui::TextDisabled("Network and resolution apply live. Frame generation needs a restart.");
+        }
+        for (unsigned i = 0; i < np; ++i)
+        {
+            char lab[48];
+            ImGui::Text("Pass %u", i + 1u);
+            // Network row - LIVE (R363): the buttons show the network this pass runs right now (what its feature
+            // was built with) and a click rebuilds the pass on the bridge thread before its next evaluates
+            // (one CreateFeature, ~100-300 ms). The ini key is written too, so the next launch starts there:
+            // pass 1 while two or more passes run writes NRPreset1x2 (the x1 value stays), else NRPreset<i>.
+            ImGui::TextDisabled("Network");
+            ImGui::SameLine(x0);
+            const bool live = st.armed && st.nr_ok;
+            const int running = live ? ((st.nr_preset_pass[i] == 1) ? 1 : 0) : pm_net_want[i];
+            const char *key_now = (i == 0u && st.passes >= 2u) ? "NRPreset1x2" : pm_net_key[i];
+            snprintf(lab, sizeof lab, "Light-FP8##net%u", i);
+            if (pick(lab, running == 0, true, bw) && running != 0)
+            {   // R364: the ini FIRST, then the request - the rebuild writes ArmCrashed to the same file (R6d: WRITE FAILED x2)
+                if (mgpu::gpu1::ui_ini_write(key_now, 0)) { pm_net_want[i] = 0; if (live) pm_net_file[i] = 0; }
+                if (live) mgpu::gpu1::ui_set_network(i, 0);
+            }
+            ImGui::SameLine(x0 + bw + gap);
+            snprintf(lab, sizeof lab, "Full-FP8##net%u", i);
+            if (pick(lab, running == 1, false, bw) && running != 1)
+            {
+                if (mgpu::gpu1::ui_ini_write(key_now, 1)) { pm_net_want[i] = 1; if (live) pm_net_file[i] = 1; }
+                if (live) mgpu::gpu1::ui_set_network(i, 1);
+            }
+            ImGui::SetCursorPosX(x0); ImGui::TextDisabled("FPS+");
+            ImGui::SameLine(x0 + bw + gap); ImGui::TextDisabled("FPS-");
+            // R362: no "at x2+" pair here (Marcelo 09:31: noisy). NRPreset1x2 is set by Best Quality-Performance
+            // and the ini; "Running now" shows the network pass 1 actually has at the current pass count.
+            // Resolution row
+            // Resolution row - LIVE too (R364): the buttons show whether the pass carries our residual right now
+            // (residual::carries), a click flips the module for that pass and rebuilds its feature at the new
+            // extent on the bridge thread; the ini is written first so the next launch starts there.
+            // R366: no "pass 1 first" gate (Pass3 / Pass4 are read for any pass-1 setting now).
+            // R367: on N01950's NRScale path the row works the same way, per pass, live - Residual = the NRScale
+            // path on this pass, Native = a full pass (the stream flips his per-pass mask, no recreate). The ini
+            // can only say "pass 1" or "every pass" for his path (NRSPass 1 | 2), so the file is written when the
+            // live set matches one of those and left alone otherwise.
+            const bool nrscale_here = live && st.nrs_on;
+            const bool res_ok = true;
+            const int res_running = live ? ((nrscale_here ? ((st.nrs_pass_mask >> i) & 1u) != 0u : mgpu::residual::carries(i)) ? 1 : 0)
+                                         : pm_res_want[i];
+            auto write_res_nrscale = [&](unsigned pass, int v)
+            {
+                const unsigned bit = 1u << pass;
+                const unsigned all = (np >= 32u) ? ~0u : ((1u << np) - 1u);
+                const unsigned m = v ? (st.nrs_pass_mask | bit) : (st.nrs_pass_mask & ~bit);
+                if (m == all) (void)mgpu::gpu1::ui_ini_write("NRSPass", 2);
+                else if (m == 1u) (void)mgpu::gpu1::ui_ini_write("NRSPass", 1);
+            };
+            ImGui::TextDisabled("Resolution");
+            ImGui::SameLine(x0);
+            ImGui::BeginDisabled(!res_ok);
+            snprintf(lab, sizeof lab, "Residual Neural##res%u", i);
+            if (pick(lab, res_running == 1, true, bw) && res_running != 1)
+            {
+                if (nrscale_here) write_res_nrscale(i, 1);
+                else if (write_res(i, 1)) { pm_res_want[i] = 1; if (live) pm_res_file[i] = 1; }
+                if (live) mgpu::gpu1::ui_set_resolution(i, true);
+            }
+            ImGui::SameLine(x0 + bw + gap);
+            snprintf(lab, sizeof lab, "Native##res%u", i);
+            if (pick(lab, res_running == 0, false, bw) && res_running != 0)
+            {
+                if (nrscale_here) write_res_nrscale(i, 0);
+                else if (write_res(i, 0)) { pm_res_want[i] = 0; if (live) pm_res_file[i] = 0; }
+                if (live) mgpu::gpu1::ui_set_resolution(i, false);
+            }
+            ImGui::EndDisabled();
+            ImGui::SetCursorPosX(x0); ImGui::TextDisabled("FPS+");
+            ImGui::SameLine(x0 + bw + gap); ImGui::TextDisabled("FPS-");
+            if (nrscale_here && i + 1u == np) ImGui::TextDisabled("Residual here = N01950's NRScale path on that pass (NRScale is set this session).");
+            if (!live && (pm_net_want[i] != pm_net_file[i] || pm_res_want[i] != pm_res_file[i])) differs = true;   // R363/R364: both live when armed
+            if (i + 1u < np) ImGui::Spacing();
+        }
+        bool fg = pm_fg_want;
+        if (ImGui::Checkbox("frame generation on the neural card", &fg))
+        {
+            if (mgpu::gpu1::ui_ini_write("FrameGen", fg ? 4 : 0)) pm_fg_want = fg;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(experimental; off by default)");
+        if (pm_fg_want != pm_fg_file) differs = true;
+        // R363: NRPreset1x2 is live too (the Best button applies it through ui_set_network)
+        if (differs)
+            ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                               "Restart the game once to apply.");
+
+        // ---- Running now: the arm's own state, not the file ----
+        ImGui::SeparatorText("Running now");
+        if (!st.armed)
+            ImGui::TextDisabled("Not armed yet.");
+        else if (!st.nr_ok)
+            ImGui::TextDisabled("Neural stage not running (transport only).");
+        else
+        {
+            // the DLL's default network: small from 310.9.16, big before it
+            unsigned va = 0, vb = 0, vc = 0, vd = 0;
+            const bool vparsed = (sscanf_s(st.nr_dll_version, "%u.%u.%u.%u", &va, &vb, &vc, &vd) == 4);
+            const bool small_ok = vparsed && (va > 310u || (va == 310u && (vb > 9u || (vb == 9u && vc >= 16u))));
+            for (unsigned i = 0; i < st.passes && i < 4u; ++i)
+            {
+                const int hint = st.nr_preset_any ? st.nr_preset_pass[i] : 0;
+                const char *net = (hint == 1) ? "Full-FP8"
+                                : (hint == 2) ? "Light-FP8"
+                                : (!vparsed ? "DLL default" : (small_ok ? "Light-FP8 (DLL default)" : "Full-FP8 (DLL default: one network)"));
+                const char *mode = mgpu::residual::carries(i) ? "Residual Neural"
+                                 : ((st.nrs_on && ((st.nrs_pass_mask >> i) & 1u)) ? "Residual (NRScale, N01950)" : "Native");
+                ImGui::Text("pass %u: %s, %s", i + 1u, net, mode);
+            }
+            ImGui::Text("StageCopy %s | frame generation %s | DLSS-NR DLL %s",
+                        st.stage_on ? "on" : "off", st.fg_on ? "on" : "off", st.nr_dll_version);
+        }
+    }
 
     bool neural = st.neural;
     if (ImGui::Checkbox("neural stage", &neural))
@@ -1391,52 +1653,10 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
                                    "Restart the game once to apply.");
 
-            // ---- R319: which 2nd pass x2 runs (R316 residual module keys) ----
-            // Light  = ResidualPass=2, ResidualScale=0.75, ResidualRender=1 (the game's render
-            //          size; on DLAA or without the NGX table it runs as Medium, R316b)
-            // Medium = ResidualPass=2, ResidualScale=0.75, ResidualRender=0
-            // Full   = ResidualPass=0 (the module stays off: the native 2nd pass, as before)
-            // Read at arm, so a change needs a restart. The file decides what is selected:
-            // no ResidualPass line selects Full, which is what such a file runs.
-            {
-                static bool rsd_loaded = false;
-                static int rsd_file = 2, rsd_want = 2;   // 0 Light, 1 Medium, 2 Full
-                if (!rsd_loaded)
-                {
-                    rsd_loaded = true;
-                    const int rp = mgpu::gpu1::ui_ini_read("ResidualPass", -1);
-                    const int rr = mgpu::gpu1::ui_ini_read("ResidualRender", 0);
-                    rsd_file = (rp == 2) ? ((rr == 1) ? 0 : 1) : 2;
-                    rsd_want = rsd_file;
-                }
-                ImGui::SeparatorText("2nd pass (x2)");
-                int pick = rsd_want;
-                bool changed = false;
-                // R319b: Medium first - it is the default 2nd pass (Marcelo 14:11).
-                if (ImGui::RadioButton("Medium##rsd", &pick, 1)) changed = true;
-                ImGui::SameLine();
-                if (ImGui::RadioButton("Light##rsd", &pick, 0)) changed = true;
-                ImGui::SameLine();
-                if (ImGui::RadioButton("Full##rsd", &pick, 2)) changed = true;
-                if (changed && pick != rsd_want)
-                {
-                    bool ok = true;
-                    if (pick == 2)
-                        ok = mgpu::gpu1::ui_ini_write("ResidualPass", 0);
-                    else
-                    {
-                        ok = mgpu::gpu1::ui_ini_write("ResidualPass", 2) &&
-                             mgpu::gpu1::ui_ini_write_float("ResidualScale", 0.75f) &&
-                             mgpu::gpu1::ui_ini_write("ResidualRender", (pick == 0) ? 1 : 0);
-                    }
-                    if (ok) rsd_want = pick;
-                }
-                ImGui::TextDisabled("Light follows the game's DLSS mode at game start.");
-                if (rsd_want != rsd_file)
-                    ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
-                                       "Restart the game once to apply.");
-            }
-
+            // R362: the R319 "2nd pass (x2)" Medium / Light / Full block was here. The top-level "Pass settings"
+            // (R355) sets the same keys (Residual Neural = Medium, Native = Full); Light (ResidualRender=1, the
+            // residual at the game's render size) stays an ini key, documented there. Marcelo 09:26: two x2 settings
+            // in one panel.
             // ---- R321: Pass 1 scale (NRS, N01950's R299 path) - Option A, one residual at a time ----
             // On  = NRScale=0.75 + NRScaleResolveDepth=0 (C5: N01950's default + Dom's fix).
             // Off = NRScale=0 (no key-removal writer; R299 needs a scale above 0.05 to turn on, so 0
@@ -2932,9 +3152,90 @@ static std::atomic<bool> g_ov_echo_bridge{false};
 // event never fires on a runtime that runs no effects - measured on 007 First
 // Light, where the GAME runtime enumerated nothing for a whole session (see
 // R138). init_effect_runtime fires for every runtime either way.
+// ---- R334: IS RESHADE'S EFFECT RUNTIME SYNC ON? Decided once, at the first runtime ----
+//
+// The built-in sync reads ReShade.ini [ADDON] SyncEffectRuntimes; absent, it turns
+// itself on when openxr_loader.dll or openvr_api.dll is in the process. With two
+// runtimes our tap enable ping-pongs inside ReShade until the stack overflows
+// (SoD2). So: read the same key through the add-on API, apply the same absent
+// rule from the module list, and when the sync is on tell the probe to stop
+// enabling the tap for this session. No key of ours: the only session whose
+// behaviour changes is the one that crashed. The value read is logged so a run
+// proves the read, whatever the result.
+static void r334_sync_guard_once(reshade::api::effect_runtime *runtime)
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    char val[32] = {};
+    size_t vn = sizeof val - 1;
+    const bool have = reshade::get_config_value(runtime, "ADDON", "SyncEffectRuntimes", val, &vn);
+    const bool xr = GetModuleHandleW(L"openxr_loader.dll") != nullptr;
+    const bool vr = GetModuleHandleW(L"openvr_api.dll") != nullptr;
+    bool sync_on;
+    if (have) sync_on = (val[0] == '1');
+    else      sync_on = (xr || vr);
+    char l[420];
+    snprintf(l, sizeof l,
+             "[MGPU][R334] ReShade Effect Runtime Sync: [ADDON] SyncEffectRuntimes=%s%s | openxr_loader.dll %s | "
+             "openvr_api.dll %s -> sync %s. %s",
+             have ? val : "absent", have ? "" : " (absent: on when OpenXR or OpenVR is loaded)",
+             xr ? "loaded" : "not loaded", vr ? "loaded" : "not loaded", sync_on ? "ON" : "off",
+             sync_on ? "The add-on will NOT switch the depth tap on itself this session (the sync would mirror "
+                       "the enable between the game's and the bridge's runtimes until the game crashes). Enable "
+                       "MGPU_DepthTap in the ReShade overlay, or add [ADDON] SyncEffectRuntimes=0 to ReShade.ini."
+                     : "No change.");
+    if (sync_on) mgpu::diag::warn(l); else mgpu::diag::info(l);
+    mgpu::probe::set_tap_self_enable(!sync_on);
+}
+
+// ---- R335: IS 3DMIGOTO BESIDE THE GAME? Said once ----
+//
+// 3DMigoto ships as d3d11.dll + d3dx.ini in the game folder. It hooks
+// CreateDXGIFactory2 in-process and refuses IDXGIFactory2 (its design; see
+// create_present_chain, R335). The bridge's factory then fails with
+// 0x80004002 before any arm. Detection only: the file pair beside the exe, and
+// whether the d3d11.dll the process loaded is that file. The remedy is the
+// Factory4=1 key (and, if the chain then stops at the IDXGISwapChain3
+// QueryInterface, the next step is known - 3DMigoto refuses that interface too).
+static void r335_migoto_note_once()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    wchar_t exe[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0) return;
+    wchar_t *cut = wcsrchr(exe, L'\\');
+    if (cut == nullptr) return;
+    cut[1] = L'\0';
+    wchar_t dll[MAX_PATH], ini[MAX_PATH];
+    swprintf(dll, MAX_PATH, L"%sd3d11.dll", exe);
+    swprintf(ini, MAX_PATH, L"%sd3dx.ini", exe);
+    const bool have_dll = GetFileAttributesW(dll) != INVALID_FILE_ATTRIBUTES;
+    const bool have_ini = GetFileAttributesW(ini) != INVALID_FILE_ATTRIBUTES;
+    if (!have_dll || !have_ini) return;
+    bool loaded_from_game = false;
+    if (HMODULE m = GetModuleHandleW(L"d3d11.dll"))
+    {
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleFileNameW(m, path, MAX_PATH) != 0)
+            loaded_from_game = (_wcsnicmp(path, exe, wcslen(exe)) == 0);
+    }
+    char l[400];
+    snprintf(l, sizeof l,
+             "[MGPU][R335] 3DMigoto is beside the game (d3d11.dll + d3dx.ini; the loaded d3d11.dll is %s). "
+             "It refuses the IDXGIFactory2 interface the bridge asks for, so the present chain fails at "
+             "CreateDXGIFactory2 with 0x80004002. Set Factory4=1 in mgpu.ini to ask for IDXGIFactory4 instead "
+             "(0.5.0 discovery).",
+             loaded_from_game ? "the one in the game folder" : "NOT the one in the game folder");
+    mgpu::diag::warn(l);
+}
+
 static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 {
     if (runtime == nullptr) return;
+    r334_sync_guard_once(runtime);   // R334: before the D3D12 filter - SoD2 is a D3D11 title
+    r335_migoto_note_once();         // R335
     reshade::api::device *dev = runtime->get_device();
     if (dev == nullptr || dev->get_api() != reshade::api::device_api::d3d12) return;
 
@@ -3142,6 +3443,11 @@ static void on_present(reshade::api::command_queue *queue,
     if (swapchain != nullptr)
         mgpu::strace::note_game_present(
             reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+    // R353: a game can switch its chain to HDR after init (SetColorSpace1 at runtime); refresh the
+    // recorded colour space from the game chain's presents. One getter + one relaxed store per present.
+    if (swapchain != nullptr &&
+        reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())) == g_r353_game_chain.load(std::memory_order_relaxed))
+        r353_note_colour_space(swapchain);
     // DX11 probe: one load when off. The immediate context and the current
     // back buffer, as natives; the module holds no ReShade type.
     if (swapchain != nullptr && queue != nullptr && mgpu::dx11probe::on())
@@ -3565,6 +3871,38 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                     {
                         static bool r312_done = false;
                         const int r312 = r312_done ? 1 : mgpu::gpu1::depth_transport();
+                        // R342a (E8): the pushed definitions persist in ReShadePreset.ini across launches, so
+                        // a launch with DepthTransport absent / 1 after a run at 2-4 kept the tap at the OLD
+                        // geometry while this add-on expected the full frame. Once per launch: if any
+                        // MGPU_DEPTH_* definition is present, push the .fx defaults back (R32F, BUFFER size)
+                        // - one reload, as R312's own push is. Nothing present: nothing pushed.
+                        static bool r342_checked = false;
+                        if (!r342_checked && !r312_done && r312 == 1)   // the KEY value: r312 reads 1 only before any push here
+                        {
+                            r342_checked = true;
+                            // R342a2 (finding #1, suite run A-K1): the push-back itself leaves the three definitions in
+                            // ReShadePreset.ini AT their default values, so a presence test fired and reloaded the effect
+                            // on every later launch. Push only when a definition is present AND differs from its default.
+                            auto stale = [&](const char *name, const char *def) -> bool
+                            {
+                                char cur[64]; size_t cn = sizeof cur;
+                                if (!runtime->get_preprocessor_definition_for_effect("mgpu_depth_tap.fx", name, cur, &cn)) return false;
+                                cur[sizeof cur - 1] = 0;
+                                return strcmp(cur, def) != 0;
+                            };
+                            const bool any = stale("MGPU_DEPTH_WIDTH", "BUFFER_WIDTH") ||
+                                             stale("MGPU_DEPTH_HEIGHT", "BUFFER_HEIGHT") ||
+                                             stale("MGPU_DEPTH_FORMAT", "R32F");
+                            if (any)
+                            {
+                                runtime->set_preprocessor_definition_for_effect("mgpu_depth_tap.fx", "MGPU_DEPTH_FORMAT", "R32F");
+                                runtime->set_preprocessor_definition_for_effect("mgpu_depth_tap.fx", "MGPU_DEPTH_WIDTH", "BUFFER_WIDTH");
+                                runtime->set_preprocessor_definition_for_effect("mgpu_depth_tap.fx", "MGPU_DEPTH_HEIGHT", "BUFFER_HEIGHT");
+                                mgpu::diag::info("[MGPU][R342] DEPTH LANE: DepthTransport is absent / 1 but mgpu_depth_tap.fx still carried MGPU_DEPTH_* "
+                                                 "definitions from an earlier launch at 2-4 - the defaults (R32F at the buffer size) are pushed back; "
+                                                 "the effect reloads once (E8).");
+                            }
+                        }
                         if (r312 >= 2)
                         {
                             const bool want_size = (r312 >= 3);

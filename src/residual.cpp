@@ -31,65 +31,6 @@ namespace mgpu::residual
 {
 namespace
 {
-std::atomic<bool> g_active{false};
-
-// keys
-unsigned g_pass = 0;          // 0-based
-float    g_scale = 0.75f;
-bool     g_render = false;    // R318: extent = the table's render size
-bool     g_depth = false;
-float    g_gain = 1.0f;
-float    g_sharp = 0.0f;
-float    g_color = 0.90f;
-unsigned g_mode = 1u;
-
-// geometry
-unsigned g_nw = 0, g_nh = 0;  // native
-unsigned g_ww = 0, g_wh = 0;  // work
-
-// D3D12 objects (ours; the device is borrowed, not AddRef'd)
-ID3D12Device         *g_dev   = nullptr;
-ID3D12RootSignature  *g_rs    = nullptr;
-ID3D12PipelineState  *g_down  = nullptr;
-ID3D12PipelineState  *g_res   = nullptr;
-ID3D12DescriptorHeap *g_heap  = nullptr;
-UINT                  g_inc   = 0;
-ID3D12Resource       *g_sin   = nullptr;   // small input  (work extent)
-ID3D12Resource       *g_sout  = nullptr;   // small output (work extent)
-DXGI_FORMAT           g_fmt   = DXGI_FORMAT_UNKNOWN;
-
-// tracked states of the scratch pair - never guessed
-D3D12_RESOURCE_STATES g_sin_state  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-D3D12_RESOURCE_STATES g_sout_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
-// per-evaluate memory (set in before, used in after)
-float g_mvx0 = 1.0f, g_mvy0 = 1.0f;
-unsigned long long g_evals = 0ull;
-unsigned g_fails = 0u;
-bool g_said_bind = false;
-bool g_said_depth = false;
-
-// one heap, two parities, disjoint slot ranges per dispatch. The root table is
-// 4 SRVs then 1 UAV at offset 4, for both kernels, so each dispatch owns five
-// consecutive slots:
-//   down    0..4   (t0 anchor at 0, u0 small_in at 4; 1..3 not read)
-//   resolve 5..9   (t0 small_in, t1 small_out, t2 anchor, t3 depth, u0 dst)
-const UINT SLOTS_PER_PARITY = 10u;
-
-// Root layout shared by both kernels: 32-bit constants at b0 (10), then one
-// table of 4 SRVs + 1 UAV. The downsample uses t0/u0 and 4 constants; the
-// rest of the table is simply not read.
-struct consts_t
-{
-    unsigned native_w, native_h;
-    unsigned depth_w, depth_h;      // for the downsample: dst w/h
-    float    gain, sharp;
-    unsigned mode;
-    float    color;
-    unsigned has_depth;
-    unsigned pad;
-};
-
 const char kHLSL[] =
     "cbuffer C : register(b0)\n"
     "{\n"
@@ -242,6 +183,91 @@ typedef HRESULT (WINAPI *pfn_d3dcompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHAD
                                          ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
                                          ID3DBlob **, ID3DBlob **);
 
+// R332: the module is PER PASS. Each pass that carries the residual owns its own
+// scratch pair, work extent, tracked states and counters; the kernels, the root
+// signature and the descriptor heap are shared (one heap, one slot range per
+// pass per parity). With NRS absent exactly one pass carries it (ResidualPass),
+// as R316 did; with NRS=1 pass 1 carries it and pass 2 may too (Pass2=nrs).
+const unsigned MAX_SETS = 4u;   // == stream_state::MAX_PASSES, by contract (checked at arm). R350: capacity 4;
+                                // a set is allocated only for a pass that carries, so 1 / 2 cost what they did.
+
+struct pass_set
+{
+    bool on = false;              // this pass carries the residual (from the keys)
+    bool active = false;          // on AND built; cleared by three failed evaluates
+    unsigned ww = 0, wh = 0;      // work extent
+    ID3D12Resource *sin = nullptr;    // small input  (work extent)
+    ID3D12Resource *sout = nullptr;   // small output (work extent)
+    // tracked states of the scratch pair - never guessed
+    D3D12_RESOURCE_STATES sin_state  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_STATES sout_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // per-evaluate memory (set in before, used in after)
+    float mvx0 = 1.0f, mvy0 = 1.0f;
+    unsigned long long evals = 0ull;
+    unsigned fails = 0u;
+    bool said_bind = false;
+    bool said_depth = false;
+    bool from_render = false;
+};
+
+std::atomic<bool> g_active{false};   // any pass active (one relaxed load for the callers)
+pass_set g_set[MAX_SETS];
+
+// keys (shared by every carrying pass: one work-extent recipe, one look)
+unsigned g_nrs = 0u;          // R332: NRS key (0 = R316 behaviour, 1 = pass 1 carries)
+unsigned g_pass2 = 0u;        // R332: 0 = Pass2 absent, 1 = full, 2 = nrs
+unsigned g_passn[MAX_SETS] = {};   // R350: the same for Pass3 / Pass4 (index = pass - 1; [0] and [1] unused)
+float    g_scale = 0.75f;
+bool     g_render = false;    // R318: extent = the table's render size
+bool     g_depth = false;
+float    g_gain = 1.0f;
+float    g_sharp = 0.0f;
+float    g_color = 0.90f;
+unsigned g_mode = 1u;
+
+// geometry
+unsigned g_nw = 0, g_nh = 0;  // native
+
+// R364 (Marcelo 2026-11-09 10:16: resolution must switch live too): what the arm was handed, kept so a pass can be
+// turned Residual / Native in the SESSION. Nothing here is used by the per-frame path.
+ID3D12Device *g_arm_dev = nullptr;      // the neural device at arm (borrowed)
+unsigned      g_arm_w = 0, g_arm_h = 0; // native extent at arm
+DXGI_FORMAT   g_arm_fmt = DXGI_FORMAT_UNKNOWN;   // the stream's raw format (make_tex takes this one)
+bool          g_arm_nrscale = false;    // NRScale carried the residual this run: our module stays out
+char          g_arm_refusal[200] = {};  // the R316a shape refusal, if any (empty = none)
+bool          g_kernels = false;        // build_kernels succeeded this arm
+
+// D3D12 objects (ours; the device is borrowed, not AddRef'd)
+ID3D12Device         *g_dev   = nullptr;
+ID3D12RootSignature  *g_rs    = nullptr;
+ID3D12PipelineState  *g_down  = nullptr;
+ID3D12PipelineState  *g_res   = nullptr;
+ID3D12DescriptorHeap *g_heap  = nullptr;
+UINT                  g_inc   = 0;
+DXGI_FORMAT           g_fmt   = DXGI_FORMAT_UNKNOWN;
+
+// one heap, per pass two parities, disjoint slot ranges per dispatch. The root
+// table is 4 SRVs then 1 UAV at offset 4, for both kernels, so each dispatch owns
+// five consecutive slots:
+//   down    0..4   (t0 anchor at 0, u0 small_in at 4; 1..3 not read)
+//   resolve 5..9   (t0 small_in, t1 small_out, t2 anchor, t3 depth, u0 dst)
+const UINT SLOTS_PER_PARITY = 10u;
+const UINT SLOTS_PER_PASS   = 2u * SLOTS_PER_PARITY;
+
+// Root layout shared by both kernels: 32-bit constants at b0 (10), then one
+// table of 4 SRVs + 1 UAV. The downsample uses t0/u0 and 4 constants; the
+// rest of the table is simply not read.
+struct consts_t
+{
+    unsigned native_w, native_h;
+    unsigned depth_w, depth_h;      // for the downsample: dst w/h
+    float    gain, sharp;
+    unsigned mode;
+    float    color;
+    unsigned has_depth;
+    unsigned pad;
+};
+
 void rel(IUnknown *&p)
 {
     if (p != nullptr) { p->Release(); p = nullptr; }
@@ -255,10 +281,15 @@ void release_all()
     u = g_res;  rel(u); g_res  = nullptr;
     u = g_rs;   rel(u); g_rs   = nullptr;
     u = g_heap; rel(u); g_heap = nullptr;
-    u = g_sin;  rel(u); g_sin  = nullptr;
-    u = g_sout; rel(u); g_sout = nullptr;
+    for (unsigned i = 0; i < MAX_SETS; ++i)
+    {
+        pass_set &ps = g_set[i];
+        u = ps.sin;  rel(u); ps.sin  = nullptr;
+        u = ps.sout; rel(u); ps.sout = nullptr;
+        ps = pass_set{};
+    }
     g_dev = nullptr;
-    g_sin_state = g_sout_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_kernels = false;
 }
 
 // ---- keys, from mgpu.ini beside the module (the nr16 reader, same rules) ----
@@ -297,10 +328,31 @@ bool key_flag(const char *buf, size_t n, const char *key)
     return v != nullptr && atoi(v) == 1;
 }
 
-// Returns the raw ResidualPass value (-1 absent). Only 1 and 2 turn the module on.
+void read_look(const char *buf, size_t got)
+{
+    g_scale  = key_float(buf, got, "ResidualScale", 0.75f, 0.30f, 1.00f);
+    g_render = key_flag(buf, got, "ResidualRender");
+    g_depth  = key_flag(buf, got, "ResidualDepth");
+    g_gain   = key_float(buf, got, "ResidualGain", 1.0f, 0.0f, 2.0f);
+    g_sharp  = key_float(buf, got, "ResidualSharpness", 0.0f, 0.0f, 1.0f);
+    g_color  = key_float(buf, got, "ResidualColor", 0.90f, 0.0f, 1.0f);
+    g_mode   = key_flag(buf, got, "ResidualMode") ? 1u
+             : ((mgpu::config::find(buf, got, "ResidualMode") != nullptr) ? 0u : 1u);
+}
+
+// Returns the raw ResidualPass value (-1 absent) and fills g_set[i].on / g_nrs / g_pass2.
+//   NRS absent or 0 (R316, unchanged): ResidualPass 1 or 2 turns that one pass on; any
+//       other value or no line: the module does not exist.
+//   NRS=1 (R332): pass 1 carries it. Pass 2 carries it when Pass2=nrs, or when Pass2 is
+//       absent and ResidualPass=2 (the panel's Medium / Light keep their meaning for the
+//       2nd pass). Pass2=full, or Pass2 absent with any other ResidualPass: pass 2 is a
+//       full pass. ResidualPass absent is fine with NRS=1.
 int read_keys()
 {
-    g_pass = 0; g_scale = 0.75f; g_render = false; g_depth = false;
+    for (unsigned i = 0; i < MAX_SETS; ++i) g_set[i].on = false;
+    g_nrs = 0u; g_pass2 = 0u;
+    for (unsigned i = 0; i < MAX_SETS; ++i) g_passn[i] = 0u;   // R350
+    g_scale = 0.75f; g_render = false; g_depth = false;
     g_gain = 1.0f; g_sharp = 0.0f; g_color = 0.90f; g_mode = 1u;
     wchar_t path[MAX_PATH];
     if (!ini_path(path, MAX_PATH)) return -1;
@@ -312,19 +364,44 @@ int read_keys()
     if (got > mgpu::config::MAX_BYTES) return -1;   // whole-document rule
     buf[got] = '\0';
     const char *v = mgpu::config::find(buf.data(), got, "ResidualPass");
-    if (v == nullptr) return -1;
-    const int raw = atoi(v);
-    if (raw != 1 && raw != 2) return raw;
-    g_pass   = (unsigned)(raw - 1);
-    g_scale  = key_float(buf.data(), got, "ResidualScale", 0.75f, 0.30f, 1.00f);
-    g_render = key_flag(buf.data(), got, "ResidualRender");
-    g_depth  = key_flag(buf.data(), got, "ResidualDepth");
-    g_gain   = key_float(buf.data(), got, "ResidualGain", 1.0f, 0.0f, 2.0f);
-    g_sharp  = key_float(buf.data(), got, "ResidualSharpness", 0.0f, 0.0f, 1.0f);
-    g_color  = key_float(buf.data(), got, "ResidualColor", 0.90f, 0.0f, 1.0f);
-    g_mode   = key_flag(buf.data(), got, "ResidualMode") ? 1u
-             : ((mgpu::config::find(buf.data(), got, "ResidualMode") != nullptr) ? 0u : 1u);
-    return raw;
+    const int raw = (v != nullptr) ? atoi(v) : -1;
+    // R332: the NRS key. Read before ResidualPass is judged, because with NRS=1 the module
+    // exists even when ResidualPass is absent.
+    g_nrs = key_flag(buf.data(), got, "NRS") ? 1u : 0u;
+    if (g_nrs != 0u)
+    {
+        const char *p2 = mgpu::config::find(buf.data(), got, "Pass2");
+        if (p2 != nullptr) g_pass2 = (p2[0] == 'n' || p2[0] == 'N') ? 2u : 1u;
+        g_set[0].on = true;
+        g_set[1].on = (g_pass2 == 2u) || (g_pass2 == 0u && raw == 2);
+        // R350 (Experimental, Passes=3 / 4): Pass3 / Pass4 = full | nrs, the Pass2 grammar. Absent = full.
+        // Only read with NRS=1, as Pass2 is; the arm turns a pass off again when it is not built.
+        for (unsigned i = 2u; i < MAX_SETS; ++i)
+        {
+            char key[8]; snprintf(key, sizeof key, "Pass%u", i + 1u);
+            const char *pn = mgpu::config::find(buf.data(), got, key);
+            g_passn[i] = (pn != nullptr) ? ((pn[0] == 'n' || pn[0] == 'N') ? 2u : 1u) : 0u;
+            g_set[i].on = (g_passn[i] == 2u);
+        }
+        read_look(buf.data(), got);
+        return raw;
+    }
+    // R366: without NRS=1, Pass3 / Pass4 = nrs still turn their pass on (the panel writes them for any pass 1
+    // setting now that resolution switches live); the module exists when any residual key names a pass.
+    bool any3 = false;
+    for (unsigned i = 2u; i < MAX_SETS; ++i)
+    {
+        char key[8]; snprintf(key, sizeof key, "Pass%u", i + 1u);
+        const char *pn = mgpu::config::find(buf.data(), got, key);
+        g_passn[i] = (pn != nullptr) ? ((pn[0] == 'n' || pn[0] == 'N') ? 2u : 1u) : 0u;
+        g_set[i].on = (g_passn[i] == 2u);
+        any3 = any3 || g_set[i].on;
+    }
+    if (v == nullptr && !any3) return -1;
+    if (raw == 1 || raw == 2) g_set[(unsigned)(raw - 1)].on = true;
+    else if (!any3) return raw;
+    read_look(buf.data(), got);
+    return (raw == -1) ? 0 : raw;
 }
 
 // ---- GPU objects ----
@@ -444,7 +521,7 @@ bool build_kernels(ID3D12Device *dev)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 2u * SLOTS_PER_PARITY;
+    hd.NumDescriptors = MAX_SETS * SLOTS_PER_PASS;   // R332: one range per pass
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_heap));
     if (FAILED(hr)) return false;
@@ -486,17 +563,17 @@ DXGI_FORMAT depth_view_format(DXGI_FORMAT f)
     }
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE cpu_slot(unsigned parity, unsigned slot)
+D3D12_CPU_DESCRIPTOR_HANDLE cpu_slot(unsigned pi, unsigned parity, unsigned slot)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = g_heap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += ((SIZE_T)(parity & 1u) * SLOTS_PER_PARITY + slot) * g_inc;
+    h.ptr += ((SIZE_T)pi * SLOTS_PER_PASS + (SIZE_T)(parity & 1u) * SLOTS_PER_PARITY + slot) * g_inc;
     return h;
 }
 
-D3D12_GPU_DESCRIPTOR_HANDLE gpu_slot(unsigned parity, unsigned slot)
+D3D12_GPU_DESCRIPTOR_HANDLE gpu_slot(unsigned pi, unsigned parity, unsigned slot)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE g = g_heap->GetGPUDescriptorHandleForHeapStart();
-    g.ptr += ((UINT64)(parity & 1u) * SLOTS_PER_PARITY + slot) * g_inc;
+    g.ptr += ((UINT64)pi * SLOTS_PER_PASS + (UINT64)(parity & 1u) * SLOTS_PER_PARITY + slot) * g_inc;
     return g;
 }
 
@@ -531,17 +608,17 @@ void transition(ID3D12GraphicsCommandList *cl, ID3D12Resource *r,
     cl->ResourceBarrier(1, &b);
 }
 
-// Tracked transitions of the scratch pair: the recorded state is the truth.
-void sin_to(ID3D12GraphicsCommandList *cl, D3D12_RESOURCE_STATES to)
+// Tracked transitions of a pass's scratch pair: the recorded state is the truth.
+void sin_to(ID3D12GraphicsCommandList *cl, pass_set &ps, D3D12_RESOURCE_STATES to)
 {
-    transition(cl, g_sin, g_sin_state, to);
-    g_sin_state = to;
+    transition(cl, ps.sin, ps.sin_state, to);
+    ps.sin_state = to;
 }
 
-void sout_to(ID3D12GraphicsCommandList *cl, D3D12_RESOURCE_STATES to)
+void sout_to(ID3D12GraphicsCommandList *cl, pass_set &ps, D3D12_RESOURCE_STATES to)
 {
-    transition(cl, g_sout, g_sout_state, to);
-    g_sout_state = to;
+    transition(cl, ps.sout, ps.sout_state, to);
+    ps.sout_state = to;
 }
 
 void uav_barrier(ID3D12GraphicsCommandList *cl, ID3D12Resource *r)
@@ -551,6 +628,43 @@ void uav_barrier(ID3D12GraphicsCommandList *cl, ID3D12Resource *r)
     b.UAV.pResource = r;
     cl->ResourceBarrier(1, &b);
 }
+
+// The pass set for `pi`, or nullptr when that pass does not carry (or is off).
+pass_set *live(unsigned pi)
+{
+    if (pi >= MAX_SETS) return nullptr;
+    pass_set &ps = g_set[pi];
+    return ps.active ? &ps : nullptr;
+}
+
+void refresh_any()
+{
+    bool any = false;
+    for (unsigned i = 0; i < MAX_SETS; ++i) any = any || g_set[i].active;
+    g_active.store(any, std::memory_order_release);
+}
+
+// The pass that bind_create (no pass argument) describes: the lowest carrying pass -
+// with NRS absent the one ResidualPass names, exactly as R316 did.
+unsigned first_pass()
+{
+    for (unsigned i = 0; i < MAX_SETS; ++i) if (g_set[i].on) return i;
+    return 0u;
+}
+
+void bind_scratch(NVSDK_NGX_Parameter *p, const pass_set &ps)
+{
+    p->Set("DLSSNR.Color", ps.sin);
+    p->Set("DLSSNR.Output", ps.sout);
+    p->Set("DLSSNR.ColorSubrectBaseX", 0u);
+    p->Set("DLSSNR.ColorSubrectBaseY", 0u);
+    p->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)ps.ww);
+    p->Set("DLSSNR.ColorSubrectHeight", (unsigned int)ps.wh);
+    p->Set("DLSSNR.OutputSubrectBaseX", 0u);
+    p->Set("DLSSNR.OutputSubrectBaseY", 0u);
+    p->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)ps.ww);
+    p->Set("DLSSNR.OutputSubrectHeight", (unsigned int)ps.wh);
+}
 } // namespace
 
 bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
@@ -558,11 +672,16 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
          const char *shape_refusal, bool srgb_in)
 {
     release_all();
-    g_evals = 0ull; g_fails = 0u; g_said_bind = false; g_said_depth = false;
     const int raw = read_keys();
-    if (raw == -1) return false;                 // key absent: the module does not exist
-    char l[600];
-    if (raw != 1 && raw != 2)
+    // R364: keep the arm's inputs for the live Residual / Native switch, whatever the keys say now
+    g_arm_dev = dev; g_arm_w = width; g_arm_h = height; g_arm_fmt = fmt; g_arm_nrscale = nrscale_on;
+    g_arm_refusal[0] = 0;
+    if (shape_refusal != nullptr) snprintf(g_arm_refusal, sizeof g_arm_refusal, "%s", shape_refusal);
+    bool any_on = false;
+    for (unsigned i = 0; i < MAX_SETS; ++i) any_on = any_on || g_set[i].on;   // R350: every set
+    if (raw == -1 && g_nrs == 0u) return false;   // keys absent: the module does not exist
+    char l[700];
+    if (!any_on)
     {
         snprintf(l, sizeof l, "[MGPU][RSD] residual pass OFF (ResidualPass=%d; 1 or 2 turns it on).", raw);
         mgpu::diag::info(l);
@@ -572,36 +691,47 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
     {
         mgpu::diag::info("[MGPU][RSD] residual pass OFF: NRScale is set, so the NRScale path (R299) "
                          "carries the residual this run. One residual path at a time.");
+        for (unsigned i = 0; i < MAX_SETS; ++i) g_set[i].on = false;
         return false;
     }
     // R319: `passes` is the number of pass features the arm creates (MAX_PASSES), not the
     // live Passes value. The panel moves between x1 and x2 live; the carrying pass's
     // feature has to exist at the work extent whichever one the session starts on.
-    if (g_pass >= passes)
+    if (passes > MAX_SETS) passes = MAX_SETS;
+    for (unsigned i = passes; i < MAX_SETS; ++i)
     {
-        snprintf(l, sizeof l, "[MGPU][RSD] residual pass OFF: ResidualPass=%u but this build creates "
-                 "%u pass feature(s).", g_pass + 1u, passes);
+        if (!g_set[i].on) continue;
+        snprintf(l, sizeof l, "[MGPU][RSD] residual pass OFF on pass %u: this build creates "
+                 "%u pass feature(s).", i + 1u, passes);
         mgpu::diag::info(l);
-        return false;
+        g_set[i].on = false;
     }
+    any_on = false;
+    for (unsigned i = 0; i < MAX_SETS; ++i) any_on = any_on || g_set[i].on;
+    if (!any_on) return false;
     // R316a: the carrying pass's feature is built at the work extent, so every frame
     // of the run must be able to take the residual. Settings that change the frame's
     // shape are known here and do not change after arm; refuse them now rather than
     // run the normal path on a feature of the wrong size.
-    if (shape_refusal == nullptr && srgb_in && g_pass == 0u)
+    // R332: with NRS=1 SrgbInput=1 on pass 1 is a PATH, not a refusal (below). With NRS
+    // absent the R316 refusal stands, word for word.
+    if (shape_refusal == nullptr && srgb_in && g_set[0].on && g_nrs == 0u)
         shape_refusal = "SrgbInput=1 is set (pass 1 would hand NR our scratch, not the sRGB input)";
     if (shape_refusal != nullptr)
     {
         snprintf(l, sizeof l, "[MGPU][RSD] residual pass OFF for this run: %s. It runs with SRUpscale=0, "
                  "Subrect=100, CostCurve=0, no ScaleMode, no Pass1Fovea / Pass2Region / Pass2Fovea"
                  "%s. Every feature is created at its usual size.",
-                 shape_refusal, (g_pass == 0u) ? " and SrgbInput=0" : "");
+                 shape_refusal, (g_set[0].on && g_nrs == 0u) ? " and SrgbInput=0" : "");
         mgpu::diag::warn(l);
+        for (unsigned i = 0; i < MAX_SETS; ++i) g_set[i].on = false;
         return false;
     }
     if (dev == nullptr || width == 0 || height == 0) return false;
 
-    // The work extent: the table's render size (R318), or scale x native.
+    // The work extent: the table's render size (R318), or scale x native. One recipe,
+    // applied to every carrying pass (pass 2's anchor is pass 1's native output, so
+    // the same extent is the right one there too).
     bool from_render = false;
     unsigned ww = 0, wh = 0;
     // R316b: the render size is used only when it is BELOW native. On DLAA the game renders
@@ -631,9 +761,16 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
     if (ww > width)  ww = width  & ~1u;
     if (wh > height) wh = height & ~1u;
 
-    g_dev = dev; g_nw = width; g_nh = height; g_ww = ww; g_wh = wh; g_fmt = view_format(fmt);
-    HRESULT h = make_tex(dev, ww, wh, fmt, &g_sin);
-    if (SUCCEEDED(h)) h = make_tex(dev, ww, wh, fmt, &g_sout);
+    g_dev = dev; g_nw = width; g_nh = height; g_fmt = view_format(fmt);
+    HRESULT h = S_OK;
+    for (unsigned i = 0; i < MAX_SETS && SUCCEEDED(h); ++i)
+    {
+        pass_set &ps = g_set[i];
+        if (!ps.on) continue;
+        ps.ww = ww; ps.wh = wh; ps.from_render = from_render;
+        h = make_tex(dev, ww, wh, fmt, &ps.sin);
+        if (SUCCEEDED(h)) h = make_tex(dev, ww, wh, fmt, &ps.sout);
+    }
     if (FAILED(h) || !build_kernels(dev))
     {
         snprintf(l, sizeof l, "[MGPU][RSD] residual pass could not be built (0x%08X) - OFF for this "
@@ -642,17 +779,49 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
         release_all();
         return false;
     }
-    snprintf(l, sizeof l,
-             "[MGPU][RSD] RESIDUAL PASS ON (R316): pass %u (of up to %u) carries it. work=%ux%u (%s) native=%ux%u "
-             "fmt=%d gain=%.2f sharp=%.2f color=%.2f mode=%u depth=%s. The pass's feature is created at the "
-             "work extent; each evaluate downsamples its input, runs DLSS-NR there and adds the residual "
-             "onto the pass's input at native size.",
-             g_pass + 1u, passes, ww, wh,
-             from_render ? "the table's render size, ResidualRender=1" : "ResidualScale x native",
-             width, height, (int)fmt, (double)g_gain, (double)g_sharp, (double)g_color, g_mode,
-             g_depth ? "guard on, taps scaled to the depth's size" : "no depth to the resolve");
-    mgpu::diag::info(l);
-    g_active.store(true, std::memory_order_release);
+    g_kernels = true;   // R364
+    for (unsigned i = 0; i < MAX_SETS; ++i)
+    {
+        pass_set &ps = g_set[i];
+        if (!ps.on) continue;
+        ps.active = true;
+        snprintf(l, sizeof l,
+                 "[MGPU][RSD] RESIDUAL PASS ON (R316): pass %u (of up to %u) carries it. work=%ux%u (%s) native=%ux%u "
+                 "fmt=%d gain=%.2f sharp=%.2f color=%.2f mode=%u depth=%s. The pass's feature is created at the "
+                 "work extent; each evaluate downsamples its input, runs DLSS-NR there and adds the residual "
+                 "onto the pass's input at native size.",
+                 i + 1u, passes, ww, wh,
+                 from_render ? "the table's render size, ResidualRender=1" : "ResidualScale x native",
+                 width, height, (int)fmt, (double)g_gain, (double)g_sharp, (double)g_color, g_mode,
+                 g_depth ? "guard on, taps scaled to the depth's size" : "no depth to the resolve");
+        mgpu::diag::info(l);
+    }
+    if (g_nrs != 0u)
+    {
+        snprintf(l, sizeof l,
+                 "[MGPU][RSD][R332] NRS=1: pass 1 runs our residual (the 0.5.0 path); pass 2 at x2 is %s "
+                 "(Pass2=%s%s). N01950's NRScale is untouched and still wins when set.",
+                 g_set[1].on ? "our residual too, anchored on pass 1's resolved native output" : "a FULL NR pass",
+                 (g_pass2 == 2u) ? "nrs" : (g_pass2 == 1u) ? "full" : "absent",
+                 (g_pass2 == 0u) ? (raw == 2 ? ", ResidualPass=2 kept its meaning for the 2nd pass"
+                                             : ", no ResidualPass=2") : "");
+        mgpu::diag::info(l);
+        if (srgb_in && g_set[0].on)
+            mgpu::diag::warn("[MGPU][RSD][R332] SrgbInput=1 with the residual on pass 1: NR reads OUR work-extent "
+                             "scratch (the linear-typed format, code values, as every SrgbInput=0 run does), not "
+                             "the sRGB-typed tex_in; the downsample reads tex_in through a UNORM view (same bytes). "
+                             "The P7.8b free-decode experiment does not apply to the carrying pass this run; "
+                             "compare halves in Present=split as that experiment says.");
+        for (unsigned i = 2u; i < MAX_SETS; ++i)   // R350: passes 3 / 4 exist only when built (Passes=3 / 4)
+        {
+            if (i >= passes) continue;
+            snprintf(l, sizeof l, "[MGPU][RSD][R350] pass %u is %s (Pass%u=%s).", i + 1u,
+                     g_set[i].on ? "our residual, anchored on the pass before it" : "a FULL NR pass",
+                     i + 1u, (g_passn[i] == 2u) ? "nrs" : (g_passn[i] == 1u) ? "full" : "absent");
+            mgpu::diag::info(l);
+        }
+    }
+    refresh_any();
     return true;
 }
 
@@ -661,88 +830,165 @@ bool active()
     return g_active.load(std::memory_order_relaxed);
 }
 
+// R364: turn pass `pi` Residual (on) or Native (off) in the session. Called on the bridge thread, between
+// frames, right before the caller recreates that pass's feature at the new extent. Native: the set stops
+// carrying (its scratch stays allocated - the GPU may still read it; it is freed at the next arm). Residual:
+// the kernels are built on first need (an ini with no residual key never built them) and the pass's scratch
+// pair is allocated at the module's extent (ResidualScale x native; the table's render size is an arm-time
+// decision and is not re-read here). Refusals mirror arm(): NRScale carrying, or the R316a shape refusal.
+bool set_pass_live(unsigned pi, bool on, char *line, size_t cap)
+{
+    if (pi >= MAX_SETS) return false;
+    pass_set &ps = g_set[pi];
+    if (!on)
+    {
+        ps.on = false; ps.active = false;
+        refresh_any();
+        snprintf(line, cap, "[MGPU][RSD][R364] pass %u -> NATIVE live (a full NR pass; its scratch stays allocated until the next arm).", pi + 1u);
+        return true;
+    }
+    if (g_arm_dev == nullptr || g_arm_w == 0u || g_arm_h == 0u)
+    {
+        snprintf(line, cap, "[MGPU][RSD][R364] pass %u cannot turn Residual live: the module saw no arm this run.", pi + 1u);
+        return false;
+    }
+    if (g_arm_nrscale)
+    {
+        snprintf(line, cap, "[MGPU][RSD][R364] pass %u cannot turn Residual live: NRScale carries the residual this run (one path at a time).", pi + 1u);
+        return false;
+    }
+    if (g_arm_refusal[0] != 0)
+    {
+        snprintf(line, cap, "[MGPU][RSD][R364] pass %u cannot turn Residual live: %s (the arm's refusal stands).", pi + 1u, g_arm_refusal);
+        return false;
+    }
+    if (!g_kernels)
+    {
+        g_dev = g_arm_dev; g_nw = g_arm_w; g_nh = g_arm_h; g_fmt = view_format(g_arm_fmt);
+        if (!build_kernels(g_arm_dev))
+        {
+            snprintf(line, cap, "[MGPU][RSD][R364] pass %u cannot turn Residual live: the kernels did not build.", pi + 1u);
+            return false;
+        }
+        g_kernels = true;
+    }
+    if (ps.sin == nullptr || ps.sout == nullptr)
+    {
+        unsigned ww = (unsigned)((double)g_arm_w * (double)g_scale + 0.5);
+        unsigned wh = (unsigned)((double)g_arm_h * (double)g_scale + 0.5);
+        if (ww < 128u) ww = 128u;
+        if (wh < 128u) wh = 128u;
+        ww &= ~1u; wh &= ~1u;
+        if (ww > g_arm_w) ww = g_arm_w & ~1u;
+        if (wh > g_arm_h) wh = g_arm_h & ~1u;
+        HRESULT h = make_tex(g_arm_dev, ww, wh, g_arm_fmt, &ps.sin);
+        if (SUCCEEDED(h)) h = make_tex(g_arm_dev, ww, wh, g_arm_fmt, &ps.sout);
+        if (FAILED(h))
+        {
+            IUnknown *u = ps.sin; rel(u); ps.sin = nullptr;
+            u = ps.sout; rel(u); ps.sout = nullptr;
+            snprintf(line, cap, "[MGPU][RSD][R364] pass %u cannot turn Residual live: scratch allocation failed (0x%08X).", pi + 1u, (unsigned)h);
+            return false;
+        }
+        ps.ww = ww; ps.wh = wh; ps.from_render = false;
+        ps.sin_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ps.sout_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    ps.on = true; ps.active = true; ps.fails = 0u; ps.evals = 0ull; ps.said_bind = false; ps.said_depth = false;
+    refresh_any();
+    snprintf(line, cap, "[MGPU][RSD][R364] pass %u -> RESIDUAL live: work=%ux%u (ResidualScale x native), native=%ux%u.",
+             pi + 1u, ps.ww, ps.wh, g_arm_w, g_arm_h);
+    return true;
+}
+
+bool carries(unsigned pi)
+{
+    return live(pi) != nullptr;
+}
+
 unsigned pass()
 {
-    return g_pass;
+    return first_pass();
 }
 
 void work_extent(unsigned &w, unsigned &h)
 {
-    w = g_ww; h = g_wh;
+    const pass_set &ps = g_set[first_pass()];
+    w = ps.ww; h = ps.wh;
+}
+
+void work_extent(unsigned pi, unsigned &w, unsigned &h)
+{
+    const pass_set *ps = live(pi);
+    if (ps == nullptr) return;
+    w = ps->ww; h = ps->wh;
 }
 
 void bind_create(NVSDK_NGX_Parameter *p)
 {
     if (!active() || p == nullptr) return;
-    p->Set("DLSSNR.Color", g_sin);
-    p->Set("DLSSNR.Output", g_sout);
-    p->Set("DLSSNR.ColorSubrectBaseX", 0u);
-    p->Set("DLSSNR.ColorSubrectBaseY", 0u);
-    p->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)g_ww);
-    p->Set("DLSSNR.ColorSubrectHeight", (unsigned int)g_wh);
-    p->Set("DLSSNR.OutputSubrectBaseX", 0u);
-    p->Set("DLSSNR.OutputSubrectBaseY", 0u);
-    p->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)g_ww);
-    p->Set("DLSSNR.OutputSubrectHeight", (unsigned int)g_wh);
+    bind_scratch(p, g_set[first_pass()]);
 }
 
-void before(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *p,
+void bind_create(NVSDK_NGX_Parameter *p, unsigned pi)
+{
+    const pass_set *ps = live(pi);
+    if (ps == nullptr || p == nullptr) return;
+    bind_scratch(p, *ps);
+}
+
+void before(ID3D12GraphicsCommandList *cl, unsigned pi, unsigned parity, NVSDK_NGX_Parameter *p,
             ID3D12Resource *anchor)
 {
-    if (!active() || cl == nullptr || p == nullptr || anchor == nullptr) return;
+    pass_set *psp = live(pi);
+    if (psp == nullptr || cl == nullptr || p == nullptr || anchor == nullptr) return;
+    pass_set &ps = *psp;
 
     // downsample: anchor (SRV, already NON_PIXEL_SHADER_RESOURCE) -> small_in (UAV)
-    sin_to(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    write_srv(cpu_slot(parity, 0u), anchor, g_fmt);
-    for (unsigned k = 1u; k <= 3u; ++k) write_srv(cpu_slot(parity, k), anchor, g_fmt);   // not read; valid anyway
-    write_uav(cpu_slot(parity, 4u), g_sin, g_fmt);
+    sin_to(cl, ps, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    write_srv(cpu_slot(pi, parity, 0u), anchor, g_fmt);
+    for (unsigned k = 1u; k <= 3u; ++k) write_srv(cpu_slot(pi, parity, k), anchor, g_fmt);   // not read; valid anyway
+    write_uav(cpu_slot(pi, parity, 4u), ps.sin, g_fmt);
     ID3D12DescriptorHeap *heaps[1] = { g_heap };
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetComputeRootSignature(g_rs);
     cl->SetPipelineState(g_down);
     consts_t c{};
-    c.native_w = g_nw; c.native_h = g_nh; c.depth_w = g_ww; c.depth_h = g_wh;
+    c.native_w = g_nw; c.native_h = g_nh; c.depth_w = ps.ww; c.depth_h = ps.wh;
     cl->SetComputeRoot32BitConstants(0, 10, &c, 0);
-    cl->SetComputeRootDescriptorTable(1, gpu_slot(parity, 0u));
-    cl->Dispatch((g_ww + 7u) / 8u, (g_wh + 7u) / 8u, 1u);
+    cl->SetComputeRootDescriptorTable(1, gpu_slot(pi, parity, 0u));
+    cl->Dispatch((ps.ww + 7u) / 8u, (ps.wh + 7u) / 8u, 1u);
     // the write is not visible until this says it is (R299's lesson)
-    sin_to(cl, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    sout_to(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    sin_to(cl, ps, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sout_to(cl, ps, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // the snippet re-reads Width/Height on every evaluate (R299's lesson)
-    p->Set("DLSSNR.Width",  (unsigned int)g_ww);
-    p->Set("DLSSNR.Height", (unsigned int)g_wh);
-    p->Set("DLSSNR.Color", g_sin);
-    p->Set("DLSSNR.Output", g_sout);
-    p->Set("DLSSNR.ColorSubrectBaseX", 0u);
-    p->Set("DLSSNR.ColorSubrectBaseY", 0u);
-    p->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)g_ww);
-    p->Set("DLSSNR.ColorSubrectHeight", (unsigned int)g_wh);
-    p->Set("DLSSNR.OutputSubrectBaseX", 0u);
-    p->Set("DLSSNR.OutputSubrectBaseY", 0u);
-    p->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)g_ww);
-    p->Set("DLSSNR.OutputSubrectHeight", (unsigned int)g_wh);
+    p->Set("DLSSNR.Width",  (unsigned int)ps.ww);
+    p->Set("DLSSNR.Height", (unsigned int)ps.wh);
+    bind_scratch(p, ps);
     // Vector scale x work/native, as the proxy and R299 do. Left as is on purpose:
     // whether the vectors want this when they are already render-sized is the open
     // scale-convention question, and it is answered by the picture, not here.
-    g_mvx0 = 1.0f; g_mvy0 = 1.0f;
-    (void)p->Get("DLSSNR.MVecScaleX", &g_mvx0);
-    (void)p->Get("DLSSNR.MVecScaleY", &g_mvy0);
-    p->Set("DLSSNR.MVecScaleX", g_mvx0 * ((float)g_ww / (float)g_nw));
-    p->Set("DLSSNR.MVecScaleY", g_mvy0 * ((float)g_wh / (float)g_nh));
+    ps.mvx0 = 1.0f; ps.mvy0 = 1.0f;
+    (void)p->Get("DLSSNR.MVecScaleX", &ps.mvx0);
+    (void)p->Get("DLSSNR.MVecScaleY", &ps.mvy0);
+    p->Set("DLSSNR.MVecScaleX", ps.mvx0 * ((float)ps.ww / (float)g_nw));
+    p->Set("DLSSNR.MVecScaleY", ps.mvy0 * ((float)ps.wh / (float)g_nh));
 }
 
-void after(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *p,
+void after(ID3D12GraphicsCommandList *cl, unsigned pi, unsigned parity, NVSDK_NGX_Parameter *p,
            ID3D12Resource *anchor, ID3D12Resource *dst, bool evaluate_ok,
            ID3D12Resource *nr_color, ID3D12Resource *nr_output,
            unsigned native_w, unsigned native_h,
            unsigned rbx, unsigned rby, unsigned rw, unsigned rh)
 {
-    if (!active() || cl == nullptr || p == nullptr) return;
+    pass_set *psp = live(pi);
+    if (psp == nullptr || cl == nullptr || p == nullptr) return;
+    pass_set &ps = *psp;
 
     // the snippet wrote small_out as a UAV; make that visible, then read it
-    uav_barrier(cl, g_sout);
-    sout_to(cl, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    uav_barrier(cl, ps.sout);
+    sout_to(cl, ps, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     // depth: whatever NGX was handed this evaluate, at any size, if readable
     ID3D12Resource *depth = nullptr;
@@ -758,12 +1004,12 @@ void after(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *
             const bool srv_ok = (dd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0;
             if (!srv_ok || dfmt == DXGI_FORMAT_UNKNOWN || dd.Width == 0 || dd.Height == 0)
             {
-                if (!g_said_depth)
+                if (!ps.said_depth)
                 {
-                    g_said_depth = true;
+                    ps.said_depth = true;
                     char l[300];
-                    snprintf(l, sizeof l, "[MGPU][RSD] depth not readable by the resolve (srv=%d fmt=%d) - "
-                             "the silhouette guard is off this run.", srv_ok ? 1 : 0, (int)dd.Format);
+                    snprintf(l, sizeof l, "[MGPU][RSD] pass %u: depth not readable by the resolve (srv=%d fmt=%d) - "
+                             "the silhouette guard is off this run.", pi + 1u, srv_ok ? 1 : 0, (int)dd.Format);
                     mgpu::diag::warn(l);
                 }
                 depth = nullptr;
@@ -774,13 +1020,13 @@ void after(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *
 
     if (evaluate_ok && anchor != nullptr && dst != nullptr)
     {
-        write_srv(cpu_slot(parity, 5u), g_sin, g_fmt);
-        write_srv(cpu_slot(parity, 6u), g_sout, g_fmt);
-        write_srv(cpu_slot(parity, 7u), anchor, g_fmt);
+        write_srv(cpu_slot(pi, parity, 5u), ps.sin, g_fmt);
+        write_srv(cpu_slot(pi, parity, 6u), ps.sout, g_fmt);
+        write_srv(cpu_slot(pi, parity, 7u), anchor, g_fmt);
         // t3 must hold a valid descriptor even when unused: small_in stands in
-        write_srv(cpu_slot(parity, 8u), (depth != nullptr) ? depth : g_sin,
+        write_srv(cpu_slot(pi, parity, 8u), (depth != nullptr) ? depth : ps.sin,
                   (depth != nullptr) ? dfmt : g_fmt);
-        write_uav(cpu_slot(parity, 9u), dst, g_fmt);
+        write_uav(cpu_slot(pi, parity, 9u), dst, g_fmt);
         ID3D12DescriptorHeap *heaps[1] = { g_heap };
         cl->SetDescriptorHeaps(1, heaps);
         cl->SetComputeRootSignature(g_rs);
@@ -792,45 +1038,49 @@ void after(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *
         c.gain = g_gain; c.sharp = g_sharp; c.mode = g_mode; c.color = g_color;
         c.has_depth = (depth != nullptr) ? 1u : 0u;
         cl->SetComputeRoot32BitConstants(0, 10, &c, 0);
-        cl->SetComputeRootDescriptorTable(1, gpu_slot(parity, 5u));
+        cl->SetComputeRootDescriptorTable(1, gpu_slot(pi, parity, 5u));
         cl->Dispatch((g_nw + 7u) / 8u, (g_nh + 7u) / 8u, 1u);
         uav_barrier(cl, dst);   // the resolve's writes done before anything reads dst
-        g_fails = 0u;
+        ps.fails = 0u;
     }
     else if (!evaluate_ok)
     {
         // A failed evaluate leaves small_out stale: no resolve (the proxy's rule),
-        // dst keeps what it had. Three in a row turn the module off for the arm.
-        if (++g_fails >= 3u && active())
+        // dst keeps what it had. Three in a row turn THIS pass's module off for the arm.
+        if (++ps.fails >= 3u && ps.active)
         {
-            g_active.store(false, std::memory_order_relaxed);
-            mgpu::diag::error("[MGPU][RSD] three failed evaluates in a row - residual pass OFF for the "
-                              "rest of this arm; the pass's feature stays at the work extent, so the "
-                              "normal path runs it at that size until the next arm.");
+            ps.active = false;
+            refresh_any();
+            char l[400];
+            snprintf(l, sizeof l, "[MGPU][RSD] pass %u: three failed evaluates in a row - residual pass OFF for the "
+                     "rest of this arm; the pass's feature stays at the work extent, so the "
+                     "normal path runs it at that size until the next arm.", pi + 1u);
+            mgpu::diag::error(l);
         }
     }
-    sout_to(cl, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ++g_evals;
+    sout_to(cl, ps, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ++ps.evals;
 
-    if (!g_said_bind)
+    if (!ps.said_bind)
     {
-        g_said_bind = true;
+        ps.said_bind = true;
         char l[400];
         snprintf(l, sizeof l,
-                 "[MGPU][RSD] first evaluate: %s. anchor==dst=%d mvScale=%.3f/%.3f depth=%s work=%ux%u",
+                 "[MGPU][RSD] pass %u first evaluate: %s. anchor==dst=%d mvScale=%.3f/%.3f depth=%s work=%ux%u",
+                 pi + 1u,
                  evaluate_ok ? "SUCCESS" : "FAILED (see the P4.1 EvaluateFeature line)",
                  (anchor == dst) ? 1 : 0,
-                 (double)(g_mvx0 * ((float)g_ww / (float)g_nw)),
-                 (double)(g_mvy0 * ((float)g_wh / (float)g_nh)),
+                 (double)(ps.mvx0 * ((float)ps.ww / (float)g_nw)),
+                 (double)(ps.mvy0 * ((float)ps.wh / (float)g_nh)),
                  (depth != nullptr) ? "bound" : (g_depth ? "none this evaluate" : "off"),
-                 g_ww, g_wh);
+                 ps.ww, ps.wh);
         mgpu::diag::info(l);
     }
-    else if ((g_evals % 600ull) == 0ull)
+    else if ((ps.evals % 600ull) == 0ull)
     {
         char l[200];
-        snprintf(l, sizeof l, "[MGPU][RSD] evaluates=%llu at work=%ux%u depth=%s", g_evals, g_ww, g_wh,
-                 (depth != nullptr) ? "bound" : "off");
+        snprintf(l, sizeof l, "[MGPU][RSD] pass %u evaluates=%llu at work=%ux%u depth=%s", pi + 1u, ps.evals,
+                 ps.ww, ps.wh, (depth != nullptr) ? "bound" : "off");
         mgpu::diag::info(l);
     }
 
@@ -848,8 +1098,13 @@ void after(ID3D12GraphicsCommandList *cl, unsigned parity, NVSDK_NGX_Parameter *
     p->Set("DLSSNR.OutputSubrectBaseY", (unsigned int)rby);
     p->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)rw);
     p->Set("DLSSNR.OutputSubrectHeight", (unsigned int)rh);
-    p->Set("DLSSNR.MVecScaleX", g_mvx0);
-    p->Set("DLSSNR.MVecScaleY", g_mvy0);
+    p->Set("DLSSNR.MVecScaleX", ps.mvx0);
+    p->Set("DLSSNR.MVecScaleY", ps.mvy0);
+}
+
+bool nrs_on()
+{
+    return g_nrs != 0u;
 }
 
 void release()

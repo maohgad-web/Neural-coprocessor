@@ -2075,6 +2075,8 @@ tech_row g_tech[TECH_MAX] = {};
 unsigned g_tech_n = 0;
 unsigned g_tech_seen = 0;
 unsigned long long g_tap_enables = 0;   // times we had to switch it on
+bool               g_tap_self_enable = true;   // R334: false = report only, never set_technique_state
+unsigned long long g_tap_enables_skipped = 0;  // R334: times the enable was wanted and withheld
 int      g_tap_state = -1;              // -1 absent, 0 present-off, 1 present-on
 // R147. CONSECUTIVE SCANS THAT DID NOT END WITH THE TAP ON.
 //
@@ -2127,10 +2129,35 @@ void tech_scan()
             rt->find_technique(g_tech[i].effect, g_tech[i].name);
         if (t.handle != 0)
         {
+            // R334: when the Effect Runtime Sync guard is on, the enable is
+            // withheld (see set_tap_self_enable); the state stays what the
+            // preset or the user made it, and the periodic line says so.
+            if (!g_tap_self_enable)
+            {
+                ++g_tap_enables_skipped;
+                if (g_tap_enables_skipped == 1u)
+                    mgpu::diag::warn("[MGPU][R334] the depth tap is OFF on this runtime and the add-on is NOT "
+                                     "switching it on (Effect Runtime Sync guard). Enable the MGPU_DepthTap "
+                                     "technique in the ReShade overlay, or add [ADDON] SyncEffectRuntimes=0 to "
+                                     "ReShade.ini and relaunch.");
+                continue;
+            }
             rt->set_technique_state(t, true);
             g_tech[i].on = true;
             g_tap_state = 1;
             ++g_tap_enables;
+            // R334 instrument: WHICH runtime the enable acted on and what it
+            // reads back. One line per enable (a scan every 300 frames, and
+            // only when the tap read OFF), so it is cheap and it settles the
+            // open question from the SoD2 case: which runtime tech_scan sees
+            // on a D3D11 title.
+            {
+                char l[200];
+                snprintf(l, sizeof l, "[MGPU][R334] tech_scan enabled %s on runtime %p: read-back %s (enable #%llu)",
+                         g_tech[i].name, (void *)rt, rt->get_technique_state(t) ? "ON" : "still OFF",
+                         g_tap_enables);
+                mgpu::diag::info(l);
+            }
         }
     }
 
@@ -2360,7 +2387,7 @@ void dump()
                 g_mvec_pick_said = pick;
                 char pl[520]; int o = snprintf(pl, sizeof pl, "[MGPU][R277d] transport candidate 0x%llx (MVecCandidate=%u) of %u eligible:", pick, pn, en);
                 for (unsigned a = 0; a < en && o > 0 && o < (int)sizeof pl - 60; ++a)
-                    o += snprintf(pl + o, sizeof pl - o, " [%u] 0x%llx %ux%u barriers=%llu", a, el[a].h, el[a].w, el[a].hh, el[a].e);
+                    o += snprintf(pl + o, sizeof pl - o, " [%u] 0x%llx %ux%u fmt=%u barriers=%llu", a, el[a].h, el[a].w, el[a].hh, el[a].fmt, el[a].e);   // R342b (C3): the format, a new field
                 mgpu::diag::info(pl);
             }
             // R280: while mvec_extract is still manufacturing its target, the dump
@@ -3437,6 +3464,11 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr)
 // than "a scan found nothing" - and that distinction is the whole point of the
 // -2. Reporting g_tap_state's -1 initialiser before any scan would put ERROR
 // 204 on screen during normal startup.
+void set_tap_self_enable(bool allowed)   // R334
+{
+    g_tap_self_enable = allowed;
+}
+
 int tap_state()
 {
     if (g_tech_seen == 0)        return -2;   // no scan has completed
