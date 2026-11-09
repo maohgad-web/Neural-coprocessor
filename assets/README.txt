@@ -64,6 +64,19 @@ copy (MVecBarrierSource=2) and no history in menus (HistoryGate=1). An edited
 mgpu.ini from 0.3.x does not have these keys: take the new file. The
 launcher's Copy files can replace it for you and keeps your Dcomp settings.
 
+0.5.0 CHANGES THE DEFAULTS. TAKE THE NEW mgpu.ini. The first pass runs at a
+reduced size (NRS=1), the big network runs on the first pass at x1 and on
+the last pass at x2 (NRPreset1=1, NRPreset1x2=0, NRPreset2=1), the copies to
+the second card leave the game's queue (StageCopy=1), games that use 3DMigoto
+start (Factory4=1) and the picture follows the game's colour space
+(ChainColorSpace=auto). An edited mgpu.ini from 0.4.x keeps the 0.4.0
+behaviour. The launcher's Copy files can replace it for you and keeps your
+Dcomp settings.
+
+USE nvngx_dlssnr.dll 310.9.16 OR NEWER. Older versions carry only the big
+network and run it on every pass, which costs more at x2. The [R351] line in
+ReShade.log says which version you have.
+
 WHAT YOU NEED FIRST
 -------------------
 
@@ -294,7 +307,7 @@ presenting. You do not have to press anything.
 
 THE BRIDGE CAN TAKE A WHILE TO ARM, AND THAT IS NORMAL. It does not arm until
 the game has bound a depth buffer and a velocity buffer, and neither exists in
-a menu. Across the five titles this build was validated on, the wait from
+a menu. Across the six titles this build was validated on, the wait from
 request to armed ran from under two seconds to about forty-five. Get into
 gameplay and it clears. If it NEVER clears, read the [R63] and [R78] lines in
 the log - they say which of the two is missing.
@@ -416,9 +429,31 @@ Frames=0       Run until the game closes. Set a number (60..100000) for a
 
                bounded run that ends with a summary.
 
-Passes=1       One neural pass per frame. The build maximum is 2 and is
+Passes=1       One neural pass per frame. x2 is a button in the panel.
 
-               enforced in code.
+               3 and 4 are experimental: set Passes=3 or 4 here. They hold
+               the second card at its power limit.
+
+PASS SETTINGS  New in 0.5.0, in the panel under the x1 / x2 buttons. For
+
+               each pass, the network (Light-FP8 = the small one, faster;
+               Full-FP8 = the big one) and the resolution (Residual Neural =
+               reduced size, faster; Native = full size). They change while
+               you play, with a short hitch and no restart. "Best Quality-
+               Performance" puts the default back. "Running now" shows what
+               each pass is actually running. The keys behind them are
+               NRPreset1 / NRPreset1x2 / NRPreset2 and NRS / Pass2.
+
+FrameGen=0     Frame generation on the second card. Experimental, off by
+
+               default. Turn off the game's own frame generation first,
+               then set FrameGen=4 or tick it in the panel (needs a
+               restart). Please report your results.
+
+ChainColorSpace=auto  How Windows reads the bridge's picture. auto follows
+
+               the game, which is what HDR displays need. Experimental on
+               HDR: please report your results.
 
 Monitor=auto   Which of the second card's outputs the window opens on.
 
@@ -486,10 +521,10 @@ prints no summary. Set Frames to a number (60..100000) if you want a bounded
 run that ends with a summary, which is what the measurement runs used.
 
 This is implemented as a bound that is never reached, NOT as a stop-and-
-restart control: no neural feature and no texture is ever torn down and
-rebuilt while the game is live, because that path has never been exercised and
-is the riskiest code that could exist here. Nothing new runs; the same single
-stream simply never satisfies the condition that ends it.
+restart control. The stream itself is never torn down while the game is live.
+Since 0.5.0 a single pass's neural feature is rebuilt when you change its
+network or resolution in the panel; the old one is released only after the
+second card has finished with it.
 
 SCREENSHOTS WITH THE OVERLAY VISIBLE
 ------------------------------------
@@ -510,8 +545,8 @@ session ended with the game rendering black on both displays after several
 minutes, on a six-pass run. The exact mechanism was never isolated - a later
 twenty-minute run at TWO passes sat at 174W of a 180W limit and was completely
 stable, so simply being at the power limit is not the explanation. This build
-allows at most two passes and the bound is enforced in code, so the condition
-that produced it is not reachable from the settings file.
+allows at most four passes, and three and four are experimental. Stay at x1 or
+x2 unless you are testing.
 
 The bridge window's own frame rate falls as the pass count rises. The game's
 does not. That is the architecture working, not a fault.
@@ -527,8 +562,9 @@ Anything that makes the game rebuild its swapchain leaves the bridge consuming
 against an arrangement that no longer exists. On the development machine this
 produced a run of dropped and reordered frames beginning a second after the
 change, and the session could freeze. Set the game up first, then let it arm.
-To change something afterwards, close the game and relaunch. The same applies
-to anything you change in the panel.
+To change something afterwards, close the game and relaunch. The pass settings
+in the panel (network and resolution) are the exception: they are made to
+change live.
 
 ENGINE MOTION VECTORS CAN NEED THE GAME TO BE RUNNING DLSS OR DLAA. Measured
 on Battlefield 6 with 0.2.2: 98% of frames carried real vectors with DLSS on,
@@ -540,7 +576,8 @@ back to deriving motion from colour, which is what 0.1.0 ran on. The [R78]
 MVEC TRANSPORT line says which it got. Whether this holds on other engines is
 not established.
 
-FRAME GENERATION IS NOT RECOMMENDED. It still flickers, as in 0.3.x.
+THE GAME'S OWN FRAME GENERATION IS NOT RECOMMENDED. It still flickers, as in
+0.4.0. Use the bridge's frame generation instead (FrameGen=4, experimental).
 
 Some games with frame generation on can crash at startup, when the bridge
 arms itself. Workaround: set AutoArm=0 in mgpu.ini, get into gameplay, and
