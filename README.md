@@ -28,7 +28,31 @@ The Super Resolution options in the panel reduce that cost. They create a second
 
 Turn it on in the panel, or edit `mgpu.ini` yourself. You can find example `mgpu.ini` files [here](https://github.com/maohgad-web/Neural-coprocessor/tree/main/reference) - [DLSS Quality](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuQUALITY.ini) and [DLSS Performance](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuPERFORMANCE.ini).
 
-**Pass 1 scale (NRS)** also reduces the cost, under Experimental settings in the panel, or set `NRScale=0.75` and `NRScaleResolveDepth=0` in `mgpu.ini`. Useful at 3440x1440 or 3840x2160.
+**Residual NRS** is on by default since 0.5.0 and also reduces the cost. In the panel's Pass settings, each pass can run Residual Neural or Native, and Light-FP8 or Full-FP8. Light-FP8 is faster, and needs `nvngx_dlssnr.dll` 310.9.16 or newer.
+
+* * *
+
+## New in 0.5.0
+
+**Choose NVIDIA's model.** With `nvngx_dlssnr.dll` 310.9.16 or newer, you can choose which of NVIDIA's two DLSS-NR models each pass uses: Light-FP8 is faster, Full-FP8 costs more but is much more stable.
+
+**New default: Residual NRS.** The first pass now runs a residual neural pass at a reduced size (NRS), so the second GPU keeps up at higher frame rates. The big network (Full-FP8) runs on the first pass at x1 and on the last pass at x2, which removes the strobing when Structure is set high. For the 0.4.0 settings, set `NRS=0`, `NRPreset1=0` and `NRPreset2=0` in `mgpu.ini`, or choose Native and Light-FP8 in the panel.
+
+**Live pass settings.** In the panel, each pass has its network (Light-FP8 or Full-FP8) and resolution (Residual Neural or Native). They change while you play, no restart. Best Quality-Performance puts the default back.
+
+**Less impact on the game's FPS.** The bridge takes less from the GPU that renders the game.
+
+**Frame generation on the second GPU (experimental).** The bridge can now generate frames on the second GPU, and it is much more stable than the game's own frame generation. Turn off the game's frame generation, then turn this on in the panel or set `FrameGen=4` in `mgpu.ini`. Please report your results.
+
+**HDR displays (experimental).** The picture follows the game's HDR setting. Please report your results.
+
+**3 and 4 passes (experimental)**, in `mgpu.ini`. Pass 1 scale (NRS) can now run on every pass.
+
+**Fixes.** Games that use 3DMigoto now start.
+
+**Launcher.** The Options page has the same pass settings. Optimization is Off or Performance; DLSS on GPU 1 has its own row.
+
+Take the new `mgpu.ini`.
 
 * * *
 
@@ -109,6 +133,8 @@ Also in 0.2.0:
 
 **0.4.0** - better performance and image stability in games that run DLSS, a reworked 2nd pass, NRS as a switch, a safe mode and a start-up log for one-display problems, and the launcher updated to match. See New in 0.4.0.
 
+**0.5.0** - choose NVIDIA's model per pass, Residual NRS as the default, pass settings that change while you play, less impact on the game's FPS, and frame generation on the second GPU, HDR and 3 and 4 passes as experimental. See New in 0.5.0.
+
 * * *
 
 ## Performance Results
@@ -142,6 +168,17 @@ Also in 0.2.0:
 **Key Finding:** Moving neural post-processing to a second GPU restores 86% of available performance gains from upscaling, compared to 39% when running on the render card.
 
 * * *
+
+## Titles run on 0.5.0
+
+| Title | API |
+| --- | --- |
+| Cyberpunk 2077 | DirectX 12 |
+| Resident Evil 4 | DirectX 12 |
+| Rise of the Tomb Raider | DirectX 12 |
+| The Blood of Dawnwalker | DirectX 12 |
+| DragonSword Awakening | DirectX 12 |
+| Skyrim Special Edition | DirectX 11 |
 
 ## Titles run on 0.4.0
 
@@ -321,13 +358,18 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `DX11=1` | DirectX 11 support. On by default. New in 0.3.0 |
 | `NgxProbeAfterScene` | Absent by default, which means `1`: the add-on starts its DLSS 5 after the game's own DLSS is running. `0` starts it at the game's first frame, as in 0.3.0. New in 0.3.1 |
 | `DepthHoldMax` | Absent by default, which means 180 seconds: how long the bridge waits for the game's depth while the game's DLSS is running, before it starts without depth. `0` waits without a limit. New in 0.3.1 |
+| `NRS=1` | Residual NRS on the first pass. On by default since 0.5.0. `0` runs Native, as in 0.4.0 |
+| `NRPreset1=1` / `NRPreset2=1` | Which NVIDIA model each pass uses. `1` Full-FP8, `2` Light-FP8, `0` as in 0.4.0. Light-FP8 needs `nvngx_dlssnr.dll` 310.9.16 or newer. New in 0.5.0 |
+| `FrameGen=0` | Frame generation on the second GPU. `4` turns it on. Experimental. New in 0.5.0 |
+| `ChainColorSpace=auto` | The picture follows the game's HDR setting. Experimental. New in 0.5.0 |
+| `Passes=1` | How many passes run. `3` and `4` are experimental. New in 0.5.0 |
 | `NRFrameFilter=0` | The frame-generation vector filter, in the panel's Experimental settings. Off in the shipped file since 0.3.1 |
 | `SFPath` | Absent by default, and absent is not off: the detector runs, the repair does not, and the add-on sets `1` itself if it sees the fault. `0` stops that. New in 0.2.5 |
 | `Frames=0` | Stop after this many frames. `0` runs until you quit. A bounded run is what prints a summary |
 
 Keys contributed by others (`NRScale`, `PanelOverPicture`, the R300 keys and more) are listed in [`docs/CONTRIBUTED_KEYS.md`](docs/CONTRIBUTED_KEYS.md). All are off until set.
 
-Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after editing it.** The same applies to changing resolution or DLSS mode in the game's own settings while the bridge is running.
+Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after editing it.** The pass settings in the panel are the exception: they change while you play. The same applies to changing resolution or DLSS mode in the game's own settings while the bridge is running.
 
 **Troubleshooting Note:** If output appears washed out, reduce the `tone` parameter in the panel (default `0.00` on development machine).
 
@@ -378,7 +420,7 @@ N is the number of the card that should render the game: the card with no monito
 - **Engine motion vectors can need the game to be running DLSS or DLAA.** Measured on Battlefield 6 (0.2.2): 96-98% of frames with DLSS or DLAA, none with TAA. Since 0.3.0 the add-on also finds the game's own motion vectors on games without DLSS, tested on Resident Evil 4 (2023).
 - **DLAA sends more data than DLSS.** It renders at native, so depth and motion vectors cross the link at full resolution.
 - **No resolution/DLSS changes while armed** (requires swapchain rebuild)
-- **Frame generation:** Not recommended. It still flickers, as in 0.3.x. Some games with frame generation on can crash at startup. Workaround: set `AutoArm=0` in `mgpu.ini`, get into gameplay, and press `CTRL+ALT+F10` to arm by hand.
+- **The game's frame generation:** Not recommended. It still flickers, as in 0.3.x; use the bridge's frame generation instead (experimental, new in 0.5.0). Some games with the game's frame generation on can crash at startup. Workaround: set `AutoArm=0` in `mgpu.ini`, get into gameplay, and press `CTRL+ALT+F10` to arm by hand.
 - **Colour handling:** Not fully implemented; tone adjustment may be needed. Motion vectors for UI and HUD elements are still missing
 - **External overlays:** Tools like RivaTuner/MSI Afterburner misbehave; use ReShade's built-in FPS display instead
 - **Unreal Engine titles can ignore Windows Graphics settings** and render on the wrong card. See Choosing the render card on Unreal Engine titles
