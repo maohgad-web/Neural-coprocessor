@@ -1811,6 +1811,12 @@ bool present_frame(float r, float g, float b)
         slot_prev = S.slot_value[slot];
     }
 
+    // R369: ChainColorSpace=auto follows the game when it states HDR (or SDR) after this chain was
+    // created. Here, with S.cs released and nothing of this frame recorded yet: on a change ReShade's
+    // SetColorSpace1 hook raises destroy/init_swapchain(resize) for OUR chain on this thread, as our
+    // own ResizeBuffers at arm does. Any other key value, or no change: relaxed loads only.
+    mgpu::chain::follow_game_colour_space(sc);
+
     char line[800];   // P5.3 widened: the Present=in banner is longer than 320 and a
                       // truncated banner is a wrong label on a whole run
 
@@ -15909,6 +15915,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
         }
     }
     bool ok = SUCCEEDED(rb);
+    if (ok) mgpu::chain::bridge_chain_resized();   // R369: auto decides again on the next present; else no-op
 
     // Re-acquire the backbuffers and rebuild their RTVs.
     if (ok)

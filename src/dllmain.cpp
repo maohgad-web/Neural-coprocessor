@@ -66,7 +66,9 @@
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
 // R141: the log must say which build wrote it. 0.2.5 + R210 + R208 (FP16, off).
-#define MGPU_VERSION_STR "0.4.0"
+// R369: bumped to 0.5.1. It was NOT bumped for 0.5.0 - every 0.5.0 log says "MGPU Bridge 0.4.0" (the
+// R173 hazard above, again; the first 0.5.0 report quoted it).
+#define MGPU_VERSION_STR "0.5.1"
 
 
 // ---- P6.4: the overlay panel ----
@@ -390,7 +392,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     mgpu::gpu1::set_build_string(MGPU_VERSION_STR);   // R267
     mgpu::stallwatch::init();
     mgpu::fgmap::init();   // D2.0 NR step one: reads NRFrameFilter once; off = nothing
-    if (swapchain != nullptr && !mgpu::strace::is_bridge_thread())   // R353: the game's chain, not ours
+    if (swapchain != nullptr && !mgpu::strace::is_bridge_thread() && !mgpu::chain::own_call())   // R353: the game's chain, not ours (R369: nor our own live SetColorSpace1 on the pacing thread)
     {
         g_r353_game_chain.store(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())), std::memory_order_relaxed);
         r353_note_colour_space(swapchain);
