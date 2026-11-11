@@ -102,6 +102,10 @@ Also in 0.2.0:
 - **Both cards now have their own DLSS Super Resolution pass.** The second card can do its neural work at a smaller resolution and let DLSS scale the result back up to full resolution, which makes that work a lot cheaper. This is its own setting and does not depend on the game's DLSS, which can be set to anything, or turned off entirely. That gives a weaker second card a way to keep up with a stronger render card, and it is what makes DLSS 5 affordable on older titles where the card doing the neural rendering was struggling. It ships off, so neural rendering runs at full resolution out of the box.
 - **General optimization, and lower latency at higher resolutions.** The two cards now balance the load between them rather than each running at its own pace, in either direction, so a mismatch in speed no longer builds into a backlog. That is also what paid for depth and motion vectors: what they cost to move still fits inside the one frame window 0.1.0 ran on. **The latency improvement requires Reflex.**
 
+* * *
+
+## Release history
+
 **0.2.1** - `mgpu_depth_tap.fx` no longer needs ReShade's standard effects pack. It included `ReShade.fxh` from that pack, so skipping the pack in the installer made the tap fail to compile and the bridge never arm. Super Resolution on the second card also gained two named panel modes, `Native Upscaling` (the default, and the higher quality of the two) and `Experimental Upscaler`.
 
 **0.2.2** - fixes a startup crash on titles that ship NVIDIA Streamline, reported by [@Zonnery](https://github.com/Zonnery) on Battlefield 6 SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)), and that title now receives the game's real motion vectors. The same report turned up a limitation: the engine's motion vectors are only available while the game itself is running DLSS or DLAA - with TAA the model falls back to deriving motion from colour, which is what 0.1.0 ran on. See Limitations.
@@ -134,6 +138,8 @@ Also in 0.2.0:
 **0.4.0** - better performance and image stability in games that run DLSS, a reworked 2nd pass, NRS as a switch, a safe mode and a start-up log for one-display problems, and the launcher updated to match. See New in 0.4.0.
 
 **0.5.0** - choose NVIDIA's model per pass, Residual NRS as the default, pass settings that change while you play, less impact on the game's FPS, and frame generation on the second GPU, HDR and 3 and 4 passes as experimental. See New in 0.5.0.
+
+**0.5.1** - fixes washed-out HDR in games that turn HDR on after they start (`ChainColorSpace=auto`), and the version shown in the log.
 
 * * *
 
@@ -246,23 +252,6 @@ The last row is a limitation rather than a fault - see Limitations. Neural rende
 
 **RoboCop Rogue City - Unfinished Business** ([#29](https://github.com/maohgad-web/Neural-coprocessor/issues/29)), 2560x1440, on an RTX 3080 Ti with an RTX 5060 Ti. Reported as depth and motion vectors going silent after a reboot, on a machine where display ownership kept moving between the two cards. It did not reproduce on 0.2.5, in either a single- or a dual-display arrangement, and that build is what settled which card was doing what.
 
-**Post 0.3.0 Regression: There is one confirmed setup where the add-on does not work since 0.3.0** ([#52](https://github.com/maohgad-web/Neural-coprocessor/issues/52)). On this setup the add-on has not worked on any title the reporter tried with 0.3.0 or 0.3.1. Versions before 0.3.0 worked on it, with the bridge in its own window, which was the default before 0.3.0. You can turn that window back on in 0.3.0 and 0.3.1 by writing `DcompOverlay=0` in `mgpu.ini`. In Cyberpunk 2077 the picture freezes about 2 seconds after the stream starts, while the game's audio continues. Kingdom Come: Deliverance II behaves the same, and Hogwarts Legacy crashes before its window opens. In Cyberpunk 2077 it froze with either card running the game, with depth on and off, with the add-on's reading of the game's DLSS off, at 1920x1080 and at 3840x2160, and with a 60 fps cap.
-
-| | Reporter's setup | My comparison run |
-| --- | --- | --- |
-| Motherboard and lanes | Maxsun MS-iCraft B850 AIGA, PCIe 5.0 x8/x8 to the CPU | x8/x8 to the CPU |
-| Cards | RTX 5080 and RTX 5070 | 2x RTX 5060 Ti 16 GB |
-| Driver | 617.42 | 617.42 |
-| Cyberpunk 2077 DLSS settings | NVIDIA app override | The same override |
-| Display mode | `DcompOverlay=1` (the default since 0.3.0), borderless | `DcompOverlay=1`, borderless |
-| Resolution | 1920x1080 and 3840x2160 | 2560x1440 |
-| Result | Freezes about 2 seconds after the stream starts | Ran to the end, no freeze |
-
-The 617.42 result on my side is one run on one rig. It does not show that this driver works on every setup. If your setup matches the reporter's, An earlier version than 0.3.0 or DcompOverlay=0 may fix the freeze issue.. If you see the same freeze on a different setup, please report it with your driver version.
-
-### Starfield, experimental
-
-Behind `SFPath=1`, and tested on one machine only. The game destroys and recreates its DLSS feature often, and the add-on stopped copying from the one actually in use once its slot list filled. Measured here at 2560x1440 over 7,803 frames: depth transported and bound on every frame with zero contract mismatches, and the engine's motion vectors carried 4,501 of them. The vector lane goes quiet in places - partly menus and cutscenes, where the game produces none, and partly not. Without the key the add-on behaves on this title as 0.2.4 does.
 
 * * *
 
