@@ -54,6 +54,11 @@ the bridge thread spun on a frame that had already arrived. No new key: it is pa
 | `NRSPass` | `2` (absent or `1`: pass 1 only) | With `NRScale`, every pass runs the `NRScale` path, at the same scale (R354) | Yes |
 | `NRProbe` | `1` | Measures the neural effect in the log (R299c). Works with or without `NRScale` | No |
 | `NRSetAtCreate` | `1` | Applies the `Set.*` lines of `mgpu.ini` to DLSS-NR before its CreateFeature as well as at each evaluate (P6.2c), for keys that size the network. Does nothing without `Set.*` lines. Separate from `NRScale` | Only through the `Set.*` keys |
+| `PanelSimple` | `1` | Shows the simple panel (Chinese labels, layout in `panel_simple.txt` beside the add-on) instead of the full panel. CTRL+ALT+F4 flips this key in game. Without `panel_simple.txt` the simple panel shows nothing and the full panel stays (R330) | Panel only |
+
+The simple panel is R330 (`src/panel_simple.cpp`, `src/panel_simple.hpp`, `assets/panel_simple.txt`, the hotkey in
+`src/worker.cpp`). Every later commit on it takes the next letter, one letter per squashed commit: R330a, R330b, ...
+Labels inside the controls are `ui.<name> | label` lines in `panel_simple.txt`; a missing line shows the English text.
 
 ## MoHasan9505
 
