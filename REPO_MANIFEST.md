@@ -12,7 +12,7 @@ assumed.
 
 ## A \- Ships in the release artifact
 
-**Seven files.** Anything not on this list is not in the zip, and the CI step
+**Eight files.** Anything not on this list is not in the zip, and the CI step
 counts them recursively so an accidental addition fails the build.
 
 | File | Note |
@@ -23,6 +23,7 @@ counts them recursively so an accidental addition fails the build.
 | `ReShade2.ini` | `PresetPath=.\gpu1.ini`, `AutoSavePreset=0`. The second key is what stops preset drift. |
 | `reshade-shaders/Shaders/mgpu_depth_tap.fx` | required because `Depth=1` ships. Without it ReShade never binds a depth buffer and the bridge waits instead of arming. |
 | `README.txt` | install and first run, written for someone who has only the zip. |
+| `panel_simple.txt` | the layout of the simple panel (`PanelSimple`): which rows it shows, in what order, with their Chinese labels. Optional \- without it the simple panel shows nothing. In `assets/` since 0.4.0, in the artifact since the build after 0.5.1. |
 | `LICENSE` |  |
 
 `nvngx_dlssnr.dll` is **not** in the artifact and never will be. The user
@@ -63,17 +64,17 @@ results that had accumulated in it are in `history/RECORD.md`.
 | --- | --- |
 | `src/` | the add\-on sources \- see the module table below |
 | `assets/` | what the artifact is built from, plus `README.txt` |
-| `.github/` | `workflows/build.yml` (CI and packaging), `FUNDING.yml` |
+| `.github/` | `workflows/build.yml` (CI and packaging of the add\-on and the launcher), `workflows/launcher.yml` and `workflows/nrcheck.yml` (the launcher and the NR check on their own), `FUNDING.yml` |
 | `tests/` | adapter selection and ini parser tests, and the script that runs them; the R300 instrument tests, `check_killswitch.py` and `check_hlsl_names.py` |
-| `tools/` | `provenance_scan.py`, the shingle scan behind `THIRD_PARTY.md` |
-| `docs/` | `0.2.0/` run logs for the five titles the README lists, `scenes/` comparison images, `R300_T119.md` (the contributed T1.19 revision: parts, keys, tags), `CONTRIBUTED_KEYS.md` (every contributed key) |
-| `reference/` | a sample `ReShade.ini` and a complete `ReShade.log` |
+| `tools/` | `launcher/` (the MGPU Bridge Launcher, its own download), `nrcheck/` (the DLSS\-NR check and bench the launcher's Diagnose runs), `latency_tools/` (`capture.bat`, `latcmp.py` and the PresentMon build they use), `flicker-probe.ps1` (contributed: a flicker measure from a desktop capture), `provenance_scan.py` (the shingle scan behind `THIRD_PARTY.md`) |
+| `docs/` | `0.2.0/` and `0.4.0/` run logs for the titles the README lists, `scenes/` comparison images, `R300_T119.md` (the contributed T1.19 revision: parts, keys, tags), `CONTRIBUTED_KEYS.md` (every contributed key) |
+| `reference/` | a sample `ReShade.ini`, a complete `ReShade.log`, and two example `mgpu.ini` files with Super Resolution on (`mgpuQUALITY.ini`, `mgpuPERFORMANCE.ini`) |
 | `history/` | the working record \- see below |
 | `workarounds/` | unsupported arrangements that worked here. Not part of the add\-on |
 
 ### `src/` \- the modules
 
-One `.cpp`/`.hpp` pair per module. Updated 2026\-10\-09 for 0.3.1, and 2026\-10\-13 for R300.
+One `.cpp`/`.hpp` pair per module. Updated 2026\-10\-09 for 0.3.1, 2026\-10\-13 for R300, and 2026\-11\-11 for 0.5.1.
 
 | Module | What it is |
 | --- | --- |
@@ -108,6 +109,13 @@ One `.cpp`/`.hpp` pair per module. Updated 2026\-10\-09 for 0.3.1, and 2026\-10\
 | `feature_diag.cpp/.hpp` | R300f: the scene-feature silence detector (`FeatureDiag`) |
 | `producer_diag.cpp/.hpp` | R300g: the producer's cost on GPU 0 (`ProducerDiag`) |
 | `producer_gpu_timers.cpp/.hpp` | R300h: GPU 0 timestamps around the producer's copies (`Gpu0Timers`) |
+| `live_panel.cpp/.hpp` | contributed: the panel drawn over the live neural picture (`PanelOverPicture`) |
+| `panel_simple.cpp/.hpp` | contributed: the simple panel, a short view of the same controls; its layout is `assets/panel_simple.txt` (`PanelSimple`) |
+| `startup_trace.cpp/.hpp` | 0.4.0: the start\-up trace and the stop record for one\-display problems (`StartupTrace`, `DcompSafeMode`) |
+| `residual.cpp/.hpp` | 0.4.0, the default since 0.5.0: the residual pass \- DLSS\-NR at a reduced size, its difference added back at full size (`NRS`, `Pass2`, `ResidualPass`) |
+| `gpu0_stage.cpp/.hpp` | 0.5.0: the copies to the second card leave the game's queue for a staging ring and a copy queue on GPU 0 (`StageCopy`) |
+| `fg_gpu1.cpp/.hpp` | 0.5.0: DLSS Frame Generation on the second card and its pacing thread (`FrameGen=4`, experimental) |
+| `chain_colour_space.cpp/.hpp` | 0.5.0, contributed: the colour space of the bridge's swap chain, following the game's (`ChainColorSpace`) |
 
 ### `history/` \- the working record
 
@@ -179,7 +187,7 @@ resolution.
 4. `ext/` is not tracked.
 5. Every link in every root document resolves to a file that exists \- including the ones that point into `history/` and `workarounds/`.
 6. `THIRD_PARTY.md`'s pinned SHAs match the `env:` block in `build.yml`.
-7. The artifact contains seven files and no more.
+7. The artifact contains eight files and no more.
 
 * * *
 
@@ -193,12 +201,11 @@ Recorded rather than deleted, so the reasoning is not lost.
 | `ngx_probe_patch.md` | deleted. Content is in `history/FACTS.md` section 09 and `ARCHITECTURE.md` |
 | `INSTALL.txt` | resolved. The shipped install text is `assets/README.txt`; there is no `dist/` directory and no root `INSTALL.txt` |
 | `AGENT_PROMPT.md` | never existed. It was carried into an earlier manifest from memory without checking the tree |
-| `tools/mgpu-sysinfo.ps1` | does not exist. Listed by the 2026\-09\-05 manifest and never in the tree. `tools/` holds `provenance_scan.py` and nothing else |
+| `tools/mgpu-sysinfo.ps1` | does not exist. Listed by the 2026\-09\-05 manifest and never in the tree. (What `tools/` holds today is in the Directories table.) |
+| `gitignore.txt` | deleted. It was not a gitignore and nothing referenced it |
 
 * * *
 
 ## Open \- resolve before the next tag
 
-| File | Disposition |
-| --- | --- |
-| `gitignore.txt` | root, 1294 bytes, alongside the real 411\-byte `.gitignore`. It is not a gitignore and nothing references it. **Delete it**, or say here what it is for |
+Nothing open as of 2026\-11\-11.

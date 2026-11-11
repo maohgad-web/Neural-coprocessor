@@ -4,6 +4,10 @@ How the bridge works, and the handful of facts that are load-bearing and
 non-obvious. `RESULTS.md` has the measurements; `METHOD.md` has the rules the
 project measures by.
 
+Brought up to date for 0.5.1 on 2026-11-11. The sections written for 0.1.0 to
+0.3.1 are kept as they were where they are still true; what later versions
+changed is said in place, with the version.
+
 ---
 
 ## The claim, and why it is not SLI
@@ -39,6 +43,8 @@ this near an online title.
 
 ## The path a frame takes
 
+As shipped in 0.5.1 (`StageCopy=1`, `DcompOverlay=1`):
+
 ```
 GPU 0 (game)                          GPU 1 (bridge)
 ────────────                          ──────────────
@@ -48,11 +54,13 @@ game renders
     │   ├── 192-byte seal   ──┐
     │   ├── colour buffer   ──┤  one command list, seal recorded first,
     │   ├── depth  (Depth=1)──┤  each lane carrying its own validity
-    │   └── vectors (MVec=3)──┤  flag for this frame
-    │                         │
-    │   Signal(produced)      │  shared fence, on the GAME's queue,
-    │   ONE EVENT LATER    ───┼──  after the copies were submitted
+    │   └── vectors (MVec=3)──┤  for this frame
     │                         ▼
+    │                    staging ring in GPU 0 VRAM (same slot layout)
+    │                         │
+    │   copy queue on GPU 0   │  moves the whole slot across the link while
+    │   Signal(produced)   ───┼──  the game renders its next frame, then
+    │                         ▼    signals the shared fence
     │                    cross-adapter shared heap, ring of 6 slots
     │                         │
     │                         ▼
@@ -62,11 +70,16 @@ game renders
     │                    unpack → DLSS-NR x N passes → ping-pong
     │                         │
     │                         ▼
-    │                    present on GPU 1's own swapchain and window
+    │                    present on GPU 1's own swapchain, composed onto
+    │                    the game's window (or shown in the bridge's own)
 ```
 
 The game's own rendering is never touched. The bridge reads the finished frame
 and does its work elsewhere.
+
+**Through 0.4.0 there was no staging ring**: the game's list copied straight
+into the shared heap and the game's own queue signalled the fence. That route is
+still there with `StageCopy=0`. See *GPU 0 staging* below.
 
 ---
 
@@ -130,6 +143,26 @@ Neither has beaten the other reproducibly, so neither has been chosen.
 **The heap is created on the game's device.** Its command list can only
 reference resources from the device that made it.
 
+### GPU 0 staging (0.5.0, on by default)
+
+Without it the game's command list copies colour, depth and vectors straight
+into the shared heap, which lives in system memory: every byte crosses the
+render card's PCIe link inside the game's frame, on the game's graphics queue.
+At 2560x1440 that is about 44 MB per frame.
+
+With `StageCopy=1` the game's list copies into a ring in GPU 0's own VRAM with
+the same slot layout - a VRAM-to-VRAM copy, a fraction of a millisecond - and a
+copy queue created on the game's device moves the slot to the shared heap while
+the game renders its next frame. That copy queue signals the fence, so the
+fence means what it always meant for GPU 1: frame f's slot is complete. The
+seal, the consumer and the shared heap are unchanged.
+
+Back-pressure is on the GPU, never the CPU: after handing frame f to the copy
+queue, the game's queue is told to wait for the fence of an older frame, so a
+staging slot is not rewritten before its copy has left it. It is never fatal: a
+failure to come up turns it off for the run and the older route runs. The design
+is a contributor's (see `CONTRIBUTORS.md`); the module is `gpu0_stage.cpp`.
+
 ### The seal
 
 192 bytes at the head of each ring slot - **seal v3** since 0.2.0, 64 bytes
@@ -152,7 +185,8 @@ would be measuring the instrument.
 ### The fence
 
 One shared fence whose value **is** the count of frames whose copies are known
-to have been submitted, signalled on the game's own queue.
+to have been submitted, signalled on the game's own queue - or, with
+`StageCopy=1`, by the copy queue that moved the slot.
 
 **Signalled one event after the copies were recorded, never the same one.**
 ReShade executes the list after the event returns; a signal placed in the same
@@ -260,6 +294,14 @@ to the same weights whatever was picked, which is indistinguishable from a knob
 with a subtle effect. If that line ever reports more than one, a preset control
 becomes worth building.
 
+**It does now.** `nvngx_dlssnr.dll` 310.9.16 carries two networks: a smaller
+one, which is its default, and the one above. Since 0.5.0 a hint given when a
+feature is created picks the network **per pass** (`NRPreset1`, `NRPreset2`; the
+panel calls them Light-FP8 and Full-FP8). Older DLLs carry the one network and
+run it whatever is asked; the log says which at start. The bigger network on the
+last pass is what removed the strobing seen at high structure strength, and
+that is why it is the shipped default.
+
 The weight heap is ~140.9 MB and is refcounted across features: N feature
 handles cost N sets of history buffers and one set of weights.
 
@@ -268,7 +310,7 @@ handles cost N sets of history buffers and one set of weights.
 `Passes=N` runs DLSS-NR N times per frame, one feature handle each,
 ping-ponging between two output textures. All handles are created at arm  - 
 179-220 ms each, one-time rather than per-resolution - so changing the count live
-costs nothing.
+costs nothing. The shipped default is one pass.
 
 **One handle per pass, not one handle evaluated twice.** The feature carries
 temporal history, so a single handle run twice in a frame would have its history
@@ -281,7 +323,7 @@ window's own output rate falls as the count climbs. That is the architecture
 working, and it is the one thing about the demo that reliably reads as a bug to
 someone who has not been told.
 
-#### The maximum is two, and it is a power decision
+#### Two is the recommended ceiling, and it is a power decision
 
 Measured on the development rig at 1080p, against a ~16.7 ms frame period:
 
@@ -307,14 +349,52 @@ which a marginally seated power connector fails.
 **The failure was observed, not hypothesised.** One development session ended
 with the game rendering black on both displays after several minutes, with no
 fault in any log. It went unexplained for two days and was briefly blamed on the
-title's engine. It was a six-pass run. `MAX_PASSES` is 2, enforced in
-`gpu1_context.cpp`; a larger value in `mgpu.ini` is clamped and the log names the
-value that was asked for.
+title's engine. It was a six-pass run. `MAX_PASSES` was 2 through 0.4.0, enforced
+in `gpu1_context.cpp`; a larger value in `mgpu.ini` is clamped and the log names
+the value that was asked for.
+
+**Since 0.5.0 the cap is 4, and 3 and 4 are experimental.** What changed is the
+cost of a pass, not the argument above: a pass can now run at a reduced size
+(next section), so three or four cheap passes are a different load from three
+full ones. `Passes=3` or `4` still builds that many features at start and can
+hold the second card at its power limit. The default is 1, and nothing above two
+is recommended.
+
+### The residual pass (0.4.0; the default first pass since 0.5.0)
+
+A pass does not have to run at the picture's size. The frame is scaled down,
+DLSS-NR runs on the small copy, and only its **difference** (output minus
+input, at the small size) is scaled up and added back onto the full-size frame.
+The fine detail of the original survives because it never went through the
+small copy; what the model adds is a little softer.
+
+There are two implementations and only one runs at a time:
+
+- **`NRScale`**, contributed, the first one: the feature is created once at a
+  native cap and the scale changes live without rebuilding it.
+- **The residual module** (`residual.cpp`; `NRS=1` for the first pass, `Pass2`
+  / `ResidualPass` for the second): each carrying pass owns its own scratch
+  textures and its feature is created at the work size. This is the shipped
+  default: the first pass at 0.75 of the picture.
+
+If `NRScale` is set, it wins and the module stays off.
+
+### Pass settings change while the stream runs (0.5.0)
+
+Each pass has a network and a size, and the panel changes both without a
+restart. A change is a **request**: the panel writes the key, the bridge thread
+picks the request up between frames, creates the new feature, and parks the old
+handle behind the stream's fence so it is released only after the GPU has
+finished with it. The new feature's first evaluate runs with `DLSSNR.Reset`
+because it has no history. A rebuild costs one CreateFeature - 70 to 280 ms
+measured here - and shows as a short hitch.
+
+Everything else in `mgpu.ini` is still read when the stream arms.
 
 The multi-pass ghosting hypothesis that motivated six passes is **not settled by
 any of this** - it was never tested, because no ghosting scene was ever captured.
-Testing it later means raising the constant in a local build. It does not ship
-raised.
+0.5.0 raised the cap to four as an experimental setting (below); the hypothesis
+is still untested.
 
 `DLSSNR.Reset` is set on the **first frame only**. Every probe before the stream
 existed set it on every evaluate, because each was an independent experiment and
@@ -437,7 +517,15 @@ process, and the README's anti-cheat section is where that is discussed.
 
 ## The present path
 
-The bridge owns its own swapchain, window and present loop on GPU 1.
+The bridge owns its own swapchain and present loop on GPU 1.
+
+**Since 0.3.0 the default is no bridge window at all** (`DcompOverlay=1`): the
+swapchain is a composition swapchain, shown as a DirectComposition visual on the
+game's own window, above what the game presents to it. The game stays the only
+window on the desktop. The visual is rooted on the first frame that carries
+neural output and is hidden while the ReShade overlay is open. This mode is for
+one display, connected to the card that runs the neural stage; `DcompOverlay=0`
+brings back the bridge's own window, described below.
 
 **The backbuffer format follows the game's format.** It was once hardcoded to
 `R10G10B10A2_UNORM`, which was correct for the title it was written against and
@@ -465,12 +553,58 @@ top on the monitor it presents to, which points at compositing, but
 success code and only fires on full occlusion, so a visible-but-uncomposited
 window returns `S_OK`.
 
+**The colour space of the chain follows the game's (0.5.0, `ChainColorSpace=auto`).**
+A new swap chain is sRGB. A game in HDR10 hands the bridge PQ-encoded pixels,
+and a chain still declared sRGB shows them washed out. The add-on records the
+colour space of the game's chain and states the same one on its own. A game
+turns HDR on with a call made **after** its chain exists, so the bridge's chain
+can be created first: since 0.5.1 the present path compares the two on every
+present and states the colour space again when the game's changes. This tells
+Windows how to read the frame; it does not make the neural pass HDR-aware.
+
+**Frame generation on the second card (0.5.0, `FrameGen=4`, experimental).**
+NVIDIA's frame-generation snippet is driven on the neural device the way NR is:
+it makes the frame between the previous and the current neural output, from the
+vectors and depth the stream already carries. A pacing thread then presents
+both - the generated frame first, the real one half an interval later. While it
+is on, every present is made by that thread and none by the bridge thread. The
+game is not touched. The design is a contributor's; the module is `fg_gpu1.cpp`.
+
+**The output side is not measured.** The latency the log reports stops when the
+neural card takes the frame. The evaluate, the frames waiting to be presented
+and the wait for the display's refresh come after that and are not timed.
+`PresentVsync=0` is the one setting that reaches that stage.
+
 `Present=split` puts the frame handed **to** the model on the left of a movable
 seam and what it **produced** on the right - the same frame, in one window. It
 exists because no two runs of a game contain the same frame, so any comparison
 made across two captures is confounded by everything that changed in between.
 The seam moves on hotkeys precisely so it can be dragged across a face with
 nothing on screen but the game.
+
+---
+
+## What 0.3.0 to 0.5.1 added, and where it lives
+
+Short, on purpose: each has its own contract written at the top of its source
+file, and that is the authority.
+
+| what | since | source | key |
+|---|---|---|---|
+| DirectX 11 games: a producer on the game's D3D11 device feeds the same D3D12 stream | 0.3.0 | `dx11_producer.cpp` | `DX11` |
+| Motion vectors and depth on games that do not run DLSS: the add-on finds the game's own buffers and learns their units | 0.3.0 | `mvec_extract.cpp`, `mvec_census.cpp`, `probe.cpp` | `MVec*` |
+| One display, composed onto the game's window | 0.3.0 | `gpu1_context.cpp` (the DComp block) | `DcompOverlay` |
+| Super Resolution on the second card | 0.2.x | `gpu1_context.cpp` (`stream_sr_create`) | `SRUpscale`, `SRScale` |
+| The residual pass | 0.4.0, default in 0.5.0 | `residual.cpp` | `NRS`, `Pass2`, `ResidualPass` |
+| A start-up trace and a safe mode for one-display problems | 0.4.0 | `startup_trace.cpp` | `StartupTrace`, `DcompSafeMode` |
+| GPU 0 staging | 0.5.0 | `gpu0_stage.cpp` | `StageCopy` |
+| The network per pass, and pass settings that change live | 0.5.0 | `gpu1_context.cpp`, `dllmain.cpp` | `NRPreset1`, `NRPreset2` |
+| Frame generation on the second card | 0.5.0 | `fg_gpu1.cpp` | `FrameGen` |
+| The chain's colour space | 0.5.0, 0.5.1 | `chain_colour_space.cpp` | `ChainColorSpace` |
+| Up to four passes | 0.5.0, experimental | `gpu1_context.cpp` | `Passes` |
+
+The launcher and the NR check are separate programs in `tools/` and are not part
+of the add-on.
 
 ---
 

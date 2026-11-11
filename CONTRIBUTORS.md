@@ -39,6 +39,11 @@ and the overlay could not be used at the same time:
   applied to each of them. Implemented here from his design with one change: each pass gets its own descriptor
   range, without which the picture went black. Opt-in via `Passes=3` / `4` and `NRSPass=2`.
 
+- **The simple panel (R330, `PanelSimple`).** A second, shorter view of the same controls, for players who only
+  want the settings that matter, with Chinese labels. Which rows it shows and in what order is data, not code:
+  `panel_simple.txt`, beside the add-on. `CTRL+ALT+F4` switches between it and the full panel. Opt-in via
+  `PanelSimple`.
+
 ## [grtninja](https://github.com/grtninja)
 
 Two fixes to the add-on's own code, reviewed and merged from external pull
