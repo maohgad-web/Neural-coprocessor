@@ -169,6 +169,12 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr);
 // is set to: the transport must not silently require the probe to be on.
 unsigned long long depth_source();
 
+// [PORT O4, 2026-11-11] the resource ReShade binds to the tap's DEPTH semantic
+// (the tap's INPUT), or 0 when nothing is bound. Read-only: it exists so the
+// depth route can be judged (tap input vs the game's declared depth) before
+// anything is delivered from the contract.
+unsigned long long depth_input_source();
+
 // ---- R145: THE LIVE STATE OF THE DEPTH TAP'S TECHNIQUE ----
 //
 // tech_scan() already computes this, self-enables the technique when it finds
@@ -292,6 +298,12 @@ struct readout
 };
 
 void read(readout &out);
+
+// [PORT PRESENTER, 2026-11-11] slot 3 = the display thread's marker, copied from
+// nc-base's probe (there: set_stage / set_stage2 / set_stage3). 0.5.1 has no stage
+// slots at all, so this is the only one; it lives in presenter_host.cpp.
+void set_stage3(int stage);
+int  stage3_now();
 
 } // namespace probe
 } // namespace mgpu

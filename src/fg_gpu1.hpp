@@ -62,6 +62,11 @@ struct arm_info
     unsigned depth_w = 0, depth_h = 0;   // the depth extent (0 = unknown -> w,h)
     bool depth_inverted = true;
     float mvec_scale_x = 1.0f, mvec_scale_y = 1.0f;
+    // [FFX, 2026-11-11] FgMvUv: 0 = the shipped pixel-unit conversion (lane_scale/extent),
+    // 1 = the game's vectors are UV and DLSS-G wants the frame fraction, 2 = UV x2 (NDC).
+    // This is SEPARATE from the NR scale on purpose: NR wants UV->pixels, DLSS-G wants the
+    // raw vector already divided by the frame extent, and one number cannot serve both.
+    int fg_uv = 0;
 };
 
 // At arm, after the stream's textures exist. Reads the key. True when FrameGen=4 is on.
@@ -89,4 +94,30 @@ void stop();
 // Bridge thread, in stream_release BEFORE the stream's textures are freed (under s.cs is fine
 // once stop() ran): drains the present queue (bounded), releases the feature, frees the sets.
 void release();
+
+// [PORT FG-PANEL, 2026-11-11] the HOT SWITCH. Off skips generation only: the
+// real frame is still copied and presented by the same pacing thread, the
+// feature is kept, and on resumes with a fresh pair. Anything read at arm time
+// (FrameGen / FgBackend / FgMulti) still needs a restart.
+void ui_set_enabled(bool on);
+
+// [PORT C] the during-play readout (layered GDI window, outside the render path).
+void ui_set_hud(bool on);
+bool ui_hud();
+bool ui_up();   // the feature is created and armed right now (read-only)
+bool ui_enabled();
+
+// [PORT FG-PANEL, 2026-11-11] READ-ONLY counters for the panel / overlay: the
+// same numbers [R341] prints, so panel and log cannot disagree. Plain loads -
+// this is a display, no decision is taken on a possibly torn value.
+// [PORT DISPLAY-LAYER 1/3] landing ledger: mean/worst late-ness in ms, and how many
+// presents were more than 8 ms late. Read-only; the pacing thread is still the only
+// present caller.
+void ui_landing(double &mean, double &worst, unsigned long long &n, unsigned long long &late);
+
+void ui_pace(double &interval_ms, unsigned long long &resync, unsigned long long &abs_frames, int &mode);
+
+void ui_status(unsigned long long &gen_made, unsigned long long &gen_presented,
+               unsigned long long &real_presented, unsigned long long &dropped,
+               unsigned long long &errors);
 }

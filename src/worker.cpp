@@ -86,6 +86,7 @@
 // The simple panel. F4 because F5/F9 are quick save/load on several titles, F6-F11 are taken by
 // the keys above, and F12 belongs to Steam.
 #define MGPU_HOTKEY_SIMPLE     0x4D51   // CTRL+ALT+F4 - full panel <-> simple panel
+#define MGPU_HOTKEY_CURSOR     0x4D52   // CTRL+ALT+F5 - show/hide the desktop cursor (DispCursor)
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -149,11 +150,301 @@ namespace
     // not DestroyWindow immediately: the window is destroyed by the ordered
     // teardown on this same thread, which is what keeps "no DestroyWindow
     // failure in the log" true.
+    // [MOUSE PUMP, 2026-11-11] THE PRESENTER'S PROVEN DESIGN, PORTED TO THIS WINDOW.
+    //
+    // PBZ原文（记忆里的成熟方案）："It swallows clicks and hides the game cursor unless
+    // the display thread pumps messages and forwards them to the game window"; "a null
+    // foreground means no window owns the keyboard so input dies"; "HTTRANSPARENT proven
+    // useless cross-thread"; PBZ needs DispClickThrough=0 (the picture window TAKES the
+    // mouse and forwards it; it does not pass through).
+    //
+    // The window stays WS_EX_NOACTIVATE + MA_NOACTIVATE, so the GAME keeps the foreground
+    // (keyboard and raw input are the game's). Only the mouse hits land here - this window
+    // is topmost and covers the screen - and each one is converted to the game's client
+    // space and posted to the game's window. No AttachThreadInput, no SetForegroundWindow,
+    // no ClipCursor: the presenter needs none of them and neither do we.
+    static bool input_pump_enabled()
+    {
+        static int v = -1;
+        if (v < 0)
+            v = (mgpu::gpu1::dcomp_overlay_mode() == 0 &&
+                 mgpu::gpu1::ui_ini_read("DispClickThrough", 0) == 0) ? 1 : 0;
+        return v != 0;
+    }
+
+    static HWND input_game_window()
+    {
+        HWND game = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+        if (game == nullptr || !IsWindow(game)) game = GetForegroundWindow();
+        return game;
+    }
+
+    // [H7/B, 2026-11-11] THE NEURAL WINDOW IS ON TOP ONLY WHILE THE GAME IS IN FRONT.
+    //
+    // THE DEFECT, WITH ITS ADDRESS. The XeFG hand-over path parks this window with
+    // SetWindowPos(hwnd, HWND_TOPMOST, ...) - gpu1_context.cpp, the
+    // "[H7/A, 2026-11-11] XeFG TAKES THE AUTHOR'S OWN WINDOW CHAIN" block - and nothing ever
+    // takes it down again. WS_EX_TOPMOST belongs to the WINDOW, not to the game's activation,
+    // so after Alt+Tab the neural picture stays over Explorer, over the browser, over
+    // everything: the window cannot be switched away from. That is the whole defect, and it
+    // is not a DcompOverlay=1 property - it is one SetWindowPos call in the mode-0 path.
+    //
+    // THE SHAPE IS presenter.cpp:752-888 (disp_housekeeping), the design that shipped and was
+    // measured on PBZ: while the game holds the foreground, show (SW_SHOWNOACTIVATE) and
+    // re-assert HWND_TOPMOST; the moment anything else does, SW_HIDE. The stream is never
+    // touched - only the window - so the neural frames keep being produced and consumed.
+    //
+    // WHY NOT JUST "REMOVE WS_EX_TOPMOST": while the game IS in front, activating its window
+    // puts it above every ordinary window, ours included, and the neural picture disappears.
+    // Topmost while the game is foreground, hidden while it is not, is the only pair that
+    // gives both behaviours.
+    //
+    // WHY HIDING IS SAFE ON THIS CHAIN: it presents with PresentVsync=0 / PresentTear=1, i.e.
+    // Present(0, ALLOW_TEARING), so a window that is not composited never blocks the bridge
+    // thread on a vblank. R111's 5 s stall was measured on a VISIBLE, COVERED window (its own
+    // log says so); a hidden window is not that state.
+    static HWND s_game_hwnd = nullptr;
+    static HWND s_last_fg = nullptr;
+    // [R457, 2026-11-11] Input census for the panel. The operator's report is "after switching
+    // windows the mouse that clicked the HOME panel no longer works". Two very different causes
+    // produce that: the window stopped receiving mouse messages (z-order / hidden), or it still
+    // receives them and the pump forwards them to the game while ReShade's overlay wanted them.
+    // These counters are what tells them apart in the next log.
+    static std::atomic<unsigned long long> s_mouse_msgs{0};
+    static std::atomic<unsigned long long> s_mouse_clicks{0};
+
+    static HWND game_window_for_follow(HWND bridge)
+    {
+        // Authoritative first: the window the GAME's own swap chain was created against.
+        HWND game = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+        if (game != nullptr && game != bridge && IsWindow(game)) return game;
+        if (s_game_hwnd != nullptr && IsWindow(s_game_hwnd)) return s_game_hwnd;
+        // Before that is known: the first foreground window of THIS process that is not the
+        // bridge window is the game. Presenter's A1b rule, same reason - a launcher can own
+        // the foreground for the first seconds and a hard-coded title match would miss.
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        if (fg != nullptr && fg != bridge) GetWindowThreadProcessId(fg, &pid);
+        if (fg != nullptr && fg != bridge && pid == GetCurrentProcessId())
+            s_game_hwnd = fg;
+        return s_game_hwnd;
+    }
+
+    // [H7/B-2, 2026-11-11] ROLLBACK WITHOUT A BINARY. `DispFollow=1` turns the foreground
+    // follow ON; absent or 0 is the SHIPPED behaviour (the window keeps the topmost bit for the
+    // whole session, exactly as before). DEFAULT 0 ON PURPOSE: the verified path must be the
+    // default, and this new path is unverified until a run says otherwise. The test rig writes
+    // DispFollow=1 explicitly. Read once - a launch-time switch, not a live knob, because the
+    // only thing it can do mid-session is strand the window in one of the two states.
+    static bool follow_enabled()
+    {
+        static int v = -1;
+        if (v < 0)
+        {
+            v = (mgpu::gpu1::ui_ini_read("DispFollow", 0) != 0) ? 1 : 0;
+            if (v == 0)
+                mgpu::diag::info("[MGPU][R454] foreground follow DISABLED (DispFollow absent or 0): "
+                                 "the neural window keeps HWND_TOPMOST for the whole session - the "
+                                 "shipped behaviour, and Alt+Tab will NOT get it out of the way. "
+                                 "Set DispFollow=1 to use the foreground follow.");
+        }
+        return v != 0;
+    }
+
+    // Runs on the bridge thread, which owns this window, from the present loop - the gate
+    // sleeps at most 4 ms, so an Alt+Tab takes effect within one or two source frames even
+    // while no neural frame is arriving.
+    static void follow_foreground(HWND bridge, unsigned long long frame)
+    {
+        if (bridge == nullptr || !IsWindow(bridge)) return;
+        if (!follow_enabled()) return;
+        const HWND fg = GetForegroundWindow();
+        const HWND game = game_window_for_follow(bridge);
+        DWORD fpid = 0;
+        if (fg != nullptr) GetWindowThreadProcessId(fg, &fpid);
+        // This process owns the game AND the bridge window. The bridge counts as "ours" too:
+        // WS_EX_NOACTIVATE keeps it out of the foreground, but if Windows ever hands it over,
+        // hiding it would be a self-inflicted black screen.
+        const bool game_fg = (fg != nullptr) &&
+                             (fg == bridge || fg == game || fpid == GetCurrentProcessId());
+        // [H7/B-2, 2026-11-11] DEBOUNCE, AND IT IS ABOUT THE CRASH, NOT ABOUT POLISH.
+        //
+        // The structural crash this project keeps meeting is a TRANSITION: game thread, bridge
+        // thread and the present provider all changing state in the same instant, and a level
+        // load is the canonical one. A hide/show is itself a transition of the present target,
+        // so it must not be driven by a one-frame foreground flick (a loading screen grabbing
+        // focus, a UAC prompt, the taskbar, an engine re-creating its window). Rules:
+        //   * SHOW on the first frame the game owns the foreground - never late;
+        //   * HIDE only after the game has been out of the foreground CONTINUOUSLY for 250 ms;
+        //   * and never during the first 120 presents, so a launch/load sequence cannot hide
+        //     the window while the chain and the provider are still settling.
+        static const ULONGLONG kHideAfterMs = 250;
+        static const unsigned long long kWarmupPresents = 120;
+        static ULONGLONG unfocused_since = 0;
+        if (game_fg) unfocused_since = 0;
+        else if (unfocused_since == 0) unfocused_since = GetTickCount64();
+        const ULONGLONG now_ms = GetTickCount64();
+        const ULONGLONG out_ms = (unfocused_since != 0) ? (now_ms - unfocused_since) : 0;
+        // [H7/B-3, 2026-11-11] AND NEVER WHILE THE CHAIN IS MOVING. A swapchain event is the
+        // game resizing / re-creating its chain: a load, a resolution change, a fullscreen
+        // toggle. That is precisely the window the structural crash lives in (game thread +
+        // bridge thread + present provider all changing), so a hide must not be allowed to
+        // land inside it. Keep the window up for 2 s after the last such event; the cost is
+        // that an Alt+Tab right after a load leaves the neural picture up for those 2 s.
+        const bool chain_moving = mgpu::adapter::ms_since_last_swapchain_event() < 2000ull;
+        // [H7/E, 2026-11-11] PANEL + ALT+TAB: CLOSE FIRST, THEN HIDE.
+        //
+        // The 16:50 run measured both halves of the old design failing at once:
+        //   * while the game held the foreground its mirrored overlay captured the mouse
+        //     (wantCapture=1) and the bridge window - the one on screen - stopped receiving input
+        //     altogether ([R457] froze at 167 msgs / 2 clicks for the whole session);
+        //   * with the panel open, Alt+Tab could not switch windows at all because the R156 guard
+        //     refused to hide under an open overlay.
+        // dllmain now blocks the GAME's overlay in follow mode: it is invisible by construction
+        // (the bridge window covers it) and its only observable effect was that capture. What is
+        // left is the bridge runtime's overlay, the visible one. When the game loses the
+        // foreground, ask THAT runtime to close it on its own thread (R158's pending mechanism),
+        // keep the window up until it has closed, then hide normally.
+        const bool ov_open = mgpu::gpu1::bridge_overlay_open();
+        bool panel_hold = false;
+        static ULONGLONG panel_close_at = 0;
+        static bool panel_wait_said = false;
+        if (game_fg || !ov_open)
+        {
+            if (panel_close_at != 0)
+            {
+                mgpu::gpu1::clear_overlay_close_request();
+                panel_close_at = 0;
+            }
+            panel_wait_said = false;
+        }
+        if (ov_open)
+        {
+            if (game_fg)
+            {
+                panel_hold = true;
+            }
+            else
+            {
+                const ULONGLONG t = GetTickCount64();
+                if (panel_close_at == 0)
+                {
+                    panel_close_at = t;
+                    mgpu::gpu1::request_overlay_close();
+                    mgpu::diag::info("[MGPU][R454] panel open and the game lost the foreground: closing "
+                                     "the overlay on its own runtime before hiding the window (never hide "
+                                     "under an open overlay - the R156 defect). Alt+Tab gets the window "
+                                     "back as soon as it has closed.");
+                }
+                panel_hold = true;
+                if (!panel_wait_said && (t - panel_close_at) > 1500ull)
+                {
+                    panel_wait_said = true;
+                    mgpu::diag::warn("[MGPU][R454] the overlay did not close within 1.5 s (its runtime is "
+                                     "not presenting). The window stays visible - fail-closed: hiding "
+                                     "under an open overlay is what R156 measured as broken.");
+                }
+            }
+        }
+        if (mgpu::gpu1::ui_panel_is_open()) panel_hold = true;   // simple panel: no close path of its own
+        const bool want = game_fg || (out_ms < kHideAfterMs) || (frame < kWarmupPresents) ||
+                          chain_moving || panel_hold;
+        // Say it when the hold is what kept the window up, or the operator reads "Alt+Tab did
+        // not work" when the code was deliberately refusing during a load/resize.
+        static bool hold_said = false;
+        if (chain_moving && !game_fg && !hold_said)
+        {
+            hold_said = true;
+            char hl[260];
+            snprintf(hl, sizeof hl,
+                     "[MGPU][R454] hide HELD: the game's chain moved %llu ms ago (load/resize/"
+                     "fullscreen). The window stays up for 2 s after the last swapchain event - "
+                     "that is the transition this code refuses to hide inside.",
+                     (unsigned long long)mgpu::adapter::ms_since_last_swapchain_event());
+            mgpu::diag::info(hl);
+        }
+        if (game_fg) hold_said = false;
+        const bool visible = IsWindowVisible(bridge) != 0;
+        const bool changed = (want != visible);
+        // [R455] ONE LINE THAT SETTLES "WHY CAN I STILL NOT SWITCH". A game window that is
+        // itself WS_EX_TOPMOST stays above every ordinary app after Alt+Tab no matter what this
+        // window does; if the next run still cannot switch, this line says whether the game, the
+        // bridge, both or neither is the topmost one.
+        static bool style_said = false;
+        if (!style_said && game != nullptr)
+        {
+            style_said = true;
+            const LONG_PTR gex = GetWindowLongPtrW(game, GWL_EXSTYLE);
+            const LONG_PTR bex = GetWindowLongPtrW(bridge, GWL_EXSTYLE);
+            char sl[300];
+            snprintf(sl, sizeof sl,
+                     "[MGPU][R455] window styles: game hwnd=0x%p ex=0x%08X topmost=%d | bridge "
+                     "ex=0x%08X topmost=%d. A topmost GAME window is above every normal app after "
+                     "Alt+Tab and this follow code cannot change that.",
+                     (void *)game, (unsigned)gex, ((gex & WS_EX_TOPMOST) != 0) ? 1 : 0,
+                     (unsigned)bex, ((bex & WS_EX_TOPMOST) != 0) ? 1 : 0);
+            mgpu::diag::info(sl);
+        }
+        if (changed)
+        {
+            // Synchronous on purpose: this thread OWNS the window, and the present loop only
+            // drains messages once per iteration - ShowWindowAsync would leave IsWindowVisible
+            // stale for a beat and this function would log the same transition again.
+            ShowWindow(bridge, want ? SW_SHOWNOACTIVATE : SW_HIDE);
+            // The system cursor follows the window that owns the screen. Hidden: give the
+            // OTHER app a usable arrow at once (WM_SETCURSOR will not reach us again while we
+            // are hidden). Shown: re-apply DispCursor immediately instead of waiting for the
+            // next mouse move, or the arrow would sit on the neural picture for a moment.
+            if (want)
+                mgpu::gpu1::disp_cursor_raise();
+            else
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            char l[420];
+            snprintf(l, sizeof l,
+                     "[MGPU][R454] output %s (fg hwnd=0x%p pid=%lu game=0x%p unfocused=%llums "
+                     "frame=%llu). %s",
+                     want ? "shown" : "hidden", (void *)fg, (unsigned long)fpid, (void *)game,
+                     (unsigned long long)out_ms, (unsigned long long)frame,
+                     want ? "The game holds the foreground: topmost again."
+                          : "Foreground is not the game: the window is out of the way and Alt+Tab "
+                            "works. The present chain and the stream are untouched.");
+            mgpu::diag::info(l);
+        }
+        // Topmost on the transition, on any foreground change, and - like the presenter - once
+        // every 32 presented frames, because a game window that is itself topmost can end up in
+        // front of us without the foreground ever changing (that reads as flicker, not as lag).
+        if (want && (changed || fg != s_last_fg || (frame % 32ull) == 0ull))
+            SetWindowPos(bridge, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                             SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+        s_last_fg = fg;
+    }
+
     LRESULT CALLBACK bridge_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
-        (void)wParam; (void)lParam;
         switch (msg)
         {
+        // [H7/A-c, 2026-11-11] THE WINDOW NEVER *OWNS* THE CURSOR; it may still SET it.
+        //
+        // DcompOverlay=0 makes this the visible fullscreen window, so Windows asks IT what
+        // the cursor should be. The game draws its pointer INTO the frame; the system arrow
+        // must therefore be hidden, not left at whatever the desktop had. DispCursor=0
+        // (default here, and the PBZ value) hides the system cursor; =1 shows the arrow.
+        case WM_SETCURSOR:
+            if (input_pump_enabled())
+            {
+                // Read LIVE and APPLY: DispCursor is also changed by CTRL+ALT+F5 and by the
+                // panel row, and those call disp_cursor_apply() themselves - a stationary
+                // pointer never sends this message, which is why the first hotkey version
+                // changed the flag and nothing on screen.
+                (void)mgpu::gpu1::disp_cursor_apply();
+            }
+            return TRUE;
+        // [MOUSE PUMP] Never activate: a click must not take the foreground away from the
+        // game, or keyboard/raw-input die (PBZ's own note (3)).
+        case WM_MOUSEACTIVATE:
+            if (input_pump_enabled()) return MA_NOACTIVATE;
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
         case WM_CLOSE:
             mgpu::diag::info("[MGPU][T4] WM_CLOSE - the bridge window was closed by the user; "
                              "signalling bridge shutdown (the game is not affected)");
@@ -165,8 +456,47 @@ namespace
             stop();
             return 0;
         default:
-            return DefWindowProcW(hWnd, msg, wParam, lParam);
+            break;
         }
+
+        // [MOUSE PUMP] The forwarding itself, exactly the presenter's shape: client ->
+        // screen -> the game's client, then PostMessage. Wheel coordinates are already
+        // screen coordinates, so that case skips ClientToScreen.
+        if (input_pump_enabled())
+        {
+            HWND game = input_game_window();
+            if (game != nullptr && game != hWnd)
+            {
+                switch (msg)
+                {
+                case WM_MOUSEMOVE:
+                case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+                case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+                case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+                case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+                {
+                    POINT pt{ (LONG)(short)LOWORD(lParam), (LONG)(short)HIWORD(lParam) };
+                    s_mouse_msgs.fetch_add(1ull, std::memory_order_relaxed);
+                    if (msg != WM_MOUSEMOVE) s_mouse_clicks.fetch_add(1ull, std::memory_order_relaxed);
+                    ClientToScreen(hWnd, &pt);
+                    ScreenToClient(game, &pt);
+                    PostMessageW(game, msg, wParam, MAKELPARAM((short)pt.x, (short)pt.y));
+                    return 0;
+                }
+                case WM_MOUSEWHEEL:
+                case WM_MOUSEHWHEEL:
+                {
+                    POINT pt{ (LONG)(short)LOWORD(lParam), (LONG)(short)HIWORD(lParam) };   // screen coords
+                    ScreenToClient(game, &pt);
+                    PostMessageW(game, msg, wParam, MAKELPARAM((short)pt.x, (short)pt.y));
+                    return 0;
+                }
+                default:
+                    break;
+                }
+            }
+        }
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
 
     // ---- P7.10: where the window is born ----
@@ -524,7 +854,8 @@ namespace
             wc.style = CS_HREDRAW | CS_VREDRAW;
             wc.lpfnWndProc = bridge_wndproc;
             wc.hInstance = mgpu::module_handle();
-            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                            // [H7/A-c] NO class cursor: this window must never paint a desktop arrow over the picture.
+                wc.hCursor = nullptr;
             wc.hIcon = nullptr;
             wc.hbrBackground = nullptr;
             wc.lpszMenuName = nullptr;
@@ -660,6 +991,31 @@ namespace
                                      "TRADEOFF: the ReShade overlay on THIS window needs focus "
                                      "to take keyboard, so use the GAME's overlay instead - it "
                                      "is the same panel.");
+                }
+
+                // [H7/A-b, 2026-11-11] THIS WINDOW IS THE SCREEN NOW. It must not take the
+                // FOREGROUND (keyboard/raw input stay the game's), but with the presenter's
+                // pump it DOES take the mouse and forwards it.
+                //
+                // [MOUSE PUMP, 2026-11-11] DispClickThrough=0 is the PBZ setting and the
+                // presenter's proven one: the visible window receives the mouse hits and
+                // posts them to the game's client area. =1 keeps the old pass-through arm
+                // (no pump, no forwarding) as the rollback.
+                if (mgpu::gpu1::dcomp_overlay_mode() == 0)
+                {
+                    ex_style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+                    const bool click_through = mgpu::gpu1::ui_ini_read("DispClickThrough", 0) != 0;
+                    if (click_through) ex_style |= WS_EX_TRANSPARENT;
+                    snprintf(line, sizeof line,
+                             "[MGPU][T4][A] DcompOverlay=0: this window is on screen, created "
+                             "WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW%s. DispClickThrough=%d: %s",
+                             click_through ? " | WS_EX_TRANSPARENT" : "",
+                             click_through ? 1 : 0,
+                             click_through
+                                 ? "mouse hits pass THROUGH to the game (old arm, no pump)"
+                                 : "the window takes the mouse and forwards it to the game "
+                                   "(presenter pump; PBZ's proven value)");
+                    mgpu::diag::info(line);
                 }
 
                 hwnd = CreateWindowExW(
@@ -798,6 +1154,17 @@ namespace
                             else
                                 mgpu::diag::warn("[MGPU][R330] simple panel hotkey CTRL+ALT+F4 FAILED to "
                                                  "register - the checkbox in the full panel still switches it.");
+                            // [MOUSE] Live cursor toggle. The arrow is needed in menus and
+                            // in the way in an FPS; one key, no restart, persisted to the ini.
+                            const bool k_c = RegisterHotKey(nullptr, MGPU_HOTKEY_CURSOR,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F5) != FALSE;
+                            if (k_c)
+                                mgpu::diag::info("[MGPU][MOUSE] desktop-cursor hotkey: CTRL+ALT+F5 toggles "
+                                                 "DispCursor (show/hide the system arrow); the simple panel has "
+                                                 "a row with the same switch.");
+                            else
+                                mgpu::diag::warn("[MGPU][MOUSE] desktop-cursor hotkey CTRL+ALT+F5 FAILED to "
+                                                 "register - the simple panel row still toggles DispCursor.");
                             if (mgpu::gpu1::dcomp_overlay_mode())
                             {
                                 char pk[440];
@@ -1079,6 +1446,10 @@ namespace
                     // toggle() rewrites mgpu.ini, and a file rewrite does not belong inside the drain.
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SIMPLE)
                     { ++simple_toggles; continue; }
+                    // [MOUSE] Immediate, not counted: it changes no stream state, and the
+                    // arrow must come back before the operator's next click, not 250 ms later.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_CURSOR)
+                    { mgpu::gpu1::disp_cursor_set(!mgpu::gpu1::disp_cursor_on()); continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
                     { ++view_cycles; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_L)
@@ -1461,6 +1832,13 @@ namespace
                     (void)mgpu::gpu1::ui_ini_write_word("DcompOverlay", "0");
                 }
                 mgpu::gpu1::stream_poll();
+                // [H7/B, 2026-11-11] Foreground follow, before the gate: the gate can sleep
+                // its 4 ms timeout, and an Alt+Tab must take this window down even while no
+                // neural frame is arriving (a game that stops rendering in the background is
+                // the normal case, not the exception). Mode 1 never shows this window - the
+                // visual lives on the game's own window - so it has nothing to follow.
+                if (mgpu::gpu1::dcomp_overlay_mode() == 0)
+                    follow_foreground(hwnd, frame);
                 if (!mgpu::gpu1::stream_present_gate(4))
                     continue;
 
@@ -1502,6 +1880,30 @@ namespace
                 // that owns the window, which is this one.
                 if (frame == 1 || frame % 30 == 0)
                     set_window_title(hwnd, frame);
+
+                // [R456, 2026-11-11] Re-assert the cursor about once a second. Between mouse
+                // moves the game's own thread can reset the shape (or hide it again with its
+                // ShowCursor count); this is the only thing that notices when the arrow silently
+                // stops being the one DispCursor asked for. One GetCursorInfo per 30 presents.
+                if (input_pump_enabled() && (frame % 30ull) == 0ull)
+                    mgpu::gpu1::disp_cursor_raise();
+
+                // [R457] Panel-input census, only while an overlay is open: if the next run still
+                // reports a dead panel mouse, this says whether the messages stop arriving or keep
+                // arriving and get forwarded past the overlay.
+                if (mgpu::gpu1::bridge_overlay_open() && (frame % 300ull) == 0ull)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][R457] panel input: overlay OPEN. This window received %llu mouse "
+                             "msg(s), %llu click(s) so far, and the pump is %s. READING: clicks flat at 0 "
+                             "while the panel is on screen = the window is not under the pointer (z-order/"
+                             "hidden); clicks climbing but the panel ignores them = they are being posted "
+                             "to the game instead of reaching ReShade's overlay.",
+                             (unsigned long long)s_mouse_msgs.load(std::memory_order_relaxed),
+                             (unsigned long long)s_mouse_clicks.load(std::memory_order_relaxed),
+                             input_pump_enabled() ? "ON (forwarding to the game)" : "OFF (pass-through arm)");
+                    mgpu::diag::info(line);
+                }
 
                 // The device-removal poll, moved from the 250 ms timer to
                 // a frame counter (every 60 frames, ~1 s at vblank): same

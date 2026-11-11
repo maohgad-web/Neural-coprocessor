@@ -218,8 +218,23 @@ void init(const char *build)
     GetFileSizeEx(g_file, &sz);
     if (sz.QuadPart > 8ll * 1024 * 1024)
     {
+        // [PORT B3-log, 2026-11-11] FIVE generations, not one. The shipped file
+        // rotated journal.log -> journal.prev.log and kept exactly one archive,
+        // so a third session overwrote the first's evidence. journal.log + .1..4.
         CloseHandle(g_file);
-        MoveFileExW(path, prev, MOVEFILE_REPLACE_EXISTING);
+        wchar_t from[MAX_PATH] = {}, to[MAX_PATH] = {};
+        _snwprintf_s(from, MAX_PATH, _TRUNCATE, L"%lsmgpu\\journal.4.log", dir);
+        DeleteFileW(from);
+        for (int g = 3; g >= 1; --g)
+        {
+            _snwprintf_s(from, MAX_PATH, _TRUNCATE, L"%lsmgpu\\journal.%d.log", dir, g);
+            _snwprintf_s(to,   MAX_PATH, _TRUNCATE, L"%lsmgpu\\journal.%d.log", dir, g + 1);
+            MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING);
+        }
+        _snwprintf_s(to, MAX_PATH, _TRUNCATE, L"%lsmgpu\\journal.1.log", dir);
+        MoveFileExW(path, to, MOVEFILE_REPLACE_EXISTING);
+        // The legacy single archive is folded into the generation scheme once.
+        DeleteFileW(prev);
         g_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (g_file == INVALID_HANDLE_VALUE) return;

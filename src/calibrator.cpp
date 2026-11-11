@@ -43,6 +43,7 @@
 #include "diag.hpp"
 #include "fg_map.hpp"   // D2.0 NR step one (NRFrameFilter=1), read only; off = one load per call site
 #include "t119_keys.hpp"   // R300 (T1.19, Dom): R300b SceneHandleSet, R300f2 FeatureDiag - absent = off
+#include "gpu1_context.hpp"   // [PORT O2] stream_depth_copy: the game's own depth, at the same evaluate
 
 #include <tlhelp32.h>
 #include <intrin.h>   // R245: _ReturnAddress for the nvapi trace
@@ -601,6 +602,9 @@ void capture(const NVSDK_NGX_Parameter *p)
     g_cost_ns.fetch_add((unsigned long long)((double)(qpc() - t0) * g_qpc_to_ns),
                         std::memory_order_relaxed);
 }
+
+// [FFX, 2026-11-11] publish_external() is defined AFTER the anonymous namespace below -
+// putting it here gave it internal linkage and the linker reported it as unresolved.
 
 // ---- D2.0 NR STEP ONE: WHAT EACH EVALUATE SAYS, FOR THE FRAME-GEN MAP ----
 //
@@ -2088,6 +2092,34 @@ std::mutex g_install_cs;
 
 // ---------------------------------------------------------------------------
 
+// [FFX, 2026-11-11] The writer for a block that came from an API other than NGX. OUTSIDE the
+// anonymous namespace on purpose: ffx_hook.cpp links to this symbol. Identical seqlock as
+// capture(): one writer at a time by construction, because a title upscales through DLSS or
+// through FSR, never both in the same frame. g_captures is incremented so read() answers.
+// [FFX, 2026-11-11] One increment per external (non-NGX) contract publish. See the header: the
+// history gate needs to know a provider handed this frame over even when no DLSS evaluate exists.
+static std::atomic<unsigned long long> g_contract_frames{0};
+
+unsigned long long contract_frame_counter()
+{
+    return g_contract_frames.load(std::memory_order_relaxed);
+}
+
+void publish_external(table t)
+{
+    g_contract_frames.fetch_add(1ull, std::memory_order_relaxed);
+    t.frame = g_frames.load(std::memory_order_relaxed);
+    t.evals = g_evals.load(std::memory_order_relaxed);
+
+    g_seq.fetch_add(1u, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    g_tbl = t;
+    std::atomic_thread_fence(std::memory_order_release);
+    g_seq.fetch_add(1u, std::memory_order_release);
+
+    g_captures.fetch_add(1, std::memory_order_relaxed);
+}
+
 // R245: public, outside the anonymous namespace (the hook and the walker it
 // calls are inside it, declared above).
 void set_trace_nvapi(bool on)
@@ -2669,6 +2701,168 @@ void log_summary()
                 (unsigned long long)g_hs_ret_taken.load(std::memory_order_relaxed),
                 (unsigned long long)g_hs_ret_copies.load(std::memory_order_relaxed));
         mgpu::diag::info(hl);
+    }
+}
+
+// ===========================================================================
+// [PORT B2, 2026-11-11] THE INLINE HOOK'S ENTRY POINTS
+//
+// ngx_hook.cpp reads the parameter block at nvngx's OWN entry points. These
+// four functions are the whole interface between it and this file, and every
+// one of them is a wrapper over machinery that already existed here:
+//
+//   note_scene_handle_external    -> latch_scene_handle + the two atomics the
+//                                    calibrator's own hook_create sets, so the
+//                                    evaluate filters and the [R101] line mean
+//                                    the same thing whichever route installed.
+//   is_scene_handle_external      -> g_sr_handle / is_latched_scene_handle.
+//   release_scene_handle_external -> unlatch_scene_handle.
+//   evaluate_external             -> g_evals, capture(), and the R106 eval-copy
+//                                    block, copied from hook_evaluate so there
+//                                    is ONE copy implementation, not two.
+//
+// WHY THE COPY BLOCK IS COPIED AND NOT CALLED: hook_evaluate is gated on g_mode
+// (Calib=) and would re-enter the real EvaluateFeature. The hook needs the
+// body, not the thunk.
+// ===========================================================================
+void after_create_external(int feature_id, void *params, void **out_handle, int result)
+{
+    after_create((NVSDK_NGX_Feature)feature_id, reinterpret_cast<NVSDK_NGX_Parameter *>(params),
+                 reinterpret_cast<NVSDK_NGX_Handle **>(out_handle), (NVSDK_NGX_Result)result);
+}
+
+void note_scene_handle_external(unsigned long long handle)
+{
+    if (handle == 0ull) return;
+    latch_scene_handle(handle);
+    g_sr_handle.store(handle, std::memory_order_relaxed);
+    g_handle_known.store(true, std::memory_order_relaxed);
+}
+
+void release_scene_handle_external(unsigned long long handle)
+{
+    if (handle == 0ull) return;
+    unlatch_scene_handle(handle);
+}
+
+bool is_scene_handle_external(unsigned long long handle)
+{
+    if (handle == 0ull) return false;
+    if (g_sr_handle.load(std::memory_order_relaxed) == handle) return true;
+    return is_latched_scene_handle(handle);
+}
+
+unsigned long long frame_now_external()
+{
+    return g_frames.load(std::memory_order_relaxed);
+}
+
+void evaluate_external(void *cmd_list, const void *handle, const void *params)
+{
+    ID3D12GraphicsCommandList *cl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list);
+    const NVSDK_NGX_Handle *h = reinterpret_cast<const NVSDK_NGX_Handle *>(handle);
+    const NVSDK_NGX_Parameter *p = reinterpret_cast<const NVSDK_NGX_Parameter *>(params);
+    const unsigned long long hv = (unsigned long long)(uintptr_t)handle;
+
+    g_evals.fetch_add(1, std::memory_order_relaxed);
+    if (p != nullptr && mgpu::fgmap::on()) fgmap_tap(h, p);
+    if (p != nullptr) capture(p);
+
+    // [PORT B2] the one line that proves the hook route is alive and what it
+    // actually captured. Said once per process, BEFORE any copy decision, so a
+    // run in which the copy never fires still says whether the contract exists.
+    {
+        static std::atomic<unsigned> said_capture{0};
+        if (said_capture.fetch_add(1, std::memory_order_relaxed) == 0u)
+        {
+            table ct{};
+            if (read(ct))
+            {
+                char cl_line[520];
+                snprintf(cl_line, sizeof cl_line,
+                         "[MGPU][R804] CONTRACT from the inline hook: color=0x%llx depth=0x%llx mvec=0x%llx | "
+                         "render=%ux%u display=%ux%u | flags=0x%08X inverted=%u mvlow=%u | jitter=%.3f,%.3f "
+                         "mvecscale=%.3f,%.3f | have=0x%X",
+                         ct.color, ct.depth, ct.mvec, ct.render_w, ct.render_h, ct.display_w, ct.display_h,
+                         ct.create_flags, ct.depth_inverted, ct.mv_low_res, ct.jitter_x, ct.jitter_y,
+                         ct.mv_scale_x, ct.mv_scale_y, ct.have);
+                mgpu::diag::info(cl_line);
+            }
+            else
+            {
+                mgpu::diag::info("[MGPU][R804] the inline hook reached a scene evaluate but capture() published "
+                                 "nothing this frame (a foreign provider may own the contract).");
+            }
+        }
+    }
+
+    // [PORT O2, 2026-11-11] THE GAME'S OWN DEPTH, AT THE SAME CALL. This runs
+    // BEFORE the vector-copy gate below and is independent of it: the depth
+    // route must not depend on MvecFromEval. stream_depth_copy is a no-op
+    // unless DepthContract=1, and every failed guard leaves the frame to the
+    // seal's tap path (one writer per frame, never two).
+    if (cl != nullptr && p != nullptr)
+    {
+        table dt{};
+        if (read(dt) && (dt.have & KEY_DEPTH) != 0u && dt.depth != 0ull)
+        {
+            const unsigned dw = (dt.depth_x != 0u) ? dt.depth_x : dt.render_w;
+            const unsigned dh = (dt.depth_y != 0u) ? dt.depth_y : dt.render_h;
+            mgpu::gpu1::stream_depth_copy((void *)cl, dt.depth, dw, dh);
+        }
+    }
+
+    // R118/R106: only mode 1 copies. 2 (AUTO) means "not yet"; gpu1_context
+    // switches it to 1 when the barrier route measures zero deliveries.
+    const int ec = g_eval_copy_mode.load(std::memory_order_relaxed);
+    if (ec != 1 || cl == nullptr || g_mvec_hook_fn == nullptr) return;
+
+    const unsigned long long fr = g_frames.load(std::memory_order_relaxed);
+    if (!is_scene_handle_external(hv) || g_eval_last_frame == fr)
+    {
+        g_eval_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_eval_last_frame = fr;
+
+    table et;
+    if (!read(et) || (et.have & KEY_MVEC) == 0u || et.mvec == 0ull) return;
+
+    const int hsi = hs_slot(hv);
+    ID3D12Resource *r = (ID3D12Resource *)(uintptr_t)et.mvec;
+    const D3D12_RESOURCE_STATES SR = (D3D12_RESOURCE_STATES)
+        (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = SR;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    g_mvec_hook_fn((void *)cl, et.mvec);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = SR;
+    cl->ResourceBarrier(1, &b);
+
+    g_eval_copies.fetch_add(1, std::memory_order_relaxed);
+    if (g_eval_copies.load(std::memory_order_relaxed) == 1ull)
+    {
+        char fl[360];
+        snprintf(fl, sizeof fl,
+                 "[MGPU][R804] FIRST eval-copy from the inline hook: mvec=0x%llx sub=%ux%u, taken on the game's "
+                 "own command list before its EvaluateFeature. This is the game's own field, not the census tap's.",
+                 et.mvec, et.sub_w, et.sub_h);
+        mgpu::diag::info(fl);
+    }
+    if (hsi >= 0)
+    {
+        g_hs[hsi].copies.fetch_add(1, std::memory_order_relaxed);
+        g_hs[hsi].w.store(et.sub_w, std::memory_order_relaxed);
+        g_hs[hsi].hh.store(et.sub_h, std::memory_order_relaxed);
     }
 }
 

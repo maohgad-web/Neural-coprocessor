@@ -1,4 +1,4 @@
-﻿// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
+// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
 //
 // WHAT THIS IS. A second view of the SAME controls the full panel has, with the log lines, the
 // counters and the timing readouts stripped out, so a player who does not care about any of that can
@@ -30,6 +30,7 @@
 // thread, from the overlay's draw. toggle() - the bridge thread's hotkey - touches the ini only.
 
 #include "panel_simple.hpp"
+#include "fg_gpu1.hpp"   // [PORT FG-PANEL] read-only FG counters for the status row
 
 #include <windows.h>
 #include <shellapi.h>
@@ -663,6 +664,16 @@ namespace mgpu::psimple
                 (void)mgpu::gpu1::ui_ini_write("NRInput16", on ? 4 : 0);
         }
 
+        // [MOUSE] The desktop arrow. Same switch as CTRL+ALT+F5; the help text in
+        // panel_simple.txt says which chord it is, because a row cannot draw a hotkey.
+        void row_disp_cursor()
+        {
+            bool on = mgpu::gpu1::disp_cursor_on();
+            if (ImGui::Checkbox("##dispcursor", &on)) mgpu::gpu1::disp_cursor_set(on);
+            ImGui::SameLine();
+            ImGui::TextDisabled("CTRL+ALT+F5");
+        }
+
         void row_crop()
         {
             const int mode = mgpu::gpu1::ui_ini_read("ScaleMode", 0);
@@ -904,6 +915,118 @@ namespace mgpu::psimple
             ImGui::SameLine();
         }
 
+        // [PORT FG-PANEL, 2026-11-11] ONE ROW PER BACKEND, as a player reads it:
+        // FSR / DLSS / XeSS each on its own line, never eight radios jammed into
+        // one. Selecting an option writes the triple (FrameGen, FgBackend,
+        // FgMulti) - one active backend, so "off" in ANY row clears all three.
+        //
+        // HOT SWITCH: "off" also calls ui_set_enabled(false), which skips
+        // generation on the very next frame while the real frame keeps its
+        // cadence; choosing an option calls ui_set_enabled(true). Only the
+        // BACKEND/MULTIPLIER choice needs a restart; on/off does not.
+        void fg_off_radio(const char *id)
+        {
+            const int fg = mgpu::gpu1::ui_ini_read("FrameGen", 0);
+            const bool off = (fg == 0) || !mgpu::fg::ui_enabled();
+            if (ImGui::RadioButton(L("ui.off", "off", id).c_str(), off))
+            {
+                (void)mgpu::gpu1::ui_ini_write("FrameGen", 0);
+                (void)mgpu::gpu1::ui_ini_write("FgBackend", 0);
+                mgpu::fg::ui_set_enabled(false);
+            }
+        }
+
+        void fg_pick(int fg, int be, int mul, const char *label, const char *id)
+        {
+            const int c_fg  = mgpu::gpu1::ui_ini_read("FrameGen", 0);
+            const int c_be  = mgpu::gpu1::ui_ini_read("FgBackend", (c_fg == 4) ? 1 : 0);
+            const int c_mul = mgpu::gpu1::ui_ini_read("FgMulti", 2);
+            const bool sel = (c_fg == fg && c_be == be && c_mul == mul && mgpu::fg::ui_enabled());
+            if (ImGui::RadioButton(L("ui.fgopt", label, id).c_str(), sel))
+            {
+                (void)mgpu::gpu1::ui_ini_write("FrameGen", fg);
+                (void)mgpu::gpu1::ui_ini_write("FgBackend", be);
+                (void)mgpu::gpu1::ui_ini_write("FgMulti", mul);
+                mgpu::fg::ui_set_enabled(true);
+            }
+        }
+
+        void fg_row_note(const char *tag)
+        {
+            ImGui::SameLine();
+            if (!mgpu::fg::ui_enabled())
+                ImGui::TextDisabled("%s: %s", tag, T("ui.fg_off_note", "generation OFF now (hot); pick an option to resume").c_str());
+            else if (mgpu::fg::ui_up())
+                ImGui::TextDisabled("%s: %s", tag, T("ui.fg_live", "live").c_str());
+            else
+                ImGui::TextDisabled("%s: %s", tag, T("ui.fg_restart", "restart to apply").c_str());
+        }
+
+        // [PORT C] the during-play readout toggle.
+        void row_fg_hud()
+        {
+            bool on = mgpu::fg::ui_hud();
+            if (ImGui::Checkbox(L("ui.fg_hud", "on-screen readout", "fg_hud").c_str(), &on))
+            {
+                mgpu::fg::ui_set_hud(on);
+                (void)mgpu::gpu1::ui_ini_write("FgHud", on ? 1 : 0);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("FG source/output, top right; a layered GDI window outside the render path");
+        }
+
+        void row_fg_dlss()
+        {
+            fg_off_radio("dlss_off"); ImGui::SameLine();
+            fg_pick(4, 1, 2, "2x", "dlss_x2"); ImGui::SameLine();
+            fg_pick(4, 1, 3, "3x", "dlss_x3"); ImGui::SameLine();
+            fg_pick(4, 1, 4, "4x", "dlss_x4");
+            fg_row_note("DLSS");
+        }
+
+        void row_fg_fsr()
+        {
+            fg_off_radio("fsr_off"); ImGui::SameLine();
+            fg_pick(5, 2, 2, "2x", "fsr_x2");
+            fg_row_note("FSR");
+        }
+
+        void row_fg_xess()
+        {
+            fg_off_radio("xess_off"); ImGui::SameLine();
+            fg_pick(6, 3, 2, "2x", "xess_x2"); ImGui::SameLine();
+            fg_pick(6, 3, 3, "3x", "xess_x3"); ImGui::SameLine();
+            fg_pick(6, 3, 4, "4x", "xess_x4");
+            fg_row_note("XeSS");
+        }
+
+        // [PORT FG-PANEL] read-only line: the numbers [R341] prints, plus the
+        // depth route that actually filled the slot, plus the hot on/off box.
+        void row_fg_status()
+        {
+            unsigned long long made = 0, pgen = 0, preal = 0, drop = 0, err = 0;
+            mgpu::fg::ui_status(made, pgen, preal, drop, err);
+            const int route = mgpu::gpu1::depth_route();
+            const char *dsrc = (route == 2) ? "contract" : (route == 1) ? "tap" : "none";
+            const double eff = (preal != 0ull) ? ((double)(pgen + preal) / (double)preal) : 0.0;
+            bool on = mgpu::fg::ui_enabled();
+            if (ImGui::Checkbox(L("ui.fg_live_box", "live", "fg_live").c_str(), &on))
+                mgpu::fg::ui_set_enabled(on);
+            ImGui::SameLine();
+            ImGui::Text("gen %llu (pres %llu) real %llu | eff %.2fx | drop %llu err %llu | depth %s | MV contract",
+                        made, pgen, preal, eff, drop, err, dsrc);
+            // [PORT DISPLAY-LAYER 1/3] the landing ledger: how late the pacing thread is
+            // against its own targets. Read-only; it does not present anything.
+            {
+                double lm = 0.0, lw = 0.0; unsigned long long ln = 0ull, ll = 0ull;
+                mgpu::fg::ui_landing(lm, lw, ln, ll);
+                ImGui::Text("landing: mean %.2f ms worst %.2f ms late>8ms %llu/%llu", lm, lw, ll, ln);
+                double pi = 0.0; unsigned long long prs = 0ull, pabs = 0ull; int pm = 0;
+                mgpu::fg::ui_pace(pi, prs, pabs, pm);
+                ImGui::Text("pace: %s interval %.2f ms resync %llu/%llu", pm ? "absolute" : "author", pi, prs, pabs);
+            }
+        }
+
         void register_rows()
         {
             row("nrs.scale",  "NRScale",        &row_nrs_scale);
@@ -929,6 +1052,7 @@ namespace mgpu::psimple
             row("model.mask",      "auto mask",    &row_model_mask);
             row("fps.cap",         "fps cap",      &row_frame_cap);
             row("colour.16bit",    "16-bit colour",&row_colour16);
+            row("disp.cursor",     "desktop cursor", &row_disp_cursor);   // [MOUSE] CTRL+ALT+F5
             row("crop",            "crop",         &row_crop);
             // R330: these seven were written but never registered, so the DLSS / frame-generation /
             // x2 sections came up empty. A row has to be BOTH drawn and registered.
@@ -943,6 +1067,11 @@ namespace mgpu::psimple
             row("sr.quality",      "DLSS quality", &row_sr_quality);
             row("sr.preset",       "DLSS preset",  &row_sr_preset);
             row("fg.mode",         "frame generation", &row_fg_mode);
+            row("fg.hud",          "on-screen readout",    &row_fg_hud);    // [PORT C]
+            row("fg.dlss",         "DLSS frame generation", &row_fg_dlss);   // [PORT FG-PANEL]
+            row("fg.fsr",          "FSR frame generation",  &row_fg_fsr);
+            row("fg.xess",         "XeSS frame generation", &row_fg_xess);
+            row("fg.status",       "FG status", &row_fg_status);                     // [PORT FG-PANEL]
             row("fg.keep",         "keep 1 in N",  &row_fg_keep);
         }
     }   // namespace
