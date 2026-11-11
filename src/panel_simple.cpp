@@ -1,4 +1,4 @@
-// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
+﻿// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
 //
 // WHAT THIS IS. A second view of the SAME controls the full panel has, with the log lines, the
 // counters and the timing readouts stripped out, so a player who does not care about any of that can
