@@ -1977,6 +1977,14 @@ char g_semC_name[72] = {};
 reshade::api::effect_texture_variable g_tap_var = {};
 std::atomic<unsigned long long> g_tap_res;
 unsigned long long g_tap_tick = 0;
+// [PORT O4, 2026-11-11] THE TAP'S INPUT, beside its output. g_tap_res is the
+// resource we WRITE (MGPU_DepthOutTex); this is the resource ReShade binds to
+// the DEPTH semantic the tap READS (MGPU_SceneDepthTex). Comparing it with the
+// contract's declared depth answers the one question a contract-depth route
+// depends on: IS THE TAP ALREADY SAMPLING THE GAME'S OWN DEPTH? A handle
+// comparison, so one map lookup and no dereference of anyone's resource.
+reshade::api::effect_texture_variable g_depth_in_var = {};
+std::atomic<unsigned long long> g_depth_in_res;
 
 int      g_dcc_state  = 0;    // 0 idle, 1 copy recorded and ripening
 unsigned long long g_dcc_at = 0;
@@ -3410,6 +3418,31 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr)
             if (h == 0) g_tap_var = reshade::api::effect_texture_variable{};   // re-resolve
             g_tap_res.store(h, std::memory_order_relaxed);
 
+            // [PORT O4] the INPUT side, resolved the same way and with the same
+            // self-healing rule: an effect reload invalidates the variable, so an
+            // unbound frame clears it and the next frame re-resolves by name.
+            // Read-only; nothing is copied, transitioned or bound because of it.
+            {
+                if (g_depth_in_var.handle == 0)
+                    g_depth_in_var = rt2->find_texture_variable(nullptr, "MGPU_SceneDepthTex");
+                unsigned long long din = 0;
+                if (g_depth_in_var.handle != 0)
+                {
+                    reshade::api::resource_view dsrv = {}, dsrgb = {};
+                    rt2->get_texture_binding(g_depth_in_var, &dsrv, &dsrgb);
+                    if (dsrv.handle != 0)
+                    {
+                        if (reshade::api::device *dv = rt2->get_device())
+                            din = dv->get_resource_from_view(dsrv).handle;
+                    }
+                    else
+                    {
+                        g_depth_in_var = reshade::api::effect_texture_variable{};
+                    }
+                }
+                g_depth_in_res.store(din, std::memory_order_relaxed);
+            }
+
             // The tap has to be ON for any of this to exist, and tech_scan
             // otherwise only runs from dump(). Throttled hard: a technique
             // enumeration is not a per-frame cost.
@@ -3480,6 +3513,15 @@ int tap_state()
 unsigned long long depth_source()
 {
     return g_tap_res.load(std::memory_order_relaxed);
+}
+
+// [PORT O4, 2026-11-11] the resource ReShade binds to the tap's DEPTH semantic
+// (MGPU_SceneDepthTex). Zero when no depth is bound or the tap is not running.
+// Compared against the game's declared depth, this says whether the tap is
+// already sampling the game's own depth or something else.
+unsigned long long depth_input_source()
+{
+    return g_depth_in_res.load(std::memory_order_relaxed);
 }
 
 // R78. THE IDENTIFIED VELOCITY BUFFER, or 0 while it is not yet known.

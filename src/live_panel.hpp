@@ -56,4 +56,10 @@ namespace mgpu::live_panel
     // The game chain's present, on its own thread. Blocks the game's input for
     // the next frame while the panel is live AND being drawn (R293).
     void block_game_input(reshade::api::effect_runtime *game_runtime);
+
+    // [PORT PRESENTER, 2026-11-11] B1.1b, copied from nc-base: while the presenter's
+    // own small window is up it owns the mouse via raw input; the game's input has to
+    // be blocked even though no ReShade panel is live. Read by dllmain's guard.
+    void set_b1_input(bool on);
+    bool b1_input_active();
 }

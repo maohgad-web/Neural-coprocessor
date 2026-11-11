@@ -183,6 +183,29 @@ namespace mgpu::gpu1
     //   present_last_fence_value: the fence value the calling thread's last present_frame
     //   signalled (0 = none / failed before the signal). Thread-local.
     void present_override(ID3D12Resource *src, D3D12_RESOURCE_STATES rest);
+    // [H2 FIX 3, 2026-11-11] the burst identity of the frame the caller is about to
+    // present: one id per SOURCE frame, shared by its generated and real pushes, and
+    // is_gen telling the display ring which of the two this is. Without it every push is
+    // its own burst, a pair can be split by the drop rules, and the reader's eff_mult is
+    // structurally 0. Thread-local like present_override; 0/false = no burst.
+    void present_override_gen(unsigned grp, bool is_gen);
+    // [PORT H4', 2026-11-11] what the frame generator needs to see about THIS frame: the
+    // two guide textures the neural pass read (they describe the picture about to be
+    // shown, not whatever the renderer moved on to) plus the six scalars XeFG's frame
+    // constants carry. Thread-local and cleared by the push that consumes it, exactly
+    // like present_override: a frame with no override pushes no guides, and the
+    // provider's per-frame hook then stays silent for it (1x passthrough, no tag).
+    // The parameters are primitives on purpose - this header must not learn what
+    // mgpu::presenter::disp_fg_params is.
+    void present_override_fg(ID3D12Resource *depth, D3D12_RESOURCE_STATES depth_state,
+                             ID3D12Resource *mvec, D3D12_RESOURCE_STATES mvec_state,
+                             float jitter_x, float jitter_y,
+                             float mv_scale_x, float mv_scale_y,
+                             float frame_ms, unsigned reset);
+    // [H2 FIX 2, 2026-11-11] true while the display layer owns the output. The FG pacing
+    // thread then hands frames over WITHOUT waiting for its own target: one timing owner
+    // (the layer's pacer), not two.
+    bool presenter_owns_output();
     ID3D12Fence *present_fence_addref();
     unsigned long long present_last_fence_value();
 
@@ -420,6 +443,17 @@ void tap_copy_scope(bool on);
 // R312 (DepthTransport). depth_transport(): the key, 1..4 (absent = 1). r312_set_target: dllmain, once,
 // the geometry it pushed into the tap's .fx; the arm then holds for depth until the tap matches it.
 int depth_transport();
+
+// [PORT FG-PANEL, 2026-11-11] the route that filled the depth slot for the last
+// sealed frame: 0 none, 1 the tap, 2 the game's own declared depth (contract).
+// Read-only, for the panel/overlay; nothing branches on it.
+int depth_route();
+
+// [PORT DISPLAY-LAYER 2/3b, 2026-11-11] the OUTPUT refresh, pushed once from the game's
+// swapchain at init. The absolute pacer must not derive its clock from its own
+// presents - that is a feedback loop, not a measurement. 0 = unknown.
+void set_display_refresh(double hz);
+double display_refresh_hz();
 void r312_set_target(unsigned w, unsigned h, unsigned fmt);
 // R315: dllmain hands over the probe's MVecBarrierSource key and its fire count, each game frame, key on only.
 void r315_note(int on, unsigned long long fires);
@@ -769,6 +803,28 @@ void ui_set_sr_request(int quality, int preset, int scale);
 // and calls stream_request() itself, because that is BRIDGE THREAD ONLY.
 void ui_panel_drawn();
 bool ui_panel_is_open();
+// [H7/D, 2026-11-11] Overlay-open state, written by dllmain for either ReShade runtime and
+// read by worker.cpp's foreground follow. Never hide the bridge window while this is true:
+// R156 measured that hiding it under an open overlay disturbs the game's own overlay.
+void note_overlay_open(bool open);
+bool overlay_is_open();
+// [H7/H, 2026-11-11] The bridge runtime's own overlay state - the one that is actually on
+// screen in follow mode. The global above is also set by the game runtime's REFUSED open, so a
+// toggle built on it reads "open" before the first panel ever appears.
+void note_bridge_overlay_open(bool open);
+bool bridge_overlay_open();
+// [H7/E, 2026-11-11] Ask the runtime that owns the open overlay to close it (applied on its own
+// thread through R158's pending mechanism). worker.cpp uses it when the game loses the
+// foreground: close first, then hide - R156 measured that hiding under an open overlay breaks it.
+void request_overlay_close();
+bool overlay_close_requested();
+void clear_overlay_close_request();
+
+// [FFX, 2026-11-11] The FSR descriptor's motionVectorScale: the UV->pixels factor when the
+// game hands FSR UV vectors, or 1 when they are already pixels. Published by ffx_hook.cpp,
+// consumed once at the arm while MVecScaleX/Y are still at their 1.0 default.
+void note_ffx_mv_scale(float sx, float sy);
+bool ffx_mv_scale(float &sx, float &sy);
 void ui_request_arm();
 bool ui_take_arm_request();
 
@@ -785,6 +841,30 @@ bool ui_take_arm_request();
 // half-written mgpu.ini launches with every key at its default and no way to
 // tell (P7.2).
 bool ui_ini_write(const char *key, int value);
+
+// [MOUSE, 2026-11-11] Desktop cursor state for the A window's WM_SETCURSOR, the
+// CTRL+ALT+F5 hotkey and the simple-panel row. Persisted as DispCursor through
+// ui_ini_write. The game's own pointer is not in the neural frame, so the system arrow
+// is the only pointer a menu can show; the hotkey exists because the arrow is in the way
+// in an FPS.
+bool disp_cursor_on();
+void disp_cursor_set(bool on);
+// [MOUSE, 2026-11-11] Put the current DispCursor on screen NOW.
+// Called from WM_SETCURSOR (the normal path), from disp_cursor_set() (a stationary
+// pointer never generates WM_SETCURSOR, so "wait for the next mouse move" is why the
+// first version of the hotkey changed the flag and nothing else) and once a second from
+// the present loop (a game that hides the cursor itself overwrites us between moves).
+bool disp_cursor_apply();
+// [R456] The expensive half: climb a display count the game pushed negative back to >= 0
+// (bounded) and set the arrow. Called ONLY on a press, on the window coming back, and once
+// a second - never from WM_SETCURSOR, which fires on every mouse move and would otherwise
+// raise the count on every event.
+void disp_cursor_raise();
+// [R456] One line of what Windows actually thinks: CURSOR_SHOWING, the current cursor
+// handle, the window under the pointer and its pid. This exists because "the flag toggles
+// in the log but the pointer does not change" has several different causes and no way to
+// tell them apart from the outside.
+void disp_cursor_probe(const char *why);
 
 // The FILE's current value for a key, cached after the first read so the panel
 // can call it while drawing. NOT the running session's value: after a write
@@ -982,6 +1062,23 @@ void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
 // run costs one mutex and two loads per frame.
 void stream_mvec_copy(void *cmd_list, unsigned long long mvec_handle);
 
+// [PORT O2, 2026-11-11] the vector-symmetric DEPTH copy. Called from the NGX
+// evaluate (the same block the vectors come from), on the game's own command
+// list, with the extent the game DECLARED. No-op unless DepthContract=1. Any
+// failed guard leaves this frame to the tap path; the seal never copies twice.
+void stream_depth_copy(void *cmd_list, unsigned long long depth_handle,
+                       unsigned declared_w, unsigned declared_h);
+
+// [FFX, 2026-11-11] The same two copies with the game's DECLARED before-state. FFX's
+// dispatch descriptor carries an FfxApiResource.state that its own backend transitions from;
+// the NGX route could assume shader-resource because NGX is only ever handed a block to read.
+// Passing the state through keeps the barrier pair and the restore honest on a route where the
+// declared state is not always SR (an FSR game hands depth/vectors at render resolution in
+// whatever state its frame graph left them).
+void stream_depth_copy_state(void *cmd_list, unsigned long long depth_handle,
+                             unsigned declared_w, unsigned declared_h, unsigned before_state);
+void stream_mvec_copy_state(void *cmd_list, unsigned long long mvec_handle, unsigned before_state);
+
 // R300d (Dom's R221, T1.5; SLTagsCapture=1|2 only). The same landing path, called at Streamline's tag
 // moment with the state the game declared in sl::Resource. The transition is recorded inside
 // stream_mvec_copy, only when the copy itself is, and the declared state is restored.
@@ -1009,4 +1106,16 @@ void stream_poll();
 // the cycling clear colour - T5's liveness proof - keeps running as it always
 // has.
 bool stream_present_gate(unsigned long timeout_ms);
+
+// ---- [PORT PRESENTER, 2026-11-11] the two nc-base host facts presenter.cpp asks for ----
+//
+// Both are DELIBERATE CUTS, defined in presenter_host.cpp, not ports:
+//
+//   fg_transition_gate     nc-base arms this around a [R646] source-identity switch.
+//                          0.5.1 has no second source in flight (the seal/contract path
+//                          owns one identity), so the honest constant is false.
+//   note_panel_transition  nc-base arms a 250 ms FG/NR settle on panel open/close.
+//                          0.5.1 has no settle window; log-only for now.
+bool fg_transition_gate();
+void note_panel_transition();
 }

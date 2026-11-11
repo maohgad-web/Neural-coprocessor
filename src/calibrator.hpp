@@ -339,5 +339,40 @@ unsigned long long latch_refused();
 bool sf_path_should_promote();
 void apply_jitter_offset(void *nr_params, float mvec_scale_x, float mvec_scale_y);
 
+// ---- [PORT B2, 2026-11-11] the inline hook's public entry points ----
+//
+// The hook in ngx_hook.cpp reads the parameter block at nvngx's own
+// CreateFeature / EvaluateFeature and needs exactly four things from this
+// file, all of them thin wrappers over machinery that already exists here
+// (latch_scene_handle, capture, the eval-copy block). Nothing about how a
+// contract is USED changes: the hook fills the same table the calibrator fills,
+// so every consumer in this tree keeps reading it the same way.
+void note_scene_handle_external(unsigned long long handle);   // CreateFeature said this is the scene feature
+// The create's other half: fgmap learn, the R134 census, the scene latch and the
+// create FLAGS (DepthInverted is bit 3 of that word). The inline hook calls this
+// with the block it was handed, so a title whose evaluate block carries no flags
+// still gets them.
+void after_create_external(int feature_id, void *params, void **out_handle, int result);
+void release_scene_handle_external(unsigned long long handle); // ReleaseFeature
+bool is_scene_handle_external(unsigned long long handle);      // the evaluate filter's question
+// One EvaluateFeature from the hook: capture the block, and (when
+// EvalCopy=1) take the vectors on the game's own command list, once per frame.
+void evaluate_external(void *cmd_list, const void *handle, const void *params);
+// The bridge`s own frame counter, so the hook can take a scene evaluate once per frame.
+unsigned long long frame_now_external();
+
+// [FFX, 2026-11-11] Publish a contract read somewhere that is NOT NGX (today: the FFX
+// upscale dispatch in ffx_hook.cpp). Same table, same seqlock, same consumers - the point
+// of this file is that nobody downstream needs to know which API produced the block. The
+// caller fills what it actually has and sets the matching KEY_* bits; `frame`/`evals` are
+// stamped here so a reader can tell how fresh it is.
+void publish_external(table t);
+// [FFX, 2026-11-11] How many times a NON-NGX provider published a contract since process start.
+// dllmain's HistoryGate (R323) asks "did the game's own DLSS evaluate this frame"; a title whose
+// upscaler is FSR never evaluates DLSS, so that answer is 0 forever and the gate resets NR
+// history on every pass - the flicker measured on 18:02. A publish from the FFX hook IS a
+// contract hand-off for this frame, and this counter lets the gate see it without touching the
+// NGX evaluate count (which R87's alignment instrument reads).
+unsigned long long contract_frame_counter();
 } // namespace calibrator
 } // namespace mgpu

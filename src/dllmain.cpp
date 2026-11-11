@@ -36,6 +36,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <dwmapi.h>   // [PORT 2/3b] DwmGetCompositionTimingInfo: the output refresh, independent of our presents
 #include <dxgi.h>   // R241d: IDXGISwapChain::GetFullscreenState
 #include <cstdio>     // P1.6: snprintf. This file had no formatted logging before.
 #include <cstring>    // R137: strstr, to spot the depth tap by its effect name.
@@ -108,6 +109,9 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "presenter.hpp"      // [PORT PRESENTER H2] the display layer (nc-base, byte-identical)
+#include "ngx_hook.hpp"   // [PORT B2] the NGX contract at nvngx's own entry
+#include "ffx_hook.hpp"   // [FFX] the FSR contract at ffxDispatch (same table, other API)
 #include "nr16.hpp"       // R219-2: the panel reads the 16-bit keys with nr16's reader
 #include "residual.hpp"   // R319a: one relaxed load, to word the x2 line
 #include "chain_colour_space.hpp"   // R353: ChainColorSpace=auto follows the game chain's colour space
@@ -120,6 +124,7 @@
 #include "own_reflex.hpp"     // D2.0: our Reflex for case-B titles, off unless OwnReflex=1
 #include "log_queue.hpp"      // D2.0: the log queue (its worker starts only with a D2.0 line)
 #include "fg_map.hpp"         // D2.0 NR step one: read-only frame-gen vector map, off unless NRFrameFilter=1
+#include "fg_gpu1.hpp"        // [PORT FG-PANEL] hot on/off from the FULL panel too (ui_set_enabled)
 #include "dx11_probe.hpp"     // DX11 transport-hop probe, off unless Dx11Probe=1 (DX11_CONTRACT_LEDGER.md)
 #include "dx11_producer.hpp"  // R227: the DX11 producer, off unless DX11=1 (DX11_CONTRACT_LEDGER.md section 7)
 #include "mvec_census.hpp"
@@ -395,8 +400,31 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     if (swapchain != nullptr && !mgpu::strace::is_bridge_thread() && !mgpu::chain::own_call())   // R353: the game's chain, not ours (R369: nor our own live SetColorSpace1 on the pacing thread)
     {
         g_r353_game_chain.store(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())), std::memory_order_relaxed);
-        r353_note_colour_space(swapchain);
-    }
+        // [PORT DISPLAY-LAYER 2/3b, 2026-11-11] THE OUTPUT REFRESH, PUSHED ONCE.
+        //
+        // The absolute pacer must not measure its own cadence: with the pacer
+        // presenting, present-to-present is what the pacer CHOSE, so feeding it
+        // back makes any initial error permanent (measured: it locked at 41
+        // real frames/s against a 50 fps source, and the source followed it
+        // down). DWM's composition clock is an independent fact: qpcRefreshPeriod
+        // is the QPC ticks of one refresh.
+        {
+            DWM_TIMING_INFO dti{};
+            dti.cbSize = sizeof dti;
+            LARGE_INTEGER fq{};
+            QueryPerformanceFrequency(&fq);
+            if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &dti)) &&
+                dti.qpcRefreshPeriod != 0ull && fq.QuadPart > 0)
+            {
+                const double hz = (double)fq.QuadPart / (double)dti.qpcRefreshPeriod;
+                mgpu::gpu1::set_display_refresh(hz);
+                char lbf[220];
+                snprintf(lbf, sizeof lbf,
+                         "[MGPU][R343] OUTPUT REFRESH %.2f Hz from DWM's composition clock (qpcRefreshPeriod) - the absolute pacer uses this, not its own presents.",
+                         hz);
+                mgpu::diag::info(lbf);
+            }
+        }    }
     // DX11 probe: a D3D11 game swap chain only (the bridge's own chain is
     // D3D12). Reads Dx11Probe once; off = one ini read, then one load.
     if (swapchain != nullptr)
@@ -650,7 +678,19 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             // how you deadlock a game at startup.
             //
             // Calib=0 returns immediately and touches nothing.
-            mgpu::calibrator::install(mgpu::probe::calib_mode());
+            // [PORT B2, 2026-11-11] NgxHook=1 replaces the contract ROUTE: the
+            // inline hook reads the game's NGX block at nvngx's own entry, and
+            // the calibrator's pointer-swap installation is kept OFF so the two
+            // routes can never write the same table in the same frame.
+            const int ngx_hook_on = mgpu::gpu1::ui_ini_read("NgxHook", 0);
+            mgpu::calibrator::install(ngx_hook_on != 0 ? 0 : mgpu::probe::calib_mode());
+            if (ngx_hook_on != 0)
+                mgpu::diag::info("[MGPU][R803] CONTRACT SOURCE = INLINE HOOK ONLY (NgxHook=1). The "
+                                 "calibrator's installation is off: one route, one writer. Depth and vectors "
+                                 "come from the same captured block.");
+            else if (mgpu::probe::calib_mode() == 0)
+                mgpu::diag::info("[MGPU][R803] CONTRACT SOURCE = NONE (NgxHook=0, Calib=0): no contract "
+                                 "latching; the velocity tap is the only vector route.");
             mgpu::calibrator::set_jitter_mode(mgpu::probe::jitter_mode());
 
             // R106. The SAME transport hook the probe uses - one copy path,
@@ -660,6 +700,21 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             mgpu::calibrator::set_mvec_hook_d3d11(&mgpu_mvec_transport_hook_d3d11);   // R232
             mgpu::calibrator::set_eval_copy(mgpu::probe::eval_copy_mode());
             mgpu::calibrator::set_sf_path(mgpu::probe::sf_path_mode());   // R180
+            // [PORT B2] install the inline hook once _nvngx.dll is resident; install()
+            // is idempotent and cheap, and the present path retries it until it lands.
+            (void)mgpu::ngxhook::install(ngx_hook_on);
+
+            // [FFX, 2026-11-11] The other contract route, for a title whose upscaler is FSR.
+            // Default 0: a DLSS title never loads the module and the hook would be dead code
+            // there anyway, but the verified path stays the default. FfxHook=1 costs one
+            // GetModuleHandle per present until the module appears, then nothing.
+            const int ffx_hook_on = mgpu::gpu1::ui_ini_read("FfxHook", 0);
+            if (ffx_hook_on != 0)
+                mgpu::diag::info("[MGPU][R820] CONTRACT SOURCE += FFX (FfxHook=1): ffxDispatch in the "
+                                 "FidelityFX API module is hooked; its upscale descriptor fills the SAME "
+                                 "table the NGX hook fills. Whichever API the title actually calls becomes "
+                                 "the writer for that frame.");
+            (void)mgpu::ffxhook::install(ffx_hook_on);
         }
     }
     if (mgpu::strace::on())   // R313
@@ -1245,6 +1300,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // 1.00 is ReShade's own size.
     {
         static float panel_scale = -1.0f;
+        // [PORT B0-a, 2026-11-11] PanelScale used to be applied only when NRScale
+        // was set (st.nrs_on), so on a title that runs NRS=1 without an NRScale
+        // line the key was read and then silently ignored. The key's own default
+        // (0.85) must not change anyone's panel when the line is ABSENT, so the
+        // test is "the key was present", not "a value was computed".
+        static bool panel_scale_key = false;
         if (panel_scale < 0.0f)
         {
             float v = 0.85f;
@@ -1270,13 +1331,17 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                         buf[got] = 0;
                         fclose(f);
                         const char *k = strstr(buf, "PanelScale=");
-                        if (k != nullptr) { const float pv = (float)atof(k + 11); if (pv > 0.5f && pv <= 1.5f) v = pv; }
+                        if (k != nullptr)
+                        {
+                            const float pv = (float)atof(k + 11);
+                            if (pv > 0.5f && pv <= 1.5f) { v = pv; panel_scale_key = true; }
+                        }
                     }
                 }
             }
             panel_scale = v;
         }
-        if (st.nrs_on) ImGui::GetIO().FontGlobalScale = panel_scale;   // R299: ReShade's font scale is untouched unless NRScale is set
+        if (st.nrs_on || panel_scale_key) ImGui::GetIO().FontGlobalScale = panel_scale;   // R299 + [PORT B0-a]: the key alone is enough
     }
     {
     // ---- Model tuning, first and always visible ----
@@ -1547,6 +1612,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         if (ImGui::Checkbox("frame generation on the neural card", &fg))
         {
             if (mgpu::gpu1::ui_ini_write("FrameGen", fg ? 4 : 0)) pm_fg_want = fg;
+            // [PORT FG-PANEL] HOT on/off: off stops generation on the next frame, on resumes
+            // with a fresh pair. Only a backend/multiplier change needs a restart.
+            mgpu::fg::ui_set_enabled(fg);
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(experimental; off by default)");
@@ -3305,6 +3373,18 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool open,
                                     reshade::api::input_source source)
 {
+    // [H7/D, 2026-11-11] Every runtime's open/close is recorded BEFORE any early return, so
+    // worker.cpp's foreground follow can refuse to hide this window under an open overlay.
+    // R156 is the precedent: hiding it while an overlay was open made the GAME's own ReShade
+    // overlay "sizzle" (measured 2026-09-17), and this note is what stops the follow from
+    // walking into the same trap.
+    mgpu::gpu1::note_overlay_open(open);
+    // [H7/H, 2026-11-11] Keep the BRIDGE runtime's state separately: it is the only overlay that
+    // is visible in follow mode, and the global above is also written by the game runtime's open
+    // that this function REFUSES - so the toggle must not read the global.
+    if (mgpu::gpu1::dcomp_explicit_off_single_display() &&
+        g_rt_bridge.load(std::memory_order_relaxed) == runtime)
+        mgpu::gpu1::note_bridge_overlay_open(open);
     if (mgpu::gpu1::dcomp_overlay_mode())
     {
         // PanelOverPicture (N01950, live_panel.cpp). Off: straight through to
@@ -3347,6 +3427,28 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
                                      mgpu::gpu1::dcomp_visual_rooted() ? "rooted" : "not rooted");
                             mgpu::diag::info(l);
                         }
+                    }
+                    // [PORT H6b, 2026-11-11] THE DISPLAY LAYER STEPS ASIDE HERE.
+                    //
+                    // The shipped answer above (unroot the visual) is right only while the
+                    // picture IS a composition visual. With the display layer up it is our
+                    // own topmost fullscreen window instead, and nothing behind it can be
+                    // revealed by unrooting. Measured 11:37:52: HOME opened the game's
+                    // overlay on its own runtime and the operator saw the neural picture
+                    // unchanged - the panel was drawn UNDER our window.
+                    //
+                    // The layer's own panel path is what the reference tree ships: park
+                    // (hide the window, drop the queue), and un-park on close.
+                    if (mgpu::gpu1::presenter_owns_output())
+                    {
+                        mgpu::presenter::disp_set_panel(open);
+                        char l2[260];
+                        snprintf(l2, sizeof l2, "[MGPU][R294] overlay %s: the display layer %s so the game's "
+                                 "overlay is the one on screen (%s)", open ? "opened" : "closed",
+                                 open ? "parks (window hidden, queue dropped)" : "takes the screen back",
+                                 runtime == g_rt_game.load(std::memory_order_relaxed) ? "game runtime" : "gpu1 runtime");
+                        mgpu::diag::info(l2);
+                        return false;
                     }
                     if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_GT_OVERLAY, "overlay-toggle", open ? "open (visual unroots)" : "close (visual roots)");   // R313
                     mgpu::gpu1::dcomp_set_visible(!open);
@@ -3398,6 +3500,65 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
     // does nothing, which is today's behaviour rather than half of the new one.
     if (g == nullptr || b == nullptr) return false;
 
+    // [H7/E, 2026-11-11] THE GAME'S OVERLAY IS THE ONE THAT STEALS THE MOUSE.
+    //
+    // Measured in the 16:50 run: with both runtimes' overlays open (R158 mirrors them), the
+    // GAME's overlay captured the mouse (wantCapture=1) and the bridge window - the one actually
+    // on screen under the follow - stopped receiving mouse messages entirely ([R457] froze at
+    // 167 msgs / 2 clicks for the whole session). The panel was clickable only while another
+    // window held the foreground, because that is when the game releases capture.
+    //
+    // With DispFollow=1 the bridge window is the screen whenever the game is foreground, so the
+    // game's overlay can never be seen - its only observable effect is that capture. Block it and
+    // let the bridge runtime own the panel, exactly as the DcompOverlay=1 branch already does.
+    // DispFollow absent/0 (the shipped arm) keeps R158's mirror untouched.
+    if (mgpu::gpu1::ui_ini_read("DispFollow", 0) != 0)
+    {
+        if (r == g)
+        {
+            // [H7/G, 2026-11-11] TOGGLE, NOT MIRROR. Because this runtime's open is REFUSED,
+            // ReShade never flips ITS overlay state - so the next Home press on this runtime is
+            // another "open", and mirroring it verbatim sends "open" again: the panel could be
+            // opened from the keyboard and never closed (measured 17:0x: Home did not close it,
+            // only switching windows did, because that path uses the close request). Ask the
+            // bridge for the NEGATION of what is actually on screen.
+            const bool bridge_open = mgpu::gpu1::bridge_overlay_open();
+            const bool want = open && !bridge_open;
+            g_ov_source.store((int)source, std::memory_order_relaxed);
+            g_ov_pend_bridge.store(want ? 1 : 0, std::memory_order_relaxed);
+            // [H7/I, 2026-11-11] RELEASE THE GAME'S MOUSE CAPTURE WHEN THE PANEL OPENS.
+            // Measured 18:17: the panel opened at 18:17:02, ReShade's feed reported
+            // wantCapture=1 at 18:17:05, and the bridge window's click counter stayed at 2 -
+            // the game's UE5 window holds SetCapture (mouse-look), so every mouse message goes
+            // there and the overlay on the bridge window gets nothing until something makes
+            // the game release it (the operator's workaround: switch windows for ten seconds
+            // and come back). WM_CANCELMODE makes DefWindowProc release capture and cancel the
+            // window's mode; ClipCursor(NULL) drops any clip the game installed. Both are what
+            // a menu-open is supposed to do to a game, and neither touches the stream.
+            if (want)
+            {
+                HWND game = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+                if (game != nullptr && IsWindow(game))
+                    PostMessageW(game, WM_CANCELMODE, 0, 0);
+                ClipCursor(nullptr);
+                static std::atomic<int> said_release{0};
+                if (said_release.fetch_add(1, std::memory_order_relaxed) < 3)
+                    mgpu::diag::info("[MGPU][R294] panel open: WM_CANCELMODE + ClipCursor(NULL) sent to "
+                                     "the game window to release its mouse capture/clip, so the overlay "
+                                     "on the bridge window gets input now instead of after a focus round-trip.");
+            }
+            static std::atomic<bool> said_follow{false};
+            if (open && !said_follow.exchange(true))
+                mgpu::diag::info("[MGPU][R294] panel key owned by the bridge runtime: the game's open is "
+                                 "refused (DispFollow=1 means the bridge window IS the screen) and the bridge is "
+                                 "asked for the OPPOSITE of its current state. Mirroring 'open' verbatim was the "
+                                 "R158 toggle trap: the game runtime never flips, so Home could open the panel "
+                                 "and never close it.");
+            return true;   // block: the game's runtime must never own the overlay in follow mode
+        }
+        if (r == b) return false;   // the visible one: ReShade handles it normally
+    }
+
     g_ov_source.store((int)source, std::memory_order_relaxed);
     if      (r == g) g_ov_pend_bridge.store(open ? 1 : 0, std::memory_order_relaxed);
     else if (r == b) g_ov_pend_game.store(open ? 1 : 0, std::memory_order_relaxed);
@@ -3424,6 +3585,17 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
 // (one load each) unless StallWatch / OwnReflex are set.
 static void on_finish_present(reshade::api::command_queue *, reshade::api::swapchain *swapchain)
 {
+    // [PORT B2] the hook needs _nvngx.dll resident, and the game loads it when
+    // its own DLSS initialises - which can be after our one-shot. install() is
+    // idempotent, returns immediately once live, and logs at most three times
+    // while the module is absent, so this costs a GetModuleHandle per frame.
+    if (mgpu::ngxhook::wanted() && !mgpu::ngxhook::installed())
+        (void)mgpu::ngxhook::install(1);
+    // [FFX] The FSR module loads when the title initialises its upscaler, which can be long
+    // after this callback starts firing. Idempotent; logs at most three times while absent.
+    if (mgpu::ffxhook::wanted() && !mgpu::ffxhook::installed())
+        (void)mgpu::ffxhook::install(1);
+
     mgpu::stallwatch::scope sw(mgpu::stallwatch::S_FINISH_CB);
     if (swapchain != nullptr)
         mgpu::own_reflex::on_finish_present(
@@ -3547,6 +3719,11 @@ static void on_present(reshade::api::command_queue *queue,
                 auto *rt = (reshade::api::effect_runtime *)target;
                 if (rt != nullptr)
                 {
+                    // [H7/E, 2026-11-11] The foreground follow asks for the panel to close when the
+                    // game loses the foreground; here is where each runtime applies it, on its OWN
+                    // thread. R158's rule: never call open_overlay across threads.
+                    if (mgpu::gpu1::overlay_close_requested())
+                        pend.store(0, std::memory_order_relaxed);
                     const int want = pend.exchange(-1, std::memory_order_relaxed);
                     if (want >= 0)
                     {
@@ -3687,6 +3864,30 @@ static void on_present(reshade::api::command_queue *queue,
              "RESOLVE IT: github.com/maohgad-web/Neural-coprocessor/issues - attach this file.",
              n);
     mgpu::diag::error(l138);
+}
+
+// [PORT B2.1, 2026-11-11] READ-ONLY descriptor probe for the depth-source
+// comparison. Reads geometry/format from a handle whose lifetime is owned by
+// someone else (ReShade's tap output, or the game's D3D12 depth), so it is
+// SEH-wrapped: a handle that has just been released must cost one missing
+// field in one log line, never a crash. It changes nothing.
+static bool b21_desc(unsigned long long hv, unsigned &w, unsigned &h, unsigned &fmt)
+{
+    w = h = fmt = 0u;
+    if (hv == 0ull) return false;
+    __try
+    {
+        ID3D12Resource *r = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)hv);
+        const D3D12_RESOURCE_DESC dd = r->GetDesc();
+        w = (unsigned)dd.Width;
+        h = (unsigned)dd.Height;
+        fmt = (unsigned)dd.Format;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
 }
 
 static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
@@ -4167,6 +4368,65 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                      (tbl != 0ull && tbl == depth_h) ? "yes"
                          : (tbl == 0ull ? "no table" : "NO"));
             mgpu::diag::info(d139);
+            // [PORT B2.1, 2026-11-11] the two numbers [R139] cannot show: EXTENT and FORMAT.
+            // Same cadence as the full line (the first R139_FULL_LINES changes), read-only:
+            // both descs are read and printed, nothing is transitioned, copied or bound.
+            // This is the evidence that decides whether a contract-depth delivery (B2.2) can
+            // reuse the depth slot the arm already sized, or has to change what the arm sizes from.
+            {
+                unsigned aw = 0, ah = 0, af = 0, bw = 0, bh = 0, bf = 0;
+                const bool aok = b21_desc(depth_h, aw, ah, af);
+                const bool bok = b21_desc(tbl, bw, bh, bf);
+                char l805[520];
+                snprintf(l805, sizeof l805,
+                         "[MGPU][R805] DEPTH COMPARE: tap 0x%llx %ux%u fmt=%u (ok=%d) | contract 0x%llx %ux%u fmt=%u (ok=%d) "
+                         "| same_extent=%s same_fmt=%s | contract depth_inverted=%u | transport=%d | READ-ONLY, changes nothing",
+                         depth_h, aw, ah, af, aok ? 1 : 0,
+                         tbl, bw, bh, bf, bok ? 1 : 0,
+                         (aok && bok) ? ((aw == bw && ah == bh) ? "YES" : "NO") : "?",
+                         (aok && bok) ? ((af == bf) ? "YES" : "NO") : "?",
+                         ct.depth_inverted, mgpu::gpu1::depth_transport());
+                mgpu::diag::info(l805);
+            // [PORT O1+O4, 2026-11-11] WOULD A CONTRACT-DEPTH COPY FIT, AND IS THE TAP
+            // ALREADY READING THE SAME RESOURCE? Read-only on both counts.
+            //   O1: the copy box must use the extent the game DECLARED (PBZ: 1256
+            //       allocated, 1253 declared) and be format-compatible by bytes per
+            //       texel (D32 and R32 are both 4).
+            //   O4: tap_INPUT is the resource ReShade binds to the tap DEPTH semantic.
+            //       Equal to the contract depth means the tap already samples the
+            //       game own depth; different means a contract route changes CONTENT.
+            if (tbl != 0ull)
+            {
+                unsigned tw = 0, th = 0, tf = 0, cw = 0, ch = 0, cf = 0;
+                const bool tapok = b21_desc(depth_h, tw, th, tf);
+                const bool cok = b21_desc(tbl, cw, ch, cf);
+                const unsigned decw = (ct.depth_x != 0u) ? ct.depth_x : ct.render_w;
+                const unsigned dech = (ct.depth_y != 0u) ? ct.depth_y : ct.render_h;
+                auto bpt1 = [](unsigned f) -> unsigned
+                {
+                    switch (f) { case 19u: case 20u: case 39u: case 40u: case 41u: return 4u;
+                                 case 54u: case 55u: case 56u: return 2u; default: return 0u; }
+                };
+                const unsigned bsrc = bpt1(cf), blane = bpt1(tf);
+                const bool fit = tapok && cok && decw >= 64u && dech >= 64u && decw <= tw && dech <= th;
+                const bool bpt_ok = (bsrc != 0u && bsrc == blane);
+                const unsigned long long tap_in = mgpu::probe::depth_input_source();
+                const bool same_in = (tap_in != 0ull && tap_in == tbl);
+                char l807[560];
+                snprintf(l807, sizeof l807,
+                         "[MGPU][R807] DEPTH ROUTE CHECK: contract 0x%llx alloc=%ux%u declared=%ux%u fmt=%u bpt=%u | "
+                         "lane(tap out) 0x%llx %ux%u fmt=%u bpt=%u | fits=%d bpt_ok=%d would_copy=%d | "
+                         "tap_INPUT=0x%llx SAME_AS_CONTRACT=%s | verdict=%s",
+                         tbl, cw, ch, decw, dech, cf, bsrc,
+                         depth_h, tw, th, tf, blane,
+                         fit ? 1 : 0, bpt_ok ? 1 : 0, (fit && bpt_ok) ? 1 : 0,
+                         tap_in, same_in ? "YES" : (tap_in == 0ull ? "?" : "NO"),
+                         same_in ? "tap already samples the game depth; a contract route buys the resample only"
+                                 : (tap_in == 0ull ? "tap input unknown (no depth bound this frame)"
+                                                   : "tap samples a DIFFERENT resource; a contract route changes content"));
+                mgpu::diag::info(l807);
+            }
+            }
         }
     }
 
@@ -4261,7 +4521,21 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
         const unsigned long long r315_evals_now = have_t ? r315_t.evals : r315_evals_seen;
         r315_evaluated = (r315_evals_now != r315_evals_seen);
         r315_evals_seen = r315_evals_now;
-        if (gate_on) mgpu::gpu1::note_game_dlss(!have_t ? -1 : (r315_evaluated ? 1 : 0));   // R323
+        if (gate_on)
+        {
+            // [FFX, 2026-11-11] THE GATE IS PROVIDER-BLIND. Its question is "did the game's own
+            // DLSS evaluate this frame", and an FSR title never calls DLSS, so the answer was 0
+            // forever and NR history was reset on every pass of every frame (measured 18:02:
+            // [R323] reset stretch from f=1, and the operator's flicker). A contract publish
+            // from the FFX hook IS this frame's hand-off. The counter is separate from the
+            // NGX evaluate count on purpose: r315_evaluated also drives the MVecBarrierSource=2
+            // tail copy, and letting an FFX frame start that copy would add a second writer.
+            static unsigned long long cf_seen = 0ull;
+            const unsigned long long cf_now = mgpu::calibrator::contract_frame_counter();
+            const bool contract_frame = (cf_now != cf_seen);
+            cf_seen = cf_now;
+            mgpu::gpu1::note_game_dlss(!have_t ? -1 : ((r315_evaluated || contract_frame) ? 1 : 0));   // R323
+        }
     }
     if (r315_two)
     {
@@ -4294,6 +4568,12 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
 // it when frame generation is switched). Off (one load) unless Discovery=1.
 static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    // [PORT PRESENTER H2, 2026-11-11] a chain going away (not a resize) is the
+    // "suspected exit" notification, NOT a death sentence: the layer is told to stop
+    // blocking in Present for 2 s and to check the game's TOP-LEVEL window before it
+    // leaves. A mid-session rebuild (level load, resolution change) keeps the window,
+    // so the layer stays. This is the H4 narrowing from 2026-11-02.
+    if (!resize) mgpu::presenter::disp_note_teardown();
     // DX11 probe: everything it made lives on this chain's device. One load when off.
     // R228: only when THIS chain is the one it was built on - the bridge's own
     // present chain is resized at arm, and that resize destroyed the probe from the
@@ -4329,6 +4609,9 @@ static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize
 static void on_destroy_device(reshade::api::device *device)
 {
     mgpu::adapter::log_device_luid("destroy_device", device);
+    // [PORT PRESENTER H2] same "suspected exit" signal as a chain destroy; the layer
+    // decides from the game's top-level window whether it is really over.
+    mgpu::presenter::disp_note_teardown();
     // R227: the D3D11 game device going away is the DX11 producer's teardown
     // point, mirroring the D3D12 game-device teardown below: the stream
     // first (its drain uses our queue and fences), then the producer.
@@ -4552,6 +4835,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 #if defined(MGPU_HAVE_IMGUI)
         reshade::unregister_overlay("MGPU Bridge", draw_mgpu_overlay);
 #endif
+        // [PORT PRESENTER H2, 2026-11-11] the display layer owns a window, a flip chain
+        // and a thread. Signal only, never join here: joining under the loader lock is
+        // the deadlock the worker comment above describes (the thread's exit needs
+        // DLL_THREAD_DETACH, which needs this lock). The zombie kill is the unload-path
+        // deadline the 2026-11-02 forensics measured: it only fires when ZombieKillMs>0
+        // (PBZ only), the game's top-level window is gone and no frame arrived for a
+        // second. Every other title has ZombieKillMs=0 and this is a no-op.
+        mgpu::presenter::disp_begin_dying();
+        if (mgpu::presenter::disp_zombie_kill_now())
+        {
+            TerminateProcess(GetCurrentProcess(), 0);
+            return TRUE;   // not reached
+        }
         // P9.1 before worker::stop: unregistering our events while the game
         // thread may still raise them is the one ordering that matters here,
         // and DllMain is single-threaded with respect to ReShade's dispatch.

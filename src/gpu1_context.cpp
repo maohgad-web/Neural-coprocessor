@@ -24,6 +24,8 @@
                       // MakeWindowAssociation) and DXGI_SWAP_CHAIN_DESC1.
                       // Cumulative include: also brings in dxgi1_2/
                       // dxgi1_3/dxgi.h.
+#include <dxgi1_6.h>   // [TEAR, 2026-11-11] IDXGIFactory5::CheckFeatureSupport and
+                       // DXGI_FEATURE_PRESENT_ALLOW_TEARING / DXGI_PRESENT_ALLOW_TEARING.
 #include <cstdio>
 #include <cstdlib>   // atoll, malloc/free - used throughout; made explicit for P5.0
 #include <cstring>
@@ -44,11 +46,14 @@
 #include "Downsample_Shader.h"
 #include "Resolve_Shader.h"
 #include "gpu1_context.hpp"
+#include "presenter.hpp"            // [PORT PRESENTER H2] the display layer (nc-base, byte-identical)
+#include "xess_fg.hpp"              // [PORT H2] the XeSS-FG provider: handover + (later) tags
 #include "chain_colour_space.hpp"   // R345 (Knowmind, H1): ChainColorSpace, absent = no call
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
+#include "mvec_zero_probe.hpp"   // [PORT B1] read-only content statistics for the delivered field
 #include "t119_keys.hpp"         // R300 (T1.19): Dom's keys, every one absent = off
 #include "startup_trace.hpp" // R313: trace points + DcompSafeMode
 #include "temporal_diag.hpp"     // R300a1 (Dom, T1.9)
@@ -60,7 +65,10 @@
 #include "residual.hpp"   // R316: the residual pass module (own keys, ResidualPass=1|2). Off unless set
 #include "gpu0_stage.hpp" // R333: StageCopy, GPU 0 async staging (Dave's OPT5 design). Off unless StageCopy=1
 #include "fg_gpu1.hpp"    // R341: DLSS Frame Generation on the neural card (Dave's DLSSG1 design). Off unless FrameGen=4
+#include "fg_camera.hpp"  // [PORT H4'] mgpu::fgcamera: the projection XeFG's frame constants carry
+#include "fg_mode.hpp"    // [PORT H3'/H5] mgpu::fgmode: who owns the output, and the multiplier
 #include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
+#include "xess_fg.hpp"   // [PORT XeFG-GATE, 2026-11-11] XeSS-FG's first gate: context + properties on the neural card
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -89,10 +97,64 @@
 // GetModuleHandle(nullptr) would return the game's module, not ours.
 namespace mgpu { HMODULE module_handle(); }
 
+// ---- [PORT H3', 2026-11-11] THE XeSS-FG SLICE'S ADDRESSES, AT GLOBAL SCOPE ----
+//
+// xefg_display.inc defines these nine functions at global scope (it is compiled into
+// xefg_host.cpp, exactly as the reference tree compiles it into gpu1_context.cpp).
+// The declarations live here, OUTSIDE namespace mgpu::gpu1, because a declaration
+// inside it would name mgpu::gpu1::mgpu_xefg_* and never link against the slice.
+//
+// What they are, in the slice's own terms:
+//   handover_wanted / display_handover  - who creates the display window's chain
+//   gen_active / gen_tag / set_present_id / gen_after_present - the per-present hooks
+//   pace_*                              - XeLL's markers (XeFGPace, off by default)
+//   apply_mode                          - the panel's backend/multiplier, applied live
+extern bool mgpu_xefg_handover_wanted();
+extern bool mgpu_xefg_display_handover(ID3D12Device *dev, ID3D12CommandQueue *q, HWND hwnd,
+                                       const DXGI_SWAP_CHAIN_DESC1 *scd, IDXGIFactory2 *fac,
+                                       IDXGISwapChain1 **out_sc, IDXGISwapChain3 **out_sc3,
+                                       const char *where);
+extern bool mgpu_xefg_gen_active();
+// [H7/A-tag, 2026-11-11] THE XeSS SLICE CALLS, DECLARED WITH THE REFERENCE LAYER TYPES.
+// display_ref.cpp defines these with the GLOBAL ::disp_fg_params from display_layer.inc, so a
+// declaration using mgpu::presenter::disp_fg_params would mangle differently and never link.
+struct disp_fg_params;
+extern int  mgpu_xefg_gen_tag(ID3D12CommandList *cl, unsigned present_id,
+                              const disp_fg_params *fc, ID3D12Resource *depth, ID3D12Resource *mvec);
+// [COPY OptiScaler, 2026-11-11] the author-chain variant: the two textures carry their
+// real resting states, and the real frame's backbuffer region is tagged too.
+extern int  mgpu_xefg_gen_tag_ex(ID3D12CommandList *cl, unsigned present_id,
+                                 const disp_fg_params *fc,
+                                 ID3D12Resource *depth, unsigned depth_state,
+                                 ID3D12Resource *mvec, unsigned mvec_state,
+                                 unsigned bb_w, unsigned bb_h);
+extern void mgpu_xefg_gen_set_present_id(unsigned present_id);
+extern int  mgpu_xefg_gen_tag(ID3D12CommandList *cl, unsigned present_id,
+                              const mgpu::presenter::disp_fg_params *fc,
+                              ID3D12Resource *depth, ID3D12Resource *mvec);
+extern void mgpu_xefg_gen_set_present_id(unsigned present_id);
+extern void mgpu_xefg_gen_after_present(unsigned *frames_presented, int *gen_result,
+                                        unsigned *gen_enabled);
+extern void mgpu_xefg_pace_present_begin(unsigned frame_id);
+extern void mgpu_xefg_pace_present_end(unsigned frame_id);
+extern void mgpu_xefg_pace_sim_begin(unsigned frame_id);
+extern void mgpu_xefg_pace_sim_end(unsigned frame_id);
+extern void mgpu_xefg_pace_submit_begin(unsigned frame_id);
+extern void mgpu_xefg_pace_submit_end(unsigned frame_id);
+extern void mgpu_xefg_pace_report();
+extern void mgpu_xefg_apply_mode();
+
 namespace mgpu::gpu1
 {
 namespace
 {
+    // [PORT PRESENTER H2, 2026-11-11] The display layer's state, declared here because
+    // BOTH sides need the same object: `dcomp_set_rooted`'s callers (a new neural frame's
+    // first present must not root the composition visual while the layer owns the screen
+    // - that is two presenters again, which is the fault family this whole port exists to
+    // avoid) and present_frame's branch. 0 = not tried, 1 = alive, -1 = refused/died.
+    static std::atomic<int> g_disp_state{0};
+
     struct state
     {
         std::mutex cs;
@@ -592,6 +654,15 @@ void tap_copy_scope(bool on) { t_tap_copy_scope = on; }
 // below never engages. Written on the game's finish_effects thread, read on the same.
 static std::atomic<unsigned> g_r312_w{0}, g_r312_h{0}, g_r312_fmt{0};
 static std::atomic<bool> g_r312_set{false};
+// [PORT FG-PANEL] 0 none, 1 tap, 2 contract - the last sealed frame's depth route.
+static std::atomic<int> g_depth_route_kind{0};
+
+// [PORT DISPLAY-LAYER 2/3b] the output refresh, from the GAME's swapchain at init.
+static std::atomic<double> g_refresh_hz{0.0};
+void set_display_refresh(double hz) { if (hz > 20.0 && hz < 500.0) g_refresh_hz.store(hz, std::memory_order_relaxed); }
+double display_refresh_hz() { return g_refresh_hz.load(std::memory_order_relaxed); }
+int depth_route() { return g_depth_route_kind.load(std::memory_order_relaxed); }
+
 int depth_transport() { return ini_read_depth_transport(); }
 // R315 (MVecBarrierSource=1). dllmain hands the probe's key and fire count over each game frame
 // (this file does not include the probe's header - the acquisition layer stays independent).
@@ -722,7 +793,8 @@ static std::atomic<bool> g_dcomp_rooted{false};
 // The game's HWND, pushed from dllmain's on_init_swapchain once the swapchain
 // has been confirmed to be the GAME's by LUID. Authoritative: it is the window
 // the game's own swapchain was created against, not a window we went looking
-// for. Only called when DcompOverlay=1, so mode 0 never reaches it.
+// for. SET IN BOTH MODES (R273, before the composition latch): mode 0 needs it for
+// the H7 mouse pump and foreground follow, mode 1 for the composition target.
 // R273b. The detection's bookkeeping: whether the composition decision is
 // still pending (inputs not there yet), the window it was decided on, and
 // the bridge thread's request to settle it now.
@@ -762,6 +834,34 @@ void set_game_hwnd(void *hwnd)
 // WM_HOTKEY is thread-posted to the same thread.
 static bool dcomp_set_rooted(bool want, const char *why)
 {
+    // ---- [H2 FIX 1, 2026-11-11] ONE ROOT WRITER ----
+    //
+    // While the display layer owns the screen it has already unrooted this visual.
+    // Any later root - "first neural frame" after a device rebuild, the quiet-chain
+    // path, a hotkey, the panel - puts a SECOND window on top of the same picture.
+    // Two topmost windows have an undefined z-order, so DWM swaps them: the other
+    // chain's last frame flashes through. That is the measured "random flashback",
+    // and it is not the presenter's copy path (copy and Present share one queue, so a
+    // flip cannot overtake a copy).
+    //
+    // The refusal is logged once, so a run can prove the guard is load-bearing.
+    if (want && g_disp_state.load(std::memory_order_relaxed) == 1 &&
+        mgpu::presenter::disp_alive())
+    {
+        static int said = 0;
+        if (said == 0)
+        {
+            said = 1;
+            char l[360];
+            snprintf(l, sizeof l,
+                     "[MGPU][R448] REFUSED to root the composition visual (%s): the display layer "
+                     "owns the screen. One presenter only - this is the single-root-writer rule, "
+                     "and the flashback stops here.", why != nullptr ? why : "?");
+            mgpu::diag::info(l);
+        }
+        return false;
+    }
+
     if (g_dcomp_target == nullptr || g_dcomp_visual == nullptr || g_dcomp_device == nullptr)
         return false;
     if (want == g_dcomp_rooted)
@@ -839,7 +939,14 @@ void dcomp_root_on_first_neural_frame()
         mgpu::diag::info(l);
         return;
     }
-    (void)dcomp_set_rooted(true, "first neural frame");
+    // [PORT PRESENTER H2] ONE PRESENTER ONLY: while the display layer owns the screen,
+    // rooting the composition visual puts the T4/T5 window back over it - two presenters
+    // of the same picture. The layer unroots at init and re-roots only when it dies.
+    if (g_disp_state.load(std::memory_order_relaxed) != 1)
+        (void)dcomp_set_rooted(true, "first neural frame");
+    else
+        mgpu::diag::info("[MGPU][R448] a new neural frame's first present did NOT root the "
+                         "composition visual: the display layer owns the screen (one presenter)");
 }
 void dcomp_apply_pending()
 {
@@ -858,7 +965,8 @@ void dcomp_apply_pending()
         g_r313_root_deferred.store(0, std::memory_order_relaxed);
         bool shown = false;
         { auto &S = st(); std::lock_guard<std::mutex> lk(S.cs); shown = S.neural_shown; }
-        if (shown) (void)dcomp_set_rooted(true, "root after a quiet game chain (DcompSafeMode=3)");
+        if (shown && g_disp_state.load(std::memory_order_relaxed) != 1)
+            (void)dcomp_set_rooted(true, "root after a quiet game chain (DcompSafeMode=3)");
     }
 }
 
@@ -869,6 +977,26 @@ void dcomp_apply_pending()
 // header at the top of this file for what was tried instead.
 void dcomp_set_visible(bool on)
 {
+    // ---- [H2 FIX 1b, 2026-11-11] the other half of the single-presenter guard ----
+    //
+    // The root guard alone is not enough: several paths (overlay edge, panel close,
+    // "first neural frame", quiet-chain re-root) call this one, and it roots/shows the
+    // composition visual by another route. While the display layer owns the screen every
+    // one of them must be refused for the same reason - a second visible chain has an
+    // undefined z-order against the layer's topmost window and DWM swaps them.
+    if (on && g_disp_state.load(std::memory_order_relaxed) == 1 &&
+        mgpu::presenter::disp_alive())
+    {
+        static int said = 0;
+        if (said == 0)
+        {
+            said = 1;
+            mgpu::diag::info("[MGPU][R448] REFUSED to show the composition visual: the display layer "
+                             "owns the screen (single-presenter guard, visibility path). This is the "
+                             "second half of the flashback fix.");
+        }
+        return;
+    }
     // R313 DcompSafeMode>=1: never from a game thread. The overlay handler
     // leaves a request; the bridge thread applies it on its next loop pass
     // (dcomp_apply_pending). Key absent: this call runs here as shipped.
@@ -920,6 +1048,61 @@ bool dcomp_visual_rooted()
 void *dcomp_game_hwnd()
 {
     return (void *)g_game_hwnd;
+}
+
+
+// [TEAR, 2026-11-11] TEARING PRESENTS, OFF BY DEFAULT (`PresentTear=1` turns them on).
+//
+// `PresentVsync=0` only stops WAITING for vblank - the frame is still composed by DWM at
+// a vblank, so it never tears. Real tearing needs two more things and both are here:
+//   * every chain this file creates carries DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, and
+//   * Present is called as Present(0, DXGI_PRESENT_ALLOW_TEARING).
+// OptiScaler does the same thing by copying the GAME's swapchain flags through
+// (FG_Hooks.cpp:1305-1333) and Lossless Scaling does it in its own chain; this is the
+// transferable half of both, without a second window.
+//
+// THREE SEPARATE BITS, because they can disagree at runtime:
+//   g_present_tear  the key was asked for AND DXGI says the platform supports it
+//   g_chain_tear    the LIVE chain was actually created with the flag
+//   g_tear_live     that chain can present with the flag now (cleared on a refused Present)
+static std::atomic<unsigned> g_present_tear{0u};
+static std::atomic<unsigned> g_chain_tear{0u};
+static std::atomic<unsigned> g_tear_live{0u};
+
+// Ask once; the answer cannot change inside a process. A platform without support is a
+// warning, not a failure: the run simply stays vblank-composed.
+static bool tearing_wanted()
+{
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+    cached = 0;
+    if (ini_read_sr_int("PresentTear", 0, 0, 1) == 0) return false;
+
+    IDXGIFactory5 *f5 = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f5))) && f5 != nullptr)
+    {
+        BOOL ok = FALSE;
+        const HRESULT hr = f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &ok, sizeof(ok));
+        f5->Release();
+        if (SUCCEEDED(hr) && ok != FALSE)
+            cached = 1;
+        else
+        {
+            char w[260];
+            snprintf(w, sizeof w,
+                     "[MGPU][R608] PresentTear=1 but this platform does not support tearing presents "
+                     "(CheckFeatureSupport hr=0x%08X supported=%d) - the run stays vblank-composed",
+                     (unsigned)hr, (int)ok);
+            mgpu::diag::warn(w);
+        }
+    }
+    else
+        mgpu::diag::warn("[MGPU][R608] PresentTear=1 but IDXGIFactory5 is unavailable - the run stays vblank-composed");
+
+    if (cached != 0)
+        mgpu::diag::info("[MGPU][R608] PresentTear=1: tearing supported. Chains get "
+                         "DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING and presents use Present(0, DXGI_PRESENT_ALLOW_TEARING).");
+    return cached != 0;
 }
 
 
@@ -1165,7 +1348,11 @@ bool create_present_chain(HWND hwnd)
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-        scd.Flags = 0;
+        // [TEAR, 2026-11-11] FLIP_DISCARD is the only swap effect that accepts tearing.
+        const bool tear = tearing_wanted();
+        scd.Flags = tear ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+        g_chain_tear.store(tear ? 1u : 0u, std::memory_order_relaxed);
+        g_tear_live.store(tear ? 1u : 0u, std::memory_order_relaxed);
 
         // Gotcha 1: the first parameter is the COMMAND QUEUE, not the
         // device. It is named pDevice and typed IUnknown *, so passing
@@ -1505,6 +1692,27 @@ bool create_present_chain(HWND hwnd)
     // It tells the COMPOSITOR how to read the bridge's frame; the neural pass itself is unchanged.
     mgpu::chain::apply_colour_space(sc3);
 
+    // ---- [PORT H3', 2026-11-11] WHY THERE IS NO XeSS HANDOVER HERE ANY MORE ----
+    //
+    // A branch used to sit at this point and offer THIS chain to XeFG
+    // (mgpu::xess_fg::handover_arm -> xefgSwapChainD3D12InitFromSwapChain). It was wrong
+    // twice over and never ran, which is why deleting it costs nothing:
+    //
+    //   1. TOO EARLY. This function runs at T4, when the window is created at the fixed
+    //      1280x720; the XeSS-FG gate runs at stream arm, seconds later. The key it
+    //      tested (handover_enabled) cannot be true yet, so the arm 2026-11-11 11:11
+    //      printed no [XFG][HO] line at all - the branch was dead on arrival.
+    //   2. WRONG CALL SHAPE. It created a chain with CreateSwapChainForHwnd and then
+    //      handed the existing chain to InitFromSwapChain. The reference tree measured
+    //      four failures of exactly that shape on 2077 (E_ACCESSDENIED): DXGI allows
+    //      ONE flip chain per HWND, and XeFG has to be the one that creates it -
+    //      InitFromSwapChainDesc with pApplicationSwapChain = nullptr.
+    //
+    // The provider path that IS measured is the display layer's: it creates its window
+    // and its chain at the source extent AFTER the gate has passed, and hands the
+    // HWND + desc + factory to the slice, which lets XeFG create the only chain that
+    // HWND will ever have. See presenter_install_provider() below.
+
     // 3. RTV heap: one descriptor per backbuffer - the frame picks the
     // current backbuffer by index.
     {
@@ -1630,9 +1838,12 @@ bool create_present_chain(HWND hwnd)
              // changed scd.Format. A log line that contradicts the code is worse
              // than no log line: it is evidence pointing the wrong way.
              "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=%u "
-             "swapeffect=FLIP_DISCARD queue=DIRECT client=%ux%u CreateSwapChainForHwnd "
+             "swapeffect=FLIP_DISCARD flags=0x%X queue=DIRECT client=%ux%u CreateSwapChainForHwnd "
              "hr=0x%08X hwnd=0x%p (vsync present, non-resizable window - no ResizeBuffers at P0)",
-             bb_count, width, height, (unsigned)swapchain_hr, (void *)hwnd);
+             bb_count,
+             g_chain_tear.load(std::memory_order_relaxed) != 0u
+                 ? (unsigned)DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u,
+             width, height, (unsigned)swapchain_hr, (void *)hwnd);
     mgpu::diag::info(line);
     if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "create-present-chain-exit", "published", (unsigned)swapchain_hr);
     return true;
@@ -1735,7 +1946,47 @@ static thread_local ID3D12Resource *t_fg_src = nullptr;
 static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMON;
 static thread_local unsigned long long t_present_fv = 0ull;
 void present_override(ID3D12Resource *src, D3D12_RESOURCE_STATES rest) { t_fg_src = src; t_fg_rest = rest; }
+
+// [H2 FIX 3] set by the FG pacing thread around ONE source frame's two pushes.
+static thread_local unsigned t_fg_grp = 0u;
+static thread_local bool     t_fg_gen = false;
+void present_override_gen(unsigned grp, bool is_gen) { t_fg_grp = grp; t_fg_gen = is_gen; }
+
+// [H2 FIX 2] one timing owner: when the display layer owns the screen, the FG pacing
+// thread stops waiting for its own absolute targets and just hands the frame over. The
+// layer's pacer assigns the presentation times; two schedules would fight.
+bool presenter_owns_output()
+{
+    return g_disp_state.load(std::memory_order_relaxed) == 1 && mgpu::presenter::disp_alive();
+}
 unsigned long long present_last_fence_value() { return t_present_fv; }
+
+// [PORT H4', 2026-11-11] the frame's generator inputs, set by the bridge thread just
+// before it hands the frame over and consumed by that same thread's push. Thread-local
+// for the same reason present_override is: the DLSS-G pacing thread presents on its own
+// thread and must never inherit another frame's guides.
+static thread_local ID3D12Resource *t_fg_d = nullptr;
+static thread_local D3D12_RESOURCE_STATES t_fg_ds = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+static thread_local ID3D12Resource *t_fg_m = nullptr;
+static thread_local D3D12_RESOURCE_STATES t_fg_ms = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+static thread_local float t_fg_jx = 0.0f, t_fg_jy = 0.0f;
+static thread_local float t_fg_sx = 1.0f, t_fg_sy = 1.0f;
+static thread_local float t_fg_fms = 0.0f;
+static thread_local unsigned t_fg_rst = 0u;
+
+void present_override_fg(ID3D12Resource *depth, D3D12_RESOURCE_STATES depth_state,
+                         ID3D12Resource *mvec, D3D12_RESOURCE_STATES mvec_state,
+                         float jitter_x, float jitter_y,
+                         float mv_scale_x, float mv_scale_y,
+                         float frame_ms, unsigned reset)
+{
+    t_fg_d = depth; t_fg_ds = depth_state;
+    t_fg_m = mvec;  t_fg_ms = mvec_state;
+    t_fg_jx = jitter_x; t_fg_jy = jitter_y;
+    t_fg_sx = mv_scale_x; t_fg_sy = mv_scale_y;
+    t_fg_fms = frame_ms; t_fg_rst = reset;
+}
+
 ID3D12Fence *present_fence_addref()
 {
     auto &S = st();
@@ -1745,10 +1996,207 @@ ID3D12Fence *present_fence_addref()
     return S.fence;
 }
 
+// ---- [PORT PRESENTER H2, 2026-11-11] THE DISPLAY LAYER OWNS THE OUTPUT ----
+//
+// WHAT THIS IS. nc-base's presenter (copied byte-identical: 8-slot ring, own window,
+// own flip chain, own display thread, absolute pacer, zombie watchdog) replaces the
+// T5 chain as the thing the user looks at. The neural layer keeps producing exactly
+// what it produced before; the only thing that changes is who presents it.
+//
+// WHEN IT STARTS (M1 rule). Not at arm. This is called from stream_present_gate, on
+// the bridge thread, every iteration - the thread that already pumps the T4/T5
+// window's messages - and only once the chain has its FINAL size (equal to the
+// stream's source extent) and a real neural frame exists. A layer created in M1 was
+// exactly the 19:41 crash's shape, so M1 never creates one.
+//
+// FAIL-CLOSED, THREE STATES. 0 = not tried; 1 = alive; -1 = refused or died. Any
+// state but 1 leaves the author's T5 path byte-for-byte as it was. A layer that dies
+// AFTER taking the screen re-roots the composition visual, and the T5 path takes the
+// picture back on the very next present - the "old DComp chain" the source's comments
+// call the fallback, which 0.5.1 still has.
+//
+// WHO IS THE CLOCK. H2a keeps the author's pacing thread as the only scheduler
+// (disp_set_pace(0)): it already produces 99.8 fps with resync 6/6000 (09:29 run).
+// The ring carries frames and the display thread presents them; adding the
+// presenter's own schedule here would be two pacer owners, which is the same class of
+// fault as two present owners.
+static std::atomic<unsigned> g_disp_fmt{0u};
+static std::mutex      g_disp_mx;
+
+static bool presenter_try_push(ID3D12Resource *src, D3D12_RESOURCE_STATES rest, DXGI_FORMAT src_fmt)
+{
+    if (g_disp_state.load(std::memory_order_relaxed) != 1) return false;
+    if (src == nullptr || (unsigned)src_fmt != g_disp_fmt.load(std::memory_order_relaxed)) return false;
+    if (!mgpu::presenter::disp_alive())
+    {
+        if (g_disp_state.exchange(-1, std::memory_order_relaxed) == 1)
+        {
+            (void)dcomp_set_rooted(true, "the display layer died - the T5 chain takes the picture back");
+            mgpu::diag::warn("[MGPU][R448] the display layer died after taking the screen: the composition "
+                             "visual is rooted again and the T5 path resumes on the next present");
+        }
+        return false;
+    }
+    // [PORT H4', 2026-11-11] the frame's guide textures and scalars travel WITH the
+    // colour into the ring slot. Without this the display layer copies colour only, the
+    // per-present hook sees f.has_fg == false, XeFG is never tagged, and an enabled
+    // generator produces nothing at all - the "XeSS does nothing" state, with a perfect
+    // log to prove it was asked.
+    mgpu::presenter::disp_fg_in fgin{};
+    fgin.depth = t_fg_d;
+    fgin.depth_state = t_fg_ds;
+    fgin.mvec = t_fg_m;
+    fgin.mvec_state = t_fg_ms;
+    mgpu::presenter::disp_fg_params fgp{};
+    fgp.jitter_x = t_fg_jx;
+    fgp.jitter_y = t_fg_jy;
+    fgp.mv_scale_x = t_fg_sx;
+    fgp.mv_scale_y = t_fg_sy;
+    fgp.frame_ms = t_fg_fms;
+    fgp.reset = t_fg_rst;
+    const bool have_guides = (fgin.depth != nullptr && fgin.mvec != nullptr);
+    if (!mgpu::presenter::disp_push(src, rest, mgpu::presenter::disp_now_ms(),
+                                    -1, 0, -1, 25.0,
+                                    have_guides ? &fgin : nullptr,
+                                    have_guides ? &fgp : nullptr,
+                                    t_fg_grp, t_fg_gen))
+        return false;
+    // The pair belongs to ONE frame. Clearing it here (rather than at the next frame's
+    // set) means a frame that produced no guides can never re-tag the previous one's.
+    t_fg_d = nullptr; t_fg_m = nullptr;
+    t_fg_rst = 0u;
+
+    // The author's pacing thread retires its sets on present_last_fence_value(). The
+    // T5 path advanced that fence after its copy; the ring copy is submitted on the
+    // SAME queue, so signalling the same fence after disp_push keeps that contract
+    // unchanged for the caller.
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    if (S.fence != nullptr && S.queue != nullptr)
+    {
+        const UINT64 fv = ++S.fence_value;
+        if (SUCCEEDED(S.queue->Signal(S.fence, fv))) t_present_fv = fv;
+    }
+    return true;
+}
+
+// ---- [PORT H6, 2026-11-11] NO PROVIDER TABLE ANY MORE ----
+//
+// presenter.hpp's hook table existed so the 8-slot layer could reach the XeSS-FG slice
+// without a vendor dependency. The layer is now the REFERENCE tree's display_layer.inc,
+// which calls mgpu_xefg_* directly because it is compiled into the same translation unit
+// as the slice (display_ref.cpp). There is nothing to fill, so there is nothing here.
+// The declarations at the top of this file are gone with it: nobody calls them from this
+// T.U. any more, and leaving them declared would be a claim that something does.
+
+
+// [COPY OptiScaler / Lossless Scaling, 2026-11-11] THE TARGET-RATE GOVERNOR.
+//
+// Neither project gets its smoothness from a higher frame rate; both pace the OUTPUT to a
+// target just under the refresh. OptiScaler: FrameLimit::sleep() with
+// interval = 1e6 / target * (interpolated + 1) - a high-resolution waitable timer plus a
+// 2 ms busy wait (FrameLimit.cpp:10-54, :71-93) - and TargetFps() = refresh - refresh^2/3600
+// when no FPS limit is set (XeFG_DynamicMFG.cpp:184-198). Lossless Scaling exposes the same
+// shape as "sync mode / max frame latency": own the cadence, do not chase fps.
+//
+// What it fixes here: with PresentVsync=0 + ALLOW_TEARING the bridge free-runs at whatever
+// the neural stage produces (measured up to ~180 presented frames/s on a 165 Hz panel).
+// Frames above the refresh are torn or never scanned, and the cadence is uneven - more fps,
+// no more smoothness. This paces the SOURCE presents to target/(N+1), which is what makes
+// the PRESENTED rate equal the target.
+//
+// FgTargetFps: absent or -1 = auto (refresh - refresh^2/3600), 0 = off, >0 = explicit.
+static std::atomic<double> g_fg_target_fps{0.0};
+
+static void fg_pace_sleep_ticks(LONGLONG ticks, LONGLONG freq)
+{
+    if (ticks <= 0 || freq <= 0) return;
+    LARGE_INTEGER start{};
+    QueryPerformanceCounter(&start);
+    const LONGLONG deadline = start.QuadPart + ticks;
+    const LONGLONG busy = freq / 500;   // 2 ms, OptiScaler's busywait_threshold
+    if (ticks > busy)
+    {
+        static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                                     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                     TIMER_ALL_ACCESS);
+        if (timer != nullptr)
+        {
+            LARGE_INTEGER due{};
+            due.QuadPart = -((ticks - busy) * 10000000LL / freq);   // 100 ns units
+            if (due.QuadPart != 0 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                (void)WaitForSingleObject(timer, 1000);
+        }
+    }
+    LARGE_INTEGER now{};
+    do { QueryPerformanceCounter(&now); } while (now.QuadPart < deadline);
+}
+
+static void fg_target_pace()
+{
+    const double target = g_fg_target_fps.load(std::memory_order_relaxed);
+    if (!(target > 1.0)) return;
+    // The DLSS-G pacing thread already owns an absolute schedule; two pacers fight.
+    if (mgpu::fg::on()) return;
+    unsigned frames_per_present = 1u;
+    if (mgpu_xefg_gen_active())
+    {
+        const int ni = (int)mgpu::fgmode::get_multi();
+        frames_per_present = (unsigned)((ni >= 0 ? ni : 0) + 1);
+    }
+    LARGE_INTEGER fq{};
+    QueryPerformanceFrequency(&fq);
+    if (fq.QuadPart <= 0) return;
+    const LONGLONG interval = (LONGLONG)((double)fq.QuadPart * (double)frames_per_present / target);
+    if (interval <= 0) return;
+
+    static LONGLONG next = 0;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    // Behind schedule (or way ahead after a count/target change): re-anchor, never catch up
+    // with a burst. FpsLimiter::limit() does exactly this (ll_fps_limiter.cpp:4-26).
+    if (next == 0 || now.QuadPart >= next || (next - now.QuadPart) > interval)
+    {
+        next = now.QuadPart + interval;
+        return;
+    }
+    fg_pace_sleep_ticks(next - now.QuadPart, fq.QuadPart);
+    next += interval;
+}
+
 bool present_frame(float r, float g, float b)
 {
     auto &S = st();
     t_present_fv = 0ull;   // R341: set after the Signal below
+
+    // ---- [PORT PRESENTER H2] THE DISPLAY LAYER, BEFORE ANY BACKBUFFER WORK ----
+    //
+    // The branch sits here, and not at the Present call, on purpose: everything below
+    // touches a backbuffer (barrier to RENDER_TARGET, clear, copy, Present). Returning
+    // from the middle of that leaves the command list open and the backbuffer in
+    // RENDER_TARGET, which is an invalid transition on the next frame. Here nothing has
+    // been recorded yet, so a push is a clean early return.
+    //
+    // The source is the neural frame the author's path would have copied (the FG
+    // pacing thread's threaded override is already in place - stream_present_source
+    // reads it), not the backbuffer. That removes the T5 chain's flip lifetime from
+    // the presenter's input entirely.
+    if (g_disp_state.load(std::memory_order_relaxed) == 1)
+    {
+        UINT pw = 0, ph = 0;
+        DXGI_FORMAT pf = DXGI_FORMAT_UNKNOWN;
+        D3D12_RESOURCE_STATES pr = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ID3D12Resource *psrc = stream_present_source(pw, ph, pf, pr);
+        if (psrc != nullptr && presenter_try_push(psrc, pr, pf))
+            return true;
+        // The layer is ALIVE but refused this frame (ring full). Dropping it is the
+        // correct answer: the T5 chain's visual is unrooted, so presenting there would
+        // do the work twice and then block in a Present nobody sees. A dead layer is
+        // different - presenter_try_push re-roots the visual and we fall through, which
+        // is the fallback path.
+        if (g_disp_state.load(std::memory_order_relaxed) == 1)
+            return true;
+    }
 
     // ---- [OURS] 2026-10-12: THE DISPLAYED FRAME RATE ---------------------------
     // This function is where a frame is actually handed to the compositor, so the gap
@@ -1790,6 +2238,7 @@ bool present_frame(float r, float g, float b)
     UINT64 fence_value = 0;
     UINT64 slot_prev = 0;
     unsigned slot = 0;
+    UINT chain_w = 0, chain_h = 0;   // [COPY OptiScaler] the real frame's region for the backbuffer tag
 
     {
         std::lock_guard<std::mutex> lk(S.cs);
@@ -1809,6 +2258,8 @@ bool present_frame(float r, float g, float b)
         allocator = S.allocator[slot];
         cl = S.command_list[slot];
         slot_prev = S.slot_value[slot];
+        chain_w = S.chain_w;
+        chain_h = S.chain_h;
     }
 
     // R369: ChainColorSpace=auto follows the game when it states HDR (or SDR) after this chain was
@@ -2344,6 +2795,41 @@ bool present_frame(float r, float g, float b)
         cl->ResourceBarrier(1, &barrier);
     }
 
+
+    // ---- [H7/A-tag, 2026-11-11] XeSS-FG TAGGING ON THE AUTHOR OWN CHAIN ----
+    //
+    // The display layer did this inside its ring push; with no display layer it has to
+    // happen here, on the list that is about to Present - which is exactly where Intel
+    // requires it (the tag is a copy recorded on the presenting list, not a CPU poke).
+    // A frame with no guides (depth or vectors missing) simply presents untagged and the
+    // proxy passes it through at 1x, which is the shipped behaviour for such a frame.
+    unsigned xefg_pid = 0u;
+    if (mgpu_xefg_gen_active() && t_fg_d != nullptr && t_fg_m != nullptr)
+    {
+        static unsigned s_xefg_pid = 0u;
+        xefg_pid = ++s_xefg_pid;
+        mgpu::presenter::disp_fg_params fpp{};
+        fpp.jitter_x = t_fg_jx; fpp.jitter_y = t_fg_jy;
+        fpp.mv_scale_x = t_fg_sx; fpp.mv_scale_y = t_fg_sy;
+        fpp.frame_ms = t_fg_fms; fpp.reset = t_fg_rst;
+        // [COPY OptiScaler, 2026-11-11] The real states travel with the textures, and the
+        // real frame's region is tagged as the backbuffer. OptiScaler does exactly this in
+        // XeFG_Dx12::Dispatch: TagFrameConstants + depth/velocity with fResource->state,
+        // then the backbuffer with RV_UNTIL_NEXT_PRESENT (XeFG_Dx12.cpp:826-966).
+        const int tag_res = mgpu_xefg_gen_tag_ex(cl, xefg_pid,
+                                                 reinterpret_cast<const disp_fg_params *>(&fpp),
+                                                 t_fg_d, (unsigned)t_fg_ds,
+                                                 t_fg_m, (unsigned)t_fg_ms,
+                                                 chain_w, chain_h);
+        // [FIX X4, 2026-11-11] A tag that did not land is not a frame the generator saw:
+        // do not consume its present id. OptiScaler/ref undo the id the same way
+        // (display_layer.inc:631-634).
+        if (tag_res != 0)
+        {
+            --s_xefg_pid;
+            xefg_pid = 0u;
+        }
+    }
     hr = cl->Close();
     if (FAILED(hr))
         return fail("Close", static_cast<unsigned>(hr));
@@ -2374,11 +2860,120 @@ bool present_frame(float r, float g, float b)
     // only runs when there is a frame to show, so the producer paces it at its
     // own rate and there is nothing to spin on.
     //
-    // PresentVsync=0 asks for the immediate present. Expect tearing - that is
-    // the trade, and it is the user's to make, not ours to make silently.
-    const UINT pi_interval = (g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u;
+    // PresentVsync=0 asks for the immediate present. That alone is NOT tearing (the chain
+    // has no ALLOW_TEARING flag and DWM still composes at a vblank) - see the long note at
+    // the top of this file. Real tearing is PresentTear=1, and it forces SyncInterval 0.
+    const bool tear_live = g_tear_live.load(std::memory_order_relaxed) != 0u;
+    const UINT pi_interval = tear_live ? 0u
+                                       : ((g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u);
+    const UINT pi_flags = tear_live ? DXGI_PRESENT_ALLOW_TEARING : 0u;
     const double r313_p0 = mgpu::strace::now_ms();   // R313: 0.0 when off
-    hr = sc->Present(pi_interval, 0);
+    if (xefg_pid != 0u) mgpu_xefg_gen_set_present_id(xefg_pid);
+    // [H7/A-hot, 2026-11-11] THE MULTIPLIER IS LIVE, NOT AN ARM-TIME CONSTANT.
+    //
+    // [FIX DLSSG-HOT, 2026-11-11] THE GATE USED TO BE `xefg_pid != 0`, i.e. the re-read
+    // only ran when XeSS was the one presenting. DLSS-G presents from its own pacing
+    // thread with xefg_pid == 0, so fgmode stayed at its arm-time value and the panel's
+    // FgMulti write reached nobody: measured 15:07:45 FgMulti=2 written, and 15:07:48
+    // still "generated 4266 ... real 2399" (2:1 = 3X), no [R341] multi-frame line.
+    // The re-read is backend-independent now; only the provider call stays XeSS-only.
+    //
+    // [FIX HOT-LATENCY, 2026-11-11] AND IT WAS THROTTLED BY PRESENTS. 120 presents is
+    // 3.0 s at 40 fps and 2.2 s at 55 fps, so a panel click was applied anywhere from
+    // 0.6 s to 3.6 s later (measured in mgpu_run.24788_5: 15:39:13 click -> 15:39:14
+    // apply, 15:40:02 click -> 15:40:05 apply). The operator reads that as "the gear
+    // did not take until I switched away and back". Wall-clock now: 250 ms, independent
+    // of frame rate. One ini slurp per 250 ms is cheaper than one per 120 frames.
+    {
+        static LARGE_INTEGER s_live_at{};
+        static LARGE_INTEGER s_live_freq{};
+        if (s_live_freq.QuadPart == 0) QueryPerformanceFrequency(&s_live_freq);
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const bool due = s_live_at.QuadPart == 0 ||
+                         (s_live_freq.QuadPart > 0 &&
+                          (now.QuadPart - s_live_at.QuadPart) * 1000 >= s_live_freq.QuadPart * 250);
+        if (due)
+        {
+            s_live_at = now;
+            // [H7/A-hot2, 2026-11-11] THE PANEL WRITES THE INI, NOT fgmode.
+            // fgmode is filled ONCE at arm ([R446]); re-read the triple here and hand it
+            // to whichever backend is running.
+            const int fg_v = ui_ini_read("FrameGen", 0);
+            const int fg_m = ui_ini_read("FgMulti", 2);
+            int fg_be = mgpu::fgmode::OFF;
+            if (fg_v == 4)      fg_be = mgpu::fgmode::DLSSG;
+            else if (fg_v == 5) fg_be = mgpu::fgmode::FSR;
+            else if (fg_v == 6) fg_be = mgpu::fgmode::XEFG;
+            mgpu::fgmode::set(fg_be, (fg_m >= 2 && fg_m <= 4) ? (fg_m - 1) : 1);
+            // Provider call only for the provider that owns the chain; DLSS-G reads fgmode
+            // per frame in record(), so the set() above is the whole update for it.
+            if (fg_be == mgpu::fgmode::XEFG) mgpu_xefg_apply_mode();
+        }
+    }
+    hr = sc->Present(pi_interval, pi_flags);
+    // A chain that was not actually created with ALLOW_TEARING refuses the flag with
+    // DXGI_ERROR_INVALID_CALL. Stop using it for this chain rather than looping on it.
+    if (tear_live && hr == DXGI_ERROR_INVALID_CALL)
+    {
+        g_tear_live.store(0u, std::memory_order_relaxed);
+        mgpu::diag::warn("[MGPU][R608] Present(0, ALLOW_TEARING) was refused with DXGI_ERROR_INVALID_CALL - "
+                         "this chain does not allow tearing; falling back to a non-blocking present without the flag");
+    }
+    // ---- [H7/A-tag2, 2026-11-11] HARD EVIDENCE: WHAT XeFG PUT UP FOR THAT PRESENT ----
+    //
+    // GetLastPresentStatus answers the only question a counter cannot: did the proxy turn
+    // ONE of our Presents into TWO frames on screen. framesPresented=2 is interpolation,
+    // 1 is passthrough - and it is read from the provider, not inferred from our cadence.
+    if (xefg_pid != 0u)
+    {
+        static unsigned long long s_n = 0ull, s_b1 = 0ull, s_b2 = 0ull, s_b3 = 0ull, s_b4 = 0ull;
+        static int s_said = 0;
+        unsigned fpn = 1u; int fres = 0; unsigned fen = 0u;
+        mgpu_xefg_gen_after_present(&fpn, &fres, &fen);
+        ++s_n;
+        if (fpn >= 4u) ++s_b4; else if (fpn == 3u) ++s_b3; else if (fpn == 2u) ++s_b2; else ++s_b1;
+        // [H7/A-tag3] A PROVIDER FAULT MUST NOT HIDE INSIDE AN AVERAGE.
+        // res is XeFG result for that present; a non-zero one means this frame was not
+        // interpolated (or generation was refused). Printed the first 8 times so a single
+        // bad sample can never be read as the session verdict again.
+        {
+            static int s_bad = 0;
+            if (fres != 0 && s_bad < 8)
+            {
+                ++s_bad;
+                char lg[240];
+                snprintf(lg, sizeof lg,
+                         "[MGPU][R490][A] provider status id=%u frames=%u res=%d enabled=%u (bad sample %d of 8 max)",
+                         xefg_pid, fpn, fres, fen, s_bad);
+                mgpu::diag::warn(lg);
+            }
+        }
+        if (s_said == 0)
+        {
+            s_said = 1;
+            char lg[260];
+            snprintf(lg, sizeof lg,
+                     "[MGPU][R490][A] XeSS tag LIVE on the author chain: first present id=%u, framesPresented=%u res=%d enabled=%u. 2 means interpolation is really happening.",
+                     xefg_pid, fpn, fres, fen);
+            mgpu::diag::info(lg);
+        }
+        if ((s_n % 600ull) == 0ull)
+        {
+            char lg[320];
+            // [FIX X1, 2026-11-11] THIS LINE USED TO HAVE FIVE CONVERSIONS FOR SEVEN
+            // ARGUMENTS. "TWO/ONE frames" printed the <=1 and ==2 buckets, and
+            // "res/enabled" actually read the ==3 and >=4 buckets - measured as
+            // "enabled=599", which is impossible for a boolean. The four buckets the
+            // nc-base build printed are restored, in the same order, so a 4X run reads
+            // 4+:N and a 3X run reads 3:N without any reconstruction.
+            snprintf(lg, sizeof lg,
+                     "[MGPU][R490][A] XeSS over %llu presents: 1:%llu 2:%llu 3:%llu 4+:%llu "
+                     "(last res=%d enabled=%u) - the bucket that grows is the delivered multiplier.",
+                     s_n, s_b1, s_b2, s_b3, s_b4, fres, fen);
+            mgpu::diag::info(lg);
+        }
+    }
     if (mgpu::strace::on()) mgpu::strace::note_bridge_present((unsigned)hr, mgpu::strace::now_ms() - r313_p0);   // R313
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
@@ -2419,6 +3014,76 @@ bool present_frame(float r, float g, float b)
         }
     }
 
+    // ---- [INSTR R346, 2026-11-11] WHAT ACTUALLY REACHED THE PANEL ----
+    //
+    // EVERYTHING THE PACER REPORTS IS MEASURED BEFORE THIS POINT. [R342] landing is
+    // "how punctually we entered Present", and Present(1,0) may then round the frame
+    // to a later vblank. At 165 Hz a 50 fps source gives pairs 10.1 ms apart, and
+    // 10.1 ms is 1.67 vblanks - so the ON-SCREEN gap can only be 1 or 2 vblanks, no
+    // matter how exact the pacer is. That is the "3.23 vbl/frame beat", and it cannot
+    // be seen from any timestamp taken before the call.
+    //
+    // DXGI reports it directly and for free: SyncRefreshCount advances once per vblank
+    // that DISPLAYED a frame. The delta between two consecutive successful Presents is
+    // therefore the on-screen spacing in vblanks. Read-only: no state, no order, no
+    // extra GPU work; one struct and one compare per presented frame.
+    //
+    // How to read it: a 1/2 mix with mean near 1.65 is 100 fps on 165 Hz (the physics
+    // of the pair, not a pacer fault). A 3/4 mix, or a mean near 2, is 82.5 fps - the
+    // output has fallen to a whole number of vblanks. 9+ is a real stall between
+    // displayed frames (menu, load, alt-tab).
+    if (hr == S_OK)
+    {
+        static std::mutex s_cad_mx;
+        static unsigned long long s_cad_prev = 0ull;
+        static unsigned long long s_cad_hist[10] = {};   // [1..8], [9] = 9+
+        static unsigned long long s_cad_n = 0ull, s_cad_sum = 0ull, s_cad_big = 0ull;
+        static unsigned long long s_cad_nofs = 0ull;
+        static int s_cad_said_nofs = 0;
+        DXGI_FRAME_STATISTICS fs{};
+        const HRESULT fsh = sc->GetFrameStatistics(&fs);
+        if (SUCCEEDED(fsh) && fs.SyncRefreshCount != 0u)
+        {
+            std::lock_guard<std::mutex> lk(s_cad_mx);
+            if (s_cad_prev != 0ull && fs.SyncRefreshCount > s_cad_prev)
+            {
+                const unsigned long long d = fs.SyncRefreshCount - s_cad_prev;
+                const unsigned b = (d > 9ull) ? 9u : (unsigned)d;
+                ++s_cad_hist[b];
+                ++s_cad_n;
+                s_cad_sum += d;
+                if (d > 9ull) ++s_cad_big;
+                if ((s_cad_n % 600ull) == 0ull)
+                {
+                    char cad[700];
+                    snprintf(cad, sizeof cad,
+                             "[MGPU][R346] ON-SCREEN cadence (vblanks between DISPLAYED frames): "
+                             "1:%llu 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7:%llu 8:%llu 9+:%llu | "
+                             "mean=%.2f over %llu presents | no-stat=%llu | READ-ONLY. "
+                             "100 fps on a 165 Hz panel averages 1.65 vbl, so a 1/2 mix is the "
+                             "pair's physics and a 3/4 mix means the output fell to 82.5 fps.",
+                             s_cad_hist[1], s_cad_hist[2], s_cad_hist[3], s_cad_hist[4],
+                             s_cad_hist[5], s_cad_hist[6], s_cad_hist[7], s_cad_hist[8],
+                             s_cad_hist[9],
+                             (s_cad_n != 0ull) ? (double)s_cad_sum / (double)s_cad_n : 0.0,
+                             s_cad_n, s_cad_nofs);
+                    mgpu::diag::info(cad);
+                }
+            }
+            s_cad_prev = fs.SyncRefreshCount;
+        }
+        else if (!s_cad_said_nofs)
+        {
+            std::lock_guard<std::mutex> lk(s_cad_mx);
+            s_cad_said_nofs = 1;
+            ++s_cad_nofs;
+            mgpu::diag::warn("[MGPU][R346] ON-SCREEN cadence: DXGI_GetFrameStatistics gave no "
+                             "SyncRefreshCount (flip-model statistics unavailable on this chain) - "
+                             "the cadence backstop is silent this run. That is a TOOL gap, not a "
+                             "clean cadence: say 'not measured', never 'no beat'.");
+        }
+    }
+
     // D6: NO WAIT HERE. This is the stall the ring exists to remove - a full
     // GPU round trip taken on the consume thread, once per presented frame,
     // for no reason but allocator reuse. The reuse wait above is where that
@@ -2440,6 +3105,9 @@ bool present_frame(float r, float g, float b)
         // the occlusion reading is checked against.
         S.present_stall_run = 0;
     }
+    // [COPY OptiScaler] Pace the NEXT present to the target rate. After Present on purpose:
+    // the interval this enforces is between presents, not between work and present.
+    fg_target_pace();
     return true;
 }
 
@@ -10358,6 +11026,10 @@ namespace
         std::atomic<unsigned> mvec_rej_w{0}, mvec_rej_h{0}, mvec_rej_fmt{0};
         // The handle the probe published this frame, whatever became of it.
         std::atomic<unsigned long long> mvec_pub_handle{0};
+// [PORT R139b, 2026-11-11] The handle of the LAST successful copy into the lane. `copies`
+// only proves that a copy was recorded; on a title where FFX names one buffer and the tap
+// names another, the model reads whichever landed last. This is that buffer's identity.
+std::atomic<unsigned long long> mvec_last_src{0};
         // Bridge thread only, read and written inside the periodic block.
         unsigned long long mvec_copies_last_report = 0;
         unsigned long long mvec_rejects_last_report = 0;
@@ -10510,6 +11182,40 @@ namespace
         ID3D12Resource *tex_mvec_keep = nullptr;
         unsigned long long mvec_keep_f = 0;
 
+        // ---- [PORT B1] MVecZeroProbe: read-only content evidence ----
+        //
+        // WHAT. Every MVecZeroEvery source frames, copy a 256x256 window out
+        // of the SAME GPU 1 landing texture the model is about to be handed
+        // (tex_mvec_r[ii]) into a READBACK buffer, and log zero share, mean
+        // |x| / |y| and peak magnitude. It is the only counter in this file
+        // that can tell "11 MB of vectors arrived" from "11 MB of zeros
+        // arrived"; every transport counter is identical in both cases.
+        //
+        // WHY IT DOES NOT DECIDE ANYTHING (B1 scope). The readback is one
+        // extra 256x256 copy on a copy queue that is already recording a full
+        // frame's copy - it cannot change the picture and it cannot move a
+        // source. The numbers go to the log only. A gate that acts on them is
+        // a LATER block, and by this project's own record the difference
+        // matters: the 11-09 audit found the old zero test was reading the
+        // role pick, not the field that was delivered.
+        //
+        // KEY. `MVecZeroProbe=1` (absent = off, byte-identical to 0.5.1).
+        // `MVecZeroEvery` = frames between samples, 10..600, default 30.
+        ID3D12Resource *zbuf = nullptr;        // READBACK buffer for the window
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT zfp{};   // its placed footprint
+        UINT z_w = 0u, z_h = 0u;               // the window actually sampled
+        UINT z_fmt = 0u;                       // its DXGI format (== the field's)
+        unsigned long long z_f = 0ull;         // frame whose sample is in flight
+        bool z_pending = false;
+        // [PORT O4b] depth content probe (same shape, separate readback)
+        unsigned z_every = 30u;
+        int z_on = -1;                         // -1 unknown, 0 off, 1 on
+        ID3D12Resource *zdbuf = nullptr;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT zdfp{};
+        UINT zd_w = 0u, zd_h = 0u, zd_fmt = 0u;
+        unsigned long long zd_f = 0ull;
+        bool zd_pending = false;
+
         // ---- R30/R63: depth transport ----
         //
         // No ReShade types here, exactly as before: the source arrives as an
@@ -10588,6 +11294,31 @@ namespace
         // verifier cross-checks the two, so a disagreement is counted rather
         // than silently resolved in favour of whichever was read first.
         unsigned char depth_slot_valid[RING] = {};
+
+        // ---- [PORT O2, 2026-11-11] THE EVALUATE-TIME DEPTH COPY ----
+        //
+        // The vector side copies at the EvaluateFeature call, on the game's own
+        // command list, into the slot the seal will name. Depth now does the
+        // same when DepthContract=1: the game's declared depth, declared extent,
+        // same call, same frame. The seal then trusts depth_slot_frame and does
+        // NOT copy again; when the evaluate copy did not land (no declaration,
+        // lock busy, geometry refused) the seal falls back to the tap exactly as
+        // before - one writer per frame either way.
+        std::atomic<bool> depth_live{false};
+        std::mutex depth_cs;
+        unsigned long long depth_copies = 0;
+        unsigned long long depth_lock_skips = 0;
+        unsigned long long depth_fmt_rejects = 0;
+        // [PORT O2.1] which route actually filled the slot, per sealed frame.
+        // Counters, not inferences: the tap fallback makes [R63]'s valid count
+        // identical either way, so the route needs its own number.
+        unsigned long long depth_seal_contract = 0;
+        unsigned long long depth_seal_tap = 0;
+        // [PORT O3, 2026-11-11] the vector-side yield rule, applied to depth: once
+        // the contract has delivered a long run, the tap's depth copy stops.
+        std::atomic<bool> depth_yield{false};
+        unsigned long long depth_seal_run = 0;
+        unsigned long long depth_yield_skips = 0;
 
         unsigned long long depth_unpacks = 0;
         unsigned long long depth_bound = 0, depth_skipped = 0;
@@ -10780,6 +11511,58 @@ namespace
     {
         static stream_state s;
         return s;
+    }
+
+    // ---- [PORT PRESENTER H2] created here, where the stream's source extent is known ----
+    static void presenter_host_tick()
+    {
+        if (g_disp_state.load(std::memory_order_relaxed) != 0) return;
+        if (!mgpu::presenter::enabled()) { g_disp_state.store(-1, std::memory_order_relaxed); return; }
+
+        auto &D = st();
+        auto &S = str();
+        ID3D12Device      *dev = nullptr;
+        ID3D12CommandQueue *q = nullptr;
+        UINT w = 0, h = 0, sw = 0, sh = 0;
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        {
+            std::lock_guard<std::mutex> lk(D.cs);
+            dev = D.device; q = D.queue; w = D.chain_w; h = D.chain_h; fmt = D.chain_fmt;
+        }
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            sw = S.width; sh = S.height;
+        }
+        // Not armed yet, or the chain is still the pre-arm 1280x720 T4 size. A layer
+        // created at the wrong extent cannot be resized later (disp_init refuses a second
+        // different extent by design), so this waits for the final one.
+        if (dev == nullptr || q == nullptr || sw < 2 || sh < 2) return;
+        if (w != sw || h != sh || fmt == DXGI_FORMAT_UNKNOWN) return;
+
+        std::lock_guard<std::mutex> lk(g_disp_mx);
+        if (g_disp_state.load(std::memory_order_relaxed) != 0) return;
+        // [PORT H6] no provider table: the reference layer reaches the XeFG slice
+        // directly, because both are compiled into display_ref.cpp.
+        if (!mgpu::presenter::disp_init(dev, q, w, h, fmt) || !mgpu::presenter::disp_alive())
+        {
+            g_disp_state.store(-1, std::memory_order_relaxed);
+            mgpu::diag::error("[MGPU][R448] the display layer did not start - the author's present chain "
+                              "keeps the picture for this session (no half handover)");
+            return;
+        }
+        g_disp_fmt.store((unsigned)fmt, std::memory_order_relaxed);
+        mgpu::presenter::disp_set_pace(1);   // [H2 FIX 2] the layer is the single pacer again
+        mgpu::presenter::disp_set_zombie_kill_ms(mgpu::gpu1::ui_ini_read("ZombieKillMs", 0));
+        (void)dcomp_set_rooted(false, "the display layer owns the screen (P22)");
+        g_disp_state.store(1, std::memory_order_relaxed);
+        {
+            char l[320];
+            snprintf(l, sizeof l,
+                     "[MGPU][R448] display layer up: %ux%u fmt=%u, own window+queue+flip chain, 8-slot ring, "
+                     "display thread. The T5 chain stays alive as the fallback; the composition visual is UNROOTED.",
+                     w, h, (unsigned)fmt);
+            mgpu::diag::info(l);
+        }
     }
 
     // P5.0. Forward-declared above present_frame. Copies out the pointer and
@@ -11117,8 +11900,9 @@ namespace
 
         char l[420];
         snprintf(l, sizeof l,
-                 "[MGPU][P7.2] mgpu.ini %s: %s (%s). THIS DOES NOT CHANGE THE RUNNING SESSION - "
-                 "the key is read at arm, so it takes effect on the next launch.",
+                 "[MGPU][P7.2] mgpu.ini %s: %s (%s). The BACKEND keys (FrameGen/FgBackend) are "
+                 "read at arm and take effect on the next launch; FgMulti is re-read every 120 "
+                 "presents and takes effect live in this session.",
                  ok ? "written" : "WRITE FAILED", line_new,
                  replaced ? "replaced in place" : "appended, the key was absent");
         if (ok) mgpu::diag::info(l); else mgpu::diag::error(l);
@@ -11168,6 +11952,198 @@ namespace
         for (unsigned i = 0; i < 12u; ++i)
             if (!g_ini_mirror[i].have)
             { g_ini_mirror[i].key = key; g_ini_mirror[i].val = v; g_ini_mirror[i].have = true; return; }
+    }
+
+    // ---- [R900, 2026-11-11] EasyMode: ONE KEY THAT APPLIES THIS BUILD'S PRESET ----
+    //
+    // SCOPE. This preset contains ONLY the keys THIS BUILD adds on top of 0.5.1, plus the six
+    // AUTHOR keys the validated rig happens to set. It is not a general profile and it does not
+    // restate 0.5.1's own configuration: every author key not listed here keeps whatever the
+    // file says, exactly as 0.5.1 would read it.
+    //
+    // MECHANISM. EasyMode=1 overlays those values IN MEMORY, after the file is read and before
+    // any key is consumed:
+    //   * the file stays the documentation and the operator's override surface;
+    //   * EasyMode=0 (the default, and the shipped value) changes NOTHING - the bytes the readers
+    //     see are the file's own;
+    //   * a preset key is replaced where it exists and appended where it does not, so a short
+    //     player ini plus EasyMode=1 is a complete configuration.
+    // No instrument keys are here: a player run should not pay for diagnostics, and the removed
+    // probe keys are back at their author defaults when this file is restored.
+    struct easy_kv { const char *k; const char *v; };
+    static const easy_kv k_easy_preset[] =
+    {
+        // ---- THIS BUILD'S KEYS (absent from 0.5.1) ----
+        { "NgxHook", "1" },            // inline NGX contract capture
+        { "FfxHook", "1" },            // inline FFX/FSR contract capture
+        { "DepthContract", "1" },      // copy the game's declared depth at the evaluate
+        { "DispFollow", "1" },         // neural window follows the foreground
+        { "DispCursor", "1" },         // system arrow; CTRL+ALT+F5 toggles it
+        { "FgMvUv", "1" },             // DLSS-G gets the UV vector unit
+        { "DispClickThrough", "0" },   // the window takes the mouse and forwards it
+        // ---- SIX AUTHOR KEYS THE VALIDATED RIG SETS (everything else untouched) ----
+        { "MVecTap", "0" },            // no second writer into the vector lane
+        { "PanelPersist", "1" },       // panel settings persist
+        { "Calib", "0" },              // one contract writer (the hooks), not the calibrator
+        { "PanelScale", "0.85" },
+        { "PanelSimple", "1" },
+        { "PanelOverPicture", "1" },
+        // ---- XeSS-FG ON THE AUTHOR (T5) CHAIN ----
+        { "FrameGen", "6" }, { "FgMulti", "2" }, { "FgBackend", "3" },
+        { "XeFG", "1" }, { "XeFGHandover", "1" }, { "XeFGChain", "1" },
+        { "XeFGUnlock", "3" }, { "XeFGMaxInterp", "2" },
+        { "DcompOverlay", "0" },
+    };
+
+    // Replace `key`'s value in place, or append the pair when the key is absent. `n` is the whole
+    // buffer capacity. Returns false only when an append would not fit.
+    static bool easy_set(char *buf, size_t n, const char *key, const char *val)
+    {
+        const size_t klen = strlen(key), vlen = strlen(val);
+        for (char *p = buf; *p != '\0'; )
+        {
+            char *line = p;
+            char *eol = p;
+            while (*eol != '\0' && *eol != '\r' && *eol != '\n') ++eol;
+            char *q = line;
+            while (*q == ' ' || *q == '\t') ++q;
+            if (_strnicmp(q, key, klen) == 0 && q[klen] == '=')
+            {
+                char *v = q + klen + 1;
+                const size_t oldlen = (size_t)(eol - v);
+                const long delta = (long)vlen - (long)oldlen;
+                const size_t total = strlen(buf);
+                if (delta > 0 && total + (size_t)delta + 1 >= n) return false;
+                if (delta != 0)
+                    memmove(v + vlen, eol, strlen(eol) + 1);
+                memcpy(v, val, vlen);
+                return true;
+            }
+            p = eol;
+            while (*p == '\r' || *p == '\n') ++p;
+        }
+        const size_t len = strlen(buf);
+        if (len + klen + vlen + 3 >= n) return false;
+        char *w = buf + len;
+        if (len != 0 && buf[len - 1] != '\n') { *w++ = '\r'; *w++ = '\n'; }
+        memcpy(w, key, klen); w += klen;
+        *w++ = '=';
+        memcpy(w, val, vlen); w += vlen;
+        *w++ = '\r'; *w++ = '\n'; *w = '\0';
+        return true;
+    }
+
+    static bool easy_read_on(const char *buf)
+    {
+        for (const char *p = buf; *p != '\0'; )
+        {
+            const char *eol = p;
+            while (*eol != '\0' && *eol != '\r' && *eol != '\n') ++eol;
+            const char *q = p;
+            while (*q == ' ' || *q == '\t') ++q;
+            if (_strnicmp(q, "EasyMode", 8) == 0 && q[8] == '=')
+            {
+                const char *v = q + 9;
+                while (*v == ' ' || *v == '\t') ++v;
+                return !(*v == '0' || *v == 'o' || *v == 'O' || *v == 'f' || *v == 'F' ||
+                         *v == 'n' || *v == 'N' || *v == '\0');
+            }
+            p = eol;
+            while (*p == '\r' || *p == '\n') ++p;
+        }
+        return false;
+    }
+
+    static unsigned easy_apply_values(char *buf, size_t n)
+    {
+        unsigned applied = 0u;
+        for (const easy_kv &kv : k_easy_preset)
+            if (easy_set(buf, n, kv.k, kv.v)) ++applied;
+        return applied;
+    }
+
+    // ONE SHOT, NOT AN OVERLAY. The first reading of EasyMode=1 rewrites the file: the 13
+    // preset values are written beside the author's keys and EasyMode itself becomes 0. From
+    // then on every launch reads the file as written, so a player who edits a value owns it -
+    // EasyMode cannot keep overwriting the edit. Setting EasyMode=1 again is the explicit
+    // "re-apply" action. If the file cannot be written (read-only folder, CWD fallback), the
+    // values are applied in memory for this run and R901 says so; nothing pretends it migrated.
+    static void easy_migrate_once(char *buf, size_t n)
+    {
+        if (!easy_read_on(buf)) return;
+
+        static std::atomic<int> gate{0};   // 0 = untouched, 1 = migrating, 2 = migrated, 3 = write failed
+        const int st = gate.load(std::memory_order_acquire);
+        if (st == 2) return;
+        if (st == 3) { easy_apply_values(buf, n); return; }   // file not writable: keep the overlay this run
+        int expected = 0;
+        if (!gate.compare_exchange_strong(expected, 1, std::memory_order_acq_rel))
+        {
+            easy_apply_values(buf, n);   // another thread is writing; this call still gets the values
+            return;
+        }
+
+        bool wrote = false;
+        const wchar_t *wp = ini_path();
+        if (wp != nullptr && wp[0] != L'\0' && GetFileAttributesW(wp) != INVALID_FILE_ATTRIBUTES)
+        {
+            wchar_t bak[540];
+            swprintf(bak, 540, L"%ls.before-easymode-%llu", wp,
+                     (unsigned long long)GetTickCount64());
+            CopyFileW(wp, bak, FALSE);   // best effort; the tmp+move below is the atomic part
+
+            char *mig = (char *)malloc(n);
+            if (mig != nullptr)
+            {
+                memcpy(mig, buf, n);
+                for (const easy_kv &kv : k_easy_preset) easy_set(mig, n, kv.k, kv.v);
+                easy_set(mig, n, "EasyMode", "0");   // the one-shot marker: next launch reads the file
+                wchar_t tmp[540];
+                swprintf(tmp, 540, L"%ls.tmp", wp);
+                FILE *f = _wfopen(tmp, L"wb");
+                if (f != nullptr)
+                {
+                    const size_t len = strlen(mig);
+                    wrote = (fwrite(mig, 1, len, f) == len) && (fflush(f) == 0);
+                    fclose(f);
+                    if (wrote && !MoveFileExW(tmp, wp, MOVEFILE_REPLACE_EXISTING))
+                    {
+                        wrote = false;
+                        DeleteFileW(tmp);
+                    }
+                }
+                free(mig);
+            }
+        }
+
+        const unsigned applied = easy_apply_values(buf, n);   // this call reads the migrated values
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            if (wrote)
+            {
+                char l[560];
+                snprintf(l, sizeof l,
+                         "[MGPU][R900] EasyMode=1: applied ONCE to \"%ls\" (%u key(s) written, EasyMode "
+                         "set to 0). The set is this build's keys - contracts, window/input, and the "
+                         "T5-chain XeSS-FG group (FrameGen=6/FgMulti=2/XeFG*=1/Unlock=3/MaxInterp=2/"
+                         "DcompOverlay=0) - plus the six author keys the rig sets. Every later launch "
+                         "reads the file as written, so YOUR edits override; set EasyMode=1 again only to "
+                         "re-apply. 0.5.1's own keys were not otherwise changed.", wp, applied);
+                mgpu::diag::info(l);
+            }
+            else
+            {
+                char l[620];
+                snprintf(l, sizeof l,
+                         "[MGPU][R901] EasyMode=1 but the ini could not be rewritten (path \"%ls\"). The "
+                         "preset is applied in memory for THIS run and will be applied again each launch "
+                         "until the file is writable or EasyMode=0. Nothing was migrated.", wp);
+                mgpu::diag::warn(l);
+            }
+        }
+        gate.store(wrote ? 2 : 3, std::memory_order_release);
     }
 
     bool ini_slurp(char *buf, size_t n)
@@ -11302,6 +12278,7 @@ namespace
         // existing line reader sees the first key; UTF-16 is rejected above.
         size_t usable = got;
         mgpu::config::strip_utf8_bom(buf, usable);
+        if (usable != 0) easy_migrate_once(buf, n);   // [R900] EasyMode: one-shot rewrite, then the file is the truth
         return usable != 0;
     }
 
@@ -12058,7 +13035,8 @@ namespace {
         if (s.sr_nrout  != nullptr) { s.sr_nrout->Release();  s.sr_nrout  = nullptr; }
         if (s.sr_expose != nullptr) { s.sr_expose->Release(); s.sr_expose = nullptr; }
         s.nr_final = nullptr;   // borrowed; released with tex_out / tex_pong
-        mgpu::fg::release();   // R341: stops the pacing thread and drains its presents before the textures go
+        mgpu::fg::release();   // R341: stops the pacing thread and drains its presents before the t
+        mgpu::xess_fg::release();   // [PORT XeFG-GATE] say the inverse of arm(), before the device goesextures go
         if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
         if (s.sc_read != nullptr) { s.sc_read->Release(); s.sc_read = nullptr; }   // R338
         free(s.sc_prev); s.sc_prev = nullptr;
@@ -12073,6 +13051,11 @@ namespace {
             { s.tex_mvec_r[mi]->Release(); s.tex_mvec_r[mi] = nullptr; }
         if (s.tex_mvec_keep != nullptr) { s.tex_mvec_keep->Release(); s.tex_mvec_keep = nullptr; }   // D2.0 NR2
         s.mvec_keep_f = 0;
+        // [PORT B1] the content probe's readback buffer
+        if (s.zbuf != nullptr) { s.zbuf->Release(); s.zbuf = nullptr; }
+        if (s.zdbuf != nullptr) { s.zdbuf->Release(); s.zdbuf = nullptr; }
+        s.zd_pending = false; s.zd_f = 0ull; s.zd_w = s.zd_h = 0u; s.zd_fmt = 0u;
+        s.z_pending = false; s.z_f = 0ull; s.z_w = s.z_h = 0u; s.z_fmt = 0u;
         for (unsigned di = 0; di < 2; ++di)
             if (s.tex_depth[di] != nullptr)
             { s.tex_depth[di]->Release(); s.tex_depth[di] = nullptr; }
@@ -12232,6 +13215,12 @@ namespace {
         {
             std::lock_guard<std::mutex> mlk(s.mvec_cs);
             s.mvec_live.store(false, std::memory_order_release);
+        }
+        // [PORT O2] same rule for depth: a copy already inside depth_cs finishes,
+        // none starts after the flag is down, and only then does anything free.
+        {
+            std::lock_guard<std::mutex> dlk(s.depth_cs);
+            s.depth_live.store(false, std::memory_order_release);
         }
         mgpu::stage::release();   // R333: drains the GPU 0 copy queue that writes gxfer, before gxfer goes
         if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
@@ -15206,14 +16195,71 @@ namespace
             (void)mgpu::residual::arm(ndev, s.width, s.height, nrfmt, s.nr_built,
                                       s.nrs_on, rsd_rw, rsd_rh, rsd_why, ini_read_srgb_input());
         }
+        // ---- [PORT H3'/H5, 2026-11-11] WHO OWNS THE OUTPUT, READ FROM THE PANEL'S OWN TRIPLE ----
+        //
+        // A PORT GAP, FOUND BY REVIEW. nc-base keeps mgpu::fgmode in sync with the panel's
+        // (FrameGen, FgBackend, FgMulti) triple; the 0.5.1 tree has the header and BOTH
+        // readers of it - the presenter's XeSS hooks (mgpu_xefg_apply_mode, hfg_gen_flag_on)
+        // and this arm's DLSS-G multiplier - but NO writer at all. So fgmode kept its
+        // header default (FSR, 1 generated frame) for the whole session no matter what the
+        // panel wrote: XeSS generation could never switch on, and every multiplier request
+        // was silently 2X. That is the "the switch exists, the consumer is right, the wire
+        // in between is missing" shape, and it would have made both remaining arms lie.
+        //
+        // THE MAPPING IS THE PANEL'S, NOT A GUESS. panel_simple.cpp's rows write exactly
+        // these triples: DLSS-G (4,1,2|3|4), FSR (5,2,2), XeSS (6,3,2|3|4) - where the
+        // third number is the MULTIPLIER the player reads ("2x"/"3x"/"4x"). fgmode encodes
+        // GENERATED FRAMES per real frame (1 = 2x), so multi = FgMulti - 1. FrameGen names
+        // the backend because it is the one field that is distinct in all three triples.
+        // Read once at arm: the panel itself says a backend/multiplier change needs a
+        // restart, and the on/off hot switch is mgpu::fg::ui_set_enabled's, not this one.
+        {
+            const int fg_v  = mgpu::gpu1::ui_ini_read("FrameGen", 0);
+            const int fg_m  = mgpu::gpu1::ui_ini_read("FgMulti", 2);
+            int fg_be = mgpu::fgmode::OFF;
+            const char *fg_name = "off";
+            if (fg_v == 4)      { fg_be = mgpu::fgmode::DLSSG; fg_name = "dlssg"; }
+            else if (fg_v == 5) { fg_be = mgpu::fgmode::FSR;   fg_name = "fsr"; }
+            else if (fg_v == 6) { fg_be = mgpu::fgmode::XEFG;  fg_name = "xefg"; }
+            const int fg_n = (fg_m >= 2 && fg_m <= 4) ? (fg_m - 1) : 1;
+            mgpu::fgmode::set(fg_be, fg_n);
+            char l[300];
+            snprintf(l, sizeof l, "[MGPU][R446] frame generation owner: FrameGen=%d (%s) FgMulti=%d -> fgmode backend=%s, "
+                     "%d generated frame(s) per real frame (%dx output). The BACKEND choice is read once here; the "
+                     "multiplier row is re-read every 120 presents and is live; the on/off switch stays live.",
+                     fg_v, fg_name, fg_m, mgpu::fgmode::name(mgpu::fgmode::get()),
+                     mgpu::fgmode::get_multi(), mgpu::fgmode::get_multi() + 1);
+            mgpu::diag::info(l);
+        }
+
         // R341: DLSS Frame Generation on the neural card. Reads FrameGen itself; absent = nothing.
         if (SUCCEEDED(h))
         {
             mgpu::fg::arm_info fgi;
             fgi.ndev = ndev; fgi.w = s.width; fgi.h = s.height; fgi.fmt = nrfmt;
+            fgi.fg_uv = ui_ini_read("FgMvUv", 0);   // [FFX] 0 pixel (shipped), 1 UV, 2 UV x2
             fgi.mvec_w = s.mvec_w; fgi.mvec_h = s.mvec_h; fgi.depth_w = s.depth_w; fgi.depth_h = s.depth_h;
             fgi.depth_inverted = s.depth_inverted != 0; fgi.mvec_scale_x = s.mvec_scale_x; fgi.mvec_scale_y = s.mvec_scale_y;
             (void)mgpu::fg::arm(fgi);
+
+            // [PORT XeFG-GATE] XeSS Frame Generation, the reference tree's module:
+            // arm() loads the two Intel libraries, creates the context on the NEURAL
+            // card and prints the properties (max interpolations, heap sizes). It is
+            // independent of FrameGen and presents NOTHING - it answers whether this
+            // second GPU accepts XeSS-FG at all, which is the precondition for any
+            // real backend. XeFG=1 in mgpu.ini is the key; absent = one early return.
+            mgpu::xess_fg::arm(ndev, s.width, s.height);
+
+            // [PORT A-2a, 2026-11-11] THE XeFG SMOKE, inert unless its flag file exists.
+            // Two flags on purpose (the ref tree learnt this the hard way): harness only
+            // first (device, queue, window, chain, no XeFG API), then the API. If the
+            // harness alone dies, the fault is ours and XeFG was never involved.
+            // It builds its OWN device/queue/window/chain: the display path, the ring,
+            // the present owner and the NGX path are untouched by construction.
+            {
+                void mgpu_xefg_smoke_start(ID3D12Device *device, const char *where);
+                mgpu_xefg_smoke_start(ndev, "stream-arm");
+            }
         }
 
         // P8.0. Always created, like tex_pong and for the same reason: the mode
@@ -15877,7 +16923,9 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     const double r313_rb0 = mgpu::strace::now_ms();
     UINT rcount = 2u;   // BB1: the count the chain was made with
     { std::lock_guard<std::mutex> lk(S.cs); rcount = S.present_buffers; }
-    const HRESULT rb = sc->ResizeBuffers(rcount, buf_w, buf_h, want_fmt, 0);
+    const HRESULT rb = sc->ResizeBuffers(rcount, buf_w, buf_h, want_fmt,
+                                         g_chain_tear.load(std::memory_order_relaxed) != 0u
+                                             ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
     if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "%ux%u fmt=%d, %.2f ms", buf_w, buf_h, (int)want_fmt, mgpu::strace::now_ms() - r313_rb0); mgpu::strace::ev(mgpu::strace::R_BT, "ResizeBuffers", d, (unsigned)rb); }
 
     // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
@@ -16653,6 +17701,11 @@ int mvec_source_mode()
 }
 bool stream_present_gate(unsigned long timeout_ms)
 {
+    // [PORT PRESENTER H2] one relaxed load per frame after the layer is up; the only
+    // place the display thread is created, and it runs on THIS thread (the bridge
+    // thread pumps the window messages the presenter's wndproc needs).
+    presenter_host_tick();
+
     stream_state &s = str();
     ID3D12Fence *f = nullptr;
     UINT64 want = 0;
@@ -18515,6 +19568,97 @@ bool ui_panel_is_open()
     return (n >= t) && (n - t) < 500ull;
 }
 
+// [H7/D, 2026-11-11] IS A RESHADE OVERLAY OPEN? Written by dllmain's
+// on_reshade_open_overlay for EVERY runtime (game and bridge), read by worker.cpp's
+// foreground follow. Last event wins, which is correct for this codebase because R158
+// mirrors open/close between the two runtimes - the two do not sit in opposite states.
+//
+// WHY THE FOLLOW NEEDS IT: R156 already tried hiding the bridge window while an overlay
+// was open. Hiding worked, but "the GAME's own ReShade overlay sizzled" (dllmain.cpp,
+// measured 2026-09-17) - removing this window from the desktop while the game presents
+// disturbs the overlay that shares the process. The follow must never do that again:
+// with an overlay open, the window stays visible (the shipped behaviour), and Alt+Tab
+// gets the follow back the moment the overlay closes.
+static std::atomic<int> g_overlay_open{0};
+// [H7/H, 2026-11-11] The BRIDGE runtime's own overlay state. The global above is set by the
+// top of dllmain's handler for EVERY runtime, including the game runtime whose open we REFUSE -
+// so by the time the toggle decision runs, the global already says "open" and the toggle turned
+// every Home press into a close (measured 17:12: the panel never appeared at all). The visible
+// panel is the bridge runtime's, so that is the state the toggle and the follow must ask.
+static std::atomic<int> g_bridge_overlay_open{0};
+
+void note_overlay_open(bool open)
+{
+    g_overlay_open.store(open ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool overlay_is_open()
+{
+    return g_overlay_open.load(std::memory_order_relaxed) != 0;
+}
+
+void note_bridge_overlay_open(bool open)
+{
+    g_bridge_overlay_open.store(open ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool bridge_overlay_open()
+{
+    return g_bridge_overlay_open.load(std::memory_order_relaxed) != 0;
+}
+
+// [H7/E, 2026-11-11] "Close the panel" asked by worker.cpp when the game loses the foreground
+// with an overlay open - before hiding the window, because R156 measured that hiding under an
+// open overlay breaks it. dllmain applies it per runtime, on that runtime's own thread, through
+// the R158 pending mechanism; this flag only carries the request.
+static std::atomic<int> g_overlay_close_req{0};
+
+void request_overlay_close()
+{
+    g_overlay_close_req.store(1, std::memory_order_relaxed);
+}
+
+bool overlay_close_requested()
+{
+    return g_overlay_close_req.load(std::memory_order_relaxed) != 0;
+}
+
+void clear_overlay_close_request()
+{
+    g_overlay_close_req.store(0, std::memory_order_relaxed);
+}
+
+// [FFX, 2026-11-11] WHAT UNIT ARE THE FSR VECTORS IN? FFX's descriptor carries
+// motionVectorScale, the factor its own shader applies to the sampled vector. When the game's
+// vectors are UV it is the render size; when they are already pixels it is 1. The NR model
+// wants pixels, so this value is exactly the conversion when it is > 1, and "no conversion"
+// when it is 1. The FFX hook publishes it; the arm prefers it over the MVecScaleX/Y ini keys
+// ONLY while those are still at their 1.0 default (an explicit key stays the operator's).
+//
+// WHY THIS IS NEEDED AT ALL: a contract title never enters the tap's R280 unit derivation (that
+// path is gated on tk/x_on/r311a_first, none of which a contract has), and the NGX contract
+// convention is "vectors are pixels, scale 1.0". FSR breaks that convention, and the run of
+// 17:01 armed at scale=(1.000,1.000) with UV vectors - the model reprojected a 0.03 UV motion
+// as 0.03 pixels, which is the flicker the operator reported.
+static std::atomic<float> g_ffx_mv_sx{0.0f};
+static std::atomic<float> g_ffx_mv_sy{0.0f};
+
+void note_ffx_mv_scale(float sx, float sy)
+{
+    if (!(sx > 0.0f) || !(sy > 0.0f)) return;
+    g_ffx_mv_sx.store(sx, std::memory_order_relaxed);
+    g_ffx_mv_sy.store(sy, std::memory_order_relaxed);
+}
+
+bool ffx_mv_scale(float &sx, float &sy)
+{
+    const float a = g_ffx_mv_sx.load(std::memory_order_relaxed);
+    const float b = g_ffx_mv_sy.load(std::memory_order_relaxed);
+    if (!(a > 0.0f) || !(b > 0.0f)) return false;
+    sx = a; sy = b;
+    return true;
+}
+
 void ui_request_arm()
 {
     g_arm_request.store(1u, std::memory_order_relaxed);
@@ -18561,6 +19705,96 @@ bool ui_ini_write(const char *key, int value)
 int ui_ini_read(const char *key, int dflt)
 {
     return ini_mirror_get(key, dflt);
+}
+
+// [MOUSE, 2026-11-11] THE DESKTOP ARROW, LIVE AND PERSISTED.
+//
+// The game draws its pointer into the native frame, not into the neural one, so with
+// DispCursor=0 the A window has NO pointer at all (measured: clicks worked, menus had
+// nothing to aim with). DispCursor=1 shows the system arrow at the real pointer - the
+// presenter's accepted behaviour. It is in the way in an FPS, hence the hotkey and the
+// simple-panel row: one switch, no restart, written back to mgpu.ini.
+static std::atomic<int> g_disp_cursor{-1};
+
+bool disp_cursor_on()
+{
+    int v = g_disp_cursor.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        v = ui_ini_read("DispCursor", 0);
+        g_disp_cursor.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+void disp_cursor_set(bool on)
+{
+    g_disp_cursor.store(on ? 1 : 0, std::memory_order_relaxed);
+    (void)ui_ini_write("DispCursor", on ? 1 : 0);
+    // [R456, 2026-11-11] THE MISSING CALL. The first version only wrote the flag: the cursor
+    // changed on the NEXT WM_SETCURSOR, and WM_SETCURSOR is generated by mouse MOVEMENT. Press
+    // the key with a still pointer and nothing happens - measured by the operator as "the hotkey
+    // does not work", which is exactly what the code did. Apply it here, at the press.
+    if (on) disp_cursor_raise();
+    else    (void)disp_cursor_apply();
+    if (on)
+        mgpu::diag::info("[MGPU][MOUSE] desktop cursor ON - the system arrow is shown at the real pointer "
+                         "(menus can be aimed; an FPS sees the arrow too). Persisted as DispCursor=1.");
+    else
+        mgpu::diag::info("[MGPU][MOUSE] desktop cursor OFF - the system arrow is hidden; the game's own "
+                         "pointer is not in the neural frame, so menus may show no pointer. Persisted as DispCursor=0.");
+    disp_cursor_probe(on ? "after toggle ON" : "after toggle OFF");
+}
+
+// [R456] See the header. SetCursor only changes OUR thread's cursor shape; it cannot undo a
+// display count a game pushed negative with ShowCursor(FALSE), and it does nothing at all if
+// the shape is reset afterwards by the game's own thread. The probe says which of those it is.
+bool disp_cursor_apply()
+{
+    const bool on = disp_cursor_on();
+    if (on) SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    else    SetCursor(nullptr);
+    return on;
+}
+
+void disp_cursor_raise()
+{
+    if (!disp_cursor_on()) { SetCursor(nullptr); return; }
+    // Bounded: a negative display count needs ShowCursor(TRUE) to climb back to >= 0. If it is
+    // already visible this is one GetCursorInfo and nothing else.
+    for (int i = 0; i < 8; ++i)
+    {
+        CURSORINFO ci{};
+        ci.cbSize = sizeof ci;
+        if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) != 0) break;
+        if (ShowCursor(TRUE) >= 0) break;
+    }
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+}
+
+void disp_cursor_probe(const char *why)
+{
+    CURSORINFO ci{};
+    ci.cbSize = sizeof ci;
+    const BOOL got = GetCursorInfo(&ci);
+    POINT pt{};
+    GetCursorPos(&pt);
+    const HWND w = WindowFromPoint(pt);
+    DWORD wpid = 0;
+    if (w != nullptr) GetWindowThreadProcessId(w, &wpid);
+    char l[520];
+    snprintf(l, sizeof l,
+             "[MGPU][R456] cursor %s: DispCursor=%d showing=%d cur=%p arrow=%p | pos=(%ld,%ld) "
+             "wnd=0x%p wpid=%lu fg=0x%p. READING: showing=0 with DispCursor=1 means Windows is not "
+             "displaying ANY cursor (a game's ShowCursor count still hides it, and SetCursor cannot "
+             "undo that); cur != arrow means the shape was reset after us; wnd != this window means "
+             "the pointer is not over the neural window, so WM_SETCURSOR belongs to somebody else.",
+             why, disp_cursor_on() ? 1 : 0,
+             (got && (ci.flags & CURSOR_SHOWING) != 0) ? 1 : 0,
+             (void *)ci.hCursor, (void *)LoadCursorW(nullptr, IDC_ARROW),
+             (long)pt.x, (long)pt.y, (void *)w, (unsigned long)wpid,
+             (void *)GetForegroundWindow());
+    mgpu::diag::info(l);
 }
 
 // R219-2. A decimal key, written with the same line-anchored writer. Two decimals.
@@ -19816,6 +21050,32 @@ void stream_request()
     s.mvec_scale_x = ini_read_named_float("MVecScaleX", 1.0f);
     s.mvec_scale_y = ini_read_named_float("MVecScaleY", 1.0f);
     s.mvec_dirty   = true;
+    // [FFX, 2026-11-11] The contract route never enters the tap's R280 unit derivation (that is
+    // gated on tk/x_on/r311a_first and a contract title has none of them), so it armed at the
+    // NGX convention scale=(1,1). FSR hands UV vectors when its descriptor's motionVectorScale
+    // is the render size; this applies that conversion at the arm. Explicit MVecScaleX/Y other
+    // than 1.0 still win - the keys are the operator's override.
+    if (s.mvec_scale_x == 1.0f && s.mvec_scale_y == 1.0f)
+    {
+        float fx = 0.0f, fy = 0.0f;
+        if (ffx_mv_scale(fx, fy) && fx > 1.5f && fy > 1.5f)
+        {
+            // The descriptor's motionVectorScale IS the game's own UV->pixel factor: this title
+            // sends 2562,1441, i.e. UV vectors at render resolution. Use exactly that; it is the
+            // same conversion FSR applies internally, so the model receives render pixels.
+            s.mvec_scale_x = fx;
+            s.mvec_scale_y = fy;
+            char fl[460];
+            snprintf(fl, sizeof fl,
+                     "[MGPU][R311x] FFX vectors are in UV: its descriptor's motionVectorScale is "
+                     "%.1f,%.1f (the game's own UV->render-pixels factor), so the NR model is armed at "
+                     "MVecScale=%.1f,%.1f. This is identical to what FSR does internally; the earlier "
+                     "attempt at the DISPLAY size over-shifted by the upscale ratio. An explicit "
+                     "MVecScaleX/Y other than 1.0 still overrides this.",
+                     fx, fy, s.mvec_scale_x, s.mvec_scale_y);
+            mgpu::diag::info(fl);
+        }
+    }
     {
         const int cqm = ini_read_copy_queue();
         if (cqm < 0)
@@ -19933,14 +21193,55 @@ void stream_request()
             s.r332_p2_reset = false; s.e16_t0.QuadPart = 0; s.e16_ev0 = s.e16_prod0 = 0ull;
             s.e16_slow_windows = 0u; s.e16_said = false;
             g_present_vsync.store(s.present_vsync, std::memory_order_relaxed);
+            // [TEAR, 2026-11-11] resolve PresentTear once, at arm; the chain was created with
+            // the same answer at startup, so the two cannot disagree within a session.
+            g_present_tear.store(tearing_wanted() ? 1u : 0u, std::memory_order_relaxed);
+            // [COPY OptiScaler, 2026-11-11] The output target. Absent / -1 = auto just under
+            // the refresh; 0 = off; >0 = explicit. See fg_target_pace above.
+            {
+                const int tgt = ini_read_sr_int("FgTargetFps", -1, -1, 1000);
+                double fps = 0.0;
+                const char *src = "off (key 0)";
+                if (tgt > 0)
+                {
+                    fps = (double)tgt;
+                    src = "explicit";
+                }
+                else if (tgt < 0)
+                {
+                    const double hz = display_refresh_hz();
+                    if (hz > 20.0 && hz < 500.0)
+                    {
+                        fps = hz - hz * hz / 3600.0;
+                        src = "auto (refresh - refresh^2/3600)";
+                    }
+                    else src = "off (no refresh measured)";
+                }
+                g_fg_target_fps.store(fps > 1.0 ? fps : 0.0, std::memory_order_relaxed);
+                char tl[280];
+                if (fps > 1.0)
+                {
+                    const int ni = (int)mgpu::fgmode::get_multi() + 1;
+                    snprintf(tl, sizeof tl,
+                             "[MGPU][R609] FgTargetFps: %.1f fps %s - output capped, one source present every "
+                             "%.2f ms at N=%d (the DLSS-G pacing thread keeps its own schedule)",
+                             fps, src, 1000.0 * (double)ni / fps, ni);
+                }
+                else
+                    snprintf(tl, sizeof tl,
+                             "[MGPU][R609] FgTargetFps: %s - the bridge presents as fast as the neural stage "
+                             "produces (no target rate)", src);
+                mgpu::diag::info(tl);
+            }
             if (s.present_vsync == 0u)
                 mgpu::diag::warn(
-                    "[MGPU][L5] PresentVsync=0 - the bridge window presents IMMEDIATELY. "
-                    "Expect tearing. This exists because the output side was never measured: "
-                    "Present(1,0) waits for vblank and D6 allows three presents in flight, so "
-                    "the chain can hold frames that L2 (which stops at consume) and P2.2 "
-                    "(which stops at the evaluate) both miss. Nothing spins: this path only "
-                    "runs when there is a frame to show, so the producer paces it.");
+                    "[MGPU][L5] PresentVsync=0 - the bridge window presents WITHOUT WAITING for a "
+                    "vblank. This alone does NOT tear: tearing needs the chain created with "
+                    "DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING and Present(0, DXGI_PRESENT_ALLOW_TEARING), "
+                    "which is PresentTear=1. What it buys is no back-pressure on the neural producer "
+                    "and the 3-deep flip queue as a jitter buffer. Present(1,0) waits for vblank and "
+                    "D6 allows three presents in flight, so the chain can hold frames that L2 (which "
+                    "stops at consume) and P2.2 (which stops at the evaluate) both miss.");
             s.auto_on         = (unsigned)ini_read_sr_int("Auto", 0, 0, 1);
             s.auto_target_fps = (unsigned)ini_read_sr_int("AutoTargetFps", 60, 20, 240);
             s.auto_budget_ms  = 1000.0 / (double)s.auto_target_fps;
@@ -22030,6 +23331,10 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         s.cq_mvec_ok[0] = s.cq_mvec_ok[1] = s.cq_depth_ok[0] = s.cq_depth_ok[1] = 0u;   // R331
         s.mvec_live.store(s.mvec_mode == 3 && s.mvec_bytes2 != 0,
                           std::memory_order_release);
+        // [PORT O2] the same lifetime rule for the depth copy route: live only
+        // once the arm has sized the depth region, cleared under its own lock at
+        // release before anything is freed.
+        s.depth_live.store(s.depth_mode != 0 && s.depth_bytes != 0, std::memory_order_release);
         return;    // record nothing on the arming frame
     }
 
@@ -22402,8 +23707,46 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     bool depth_ok = false;
     if (s.depth_mode != 0)
     {
-        if (depth_handle != 0 && s.depth_bytes != 0)
+        g_depth_route_kind.store(0, std::memory_order_relaxed);   // [PORT FG-PANEL] reset per frame
+        // [PORT O2, 2026-11-11] Did the EVALUATE already deliver this frame's depth
+        // from the game's own block? Then the seal describes it and must not copy
+        // again - one writer per frame. When it did not (no declaration this frame,
+        // lock busy, geometry refused), the tap path below runs exactly as before,
+        // so this is a per-frame fallback and never two copies of one frame.
+        const bool o2_mid_depth =
+            (s.depth_slot_frame[(fi - 1ull) % stream_state::TAG_RING].load(std::memory_order_acquire) == fi);
+        if (o2_mid_depth)
         {
+            depth_ok = true;
+            ++s.depth_seal_contract;
+            g_depth_route_kind.store(2, std::memory_order_relaxed);   // [PORT FG-PANEL] contract
+            dsrc = nullptr;   // already in the slot; the copy below is skipped
+            ++s.depth_seal_run;
+            // [PORT O3] after a long run of contract frames, the tap yields for good.
+            // The rule is the vector side's (R106b / R280o): one route at a time.
+            if (s.depth_seal_run >= 120ull && !s.depth_yield.load(std::memory_order_relaxed))
+            {
+                static int depth_yield_key = -1;
+                if (depth_yield_key < 0)
+                    depth_yield_key = (ui_ini_read("DepthYield", 1) != 0) ? 1 : 0;
+                if (depth_yield_key != 0)
+                {
+                    s.depth_yield.store(true, std::memory_order_release);
+                    mgpu::diag::info("[MGPU][R810] DEPTH TAP YIELD: the contract route delivered 120 consecutive "
+                                     "sealed frames, so the tap's depth copy stops for the rest of this session "
+                                     "(one writer, the vector side's R106b rule applied to depth). Frames without "
+                                     "a declaration now ship NO depth rather than the tap's. DepthYield=0 disables.");
+                }
+            }
+        }
+        else if (s.depth_yield.load(std::memory_order_acquire))
+        {
+            s.depth_seal_run = 0;
+            if (depth_handle != 0 && s.depth_bytes != 0) ++s.depth_yield_skips;
+        }
+        else if (depth_handle != 0 && s.depth_bytes != 0)
+        {
+            s.depth_seal_run = 0;
             dsrc = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)depth_handle);
             const D3D12_RESOURCE_DESC dd = dsrc->GetDesc();
 
@@ -22512,6 +23855,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     if (t119_pd) mgpu::p0t::mark(gl, fi, 2);   // R300h: after the colour copy and the barrier back
     if (depth_ok && dsrc != nullptr)
     {
+        ++s.depth_seal_tap;
+        g_depth_route_kind.store(1, std::memory_order_relaxed);   // [PORT FG-PANEL] tap
         D3D12_TEXTURE_COPY_LOCATION ds{}, dt{};
         ds.pResource = dsrc;
         ds.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -22576,6 +23921,146 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 // the seal is recorded at finish-effects; command lists execute in submission
 // order, so the vectors are in the slot before the seal that describes them,
 // and the single fence signal covers both.
+// [PORT O2, 2026-11-11] THE EVALUATE-TIME DEPTH COPY.
+//
+// Vector-symmetric, and that symmetry is the whole point: the game hands NGX a
+// block with colour, depth and motion vectors in it at the SAME call, so depth
+// is copied here, on the game's own command list, into the slot the seal will
+// name - same call, same frame, same block as the vectors.
+//
+// GEOMETRY. The copy box is the extent the game DECLARED, not the allocation:
+// PBZ allocates 2228x1256 and declares 2228x1253, and the three padding rows
+// are not scene depth. The slot was sized from the tap at 2228x1253, so the
+// declared extent fits it exactly - no lane rebuild, no subrect.
+//
+// FORMAT. D32_FLOAT (19) arrives into an R32_FLOAT (41) lane; the guard is
+// bytes per texel (4 == 4), the same compatibility view the working tree uses,
+// because CopyTextureRegion does not convert formats and D32/R32 share the
+// layout.
+//
+// STATE. The assumed before-state is SHADER_RESOURCE - the SAME assumption
+// stream_mvec_copy makes for the velocity buffer at the same call, and grounded
+// in the same fact: the game is handing both to NGX to READ, so both are in a
+// shader-resource state at this instant. It is restored exactly.
+//
+// FAILURE IS PER-FRAME. Any guard that fails leaves depth_slot_frame without
+// this frame's entry, and the seal then copies from the tap exactly as before.
+// One writer per frame, never two.
+static unsigned bpt_of_fmt(unsigned f)
+{
+    switch (f)
+    {
+    case 19u: case 20u: case 39u: case 40u: case 41u: return 4u;
+    case 54u: case 55u: case 56u: return 2u;
+    default: return 0u;
+    }
+}
+
+void stream_depth_copy_state(void *cmd_list_v, unsigned long long depth_handle,
+                             unsigned declared_w, unsigned declared_h, unsigned before_state)
+{
+    stream_state &s = str();
+    static int depth_contract_on = -1;
+    if (depth_contract_on < 0)
+        depth_contract_on = (ui_ini_read("DepthContract", 0) != 0) ? 1 : 0;
+    if (depth_contract_on == 0) return;
+
+    if (!s.depth_live.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> lk(s.depth_cs, std::try_to_lock);
+    if (!lk.owns_lock()) { ++s.depth_lock_skips; return; }
+    if (!s.depth_live.load(std::memory_order_relaxed)) return;
+    if (s.depth_mode == 0 || s.depth_bytes == 0 || s.gxfer == nullptr) return;
+
+    ID3D12GraphicsCommandList *gl = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
+    ID3D12Resource *dsrc = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)depth_handle);
+    if (gl == nullptr || dsrc == nullptr) return;
+
+    const D3D12_RESOURCE_DESC dd = dsrc->GetDesc();
+    if (declared_w == 0u || declared_h == 0u)
+    {
+        declared_w = (unsigned)dd.Width;
+        declared_h = (unsigned)dd.Height;
+    }
+    if (declared_w > (unsigned)dd.Width || declared_h > (unsigned)dd.Height ||
+        declared_w > s.depth_w || declared_h > s.depth_h)
+    {
+        ++s.depth_size_rejects;
+        return;
+    }
+    const unsigned bsrc = bpt_of_fmt((unsigned)dd.Format);
+    const unsigned blane = bpt_of_fmt(s.depth_format);
+    if (bsrc == 0u || bsrc != blane) { ++s.depth_fmt_rejects; return; }
+
+    const unsigned slot = (unsigned)(s.produced_a.load(std::memory_order_acquire) % stream_state::RING);
+    const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
+    // [FFX, 2026-11-11] The caller names the state the resource is in. NGX's evaluate hands
+    // depth in a shader-read state and stream_depth_copy() keeps that; FFX's dispatch desc
+    // declares its own state (and it is not always SR), so the transition must start from
+    // what the game declared or the barrier pair is a lie the release runtime will not catch.
+    const D3D12_RESOURCE_STATES SR = (D3D12_RESOURCE_STATES)before_state;
+
+    barrier(gl, dsrc, SR, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    D3D12_TEXTURE_COPY_LOCATION ds{}, dt{};
+    ds.pResource = dsrc;
+    ds.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    ds.SubresourceIndex = 0;
+    dt.pResource = mgpu::stage::dst(s.gxfer);
+    dt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dt.PlacedFootprint = s.depth_fp;
+    dt.PlacedFootprint.Offset = slot_off + s.depth_off;
+    const D3D12_BOX box{ 0u, 0u, 0u, declared_w, declared_h, 1u };
+    gl->CopyTextureRegion(&dt, 0, 0, 0, &ds, &box);
+
+    barrier(gl, dsrc, D3D12_RESOURCE_STATE_COPY_SOURCE, SR);
+
+    s.depth_slot_valid[slot] = 1u;
+    const unsigned long long fi = s.produced_a.load(std::memory_order_acquire) + 1ull;
+    s.depth_slot_frame[(fi - 1ull) % stream_state::TAG_RING].store(fi, std::memory_order_release);
+    ++s.depth_copies;
+    if (s.depth_copies == 1ull)
+    {
+        char l[420];
+        snprintf(l, sizeof l,
+                 "[MGPU][R808] DEPTH CONTRACT COPY ARMED: the game's declared depth is now copied at the evaluate, "
+                 "same call and same frame as the vectors. handle=0x%llx declared=%ux%u lane=%ux%u src_fmt=%u "
+                 "lane_fmt=%u | the seal will trust the frame flag and skip its own copy for this frame",
+                 depth_handle, declared_w, declared_h, s.depth_w, s.depth_h,
+                 (unsigned)dd.Format, s.depth_format);
+        mgpu::diag::info(l);
+    }
+}
+
+// [FFX, 2026-11-11] The NGX route's entry, unchanged: the game is handing depth to DLSS to
+// READ, so the declared state is shader-resource and the copy restores exactly that.
+void stream_depth_copy(void *cmd_list_v, unsigned long long depth_handle,
+                       unsigned declared_w, unsigned declared_h)
+{
+    stream_depth_copy_state(cmd_list_v, depth_handle, declared_w, declared_h,
+                            (unsigned)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+}
+
+// [FFX, 2026-11-11] The same copy path with the game's declared state. FFX's dispatch desc
+// carries a state word the FSR backend itself transitions from; ours must agree with it or the
+// restore leaves the texture in a state the game does not expect. The tag-time capture route
+// (R300d) already established this shape - this is the same mechanism, exposed by name.
+void stream_mvec_copy_state(void *cmd_list_v, unsigned long long mvec_handle, unsigned before_state)
+{
+    if (before_state == (unsigned)D3D12_RESOURCE_STATE_COPY_SOURCE)
+    {
+        stream_mvec_copy(cmd_list_v, mvec_handle);
+        return;
+    }
+    const bool prev_barrier = t_t119_tag_barrier;
+    const unsigned prev_state = t_t119_tag_state;
+    t_t119_tag_state = before_state;
+    t_t119_tag_barrier = true;
+    stream_mvec_copy(cmd_list_v, mvec_handle);
+    t_t119_tag_state = prev_state;
+    t_t119_tag_barrier = prev_barrier;
+}
+
 void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
 {
     stream_state &s = str();
@@ -22730,6 +24215,7 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     if (s.mvec_slot_valid[slot].load(std::memory_order_relaxed) == 0u)
     {
         ++s.mvec_copies;
+    s.mvec_last_src.store(mvec_handle, std::memory_order_relaxed);   // [PORT R139b] who wrote the lane
         if (t_tap_copy_scope) ++s.mvec_copies_tap;   // R280o: same point, same condition, so tap <= copies
         else ++s.mvec_copies_own;                     // R289: counted directly - no subtraction, no fake delivery
     }
@@ -23003,8 +24489,226 @@ static inline void r338_mvec_source(stream_state &s, unsigned slot, unsigned lon
     ++s.latch_applied;
 }
 
+// ---- [PORT B1] the read-only content probe, harvest and record ----
+//
+// Both run inside stream_cq_submit, i.e. on the bridge thread that already
+// owns s.cq / s.cqf. The harvest reads the PREVIOUS sample (its copy is done
+// when the copy queue's fence has passed it); the record writes the next one
+// into the same batch that carries this frame's real copies, so it costs one
+// 256x256 CopyTextureRegion on a queue that is already recording ~55 MB.
+static void b1_harvest(stream_state &s)
+{
+    if (!s.z_pending || s.zbuf == nullptr || s.cqf == nullptr) return;
+    if (s.cqf->GetCompletedValue() < s.z_f) return;
+
+    void *p = nullptr;
+    if (FAILED(s.zbuf->Map(0, nullptr, &p)) || p == nullptr) { s.z_pending = false; return; }
+    const mgpu::mzero::stats st =
+        mgpu::mzero::sample(static_cast<const unsigned char *>(p),
+                            (unsigned)s.zfp.Footprint.RowPitch, s.z_w, s.z_h, s.z_fmt);
+    D3D12_RANGE none{ 0, 0 };
+    s.zbuf->Unmap(0, &none);
+    s.z_pending = false;
+    if (st.n == 0u) return;   // format not understood: say nothing rather than a false zero
+
+    char l[420];
+    snprintf(l, sizeof l,
+             "[MGPU][R486] mvec ZERO f=%llu | window %ux%u fmt=%u | zero=%.1f%% | |x| mean=%.4f | |y| mean=%.4f "
+             "| peak=%.3f | nan=%u of %u | READ-ONLY: this line never changes a source or a bind",
+             s.z_f, s.z_w, s.z_h, s.z_fmt, st.zero_pct, st.mean_abs_x, st.mean_abs_y, st.max_mag,
+             st.nan_count, st.n);
+    mgpu::diag::info(l);
+}
+
+static void b1_record(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *tex,
+                      unsigned long long f)
+{
+    if (s.z_on < 0)
+    {
+        s.z_on = (ini_has_key("MVecZeroProbe") && ini_read_float("MVecZeroProbe", 0.0f) >= 0.5f) ? 1 : 0;
+        float ev = ini_read_float("MVecZeroEvery", 30.0f);
+        if (ev < 10.0f) ev = 10.0f;
+        if (ev > 600.0f) ev = 600.0f;
+        s.z_every = (unsigned)ev;
+        if (s.z_on == 1)
+            mgpu::diag::info("[MGPU][R486] MVecZeroProbe=1: every MVecZeroEvery source frames a 256x256 window of "
+                             "the DELIVERED field is read back and its content logged. Read-only: no source, no bind, "
+                             "no gate is touched (B1 scope).");
+    }
+    if (s.z_on != 1 || tex == nullptr || cl == nullptr || s.mvec_fp2.Footprint.Width == 0u) return;
+    if ((f % (unsigned long long)s.z_every) != 0ull || s.z_pending) return;
+
+    const unsigned pw = (unsigned)s.mvec_fp2.Footprint.Width;
+    const unsigned ph = (unsigned)s.mvec_fp2.Footprint.Height;
+    const unsigned w = (pw < 256u) ? pw : 256u;
+    const unsigned h = (ph < 256u) ? ph : 256u;
+    const UINT fmt = (UINT)s.mvec_fp2.Footprint.Format;
+
+    if (s.zbuf == nullptr || s.z_fmt != fmt)
+    {
+        if (s.zbuf != nullptr) { s.zbuf->Release(); s.zbuf = nullptr; }
+        if (s.zdbuf != nullptr) { s.zdbuf->Release(); s.zdbuf = nullptr; }
+        s.zd_pending = false; s.zd_f = 0ull; s.zd_w = s.zd_h = 0u; s.zd_fmt = 0u;
+        ID3D12Device *dev = nullptr;
+        if (FAILED(cl->GetDevice(IID_PPV_ARGS(&dev))) || dev == nullptr) return;
+
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = (DXGI_FORMAT)fmt; td.SampleDesc.Count = 1;
+
+        UINT rows = 0; UINT64 rowb = 0, total = 0;
+        dev->GetCopyableFootprints(&td, 0, 1, 0, &s.zfp, &rows, &rowb, &total);
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&s.zbuf));
+        dev->Release();
+        if (FAILED(hr) || s.zbuf == nullptr)
+        {
+            s.zbuf = nullptr;
+            s.z_on = 0;
+            mgpu::diag::error("[MGPU][R486] MVecZeroProbe: the readback buffer could not be made - probe OFF for "
+                             "this process (nothing else changes).");
+            return;
+        }
+        s.zfp.Offset = 0;
+        s.z_w = w; s.z_h = h; s.z_fmt = fmt;
+    }
+
+    barrier(cl, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = tex; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    dst.pResource = s.zbuf; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = s.zfp; dst.PlacedFootprint.Offset = 0;
+    const UINT x0 = (pw - w) / 2u, y0 = (ph - h) / 2u;
+    const D3D12_BOX box{ x0, y0, 0u, x0 + w, y0 + h, 1u };
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    barrier(cl, tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    s.z_f = f;
+    s.z_pending = true;
+}
+
+// ---- [PORT O4b, 2026-11-11] THE DEPTH CONTENT PROBE (read-only) ----
+//
+// The O2 arm proved WHERE the depth comes from; this says WHAT is in it. A
+// cleared buffer is a constant plane and reprojects perfectly, so zero% alone
+// is not enough: the line reports min/max/mean as well, and min == max is the
+// constant-plane signature.
+//
+// Same shape as the vector probe above: a 256x256 window of the GPU 1 landing
+// texture the model is about to read, one READBACK buffer, fence-gated map.
+// Key DepthZeroProbe=1 (absent = off, byte-identical to no probe).
+static void b1_depth_harvest(stream_state &s)
+{
+    if (!s.zd_pending || s.zdbuf == nullptr || s.cqf == nullptr) return;
+    if (s.cqf->GetCompletedValue() < s.zd_f) return;
+
+    void *p = nullptr;
+    if (FAILED(s.zdbuf->Map(0, nullptr, &p)) || p == nullptr) { s.zd_pending = false; return; }
+    const mgpu::mzero::scalar_stats st =
+        mgpu::mzero::sample_scalar(static_cast<const unsigned char *>(p),
+                                   (unsigned)s.zdfp.Footprint.RowPitch, s.zd_w, s.zd_h, s.zd_fmt);
+    D3D12_RANGE none{ 0, 0 };
+    s.zdbuf->Unmap(0, &none);
+    s.zd_pending = false;
+    if (st.n == 0u) return;
+
+    char l[400];
+    snprintf(l, sizeof l,
+             "[MGPU][R811] depth ZERO f=%llu | window %ux%u fmt=%u | zero=%.1f%% | min=%.6f max=%.6f mean=%.6f "
+             "| constant_plane=%s | nan=%u of %u | READ-ONLY",
+             s.zd_f, s.zd_w, s.zd_h, s.zd_fmt, st.zero_pct, st.min_v, st.max_v, st.mean,
+             (std::fabs(st.max_v - st.min_v) < 1e-9) ? "YES (suspicious)" : "no",
+             st.nan_count, st.n);
+    mgpu::diag::info(l);
+}
+
+static void b1_depth_record(stream_state &s, ID3D12GraphicsCommandList *cl, ID3D12Resource *tex,
+                            unsigned long long f)
+{
+    static int on = -1;
+    static unsigned every = 30u;
+    if (on < 0)
+    {
+        on = (ini_has_key("DepthZeroProbe") && ini_read_float("DepthZeroProbe", 0.0f) >= 0.5f) ? 1 : 0;
+        float ev = ini_read_float("MVecZeroEvery", 30.0f);
+        if (ev < 10.0f) ev = 10.0f;
+        if (ev > 600.0f) ev = 600.0f;
+        every = (unsigned)ev;
+        if (on == 1)
+            mgpu::diag::info("[MGPU][R811] DepthZeroProbe=1: every MVecZeroEvery source frames a 256x256 window of "
+                             "the DEPTH the model is handed is read back and its range logged. Read-only.");
+    }
+    if (on != 1 || tex == nullptr || cl == nullptr || s.depth_w == 0u) return;
+    if ((f % (unsigned long long)every) != 0ull || s.zd_pending) return;
+
+    const unsigned pw = s.depth_w, ph = s.depth_h;
+    const unsigned w = (pw < 256u) ? pw : 256u;
+    const unsigned h = (ph < 256u) ? ph : 256u;
+    const UINT fmt = (UINT)s.depth_format;
+
+    if (s.zdbuf == nullptr || s.zd_fmt != fmt)
+    {
+        if (s.zdbuf != nullptr) { s.zdbuf->Release(); s.zdbuf = nullptr; }
+        ID3D12Device *dev = nullptr;
+        if (FAILED(cl->GetDevice(IID_PPV_ARGS(&dev))) || dev == nullptr) return;
+
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = (DXGI_FORMAT)fmt; td.SampleDesc.Count = 1;
+
+        UINT rows = 0; UINT64 rowb = 0, total = 0;
+        dev->GetCopyableFootprints(&td, 0, 1, 0, &s.zdfp, &rows, &rowb, &total);
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&s.zdbuf));
+        dev->Release();
+        if (FAILED(hr) || s.zdbuf == nullptr)
+        {
+            s.zdbuf = nullptr;
+            on = 0;
+            mgpu::diag::error("[MGPU][R811] DepthZeroProbe: the readback buffer could not be made - probe OFF "
+                             "for this process (nothing else changes).");
+            return;
+        }
+        s.zdfp.Offset = 0;
+        s.zd_w = w; s.zd_h = h; s.zd_fmt = fmt;
+    }
+
+    barrier(cl, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = tex; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    dst.pResource = s.zdbuf; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = s.zdfp; dst.PlacedFootprint.Offset = 0;
+    const UINT x0 = (pw - w) / 2u, y0 = (ph - h) / 2u;
+    const D3D12_BOX box{ x0, y0, 0u, x0 + w, y0 + h, 1u };
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    barrier(cl, tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    s.zd_f = f;
+    s.zd_pending = true;
+}
+
 static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)   // R343 (FIX6): the half is the caller's; key absent it is f & 1
 {
+    b1_harvest(s);   // [PORT B1] drain the previous sample before recording this frame
+    b1_depth_harvest(s);   // [PORT O4b] the depth sample, same rule
     if (s.cq == nullptr || s.cqf == nullptr || s.cqa[ii] == nullptr ||
         s.cql[ii] == nullptr || s.tex_in[ii] == nullptr || s.nxfer == nullptr)
         return false;
@@ -23062,6 +24766,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
         ddu.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         ddu.SubresourceIndex = 0;
         s.cql[ii]->CopyTextureRegion(&ddu, 0, 0, 0, &dsu, nullptr);
+        b1_depth_record(s, s.cql[ii], s.tex_depth[ii], f);   // [PORT O4b] read-only content sample, same batch
         ++s.depth_unpacks;
     }
 
@@ -23086,6 +24791,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
         mdu.SubresourceIndex = 0;
         s.cql[ii]->CopyTextureRegion(&mdu, 0, 0, 0, &msu, nullptr);
         ++s.mvec_unpacks;
+        b1_record(s, s.cql[ii], s.tex_mvec_r[ii], f);   // [PORT B1] read-only content sample, same batch
     }
 
     if (s.seal_valid_on != 0u) { s.cq_depth_ok[ii] = r331_depth_copied ? 1u : 0u; s.cq_mvec_ok[ii] = r331_mvec_copied ? 1u : 0u; }   // R331 (OPT4)
@@ -23823,6 +25529,17 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 {
                     s.depth_report_at = f + 300ull;
                     const unsigned long long tot = s.depth_seen_valid + s.depth_seen_invalid;
+                    // [PORT O2.2, 2026-11-11] WHICH ROUTE DELIVERED, as a field on the line
+                    // people already read. Window deltas, not cumulative: the answer must
+                    // describe THIS report's 300 frames, not the whole session.
+                    static unsigned long long r63_c_prev = 0ull, r63_t_prev = 0ull;
+                    const unsigned long long r63_dc = s.depth_seal_contract - r63_c_prev;
+                    const unsigned long long r63_dt = s.depth_seal_tap - r63_t_prev;
+                    r63_c_prev = s.depth_seal_contract;
+                    r63_t_prev = s.depth_seal_tap;
+                    const char *r63_src = (r63_dc != 0ull && r63_dt == 0ull) ? "contract"
+                                        : (r63_dt != 0ull && r63_dc == 0ull) ? "tap"
+                                        : (r63_dc != 0ull && r63_dt != 0ull) ? "mixed" : "none";
                     snprintf(line, sizeof line,
                         "[MGPU][R63] DEPTH TRANSPORT f=%llu mode=%d (%s) | producer: valid=%llu "
                         "invalid=%llu size-rejected=%llu, arm held %llu frame(s) | consumer: "
@@ -23839,7 +25556,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         "disagreement between them is real). BOUND vs SKIPPED IS THE R61 TEST: "
                         "skipped counts frames where ReShade had no depth and the model was "
                         "given NONE rather than the previous frame's - open a menu mid-stream "
-                        "and this must move.",
+                        "and this must move. | depth src=%s contract=%llu tap=%llu (this window)",
                         f, s.depth_mode,
                         (s.depth_mode == 1) ? "TRANSPORTED AND BOUND"
                                             : "ON THE BUS, NOT BOUND - transport-cost arm",
@@ -23853,8 +25570,25 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         (unsigned long long)s.slot_bytes,
                         (tot != 0) ? (100.0 * (double)s.depth_seen_valid / (double)tot) : 0.0,
                         s.depth_unpacks, s.depth_bound, s.depth_skipped,
-                        s.depth_inverted, s.depth_flag_disagree);
+                        s.depth_inverted, s.depth_flag_disagree, r63_src, r63_dc, r63_dt);
                     mgpu::diag::info(line);
+                    // [PORT O2.1, 2026-11-11] WHICH ROUTE FILLED THE SLOT. The tap
+                    // fallback makes the R63 valid count identical either way, so the
+                    // route gets its own number: on a working contract arm
+                    // seal-contract tracks the frame count and seal-tap stays near 0
+                    // (menus are where the tap is legitimately used).
+                    {
+                        char r809[360];
+                        snprintf(r809, sizeof r809,
+                                 "[MGPU][R809] DEPTH ROUTE: contract-copies=%llu seal-contract=%llu seal-tap=%llu "
+                                 "lock-skips=%llu fmt-rejects=%llu size-rejects=%llu | DepthContract=%d tap-yield=%d yield-skips=%llu",
+                                 s.depth_copies, s.depth_seal_contract, s.depth_seal_tap,
+                                 s.depth_lock_skips, s.depth_fmt_rejects, s.depth_size_rejects,
+                                 ui_ini_read("DepthContract", 0),
+                                 s.depth_yield.load(std::memory_order_relaxed) ? 1 : 0,
+                                 s.depth_yield_skips);
+                        mgpu::diag::info(r809);
+                    }
                 }
             }
 
@@ -24034,6 +25768,30 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         s.mvec_scale_x, s.mvec_scale_y,
                         (mtot != 0) ? (100.0 * (double)s.mvec_seen_valid / (double)mtot) : 0.0);
                     mgpu::diag::info(ml);
+
+                    // [PORT R139b, 2026-11-11] WHICH VECTOR BUFFER ACTUALLY WROTE THE LANE.
+                    // `copies` counts that A copy happened, not WHICH buffer it was. On a title
+                    // the game hands to FSR, the FFX dispatch names one handle and the tap/barrier
+                    // route names another; both write the same slot, and the model reads whatever
+                    // landed last. This prints the handle of the last successful copy beside the
+                    // contract's declared handle, so "vectors arrived" and "the RIGHT vectors
+                    // arrived" become two different readings instead of one assumption.
+                    {
+                        mgpu::calibrator::table t{};
+                        const bool have = mgpu::calibrator::read(t) &&
+                                          (t.have & mgpu::calibrator::KEY_MVEC) != 0u;
+                        const unsigned long long decl = have ? t.mvec : 0ull;
+                        const unsigned long long last = s.mvec_last_src.load(std::memory_order_relaxed);
+                        char bl[640];
+                        snprintf(bl, sizeof bl,
+                                 "[MGPU][R139b] MVEC SOURCES: last-copy-src=0x%llx | declared contract "
+                                 "mvec=0x%llx | SAME=%s. NO means the lane's last writer is a tap/ranked "
+                                 "candidate, not the field the game handed the upscaler - the FFX copy can "
+                                 "have run and still been overwritten in the same frame.",
+                                 last, decl,
+                                 (decl == 0ull) ? "no table" : ((decl == last) ? "yes" : "NO"));
+                        mgpu::diag::info(bl);
+                    }
 
                     // ---- R182 / R184: OCCUPANCY, FOOTPRINT, AND RECREATION ----
                     //
@@ -24834,6 +26592,152 @@ void stream_poll()
         // (P7.8, nr_linear_format). 28 and 24 titles pass through unchanged.
         if (!s.profile)
             (void)present_resize(s.width, s.height, s.window_mode, nr_linear_format(s.format));
+
+        // ---- [H7/A, 2026-11-11] XeFG TAKES THE AUTHOR'S OWN WINDOW CHAIN ----
+        //
+        // With DcompOverlay=1 the picture reaches the screen as a composition visual on the
+        // GAME's window, and a composition chain cannot be handed to XeFG (InitFromSwapChain*
+        // wants an HWND flip chain). That is the ONLY reason the display layer had to own a
+        // second window. With DcompOverlay=0 the author's own chain IS a flip chain on the
+        // bridge window, so XeFG can create it and the second window disappears: three chains
+        // become two (game + this one), which is Magpie's topology.
+        //
+        // THE PART NEVER DONE HERE: releasing a flip chain and letting another component
+        // create the next one on the SAME HWND. DXGI allows one per HWND, so the old one must
+        // be gone before XeFG is asked - that is the mechanism behind every E_ACCESSDENIED in
+        // the 2b-1 record. Fail-closed: if XeFG refuses, a plain chain of the same shape is
+        // built in its place and the session runs 1x exactly as the shipped path does.
+        if (!s.profile && dcomp_overlay_mode() == 0 && mgpu_xefg_handover_wanted())
+        {
+            auto &S = st();
+            ID3D12Device *adev = nullptr; ID3D12CommandQueue *aq = nullptr;
+            ID3D12DescriptorHeap *aheap = nullptr; HWND ahwnd = nullptr;
+            UINT abufs = 2u;
+            {
+                std::lock_guard<std::mutex> lk(S.cs);
+                adev = S.device; aq = S.queue; aheap = S.rtv_heap; ahwnd = S.hwnd;
+                abufs = S.present_buffers;
+            }
+            if (adev != nullptr && aq != nullptr && aheap != nullptr && ahwnd != nullptr)
+            {
+                {
+                    std::lock_guard<std::mutex> lk(S.cs);
+                    for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)
+                        if (S.backbuffer[i] != nullptr) { S.backbuffer[i]->Release(); S.backbuffer[i] = nullptr; }
+
+                    if (S.swapchain != nullptr) { S.swapchain->Release(); S.swapchain = nullptr; }
+                }
+                SetWindowLongPtrW(ahwnd, GWL_STYLE,
+                                  (GetWindowLongPtrW(ahwnd, GWL_STYLE) & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP);
+                // [H7/B, 2026-11-11] This raise is the FIRST one only. It is also the exact
+                // call that used to make Alt+Tab impossible: WS_EX_TOPMOST is a property of the
+                // window, so it stayed above Explorer and every other app for the whole
+                // session. worker.cpp's follow_foreground() now owns the state from here -
+                // topmost while the game is the foreground, SW_HIDE while it is not.
+                SetWindowPos(ahwnd, HWND_TOPMOST, 0, 0, (int)s.width, (int)s.height,
+                             SWP_SHOWWINDOW | SWP_NOACTIVATE);
+                // [H7/A-fg, 2026-11-11] HAND THE FOREGROUND BACK - ONCE, WITHOUT AttachThreadInput.
+                // A NULL FOREGROUND IS WHAT KILLS KEYBOARD AND CLICKS. This window is topmost
+                // and covers the screen, so Windows gave foreground to it; one request puts it
+                // back on the game. No thread attach, no input-queue sharing, nothing to crash.
+                {
+                    HWND gh = (HWND)dcomp_game_hwnd();
+                    if (gh != nullptr)
+                    {
+                        SetForegroundWindow(gh);
+                        char lf[240];
+                        snprintf(lf, sizeof lf,
+                                 "[MGPU][T4][A-fg] foreground handed back to the game: hwnd=%p fg_now=%p equal=%d. A NULL FOREGROUND IS WHAT KILLS KEYBOARD AND CLICKS.",
+                                 (void *)gh, (void *)GetForegroundWindow(),
+                                 (GetForegroundWindow() == gh) ? 1 : 0);
+                        mgpu::diag::info(lf);
+                        // [H7/A-clip, REMOVED 2026-11-11] ClipCursor 2x2 and SetCursorPos parked
+                        // the desktop pointer on the bottom edge because, with no pump, the game
+                        // read THAT pointer and a menu could not be driven. That is exactly the
+                        // arm the presenter replaces: the window now TAKES the mouse and forwards
+                        // it (worker.cpp, DispClickThrough=0), so the pointer must be free and the
+                        // system arrow hidden by WM_SETCURSOR (DispCursor=0), not clipped.
+                    }
+                }
+
+                DXGI_SWAP_CHAIN_DESC1 ascd{};
+                ascd.Width = s.width; ascd.Height = s.height;
+                ascd.Format = nr_linear_format(s.format);
+                ascd.SampleDesc.Count = 1; ascd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                ascd.BufferCount = (abufs >= 2u && abufs <= 3u) ? abufs : 2u;
+                ascd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+                ascd.Scaling = DXGI_SCALING_STRETCH;
+                ascd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+                // [TEAR, 2026-11-11] The chain XeFG creates from this desc must allow tearing
+                // for Present(0, DXGI_PRESENT_ALLOW_TEARING) to be legal. OptiScaler copies the
+                // game's flags for the same reason (FG_Hooks.cpp:665-669). If the key is off
+                // this is 0 and nothing about the session changes.
+                ascd.Flags = g_present_tear.load(std::memory_order_relaxed) != 0u
+                                 ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+
+                IDXGIFactory2 *afac = nullptr;
+                if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&afac))) && afac != nullptr)
+                {
+                    IDXGISwapChain1 *nsc = nullptr; IDXGISwapChain3 *nsc3 = nullptr;
+                    const bool ho = mgpu_xefg_display_handover(adev, aq, ahwnd, &ascd, afac,
+                                                               &nsc, &nsc3, "author-chain");
+                    if (!ho || nsc == nullptr || nsc3 == nullptr)
+                    {
+                        nsc = nullptr; nsc3 = nullptr;
+                        if (SUCCEEDED(afac->CreateSwapChainForHwnd(aq, ahwnd, &ascd, nullptr, nullptr, &nsc)) &&
+                            nsc != nullptr)
+                            nsc->QueryInterface(IID_PPV_ARGS(&nsc3));
+                        mgpu::diag::error("[MGPU][R489][A] XeFG refused the AUTHOR's chain - a plain chain was "
+                                          "built in its place; this session runs 1x through it (fail-closed).");
+                    }
+                    afac->Release();
+                    if (nsc != nullptr && nsc3 != nullptr)
+                    {
+                        const UINT rs = adev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                        {
+                            std::lock_guard<std::mutex> lk(S.cs);
+                            S.swapchain = nsc3;
+                            D3D12_CPU_DESCRIPTOR_HANDLE d = aheap->GetCPUDescriptorHandleForHeapStart();
+                            for (UINT i = 0; i < state::MAX_BACKBUFFERS && i < ascd.BufferCount; ++i)
+                            {
+                                if (FAILED(nsc3->GetBuffer(i, IID_PPV_ARGS(&S.backbuffer[i]))))
+                                {
+                                    S.backbuffer[i] = nullptr;
+                                    break;
+                                }
+                                adev->CreateRenderTargetView(S.backbuffer[i], nullptr, d);
+                                d.ptr += rs;
+                            }
+                            S.chain_w = s.width; S.chain_h = s.height; S.chain_fmt = ascd.Format;
+                        }
+                        char la[300];
+                        snprintf(la, sizeof la,
+                                 "[MGPU][R489][A] the author's window chain is now %s: hwnd=%p %ux%u fmt=%u buffers=%u "
+                                 "flags=0x%X. No second window is needed in this session.",
+                                 ho ? "XeFG's proxy" : "a plain fallback chain", (void *)ahwnd,
+                                 s.width, s.height, (unsigned)ascd.Format, ascd.BufferCount,
+                                 (unsigned)ascd.Flags);
+                        mgpu::diag::info(la);
+                        // [TEAR] the chain that is live now is the one the flag describes.
+                        {
+                            const bool tear_chain = (ascd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0u;
+                            g_chain_tear.store(tear_chain ? 1u : 0u, std::memory_order_relaxed);
+                            g_tear_live.store(tear_chain ? 1u : 0u, std::memory_order_relaxed);
+                        }
+                        // [H7/A-mode, 2026-11-11] THE MULTIPLIER IS NOT SET BY INIT.
+                        // xefg_display.inc records the measurement: after InitFromSwapChainDesc the
+                        // provider reports applied_ni = 1 even when the patched ceiling is 2 - the
+                        // ceiling is what it MAY do, not what it does. mgpu_xefg_apply_mode() is
+                        // the call that hands it the number (SetNumInterpolatedFrames). The display
+                        // layer used to make that call once per frame; with the layer retired there
+                        // is nobody left, and the arm would sit at 2x with a 3x ceiling.
+                        if (ho) mgpu_xefg_apply_mode();
+                        else if (!ho) { /* plain fallback chain: no provider to configure */ }
+
+                    }
+                }
+            }
+        }
     }
 
     // ---- RING WINDOW: hold no more depth than this run has earned ----
@@ -25848,6 +27752,25 @@ void stream_poll()
                                  vr.mean_ax, vr.max_ax, vr.mean_ay, vr.max_ay, 100.0 * vr.pos_x, 100.0 * vr.pos_y,
                                  hx[0] ? hx : "-", vr.n ? 100.0 * (double)vr.same_as_first / (double)vr.n : 0.0, vr.verdict);
                         mgpu::diag::info(vl);
+                        {
+                            // [PORT R257e, 2026-11-11] WHAT THE MODEL ACTUALLY REPROJECTS WITH.
+                            // The raw slot bytes above are one number; NR multiplies them by the
+                            // armed scale (and adds the offset), and THAT product is what moves the
+                            // history. Without this line "mean |x| = 0.02" and "mean = 41 px" are
+                            // the same reading and the operator cannot tell a live field from a
+                            // mis-scaled one. Rectangles are magnitudes: an upper bound for signed
+                            // data, exact for one sign.
+                            const float ax = fabsf(s.mvec_scale_x), ay = fabsf(s.mvec_scale_y);
+                            const float adx = fabsf(s.mvec_dx), ady = fabsf(s.mvec_dy);
+                            char el[360];
+                            snprintf(el, sizeof el,
+                                     "[MGPU][R257e] effective = raw * (%.6f, %.6f) + (%.3f, %.3f): "
+                                     "|x| mean=%.4f max=%.4f | |y| mean=%.4f max=%.4f (pixels the history moves)",
+                                     s.mvec_scale_x, s.mvec_scale_y, s.mvec_dx, s.mvec_dy,
+                                     vr.mean_ax * ax + adx, vr.max_ax * ax + adx,
+                                     vr.mean_ay * ay + ady, vr.max_ay * ay + ady);
+                            mgpu::diag::info(el);
+                        }
                     }
                 }
                 // ---- R315b (MVecBarrierSource=2): the judge ----
@@ -26929,6 +28852,39 @@ void stream_poll()
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     if (tdec.reset) rst = 1u;   // R300a1: TemporalResetK, off unless set
                     if (gate_rst) rst = 1u;     // R323: no history across frames the game's DLSS did not evaluate
+                    // [FFX, 2026-11-11] THE PROVIDER'S OWN "HISTORY INVALID" FOR THIS FRAME.
+                    // ffxDispatchDescUpscale.reset is how an FSR title says "cut, teleport, new
+                    // scene - do not reproject across this". It was published (KEY_RESET) and the
+                    // jitter path already suppressed its delta on it, but it never reached
+                    // DLSSNR.Reset: on an FSR title the only frame-level reset was R323, whose
+                    // question ("did the game's DLSS evaluate") is always 0 there. Read the table
+                    // here (bounded seqlock, no lock) and apply it to every pass of the frame.
+                    bool contract_rst = false;
+                    {
+                        mgpu::calibrator::table rt{};
+                        if (mgpu::calibrator::read(rt) &&
+                            (rt.have & mgpu::calibrator::KEY_RESET) != 0u && rt.reset != 0u)
+                            contract_rst = true;
+                    }
+                    if (contract_rst)
+                    {
+                        rst = 1u;
+                        if (pi == 0u)
+                        {
+                            static std::atomic<int> said_cr{0};
+                            const int ncr = said_cr.fetch_add(1, std::memory_order_relaxed);
+                            if (ncr < 5 || (ncr % 100) == 0)
+                            {
+                                char crl[320];
+                                snprintf(crl, sizeof crl,
+                                         "[MGPU][R825] NR reset from the CONTRACT's reset flag at f=%llu (#%d): the "
+                                         "game told the upscaler this frame's history is invalid (cut/teleport/new "
+                                         "scene). This is the FSR-title equivalent of R323's menu protection.",
+                                         f, ncr + 1);
+                                mgpu::diag::info(crl);
+                            }
+                        }
+                    }
                     if (pi == 1u && s.r332_p2_reset) { rst = 1u; s.r332_p2_reset = false;   // R332 (E12)
                         mgpu::diag::info("[MGPU][R332] Pass2Reset: live x1 -> x2, pass 2's first evaluate runs with "
                                          "DLSSNR.Reset=1 (its history predates the switch)."); }
@@ -27674,6 +29630,60 @@ void stream_poll()
                                      mvec_here ? s.tex_mvec_r[ii] : nullptr,
                                      depth_here ? s.tex_depth[ii] : nullptr,
                                      mv_el_frame, f);
+
+                // ---- [PORT H4', 2026-11-11] the same two textures, for the provider ----
+                //
+                // XeSS-FG owns the chain in this session's other configuration, and its
+                // per-present tag needs exactly what the neural pass itself read this
+                // frame: the depth and the REAL vectors. Reading them here (rather than
+                // at push time) is the reference tree's own choice - the textures are
+                // the ones the evaluate used, so the tag describes the frame that is
+                // about to be shown.
+                //
+                // THE STATE IS THE RESTING ONE, NOT THE ONE THEY ARE IN NOW. The push's
+                // command list is submitted behind this frame's, which ends by putting
+                // both textures back into s.tex_in_rest (T1b: "depth has the same
+                // lifecycle and therefore the same resting state" - and R78 writes it the
+                // same way for the vectors). Declaring NON_PIXEL_SHADER_RESOURCE here
+                // would name a StateBefore the resource is no longer in when that list
+                // runs - a wrong barrier the debug layer flags and a release build
+                // accepts in silence. This is the reference's stream_guide_depth_rest().
+                //
+                // The scalars are measurements, not constants, and follow the reference
+                // (R490): the scale is the one this bridge hands DLSS, the jitter is the
+                // calibrator's table re-read every 240 frames, and the frame time is
+                // measured from this thread's own push cadence. Nothing here runs unless
+                // the display layer is up - present_override_fg is ten stores.
+                if (g_disp_state.load(std::memory_order_relaxed) == 1 || mgpu_xefg_gen_active())
+                {
+                    mgpu::fgcamera::update(s.width, s.height);
+                    static mgpu::calibrator::table h4_ct{};
+                    static unsigned long long h4_ct_read = ~0ull;
+                    if (h4_ct_read == ~0ull || f - h4_ct_read > 240ull)
+                    {
+                        (void)mgpu::calibrator::read(h4_ct);
+                        h4_ct_read = f;
+                    }
+                    static LARGE_INTEGER h4_q{};
+                    static unsigned long long h4_last = 0ull;
+                    if (h4_q.QuadPart == 0) QueryPerformanceFrequency(&h4_q);
+                    LARGE_INTEGER h4_now{}; QueryPerformanceCounter(&h4_now);
+                    float h4_ms = 16.7f;
+                    if (h4_last != 0ull && h4_q.QuadPart != 0)
+                        h4_ms = (float)((double)(h4_now.QuadPart - h4_last) * 1000.0 / (double)h4_q.QuadPart);
+                    h4_last = (unsigned long long)h4_now.QuadPart;
+                    if (!(h4_ms > 1.0f && h4_ms < 200.0f)) h4_ms = 16.7f;
+                    const float h4_dw = (float)(s.mvec_w != 0u ? s.mvec_w : s.width);
+                    const float h4_dh = (float)(s.mvec_h != 0u ? s.mvec_h : s.height);
+                    present_override_fg(depth_here ? s.tex_depth[ii] : nullptr,
+                                        s.tex_in_rest,
+                                        mvec_here ? s.tex_mvec_r[ii] : nullptr,
+                                        s.tex_in_rest,
+                                        (float)h4_ct.jitter_x, (float)h4_ct.jitter_y,
+                                        (h4_dw > 1.0f) ? s.mvec_scale_x / h4_dw : s.mvec_scale_x,
+                                        (h4_dh > 1.0f) ? s.mvec_scale_y / h4_dh : s.mvec_scale_y,
+                                        h4_ms, (f < 3ull) ? 1u : 0u);
+                }
                 if (!s.profile)
                 {
                 // P6.0: sample the LAST pass's output, not tex_out. With

@@ -60,6 +60,10 @@ int read_key(void *module)
 
 // ---- the panel's state ------------------------------------------------------
 std::atomic<int>    g_live{0};            // 1 = the panel is up on the neural layer
+// [PORT PRESENTER, 2026-11-11] B1.1b, copied from nc-base: while the presenter's own
+// small window is up it owns the mouse via raw input, so the game's input must be
+// blocked even when no ReShade panel is live. The presenter is the only writer.
+std::atomic<bool>   g_b1_input{false};
 std::atomic<void *> g_game{nullptr};      // the game's effect runtime
 std::atomic<void *> g_windowless{nullptr};// the GPU 1 runtime with no window = the neural picture
 std::atomic<void *> g_host{nullptr};      // the runtime the panel was actually opened on
@@ -339,6 +343,10 @@ void set_live(bool up)
     g_live.store(up ? 1 : 0, std::memory_order_relaxed);
     if (up) g_host_drawn_ms.store(GetTickCount64(), std::memory_order_relaxed);   // R293: grace until the first draw
 }
+
+// [PORT PRESENTER, 2026-11-11] copied verbatim from nc-base live_panel.cpp:342-343.
+void set_b1_input(bool on) { g_b1_input.store(on, std::memory_order_relaxed); }
+bool b1_input_active() { return g_b1_input.load(std::memory_order_relaxed); }
 
 void *host_target(void *fallback)
 {
