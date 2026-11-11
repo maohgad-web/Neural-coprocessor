@@ -955,6 +955,7 @@ namespace
         { L"ReShade2.ini",                  L"RESHADE2.INI",     true,  true  },
         { L"mgpu\\nvngx_dlssnr.dll",        L"NVNGX_DLSSNR.DLL", true,  false },
         { L"README.txt",                    L"README.TXT",       false, true  },
+        { L"panel_simple.txt",              L"PANEL_SIMPLE.TXT", false, true  },   // the simple panel's layout (PanelSimple=1); in the zip since the build after 0.5.1
         { L"LICENSE",                       L"LICENSE",          false, true  },
     };
     const wchar_t *const k_url_reshade = L"https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe";
