@@ -42,10 +42,10 @@
                               // mgpu::presenter::disp_fg_in / disp_fg_params
 #include "gpu1_context.hpp"   // mgpu::gpu1::ui_ini_read, display_refresh_hz
 
-#include "../ext/xess_fg/xefg_swapchain.h"
-#include "../ext/xess_fg/xefg_swapchain_d3d12.h"
-#include "../ext/xess_fg/xell.h"
-#include "../ext/xess_fg/xell_d3d12.h"
+#include "../third_party/xess_fg/xefg_swapchain.h"
+#include "../third_party/xess_fg/xefg_swapchain_d3d12.h"
+#include "../third_party/xess_fg/xell.h"
+#include "../third_party/xess_fg/xell_d3d12.h"
 
 // NOTE ON THE TWO PAIRS OF STRUCTS. presenter.hpp defines mgpu::presenter::disp_fg_in /
 // disp_fg_params (field-for-field the same four and six fields), and display_layer.inc
