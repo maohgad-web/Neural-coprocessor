@@ -201,6 +201,9 @@ WHAT THE FOLDER SHOULD LOOK LIKE WHEN YOU ARE DONE
     mgpu.ini                          <- from this download
     gpu1.ini                          <- from this download
     ReShade2.ini                      <- from this download
+    panel_simple.txt                  <- from this download. Optional: the
+                                         layout of the simple panel
+                                         (PanelSimple, below).
     mgpu\
         nvngx_dlssnr.dll              <- NOT from this download. Yours.
                                          NOT beside the .exe.
@@ -456,6 +459,18 @@ ChainColorSpace=auto  How Windows reads the bridge's picture. auto follows
                HDR: please report your results.
 
 Monitor=auto   Which of the second card's outputs the window opens on.
+
+PanelSimple    The simple panel: a short list of the settings that matter,
+
+               shown in place of the full panel. Turn it on with the
+               "PanelSimple" checkbox in the full panel, with CTRL+ALT+F4,
+               or with PanelSimple=1 in mgpu.ini. The same keys switch back.
+               Its rows and their order come from panel_simple.txt beside
+               the add-on; edit that file to change them, then press reload
+               in the panel. The labels in the file are Chinese. If
+               ReShade's font has no Chinese characters, the panel shows
+               English labels. Without panel_simple.txt the full panel
+               stays.
 
 CHECK YOUR OWN ReShade.ini
 --------------------------
