@@ -238,6 +238,7 @@ jobs:
         run: |
           MISSING=0
           for F in assets/gpu1.ini assets/mgpu.ini assets/ReShade2.ini assets/README.txt \
+                   assets/panel_simple.txt \
                    assets/reshade-shaders/Shaders/mgpu_depth_tap.fx LICENSE; do
             if [ ! -f "$F" ]; then
               echo "::error::missing $F"
@@ -247,7 +248,7 @@ jobs:
           [ "$MISSING" -eq 0 ] || exit 1
 
       # The artifact is the complete deploy set. Unpack it into
-      # <game>\...\Binaries\Win64\ beside dxgi.dll: six files at the zip root,
+      # <game>\...\Binaries\Win64\ beside dxgi.dll: seven files at the zip root,
       # plus reshade-shaders\Shaders\mgpu_depth_tap.fx, which must keep its
       # path because ReShade loads it from a shader search path rather than
       # from the game folder.
@@ -285,6 +286,10 @@ jobs:
           cp assets/ReShade2.ini  _deploy/
           cp assets/README.txt    _deploy/
           cp LICENSE              _deploy/
+          # After 0.5.1. THE SIMPLE PANEL'S LAYOUT. panel_simple.cpp reads panel_simple.txt
+          # from beside the add-on; without the file PanelSimple=1 shows nothing
+          # ([R330] "not found"). It was in assets/ since 0.4.0 and never in the zip.
+          cp assets/panel_simple.txt _deploy/
           # 0.2.0. THE TAP SHADER, AND IT KEEPS ITS SUBFOLDER ON PURPOSE.
           #
           # Everything else in this set lands beside the game .exe, flat. This
@@ -314,19 +319,21 @@ jobs:
           echo "--- mgpu.ini keys as shipped ---"
           grep -vE '^\s*(;|$)' _deploy/mgpu.ini || true
 
-      # The artifact is seven files. Stated as a number so that a file added to
+      # The artifact is eight files. Stated as a number so that a file added to
       # assets/ without a decision cannot reach a user's game folder unnoticed.
       #
-      # 0.2.0 raised this from six, for mgpu_depth_tap.fx. COUNT RECURSIVELY:
+      # After 0.5.1 this was raised from seven, for panel_simple.txt (the decision: the
+      # simple panel ships; Marcelo 2026-11-11).
+      # 0.2.0 raised it from six, for mgpu_depth_tap.fx. COUNT RECURSIVELY:
       # that file is in a subdirectory, so `ls -1 _deploy` would see one entry
       # named reshade-shaders and count a directory as a file - it would pass
-      # at seven whether the shader was inside it or not.
-      - name: Verify the artifact is exactly the seven-file set
+      # at the right number whether the shader was inside it or not.
+      - name: Verify the artifact is exactly the eight-file set
         shell: bash
         run: |
           COUNT=$(find _deploy -type f | wc -l)
-          if [ "$COUNT" -ne 7 ]; then
-            echo "::error::_deploy holds $COUNT files, expected 7"
+          if [ "$COUNT" -ne 8 ]; then
+            echo "::error::_deploy holds $COUNT files, expected 8"
             find _deploy -type f | sort
             exit 1
           fi
@@ -338,7 +345,7 @@ jobs:
           if-no-files-found: error
 
   # 0.3.0: the launcher, shipped with everything COPY FILES copies. Its
-  # payload\ is this run's mgpu_bridge set (the seven files, the shader under
+  # payload\ is this run's mgpu_bridge set (the eight files, the shader under
   # reshade-shaders\Shaders\), and payload\tools\ holds nrcheck for DIAGNOSE.
   # nvngx_dlssnr.dll is never in it: the launcher's INSTALL page says where to
   # get it. The build job above is unchanged; this job only reads its artifact.
@@ -390,7 +397,7 @@ jobs:
           cp tools/nrcheck/build/Release/nvngx.dll_nrcheck.dll _launcher/payload/tools/
           cp tools/nrcheck/Run-NRBench.ps1 _launcher/payload/tools/
           find _launcher -type f | sort
-          for F in nvngx.dll_mgpu_bridge.addon64 mgpu.ini gpu1.ini ReShade2.ini README.txt LICENSE \
+          for F in nvngx.dll_mgpu_bridge.addon64 mgpu.ini gpu1.ini ReShade2.ini README.txt LICENSE panel_simple.txt \
                    reshade-shaders/Shaders/mgpu_depth_tap.fx tools/nrcheck.exe tools/nvngx.dll_nrcheck.dll; do
             test -f "_launcher/payload/$F" || { echo "::error::payload is missing $F"; exit 1; }
           done
