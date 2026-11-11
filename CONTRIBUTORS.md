@@ -147,13 +147,13 @@ are in 0.5.0, written here from his fork with his permission:
 
 The multi-display composition behaviour (`DcompMultiDisplay=1`) also came from his fork.
 
-## Knowmind
+## Knownmind
 
-His test system: an AMD card renders the game, an RTX card runs DLSS-NR, HDR10 display.
+Test system: an AMD card renders the game, an RTX card runs DLSS-NR, HDR10 display.
 
-- **A present-path barrier defect (R346).** He found and documented a barrier that stopped the present loop when
+- **A present-path barrier defect (R346).** Knownmind found and documented a barrier that stopped the present loop when
   the picture was already in the state it asked for, with a reproduction and the fix.
-- **The swap chain colour space (R345, `ChainColorSpace`).** His module tells Windows how to read the bridge's
-  picture on HDR displays. In 0.5.0 it also follows the game's own colour space (`ChainColorSpace=auto`).
+- **The swap chain colour space (R345, `ChainColorSpace`).** Knownmind's module tells Windows how to read the bridge's
+  picture on HDR displays. In 0.5.0 it also follows the game's own colour space (`ChainColorSpace=auto`), which Knownmind tested on that system.
 - **`tools/flicker-probe.ps1` (R347).** Measures flicker from a desktop capture, frame by frame.
 

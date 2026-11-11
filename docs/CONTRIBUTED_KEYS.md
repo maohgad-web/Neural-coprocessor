@@ -92,7 +92,7 @@ Written here from his designs. Absent = off, except `StageCopy`, which is on in 
 | `LateLatch`, `LateLatchAge` | `1`; age `2` | The neural card evaluates the newest frame that has arrived (R343) | Frame timing only |
 | `DcompMultiDisplay` | `1` | The multi-display composition behaviour from his fork (R267 / R273) | No |
 
-## Knowmind
+## Knownmind
 
 | Key | Values | What it does | Changes the picture |
 |---|---|---|---|
