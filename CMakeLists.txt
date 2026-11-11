@@ -104,6 +104,15 @@ add_library(mgpu_bridge SHARED
     src/feature_diag.cpp          # R300f1: scene-feature silence detector (FeatureDiag)
     src/producer_diag.cpp         # R300g1-R300g6: producer (GPU 0) cost bookkeeping (ProducerDiag)
     src/producer_gpu_timers.cpp   # R300h: GPU 0 timestamps (Gpu0Timers)
+
+    # [PR] contract capture, the XeSS-FG provider adapter, and their vendored deps.
+    src/ngx_hook.cpp
+    src/ffx_hook.cpp
+    src/display_ref.cpp
+    src/b1_loader_stub.cpp
+    src/xess_fg.cpp
+    third_party/safetyhook/safetyhook.cpp
+    third_party/safetyhook/Zydis.c
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -185,6 +194,9 @@ target_include_directories(mgpu_bridge PRIVATE
     # CI creates ext/reshade/ from crosire/reshade at the pinned SHA
     # (see .github/workflows/build.yml and VENDOR_LOCK.md).
     ${CMAKE_CURRENT_SOURCE_DIR}/ext/reshade
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/safetyhook
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xess_fg
+    ${CMAKE_CURRENT_SOURCE_DIR}/ext/ngx
 )
 
 target_compile_definitions(mgpu_bridge PRIVATE
@@ -202,6 +214,7 @@ target_compile_definitions(mgpu_bridge PRIVATE
     # Microsoft's documented switch for exactly that case. The alternative, a
     # static CRT, is the broader answer and a later milestone.
     _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
+    ZYDIS_STATIC_BUILD
 )
 
 # dxgi: factory + EnumAdapters1 (T2). d3d12: the private device (T3).
@@ -223,6 +236,10 @@ target_compile_options(mgpu_bridge PRIVATE /W3)
 # UTF-8). Only that file: every other source compiles exactly as before.
 if (MSVC)
     set_source_files_properties(src/panel_simple.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+    # [PR] the two hook TUs and SafetyHook need C++latest; the rest of the add-on stays C++17.
+    set_source_files_properties(
+        src/ngx_hook.cpp src/ffx_hook.cpp third_party/safetyhook/safetyhook.cpp
+        PROPERTIES COMPILE_OPTIONS "/std:c++latest")
 endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)

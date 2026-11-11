@@ -33,10 +33,10 @@
 // The Intel headers are included for their TYPES only. Every function is reached
 // through GetProcAddress, so nothing from them is linked and no import table
 // entry names a file the user may not have installed.
-#include "../ext/xess_fg/xefg_swapchain.h"
-#include "../ext/xess_fg/xefg_swapchain_d3d12.h"
-#include "../ext/xess_fg/xell.h"
-#include "../ext/xess_fg/xell_d3d12.h"
+#include "../third_party/xess_fg/xefg_swapchain.h"
+#include "../third_party/xess_fg/xefg_swapchain_d3d12.h"
+#include "../third_party/xess_fg/xell.h"
+#include "../third_party/xess_fg/xell_d3d12.h"
 
 namespace mgpu::xess_fg
 {
