@@ -56,4 +56,9 @@ namespace mgpu::live_panel
     // The game chain's present, on its own thread. Blocks the game's input for
     // the next frame while the panel is live AND being drawn (R293).
     void block_game_input(reshade::api::effect_runtime *game_runtime);
+
+    // R295. PanelFreeCursor. Re-read when the panel opens, so one session can
+    // A/B it without a restart. Absent or 0: none of the takeover code runs.
+    void reload_keys();
+    bool free_cursor();
 }
