@@ -44,6 +44,15 @@ and the overlay could not be used at the same time:
   `panel_simple.txt`, beside the add-on. `CTRL+ALT+F4` switches between it and the full panel. Opt-in via
   `PanelSimple`.
 
+- **The alternative routes to the game's DLSS and FSR calls (0.6.0: R377 `NgxHook`, R381 `FfxHook`, R382).**
+  NO1950's inline hooks on NGX and on the FidelityFX API, each as its own module. They read depth, vectors and the
+  game's own settings at the game's upscaler call, and keep the count of the game's FSR calls apart from the bridge's
+  own (NO1950's design, R382). Off by default. Built with SafetyHook and Zydis, fetched at a pinned version.
+
+- **Frame generation ideas in 0.6.0.** From NO1950's pull request, rewritten here: the display-side instruments
+  (`FGInstr`, R371: on-screen cadence and the display refresh), the display-paced clock (`FGPace=3`, R372, kept for
+  comparison), and the frame loop shape for 3x / 4x (`FGMulti`, R373).
+
 ## [grtninja](https://github.com/grtninja)
 
 Two fixes to the add-on's own code, reviewed and merged from external pull
@@ -131,6 +140,8 @@ Test system: two RTX 5080s, 3840x2160 at 120 Hz, Stellar Blade. Tested on davidm
 bands to the per-frame clear reaching the screen in Independent Flip, shown by dyeing the clear magenta.
 The clear now runs only when the picture will not cover the back buffer, and the buffer count is a key.
 - **The stray panel pointer (PP4).** The pointer stayed on the picture after the panel closed.
+- **The waitable present chain (R375, `PresentLatency1`).** At most one frame waits behind the one on screen.
+On by default from 0.6.0.
 
 ## [davidm71](https://github.com/davidm71)
 
@@ -146,6 +157,12 @@ are in 0.5.0, written here from his fork with his permission:
 - **Late latch (R343, `LateLatch`).** The neural card takes the newest frame that has arrived. Optional.
 
 The multi-display composition behaviour (`DcompMultiDisplay=1`) also came from his fork.
+
+In 0.6.0, two more designs from the same fork:
+
+- **FSR frame generation on the neural card (R380, `FrameGen=3`).** Design and first implementation from the fork.
+  Experimental.
+- **The frame clock (R372, `FGPace=2`).** One steady clock that shows each frame by its scene time. Optional.
 
 ## Knownmind
 
