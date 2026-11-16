@@ -1485,7 +1485,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         //   Path Tracing (Marcelo 17:49 / 18:04): the final pass on Full-FP8 Native - pass 1 at x1, the last pass at
         //     x2+ (Residual loses stability on quick camera moves with path tracing); pass 1 at x2+ Light-FP8 Native.
         {
-            auto r411_apply = [&](int p1_x1, int p1_x2, int mid, int last, int res_p1, int res_mid, int res_last)
+            auto r411_apply = [&](int p1_x1, int p1_x2, int mid, int last, int res_p1, int res_mid, int res_last, unsigned passes_now)
             {
                 const bool live_b = st.armed && st.nr_ok;
                 int net_of[4] = {}, res_of[4] = {};
@@ -1502,7 +1502,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 {
                     for (unsigned i = 0; i < np; ++i)
                     {
-                        mgpu::gpu1::ui_set_network(i, (i == 0u && st.passes >= 2u) ? p1_x2 : net_of[i]);
+                        mgpu::gpu1::ui_set_network(i, (i == 0u && passes_now >= 2u) ? p1_x2 : net_of[i]);
                         mgpu::gpu1::ui_set_resolution(i, res_of[i] == 1);
                     }
                 }
@@ -1524,7 +1524,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 ImGui::PopStyleColor(3);
                 if (clicked && !on)
                 {
-                    r411_apply(0, 0, 0, 1, (st.passes >= 2u) ? 1 : 0, 1, 1);
+                    r411_apply(0, 0, 0, 1, (st.passes >= 2u) ? 1 : 0, 1, 1, st.passes);
                     (void)mgpu::gpu1::ui_ini_write_word("ResidualPass", "2");   // the 2nd pass Residual whatever NRS says
                     (void)mgpu::gpu1::ui_ini_write_word("Pass2", "nrs");
                     if (mgpu::gpu1::ui_ini_write_word("BestQuality", "1")) pm_best_want = 1;
@@ -1533,14 +1533,34 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 else if (clicked && on) r414_best_off();
             }
             ImGui::SameLine();
-            if (ImGui::Button("Best Performance", ImVec2(r411_w, 0.0f)))         { r414_best_off(); r411_apply(0, 0, 0, 0, 1, 1, 1); }
+            if (ImGui::Button("Best Performance", ImVec2(r411_w, 0.0f)))         { r414_best_off(); r411_apply(0, 0, 0, 0, 1, 1, 1, st.passes); }
+            // R416 (Marcelo 22:53): Path Tracing goes to x2 by itself - pass 1 Light-FP8 Residual, pass 2 Full-FP8
+            // NATIVE (Residual on the last pass loses stability with path tracing; at x1 it flickers slightly). Under
+            // the two buttons, with the one warning. The help lines are gone: a status line says what runs.
+            if (ImGui::Button("Path Tracing (x2)", ImVec2(r411_w, 0.0f)))
+            {
+                r414_best_off();
+                mgpu::gpu1::ui_set_passes(2u);
+                (void)mgpu::gpu1::ui_ini_write_word("Passes", "2");
+                r411_apply(1, 0, 0, 1, 1, 1, 0, (st.max_passes >= 2u) ? 2u : 1u);   // a one-pass build stays x1
+            }
             ImGui::SameLine();
-            if (ImGui::Button("Path Tracing", ImVec2(r411_w, 0.0f)))             { r414_best_off(); r411_apply(1, 0, 0, 1, 0, 1, 0); }
-            ImGui::TextDisabled("Best Quality-Performance ON: x1 = pass 1 Light-FP8 Native. x2 = pass 1 Light-FP8 Residual,");
-            ImGui::TextDisabled("pass 2 Full-FP8 Residual. It follows x1 / x2. Any manual change turns it off.");
-            ImGui::TextDisabled("Best Performance: Light-FP8 Residual on every pass. Not for path tracing.");
-            ImGui::TextDisabled("Path Tracing: the last pass Full-FP8 Native.");
-            ImGui::TextDisabled("Network and resolution apply live.");
+            ImGui::TextDisabled("Path tracing at x1 flickers slightly.");
+            if (st.armed && st.nr_ok)
+            {   // R416: what runs now, one line
+                unsigned va = 0, vb = 0, vc = 0, vd = 0;
+                const bool vp = (sscanf_s(st.nr_dll_version, "%u.%u.%u.%u", &va, &vb, &vc, &vd) == 4);
+                const bool small_ok = vp && (va > 310u || (va == 310u && (vb > 9u || (vb == 9u && vc >= 16u))));
+                char now[200]; int at = snprintf(now, sizeof now, "Now: x%u", st.passes);
+                for (unsigned i = 0; i < st.passes && i < 4u && at > 0 && at < (int)sizeof now; ++i)
+                {
+                    const int hint = st.nr_preset_any ? st.nr_preset_pass[i] : 0;
+                    const char *net = (hint == 1) ? "Full-FP8" : (hint == 2) ? "Light-FP8" : (small_ok ? "Light-FP8" : "Full-FP8");
+                    const char *res = (mgpu::residual::carries(i) || (st.nrs_on && ((st.nrs_pass_mask >> i) & 1u))) ? "Residual" : "Native";
+                    at += snprintf(now + at, sizeof now - (size_t)at, "  |  pass %u %s %s", i + 1u, net, res);
+                }
+                ImGui::TextUnformatted(now);
+            }
         }
         for (unsigned i = 0; i < np; ++i)
         {
@@ -1698,16 +1718,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             unsigned va = 0, vb = 0, vc = 0, vd = 0;
             const bool vparsed = (sscanf_s(st.nr_dll_version, "%u.%u.%u.%u", &va, &vb, &vc, &vd) == 4);
             const bool small_ok = vparsed && (va > 310u || (va == 310u && (vb > 9u || (vb == 9u && vc >= 16u))));
-            for (unsigned i = 0; i < st.passes && i < 4u; ++i)
-            {
-                const int hint = st.nr_preset_any ? st.nr_preset_pass[i] : 0;
-                const char *net = (hint == 1) ? "Full-FP8"
-                                : (hint == 2) ? "Light-FP8"
-                                : (!vparsed ? "DLL default" : (small_ok ? "Light-FP8 (DLL default)" : "Full-FP8 (DLL default: one network)"));
-                const char *mode = mgpu::residual::carries(i) ? "Residual Neural"
-                                 : ((st.nrs_on && ((st.nrs_pass_mask >> i) & 1u)) ? "Residual (NRScale, N01950)" : "Native");
-                ImGui::Text("pass %u: %s, %s", i + 1u, net, mode);
-            }
+            (void)small_ok; (void)vparsed;   // R416: the per-pass lines moved up, under the preset buttons ("Now: ...")
             ImGui::Text("StageCopy %s | frame generation %s | DLSS-NR DLL %s",
                         st.stage_on ? "on" : "off", st.fg_on ? "on" : "off", st.nr_dll_version);
         }
