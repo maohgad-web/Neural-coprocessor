@@ -320,10 +320,10 @@ namespace
                 {
                     snprintf(out.detail, sizeof out.detail,
                              "the bridge adapter reports no attached output and this desktop has "
-                             "only one monitor - running HEADLESS or single-screen. This works, "
-                             "but a monitor on the second card was worth +33%% throughput and "
-                             "roughly half the latency on the rig this was measured on. Window "
-                             "placed by Windows");
+                             "only one monitor - running HEADLESS or single-screen. This works; "
+                             "with the display on the card that renders the game the latency "
+                             "measured about 9-11%% higher than with it on the second card. Window "
+                             "placed by Windows");   // R370: was "+33%% throughput and roughly half the latency" - that figure is the game and the neural stage on ONE card, not this
                     return;
                 }
                 how = "auto, from the DESKTOP monitor list because the bridge adapter reported "

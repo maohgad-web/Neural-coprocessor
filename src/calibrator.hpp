@@ -339,5 +339,28 @@ unsigned long long latch_refused();
 bool sf_path_should_promote();
 void apply_jitter_offset(void *nr_params, float mvec_scale_x, float mvec_scale_y);
 
+// ---- R377 (0.5.1 discovery): the doors of the alternative NGX route (alt_ngx_hook.cpp). NgxHook=1 only;
+//      with the key absent none of them is ever called. ----
+// Arms the capture WITHOUT installing either rung: no import slot and no data word is written. The three
+// pointers are what the hook functions call as "the real function" (the inline hook's trampolines). False if
+// Calib=0 or the calibrator is already installed by its own route.
+bool arm_external(int packed, void *real_create, void *real_evaluate, void *real_release);
+// The calibrator's own hook functions, the ones the import route installs. Same code on both routes.
+int external_create(void *cmd_list, int feature, void *params, void **out_handle);
+int external_evaluate(void *cmd_list, const void *handle, const void *params, void *cb);
+int external_release(void *handle);
+// N01950's late latch (a scene feature created before the hook was live).
+bool external_scene_known(unsigned long long handle);
+void external_note_scene(unsigned long long handle);
+
+// ---- R381 (0.5.1 discovery): the door of the FSR contract route (alt_ffx_hook.cpp). FfxHook=1 only. ----
+// Another upscaler's contract (the game's FSR upscale call) into the SAME table, with the same sequence lock
+// capture() uses. `frame` and `evals` are filled here. The DLSS evaluate count does not move (R382a): each publish
+// is counted in contract_frame_counter(), which HistoryGate reads beside the DLSS count.
+// Works with Calib=0 too (no install rung is needed for it). The caller keeps the one-writer rule (it stays out
+// while DLSS captures). Always true.
+bool publish_external(table t);
+unsigned long long contract_frame_counter();   // R382a: FSR contract publishes so far (0 for ever without FfxHook)
+
 } // namespace calibrator
 } // namespace mgpu

@@ -77,6 +77,29 @@ bool on();
 void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
             ID3D12Resource *mvec, ID3D12Resource *depth, float mv_el, unsigned long long f);
 
+// R397 (FGMvScaleNow=1). Bridge thread, once per evaluated frame, before forward_take() / record(): the vector scale the
+// stream uses now. Frame generation otherwise works from the copy made at the arm (0.5.1). what = 5 in ui_get / ui_set.
+void stream_scale(float x, float y);
+
+// R396 (FrameGen=5, the forward warp; fg_forward.hpp). Bridge thread, in the consume list of game frame B, BEFORE
+// record(): B's vectors / depth / input colour are bound, B's neural output does not exist yet. The newest neural frame
+// is handed to the pacing thread to be pushed along B's vectors. `unpack` is the copy queue's fence and `unpack_value`
+// its value for B (nullptr = the inline unpack: no forward frame). A no-op for every other generator.
+void forward_take(ID3D12Resource *mvec, ID3D12Resource *depth, ID3D12Resource *game, float mv_el,
+                  unsigned long long f, ID3D12Fence *unpack, unsigned long long unpack_value);
+
+// R399 (FGAhead=1|2 with FrameGen=3 or 4; fg_ahead.hpp). Bridge thread, at the same place as forward_take(): game frame B
+// has just been picked. The in-between frame(s) of the newest neural frame and B's own picture are made now, on `queue`
+// (the neural queue) ahead of B's list, and shown after that neural frame while B is evaluated; B's neural frame is then
+// shown the moment it finishes. The game frame is never shown. `unpack` / `unpack_value` as forward_take(). One relaxed
+// load with the key absent.
+void ahead_take(ID3D12CommandQueue *queue, ID3D12Resource *mvec, ID3D12Resource *depth, ID3D12Resource *game, float mv_el,
+                unsigned long long f, ID3D12Fence *unpack, unsigned long long unpack_value);
+
+// R400 (FGGameClock=1|2). The GAME's thread, at the present of the game's own chain: the mark the pacing thread places
+// its frames on. One relaxed load with the key absent; never a wait.
+void game_present_mark();
+
 // Bridge thread, where present_frame would be called. True: the module presents this
 // frame (the caller must NOT call present_frame). False: the caller presents as today.
 bool handoff(float r, float g, float b);
@@ -85,6 +108,19 @@ bool handoff(float r, float g, float b);
 // joins the pacing thread. The thread's present_frame takes s.cs through stream_present_source,
 // so joining it under s.cs would deadlock. Idempotent; a no-op when the thread never started.
 void stop();
+
+// R392 (0.5.1 discovery): the panel's live switches of the frame-generation discovery keys. Any thread.
+// what: 0 FGMvUnit, 1 FGSkipCarry, 2 FGLimit, 3 FGFill. A key set here stays the panel's for the session
+// (FGLive's re-read of mgpu.ini leaves it alone). FGFill shows at most the in-between frames the arm made textures for.
+// ui_set returns the value now in use (FGFill: the file's own 1 or 2 when switched on), which is what the panel writes.
+int ui_get(int what);
+int ui_set(int what, int value);
+// R399 (FGAhead): what = 6 in ui_get / ui_set (on = the file's own 1 or 2).
+// R400: what = 7 FGSkipJump, 8 FGGameClock (on = the file's own value; 3 and 1 when the file never said).
+// R401: what = 9 FGPhase (on = the file's own 67 or 75; 75 when the file never said).
+// R395 (FGDisplayCheck=1): what = 4 in ui_get / ui_set. ui_display_check: 0 nothing to say, 1 frame generation is off
+// because the display cannot show 2x, 2.. the multiplier it was lowered to. disp / would: frames a second.
+int ui_display_check(int *disp, int *would);
 
 // Bridge thread, in stream_release BEFORE the stream's textures are freed (under s.cs is fine
 // once stop() ran): drains the present queue (bounded), releases the feature, frees the sets.

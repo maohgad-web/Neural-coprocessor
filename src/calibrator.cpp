@@ -58,6 +58,7 @@
 // declared in nvsdk_ngx.h itself. Same include this project already uses.
 #include "../ext/ngx/nvsdk_ngx.h"
 #include "../ext/ngx/nvsdk_ngx_defs_dlssg.h"   // D2.0 NR step one: frame generation's public parameter names
+#include "depth_src.hpp"   // R376: the game's own depth at the DLSS evaluate. Off unless DepthSource=1
 
 namespace mgpu
 {
@@ -223,6 +224,7 @@ std::atomic<int> g_eval_copy_mode{0};
 std::atomic<unsigned long long> g_eval_copies{0};
 std::atomic<unsigned long long> g_eval_skips{0};
 unsigned long long g_eval_last_frame = 0xFFFFFFFFFFFFFFFFull;
+unsigned long long g_r376_last_frame = 0xFFFFFFFFFFFFFFFFull;   // R376: the depth twin of the line above
 
 // The tracked feature. Streamline and the SDK both create several features in
 // one process - super sampling, frame generation, reflex - and only one of
@@ -788,6 +790,23 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
                         g_hs[hsi].hh.store(et.sub_h, std::memory_order_relaxed);
                     }
                 }
+                }
+            }
+
+            // R376 (0.5.1 discovery; DepthSource=1 only - absent: one relaxed load). The game's own depth, copied
+            // at the same evaluate and under the same two guards as the vectors above (a latched scene handle,
+            // once per frame). The copy, its checks and its state rule are depth_src.cpp.
+            if (cl != nullptr && mgpu::depthsrc::wants_dlss())
+            {
+                const unsigned long long fr6 = g_frames.load(std::memory_order_relaxed);
+                if (g_handle_known.load(std::memory_order_relaxed) &&
+                    is_latched_scene_handle((unsigned long long)(uintptr_t)h) && g_r376_last_frame != fr6)
+                {
+                    g_r376_last_frame = fr6;
+                    table dt6;
+                    if (read(dt6) && (dt6.have & KEY_DEPTH) != 0u && dt6.depth != 0ull)
+                        mgpu::depthsrc::on_dlss_evaluate((void *)cl, dt6.depth, dt6.render_w, dt6.render_h,
+                                                         dt6.depth_x, dt6.depth_y);
                 }
             }
         }
@@ -2083,6 +2102,7 @@ void unscan_cached_pointers()
 }
 
 std::mutex g_install_cs;
+std::atomic<bool> g_r377_external{false};   // R377: armed by the inline hook, no rung ran (NgxHook=1 only)
 
 } // namespace
 
@@ -2464,6 +2484,14 @@ void uninstall()
 {
     std::lock_guard<std::mutex> lk(g_install_cs);
     if (!g_installed.load(std::memory_order_relaxed)) return;
+    if (g_r377_external.load(std::memory_order_relaxed))
+    {   // R377: on the inline-hook route no slot was ever patched - nothing to walk, nothing to put back
+        g_mode.store(0, std::memory_order_relaxed);
+        g_installed.store(false, std::memory_order_relaxed);
+        g_r377_external.store(false, std::memory_order_relaxed);
+        mgpu::diag::info("[MGPU][R377] calibrator disarmed (inline-hook route: no import slot or data word was ever written).");
+        return;
+    }
 
     unscan_cached_pointers();
     scan_and_patch((void *)&hook_gpa, (void *)g_real_gpa);
@@ -2670,6 +2698,90 @@ void log_summary()
                 (unsigned long long)g_hs_ret_copies.load(std::memory_order_relaxed));
         mgpu::diag::info(hl);
     }
+}
+
+// ---- R377 (0.5.1 discovery): the doors of the alternative NGX route (alt_ngx_hook.cpp, NgxHook=1 only) ----
+// With the key absent nothing below is ever called. Nothing above this line was changed for it.
+bool arm_external(int packed, void *real_create, void *real_evaluate, void *real_release)
+{
+    const int mode = packed & 0xFF;
+    if (mode == 0 || real_evaluate == nullptr) return false;
+    std::lock_guard<std::mutex> lk(g_install_cs);
+    if (g_installed.load(std::memory_order_relaxed)) return false;
+    qpc_init();
+    g_mode.store(mode, std::memory_order_relaxed);
+    g_rung.store(0, std::memory_order_relaxed);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&install, &g_self);
+    g_real_eval = (pf_evaluate)real_evaluate;
+    g_real_create = (pf_create)real_create;
+    g_real_release = (pf_release)real_release;
+    // note_frame rescans for late modules only while nothing has resolved. Nothing may be rescanned on this
+    // route (a rescan IS the import swap and the data scan), so the counter is made non-zero here.
+    if (g_resolved.load(std::memory_order_relaxed) == 0ull) g_resolved.store(1ull, std::memory_order_relaxed);
+    g_site = "inline-hook";
+    g_r377_external.store(true, std::memory_order_relaxed);
+    g_installed.store(true, std::memory_order_relaxed);
+    char line[420];
+    std::snprintf(line, sizeof line,
+        "[MGPU][R377] CALIBRATOR ARMED BY THE INLINE HOOK mode=%d site=%s. Neither install rung ran: no import slot "
+        "and no data word of any module was written, and none will be (the late-module rescan is off). The table, "
+        "the latch and the copies are the calibrator's own code, reached from _nvngx.dll's entries.", mode, g_site);
+    mgpu::diag::info(line);
+    return true;
+}
+int external_create(void *cmd_list, int feature, void *params, void **out_handle)
+{
+    return (int)hook_create((ID3D12GraphicsCommandList *)cmd_list, (NVSDK_NGX_Feature)feature,
+                            (NVSDK_NGX_Parameter *)params, (NVSDK_NGX_Handle **)out_handle);
+}
+int external_evaluate(void *cmd_list, const void *handle, const void *params, void *cb)
+{
+    return (int)hook_evaluate((ID3D12GraphicsCommandList *)cmd_list, (const NVSDK_NGX_Handle *)handle,
+                              (const NVSDK_NGX_Parameter *)params, cb);
+}
+int external_release(void *handle)
+{
+    return (int)hook_release((NVSDK_NGX_Handle *)handle);
+}
+bool external_scene_known(unsigned long long handle)
+{
+    if (handle == 0ull) return false;
+    if (g_handle_known.load(std::memory_order_relaxed) &&
+        g_sr_handle.load(std::memory_order_relaxed) == handle) return true;
+    return is_latched_scene_handle(handle);
+}
+void external_note_scene(unsigned long long handle)
+{
+    if (handle == 0ull) return;
+    latch_scene_handle(handle);
+    g_sr_handle.store(handle, std::memory_order_relaxed);
+    g_handle_known.store(true, std::memory_order_relaxed);
+}
+
+// ---- R381 (0.5.1 discovery): the door of the FSR contract route (alt_ffx_hook.cpp, FfxHook=1 only) ----
+// R382a: one count per FSR contract publish, apart from the DLSS evaluate count (N01950's design, PR dllmain
+// "THE GATE IS PROVIDER-BLIND"). HistoryGate reads it to know the game handed this frame to an upscaler. The DLSS
+// count is NOT moved: it also starts the MVecBarrierSource=2 tail copy, and an FSR frame starting that copy
+// would be a second writer of the vector lane.
+static std::atomic<unsigned long long> g_contract_frames{0};
+unsigned long long contract_frame_counter() { return g_contract_frames.load(std::memory_order_relaxed); }
+
+bool publish_external(table t)
+{
+    // R382: no Calib test. N01950's instruction for the hook routes is Calib=0 (no install rungs); the table is
+    // read by read(), which asks only whether anything was ever captured.
+    g_contract_frames.fetch_add(1ull, std::memory_order_relaxed);
+    t.frame = g_frames.load(std::memory_order_relaxed);
+    t.evals = g_evals.load(std::memory_order_relaxed);
+    g_seq.fetch_add(1u, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    g_tbl = t;
+    std::atomic_thread_fence(std::memory_order_release);
+    g_seq.fetch_add(1u, std::memory_order_release);
+    g_captures.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 } // namespace calibrator

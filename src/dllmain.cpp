@@ -68,7 +68,7 @@
 // R141: the log must say which build wrote it. 0.2.5 + R210 + R208 (FP16, off).
 // R369: bumped to 0.5.1. It was NOT bumped for 0.5.0 - every 0.5.0 log says "MGPU Bridge 0.4.0" (the
 // R173 hazard above, again; the first 0.5.0 report quoted it).
-#define MGPU_VERSION_STR "0.5.1"
+#define MGPU_VERSION_STR "0.6.0"
 
 
 // ---- P6.4: the overlay panel ----
@@ -128,6 +128,11 @@
 #include "calibrator.hpp"
 #include "probe.hpp"
 #include "sl_probe.hpp"   // SL1
+#include "fg_gpu1.hpp"    // R392: the panel's live switches of the frame-generation discovery keys (ui_get / ui_set)
+#include "sl_camera.hpp"  // R379: the game's camera block for frame generation from slSetConstants, off unless FGCamera=1
+#include "alt_ffx_hook.hpp"  // R381: N01950's FidelityFX hook as the FSR contract route, off unless FfxHook=1
+#include "alt_ngx_hook.hpp"  // R377: N01950's inline NGX hook as an alternative route, off unless NgxHook=1
+#include "depth_src.hpp"  // R376: the game's own depth as a lane source, off unless DepthSource=1|2|3
 #include "sl_tags.hpp"    // R300c/R300d (Dom's R220/R221): the Streamline-tagged vectors
 #include "t119_keys.hpp"  // R300 (T1.19): Dom's keys, every one absent = off
 #include "startup_trace.hpp" // R313
@@ -639,6 +644,11 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             mgpu::probe::set_mode(mgpu::probe::mode_from_ini());
             if (mgpu::t119::sltags_capture() != 0)   // R300d: key absent = SLT1 stays observer-only
                 mgpu::sltags::set_mvec_capture(&mgpu_tagged_mvec_capture_hook);
+            mgpu::depthsrc::init();   // R376: reads DepthSource. Key absent = nothing installed, mode 0
+            mgpu::slcam::init();      // R379: reads FGCamera. Key absent = nothing installed
+            mgpu::altffx::init();     // R381: reads FfxHook. Key absent = nothing installed
+            if (mgpu::depthsrc::present())
+                mgpu::sltags::set_depth_capture(&mgpu::depthsrc::on_sl_tag);
 
             // ---- R101: THE NGX TAP, INSTALLED ON THE SAME ONE-SHOT ----
             //
@@ -650,7 +660,11 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             // how you deadlock a game at startup.
             //
             // Calib=0 returns immediately and touches nothing.
-            mgpu::calibrator::install(mgpu::probe::calib_mode());
+            // R377: NgxHook=1 asks for the alternative route INSTEAD of the two install rungs (one route per
+            // session). Key absent: init reads mgpu.ini once, wanted() is false and install runs as before.
+            mgpu::altngx::init(mgpu::probe::calib_mode());
+            if (!mgpu::altngx::wanted())
+                mgpu::calibrator::install(mgpu::probe::calib_mode());
             mgpu::calibrator::set_jitter_mode(mgpu::probe::jitter_mode());
 
             // R106. The SAME transport hook the probe uses - one copy path,
@@ -1303,6 +1317,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     float structure = st.structure_strength;
     if (ImGui::SliderFloat("structure", &structure, 0.0f, 2.0f, "%.2f"))
         mgpu::gpu1::ui_set_tuning_value(1, structure);
+    if (st.structure_in_use < st.structure_strength)   // R406
+        ImGui::TextDisabled("structure is held at %.2f: the final pass is on Light-FP8, which strobes above it", st.structure_in_use);
     float skin = st.skin_strength;
     if (ImGui::SliderFloat("skin", &skin, 0.0f, 2.0f, "%.2f"))
         mgpu::gpu1::ui_set_tuning_value(2, skin);
@@ -1352,9 +1368,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // NRPreset<i>=0) in GREEN with "FPS+" under it, Full-FP8 (the big network, NRPreset<i>=1) in RED with
     // "FPS-" under it; below, "Resolution" with two buttons - Residual Neural (our residual on that pass)
     // GREEN / FPS+, Native (a full pass) RED / FPS-. The selected button is drawn solid, the other dimmed.
-    // To the right, one button "Best Quality-Performance" restores Marcelo's default: every pass Light-FP8 +
-    // Residual, the LAST pass Full-FP8 + Residual (the big network on the final pass is what removes the
-    // structure strobe; N2b).
+    // Under the header (R411, 0.6.0): three preset buttons - Best Quality-Performance (the 0.6.0 default), Best
+    // Performance, Path Tracing - see the block itself. (Before R411: one button, the R360 default.)
     // Keys (all read at arm; the file is written, the restart line shows while it differs from what loaded):
     //   network: NRPreset<i> 0 | 1 (R349)
     //   pass 1 resolution: NRS 1 | 0 (R332)
@@ -1367,7 +1382,10 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         static bool pm_loaded = false;
         static int  pm_net_file[4] = {}, pm_net_want[4] = {};   // 0 Light-FP8 (small), 1 Full-FP8 (big)
         static int  pm_res_file[4] = {}, pm_res_want[4] = {};   // 1 Residual Neural, 0 Native
-        static bool pm_fg_file = false, pm_fg_want = false;
+        static int  pm_fg_file = 0, pm_fg_want = 0;              // R411: FrameGen 0 / 3 (FSR) / 4 (DLSS)
+        static int  pm_dyn_file = 0;                             // R411: FGDisplayCheck in the file (shown while not armed)
+        static int  pm_vs_file = 0, pm_vs_want = 0;              // R412: PresentVsync (read at arm: a restart applies it)
+        static int  pm_best_want = 0;                            // R414: BestQuality (the mode), as the file / bridge has it
         static int  pm_x2_file = 0, pm_x2_want = 0;              // R361: pass 1's network at x2+ (NRPreset1x2; absent = NRPreset1)
         // Literals, not stack buffers: ui_ini_read / ui_ini_write keep the key POINTER in their mirror.
         static const char *const pm_net_key[4]  = { "NRPreset1", "NRPreset2", "NRPreset3", "NRPreset4" };
@@ -1395,8 +1413,27 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 pm_net_want[i] = pm_net_file[i];
                 pm_res_want[i] = pm_res_file[i];
             }
-            pm_fg_file = (mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4);
+            {
+                const int fgv = mgpu::gpu1::ui_ini_read("FrameGen", 0);
+                pm_fg_file = (fgv == 4 || fgv == 3) ? fgv : 0;
+            }
             pm_fg_want = pm_fg_file;
+            {
+                char w[16] = {};
+                mgpu::gpu1::ui_ini_read_word("FGDisplayCheck", w, sizeof w);   // R411: the file, not the 12-slot mirror
+                pm_dyn_file = (w[0] == '1') ? 1 : 0;
+            }
+            {
+                char w[16] = {};
+                mgpu::gpu1::ui_ini_read_word("PresentVsync", w, sizeof w);   // R412: no line = 1 (the arm's default)
+                pm_vs_file = (w[0] == '0') ? 0 : 1;
+                pm_vs_want = pm_vs_file;
+            }
+            {
+                char w[16] = {};
+                mgpu::gpu1::ui_ini_read_word("BestQuality", w, sizeof w);   // R414: no line = off
+                pm_best_want = (w[0] == '1') ? 1 : 0;
+            }
             {
                 char w[16] = {};
                 mgpu::gpu1::ui_ini_read_word("NRPreset1x2", w, sizeof w);   // R361
@@ -1416,6 +1453,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             }
             return mgpu::gpu1::ui_ini_write_word(pm_pass_key[i], res ? "nrs" : "full");
         };
+        // R414: any manual network / resolution change, Best Performance or Path Tracing turns the mode off
+        auto r414_best_off = [&]()
+        {
+            if (pm_best_want == 0) return;
+            if (mgpu::gpu1::ui_ini_write_word("BestQuality", "0")) pm_best_want = 0;
+            mgpu::gpu1::ui_set_best(false);
+        };
         // one choice button: solid in its colour when selected, dimmed when not
         auto pick = [&](const char *label, bool selected, bool green, float w) -> bool
         {
@@ -1433,39 +1477,70 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         ImGui::SeparatorText("Pass settings");
         bool differs = false;
         const unsigned np = (st.max_passes < 4u) ? st.max_passes : 4u;
-        // the restore button, right-aligned on the header row
+        // R411 (0.6.0, Marcelo 2026-11-15): three preset buttons. Each writes every pass's network and resolution to the
+        // file (the ini first, R364) and, armed, applies them live. Frame generation is its own switch (R405).
+        //   Best Quality-Performance (the 0.6.0 default, Marcelo 21:14): pass 1 Light-FP8 on Native (x1 and x2+),
+        //     the last pass Full-FP8 Residual, passes between Light-FP8 Residual.
+        //   Best Performance (agreed 17:27): Light-FP8 Residual on every pass. Not for path tracing.
+        //   Path Tracing (Marcelo 17:49 / 18:04): the final pass on Full-FP8 Native - pass 1 at x1, the last pass at
+        //     x2+ (Residual loses stability on quick camera moves with path tracing); pass 1 at x2+ Light-FP8 Native.
         {
-            const float rw = 215.0f;
-            const float avail = ImGui::GetContentRegionAvail().x;
-            if (avail > rw) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - rw);
-            if (ImGui::Button("Best Quality-Performance", ImVec2(rw, 0.0f)))
+            auto r411_apply = [&](int p1_x1, int p1_x2, int mid, int last, int res_p1, int res_mid, int res_last)
             {
-                // Marcelo's default (R360): Residual on every pass; Full-FP8 on pass 1 AND the last pass, Light-FP8
-                // on the passes between (3 / 4 only).
-                // Each write that lands moves the panel's choice; what loaded at panel start stays as
-                // the reference, so the restart line still says whether this session differs.
-                if (mgpu::gpu1::ui_ini_write("NRS", 1)) pm_res_want[0] = 1;
                 const bool live_b = st.armed && st.nr_ok;
-                for (unsigned i = 0; i < np; ++i)   // the ini first (R364), every key
+                int net_of[4] = {}, res_of[4] = {};
+                for (unsigned i = 0; i < np; ++i)   // the ini first (R364), every key; pass 1 first (write_res reads NRS)
                 {
-                    const int net = (i == 0u || i + 1u == np) ? 1 : 0;   // R360
-                    if (mgpu::gpu1::ui_ini_write(pm_net_key[i], net)) { pm_net_want[i] = net; pm_net_file[i] = net; }
-                    if (i >= 1u && mgpu::gpu1::ui_ini_write_word(pm_pass_key[i], "nrs")) { pm_res_want[i] = 1; if (live_b) pm_res_file[i] = 1; }
+                    const bool is_last = (np >= 2u && i + 1u == np);
+                    net_of[i] = (i == 0u) ? p1_x1 : (is_last ? last : mid);
+                    res_of[i] = (i == 0u) ? res_p1 : (is_last ? res_last : res_mid);
+                    if (mgpu::gpu1::ui_ini_write(pm_net_key[i], net_of[i])) { pm_net_want[i] = net_of[i]; pm_net_file[i] = net_of[i]; }
+                    if (write_res(i, res_of[i])) { pm_res_want[i] = res_of[i]; if (live_b) pm_res_file[i] = res_of[i]; }
                 }
-                if (mgpu::gpu1::ui_ini_write("NRPreset1x2", 0)) pm_x2_want = 0;   // R361: Light-FP8 on pass 1 while x2+ runs
+                if (mgpu::gpu1::ui_ini_write("NRPreset1x2", p1_x2)) pm_x2_want = p1_x2;   // R361: pass 1 while x2+ runs
                 if (live_b)   // then the live requests (R363 / R364)
                 {
                     for (unsigned i = 0; i < np; ++i)
                     {
-                        const int net = (i == 0u || i + 1u == np) ? 1 : 0;
-                        mgpu::gpu1::ui_set_network(i, (i == 0u && st.passes >= 2u) ? 0 : net);
-                        mgpu::gpu1::ui_set_resolution(i, true);
+                        mgpu::gpu1::ui_set_network(i, (i == 0u && st.passes >= 2u) ? p1_x2 : net_of[i]);
+                        mgpu::gpu1::ui_set_resolution(i, res_of[i] == 1);
                     }
                 }
-                if (mgpu::gpu1::ui_ini_write("FrameGen", 0)) pm_fg_want = false;
+            };
+            const float r411_w = 200.0f;
+            // R414 (Marcelo 22:11): Best Quality-Performance is a TOGGLE - a mode, green while on, red while off.
+            // On: Light-FP8 on pass 1 at x1 and x2, Full-FP8 Residual on the last pass, and pass 1's resolution
+            // follows the pass count (x1 Native - the Dragon Sword shape, the structure cap covers the strobe;
+            // x2+ Residual - the 0.5.1 x2 preset). The bridge flips pass 1 on every x1 <-> x2 switch (ui_set_passes).
+            // Any manual network / resolution change, Best Performance or Path Tracing turns it off.
+            {
+                const bool on = (pm_best_want == 1);
+                const ImVec4 c = on ? ImVec4(0.18f, 0.62f, 0.30f, 1.0f) : ImVec4(0.72f, 0.24f, 0.24f, 1.0f);
+                ImGui::PushStyleColor(ImGuiCol_Button, c);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, c);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, c);
+                const bool clicked = ImGui::Button(on ? "Best Quality-Performance: ON##best" : "Best Quality-Performance: OFF##best",
+                                                   ImVec2(r411_w + 60.0f, 0.0f));
+                ImGui::PopStyleColor(3);
+                if (clicked && !on)
+                {
+                    r411_apply(0, 0, 0, 1, (st.passes >= 2u) ? 1 : 0, 1, 1);
+                    (void)mgpu::gpu1::ui_ini_write_word("ResidualPass", "2");   // the 2nd pass Residual whatever NRS says
+                    (void)mgpu::gpu1::ui_ini_write_word("Pass2", "nrs");
+                    if (mgpu::gpu1::ui_ini_write_word("BestQuality", "1")) pm_best_want = 1;
+                    mgpu::gpu1::ui_set_best(true);
+                }
+                else if (clicked && on) r414_best_off();
             }
-            ImGui::TextDisabled("Restores the default: Residual on every pass; Full-FP8 on pass 1 at x1 and on the last pass at x2+.");
-            ImGui::TextDisabled("Network and resolution apply live. Frame generation needs a restart.");
+            ImGui::SameLine();
+            if (ImGui::Button("Best Performance", ImVec2(r411_w, 0.0f)))         { r414_best_off(); r411_apply(0, 0, 0, 0, 1, 1, 1); }
+            ImGui::SameLine();
+            if (ImGui::Button("Path Tracing", ImVec2(r411_w, 0.0f)))             { r414_best_off(); r411_apply(1, 0, 0, 1, 0, 1, 0); }
+            ImGui::TextDisabled("Best Quality-Performance ON: x1 = pass 1 Light-FP8 Native. x2 = pass 1 Light-FP8 Residual,");
+            ImGui::TextDisabled("pass 2 Full-FP8 Residual. It follows x1 / x2. Any manual change turns it off.");
+            ImGui::TextDisabled("Best Performance: Light-FP8 Residual on every pass. Not for path tracing.");
+            ImGui::TextDisabled("Path Tracing: the last pass Full-FP8 Native.");
+            ImGui::TextDisabled("Network and resolution apply live.");
         }
         for (unsigned i = 0; i < np; ++i)
         {
@@ -1478,19 +1553,25 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextDisabled("Network");
             ImGui::SameLine(x0);
             const bool live = st.armed && st.nr_ok;
-            const int running = live ? ((st.nr_preset_pass[i] == 1) ? 1 : 0) : pm_net_want[i];
-            const char *key_now = (i == 0u && st.passes >= 2u) ? "NRPreset1x2" : pm_net_key[i];
+            // R407 (Marcelo 2026-11-15 18:10): not armed, pass 1 at x2+ showed NRPreset1 (its x1 network) although
+            // NRPreset1x2 is what that pass runs - after Best Quality-Performance it read Full-FP8 while the file said
+            // Light-FP8. Pass 1 at x2+ now shows and keeps NRPreset1x2. Armed, the built network is shown, as before.
+            const bool x2p1 = (i == 0u && st.passes >= 2u);
+            const int running = live ? ((st.nr_preset_pass[i] == 1) ? 1 : 0) : (x2p1 ? pm_x2_want : pm_net_want[i]);
+            const char *key_now = x2p1 ? "NRPreset1x2" : pm_net_key[i];
             snprintf(lab, sizeof lab, "Light-FP8##net%u", i);
             if (pick(lab, running == 0, true, bw) && running != 0)
-            {   // R364: the ini FIRST, then the request - the rebuild writes ArmCrashed to the same file (R6d: WRITE FAILED x2)
-                if (mgpu::gpu1::ui_ini_write(key_now, 0)) { pm_net_want[i] = 0; if (live) pm_net_file[i] = 0; }
+            {   r414_best_off();
+                // R364: the ini FIRST, then the request - the rebuild writes ArmCrashed to the same file (R6d: WRITE FAILED x2)
+                if (mgpu::gpu1::ui_ini_write(key_now, 0)) { if (x2p1) pm_x2_want = 0; else { pm_net_want[i] = 0; if (live) pm_net_file[i] = 0; } }
                 if (live) mgpu::gpu1::ui_set_network(i, 0);
             }
             ImGui::SameLine(x0 + bw + gap);
             snprintf(lab, sizeof lab, "Full-FP8##net%u", i);
             if (pick(lab, running == 1, false, bw) && running != 1)
             {
-                if (mgpu::gpu1::ui_ini_write(key_now, 1)) { pm_net_want[i] = 1; if (live) pm_net_file[i] = 1; }
+                r414_best_off();
+                if (mgpu::gpu1::ui_ini_write(key_now, 1)) { if (x2p1) pm_x2_want = 1; else { pm_net_want[i] = 1; if (live) pm_net_file[i] = 1; } }
                 if (live) mgpu::gpu1::ui_set_network(i, 1);
             }
             ImGui::SetCursorPosX(x0); ImGui::TextDisabled("FPS+");
@@ -1524,6 +1605,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             snprintf(lab, sizeof lab, "Residual Neural##res%u", i);
             if (pick(lab, res_running == 1, true, bw) && res_running != 1)
             {
+                r414_best_off();
                 if (nrscale_here) write_res_nrscale(i, 1);
                 else if (write_res(i, 1)) { pm_res_want[i] = 1; if (live) pm_res_file[i] = 1; }
                 if (live) mgpu::gpu1::ui_set_resolution(i, true);
@@ -1532,6 +1614,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             snprintf(lab, sizeof lab, "Native##res%u", i);
             if (pick(lab, res_running == 0, false, bw) && res_running != 0)
             {
+                r414_best_off();
                 if (nrscale_here) write_res_nrscale(i, 0);
                 else if (write_res(i, 0)) { pm_res_want[i] = 0; if (live) pm_res_file[i] = 0; }
                 if (live) mgpu::gpu1::ui_set_resolution(i, false);
@@ -1540,17 +1623,64 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::SetCursorPosX(x0); ImGui::TextDisabled("FPS+");
             ImGui::SameLine(x0 + bw + gap); ImGui::TextDisabled("FPS-");
             if (nrscale_here && i + 1u == np) ImGui::TextDisabled("Residual here = N01950's NRScale path on that pass (NRScale is set this session).");
-            if (!live && (pm_net_want[i] != pm_net_file[i] || pm_res_want[i] != pm_res_file[i])) differs = true;   // R363/R364: both live when armed
+            if (!live && (pm_net_want[i] != pm_net_file[i] || pm_res_want[i] != pm_res_file[i] || (i == 0u && st.passes >= 2u && pm_x2_want != pm_x2_file))) differs = true;   // R407: pass 1 at x2+ too   // R363/R364: both live when armed
             if (i + 1u < np) ImGui::Spacing();
         }
-        bool fg = pm_fg_want;
-        if (ImGui::Checkbox("frame generation on the neural card", &fg))
+        // R411 (0.6.0, Marcelo 2026-11-15 21:37-21:44): frame generation is ONE switch per generator. "DLSS Frame
+        // Generation 2x" writes FrameGen=4 and the keys settled on Cyberpunk; FSR below it (Experimental) writes
+        // FrameGen=3 with the same keys. Dynamic (FGDisplayCheck) stays, off by default. Every other frame-generation
+        // key lives in mgpu.ini with its text (no checkbox: they cannot be operated by a reader who is not a native
+        // English speaker). x3 / x4 (FGMulti) are ini-only and experimental. Both switches need a restart.
         {
-            if (mgpu::gpu1::ui_ini_write("FrameGen", fg ? 4 : 0)) pm_fg_want = fg;
+            auto r411_fg_keys = []()
+            {   // the word writer: the file, not the 12-slot mirror
+                static const char *const k[7] = { "FGMulti", "FGPhase", "FGMvScaleNow", "FGMvUnit", "FGSkipCarry", "FGPace", "FGSkipJump" };
+                static const char *const v[7] = { "2",       "75",      "1",            "1",        "1",           "1",      "0" };
+                for (int j = 0; j < 7; ++j) (void)mgpu::gpu1::ui_ini_write_word(k[j], v[j]);
+            };
+            ImGui::SeparatorText("Frame generation");
+            bool fg_dlss = (pm_fg_want == 4);
+            if (ImGui::Checkbox("DLSS Frame Generation 2x", &fg_dlss))
+            {
+                if (fg_dlss) r411_fg_keys();
+                if (mgpu::gpu1::ui_ini_write("FrameGen", fg_dlss ? 4 : 0)) pm_fg_want = fg_dlss ? 4 : 0;
+            }
+            {
+                ImGui::Indent();
+                const bool dyn_live = mgpu::fg::on();
+                bool dv = dyn_live ? (mgpu::fg::ui_get(4) != 0) : (pm_dyn_file != 0);
+                if (ImGui::Checkbox("Dynamic: off when the display can't show 2x", &dv))
+                {
+                    const int r395_now = dyn_live ? mgpu::fg::ui_set(4, dv ? 1 : 0) : (dv ? 1 : 0);
+                    if (mgpu::gpu1::ui_ini_write_word("FGDisplayCheck", r395_now == 1 ? "1" : "0")) pm_dyn_file = r395_now;
+                }
+                ImGui::Unindent();
+            }
+            bool fg_fsr = (pm_fg_want == 3);
+            if (ImGui::Checkbox("FSR Frame Generation (Experimental)", &fg_fsr))
+            {
+                if (fg_fsr) r411_fg_keys();
+                if (mgpu::gpu1::ui_ini_write("FrameGen", fg_fsr ? 3 : 0)) pm_fg_want = fg_fsr ? 3 : 0;
+            }
+            if (pm_fg_want != pm_fg_file) differs = true;
+            {   // R412 (Marcelo 21:57): 0.6.0 ships PresentVsync=0; on a display without VRR that can tear
+                bool vs = (pm_vs_want == 1);
+                if (ImGui::Checkbox("VSync on the bridge window (no tearing, more latency)", &vs))
+                {
+                    if (mgpu::gpu1::ui_ini_write_word("PresentVsync", vs ? "1" : "0")) pm_vs_want = vs ? 1 : 0;
+                }
+                if (pm_vs_want != pm_vs_file) differs = true;
+            }
+            if (mgpu::fg::on())
+            {   // R395: what the display check sees
+                int r395_disp = 0, r395_would = 0;
+                const int r395_st = mgpu::fg::ui_display_check(&r395_disp, &r395_would);
+                if (r395_st == 1)
+                    ImGui::TextDisabled("frame generation is off: the display shows %d frames a second, 2x would be %d", r395_disp, r395_would);
+                else if (r395_st >= 2)
+                    ImGui::TextDisabled("frame generation at %dx: the display shows %d frames a second", r395_st, r395_disp);
+            }
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(experimental; off by default)");
-        if (pm_fg_want != pm_fg_file) differs = true;
         // R363: NRPreset1x2 is live too (the Best button applies it through ui_set_network)
         if (differs)
             ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
@@ -1744,7 +1874,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // NRFrameFilter=1 crashed Dawnwalker at the bridge start on some
             // launches (2026-10-08) - hence the warning. Mode 1 (the read-only
             // map) stays ini-only: the radios show none selected while it runs.
-            ImGui::SeparatorText("Frame generation");
+            ImGui::SeparatorText("The game's own frame generation (filter)");   // R411: not the bridge's frame generation above
             ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
                                "Warning: may crash the game at startup. Off by default.");
             int fm = mgpu::fgmap::ui_mode();
@@ -3422,12 +3552,18 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
 
 // D2.0: after the game's Present returns; anchor=finish sleeps here. Off
 // (one load each) unless StallWatch / OwnReflex are set.
-static void on_finish_present(reshade::api::command_queue *, reshade::api::swapchain *swapchain)
+static void on_finish_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
 {
     mgpu::stallwatch::scope sw(mgpu::stallwatch::S_FINISH_CB);
     if (swapchain != nullptr)
         mgpu::own_reflex::on_finish_present(
             reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+    // R404 (SignalAt=2): the produced-count signal of this frame, on the game's chain only. A plain read unless the key is 2.
+    // R408: D3D12 only - on a DX11 title the queue native is an ID3D11DeviceContext (the crash noted over on_reshade_finish_effects).
+    if (queue != nullptr && swapchain != nullptr && queue->get_device() != nullptr &&
+        queue->get_device()->get_api() == reshade::api::device_api::d3d12 &&
+        reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())) == g_r353_game_chain.load(std::memory_order_relaxed))
+        mgpu::gpu1::stream_on_finish_present(reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native())));
 }
 
 static void on_present(reshade::api::command_queue *queue,
@@ -3450,6 +3586,10 @@ static void on_present(reshade::api::command_queue *queue,
     if (swapchain != nullptr &&
         reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())) == g_r353_game_chain.load(std::memory_order_relaxed))
         r353_note_colour_space(swapchain);
+    // R400 (FGGameClock): the game chain's present as a time mark for frame generation. One relaxed load with the key absent.
+    if (swapchain != nullptr &&
+        reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())) == g_r353_game_chain.load(std::memory_order_relaxed))
+        mgpu::fg::game_present_mark();
     // DX11 probe: one load when off. The immediate context and the current
     // back buffer, as natives; the module holds no ReShade type.
     if (swapchain != nullptr && queue != nullptr && mgpu::dx11probe::on())
@@ -3817,6 +3957,9 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                     // R101. Same tick, same runtime, same reason: the tap's
                     // ns/frame figure has to be against the GAME's frames.
                     mgpu::calibrator::note_frame();
+                    if (mgpu::altngx::pending()) mgpu::altngx::try_install();   // R377: NgxHook absent = one relaxed load
+                    if (mgpu::slcam::on()) mgpu::slcam::tick();                 // R379: FGCamera absent = one relaxed load
+                    if (mgpu::altffx::pending()) mgpu::altffx::try_install();   // R381: FfxHook absent = one relaxed load
 
                     // ---- R103: HAND THE TRANSPORT THE GAME'S OWN HANDLE ----
                     //
@@ -4261,7 +4404,15 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
         const unsigned long long r315_evals_now = have_t ? r315_t.evals : r315_evals_seen;
         r315_evaluated = (r315_evals_now != r315_evals_seen);
         r315_evals_seen = r315_evals_now;
-        if (gate_on) mgpu::gpu1::note_game_dlss(!have_t ? -1 : (r315_evaluated ? 1 : 0));   // R323
+        if (gate_on)
+        {   // R382a (N01950's design): an FSR contract publish is this frame's hand-off to the gate as a DLSS
+            // evaluate is. Counted apart, so it never starts the tail copy below. Without FfxHook the count stays 0.
+            static unsigned long long r382_cf_seen = 0ull;
+            const unsigned long long r382_cf_now = mgpu::calibrator::contract_frame_counter();
+            const bool r382_contract_frame = (r382_cf_now != r382_cf_seen);
+            r382_cf_seen = r382_cf_now;
+            mgpu::gpu1::note_game_dlss(!have_t ? -1 : ((r315_evaluated || r382_contract_frame) ? 1 : 0));   // R323
+        }
     }
     if (r315_two)
     {
@@ -4565,6 +4716,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // D1: the same for the discovery map's NvAPI thunks. A no-op unless
         // Discovery=1 installed them.
         mgpu::discovery::uninstall();
+        mgpu::altffx::uninstall();   // R381: the FSR DLL's two entries get their bytes back (nothing unless the hook is live)
+        mgpu::slcam::uninstall();    // R379: the slSetConstants slots go back (nothing unless the tap is installed)
+        mgpu::altngx::uninstall();   // R377: the three entries of _nvngx.dll get their bytes back (nothing unless the hook is live)
         mgpu::calibrator::uninstall();
         // D2.0: our two threads leave their loops (waited for only on the
         // FreeLibrary path, max 300 ms each), then the journal's close line,

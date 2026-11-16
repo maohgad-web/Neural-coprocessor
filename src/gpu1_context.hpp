@@ -183,7 +183,11 @@ namespace mgpu::gpu1
     //   present_last_fence_value: the fence value the calling thread's last present_frame
     //   signalled (0 = none / failed before the signal). Thread-local.
     void present_override(ID3D12Resource *src, D3D12_RESOURCE_STATES rest);
+    // R387 (FGPresentFree=1, set by fg::arm, cleared by fg::release): a present with an override source does not take
+    // the stream lock once the geometry of this arm has been read under it (the first paced present). false = as before.
+    void present_override_free(bool on);
     ID3D12Fence *present_fence_addref();
+    ID3D12CommandQueue *present_queue_addref();   // R396 (FrameGen=5): the present chain's queue, AddRef'd, or nullptr
     unsigned long long present_last_fence_value();
 
     // Any thread (takes this file's lock). True when the present chain
@@ -502,6 +506,7 @@ struct ui_state
     bool  tuning_on = false, auto_mask = false;
     float tone_strength = 1.0f, structure_strength = 1.0f, skin_strength = 1.0f,
           style = 0.0f;
+    float structure_in_use = 1.0f;   // R406: the structure the model is handed (the cap with x2+ and a light last pass)
     // P8.0: 0 = off (no DLSSNR.MVec bound - the control arm and what every
     // published measurement ran under), 1 = a synthetic constant field.
     int   mvec_mode = 0;
@@ -655,6 +660,7 @@ void ui_nrs_set(int which, float v);
 // only a count change - nothing is created or destroyed, and it takes effect on
 // the next consumed frame. Clamped to 1..max_passes.
 void ui_set_passes(unsigned n);
+void ui_set_best(bool on);   // R414: Best Quality-Performance as a mode (pass 1 Native at x1, Residual at x2+)
 void ui_set_network(unsigned pass, int hint);   // R363: rebuild that pass live on the given network (0 default / 1 big / 2 small)
 void ui_set_resolution(unsigned pass, bool residual);   // R364: Residual (our residual on that pass) / Native (a full pass), live
 
@@ -958,6 +964,10 @@ void stream_note_real_vectors();
 // consumer reads a slot whose copy has not landed and the SEAL checker says so
 // on the first frame - bad_magic or a contract mismatch, loudly, not silently.
 void stream_on_present(void *cmd_queue);
+// R404 (SignalAt=2): the produced-count signal of frame N at N's own finish_present. A plain read and a return unless the key is 2.
+void stream_on_finish_present(void *cmd_queue);
+// R408a (SignalAt=2 on the DX11 producer): the produced-count signal right after the producer's own list was executed.
+void stream_signal_after_submit(void *d3d12_queue);
 
 void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
                               unsigned long long rtv_handle,
@@ -987,6 +997,25 @@ void stream_mvec_copy(void *cmd_list, unsigned long long mvec_handle);
 // stream_mvec_copy, only when the copy itself is, and the declared state is restored.
 void stream_mvec_copy_tagged(void *cmd_list, unsigned long long mvec_handle,
                              unsigned declared_state, int lifecycle);
+
+// R381 (0.5.1 discovery; alt_ffx_hook.cpp, FfxHook=1 only). The same landing path as stream_mvec_copy_tagged,
+// for a caller that already holds the resource's state as D3D12 states (the game's FSR upscale call declares
+// it). Not tied to SLTagsCapture. The transition is recorded only when the copy is, and the state is restored.
+void stream_mvec_copy_declared(void *cmd_list, unsigned long long mvec_handle, unsigned declared_state);
+
+// R376 (0.5.1 discovery; depth_src.cpp, DepthSource=1|2|3 only). The depth lane of the slot the next seal
+// signs, handed to `fn` under the same guard as stream_mvec_copy (try-lock, live stream, MVec=3 armed). `fn`
+// records a copy of the game's own depth into it on the game's command list and returns true if it did; that
+// slot is then sealed with this depth and the tap's copy is skipped for it. Returns false, without calling
+// `fn`, when the stream is not live, the lock is busy, there is no depth lane, or the slot already has one.
+struct depth_lane_t
+{
+    ID3D12Resource *dst;          // the buffer the lane lives in (the staging ring when StageCopy is up)
+    unsigned long long offset;    // of this slot's depth lane inside dst
+    unsigned width, height, format, row_pitch;
+    unsigned slot;
+};
+bool stream_depth_from_game(bool (*fn)(void *ctx, const depth_lane_t &lane), void *ctx);
 
 // Bridge thread, once per present. Consumes whatever the fence says has
 // arrived, checks each seal, and prints the summary once the producer has

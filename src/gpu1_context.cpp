@@ -32,6 +32,7 @@
                      // load path that fails to compile is not a fix.
 #include <mutex>
 #include <atomic>
+#include <thread>   // R409: std::this_thread::yield in the teardown gate
 #include <vector>   // R258: the calibration profiles    // R78: one counter, written from the game's render thread
                      // without this file's mutex - it counts the times that
                      // mutex was NOT taken, so it cannot be guarded by it.
@@ -44,7 +45,7 @@
 #include "Downsample_Shader.h"
 #include "Resolve_Shader.h"
 #include "gpu1_context.hpp"
-#include "chain_colour_space.hpp"   // R345 (Knowmind, H1): ChainColorSpace, absent = no call
+#include "chain_colour_space.hpp"   // R345 (Knownmind, H1): ChainColorSpace, absent = no call
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
@@ -58,8 +59,16 @@
 #include "producer_gpu_timers.hpp"   // R300h (Dom, T1.16)
 #include "nr16.hpp"       // R208: experimental FP16 input path. Off unless NRInput16=4
 #include "residual.hpp"   // R316: the residual pass module (own keys, ResidualPass=1|2). Off unless set
+#include "dx11_producer.hpp" // R408: SignalAt is D3D12-only - the DX11 producer keeps the effects-time signal
 #include "gpu0_stage.hpp" // R333: StageCopy, GPU 0 async staging (Dave's OPT5 design). Off unless StageCopy=1
+#include "lat_split.hpp"   // R402: LatSplit=1, read-only
 #include "fg_gpu1.hpp"    // R341: DLSS Frame Generation on the neural card (Dave's DLSSG1 design). Off unless FrameGen=4
+#include "fg_instr.hpp"   // R371: read-only frame-generation instruments. Off unless FGInstr=1 and FrameGen=4
+#include "alt_ngx_hook.hpp"   // R382: is N01950's contract path in use (NgxHook / FfxHook)
+#include "alt_ffx_hook.hpp"
+#include "sl_camera.hpp"   // R379: stamps each seal with the game's newest camera block. Off unless FGCamera=1
+#include "depth_src.hpp"   // R376: the game's own depth as a lane source. Off unless DepthSource=1|2|3
+#include "present_wait.hpp"   // R375: waitable present chain, frame latency 1 (Zhizhen's LP1). Off unless PresentLatency1=1
 #include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
@@ -1165,7 +1174,7 @@ bool create_present_chain(HWND hwnd)
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-        scd.Flags = 0;
+        scd.Flags = mgpu::pwait::chain_flags();   // R375: PresentLatency1 absent = 0, the value this line always had
 
         // Gotcha 1: the first parameter is the COMMAND QUEUE, not the
         // device. It is named pDevice and typed IUnknown *, so passing
@@ -1498,12 +1507,13 @@ bool create_present_chain(HWND hwnd)
         sc1->Release();
         sc1 = nullptr;
     }
-    // R345 (Knowmind, H1): state the chain's colour space before anything is presented into it. This
+    // R345 (Knownmind, H1): state the chain's colour space before anything is presented into it. This
     // point is reached by BOTH routes (CreateSwapChainForComposition with DcompOverlay=1, and
     // CreateSwapChainForHwnd) - his patch sat after the HWND route's query only. Key-gated
     // ("ChainColorSpace" in mgpu.ini); absent -> no DXGI call at all, the chain keeps its default.
     // It tells the COMPOSITOR how to read the bridge's frame; the neural pass itself is unchanged.
     mgpu::chain::apply_colour_space(sc3);
+    mgpu::pwait::after_create(sc3);   // R375: latency 1 + the waitable object; nothing unless the chain was made waitable
 
     // 3. RTV heap: one descriptor per backbuffer - the frame picks the
     // current backbuffer by index.
@@ -1735,6 +1745,16 @@ static thread_local ID3D12Resource *t_fg_src = nullptr;
 static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMON;
 static thread_local unsigned long long t_present_fv = 0ull;
 void present_override(ID3D12Resource *src, D3D12_RESOURCE_STATES rest) { t_fg_src = src; t_fg_rest = rest; }
+// R387 (FGPresentFree=1). The override source is a texture of the frame-generation module, alive until its release(),
+// which joins the pacing thread first. Its size and format are the stream's, fixed for the arm; they are read ONCE
+// under the stream lock (the first paced present) and kept here. Key absent: g_r387_on stays false.
+static std::atomic<bool> g_r387_on{false}, g_r387_have{false};
+static std::atomic<unsigned> g_r387_w{0}, g_r387_h{0}, g_r387_fmt{0};
+void present_override_free(bool on)
+{
+    g_r387_have.store(false, std::memory_order_release);
+    g_r387_on.store(on, std::memory_order_release);
+}
 unsigned long long present_last_fence_value() { return t_present_fv; }
 ID3D12Fence *present_fence_addref()
 {
@@ -1743,6 +1763,17 @@ ID3D12Fence *present_fence_addref()
     if (S.fence == nullptr) return nullptr;
     S.fence->AddRef();
     return S.fence;
+}
+
+// R396 (FrameGen=5): the present chain's own queue, AddRef'd (nullptr = no chain). The forward warp makes its
+// frames on this queue so each present is ordered behind its frame. Nothing calls this with the key absent.
+ID3D12CommandQueue *present_queue_addref()
+{
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    if (S.queue == nullptr) return nullptr;
+    S.queue->AddRef();
+    return S.queue;
 }
 
 bool present_frame(float r, float g, float b)
@@ -2133,7 +2164,7 @@ bool present_frame(float r, float g, float b)
         nb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         nb.Transition.StateBefore = nrest;
         nb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        // R346 (Knowmind, 2026-11-03, "defect 1"): a source that already rests in COPY_SOURCE must not get a
+        // R346 (Knownmind, 2026-11-03, "defect 1"): a source that already rests in COPY_SOURCE must not get a
         // COPY_SOURCE -> COPY_SOURCE transition - D3D12 rejects it at Close() (E_INVALIDARG, device fine) and the
         // present loop stopped, reading like a hang. No present source of this tree rests there today (UAV,
         // tex_in_rest, R341's UAV / NPSR), so this guard changes no shipped frame; it stops the next source that does.
@@ -2376,12 +2407,18 @@ bool present_frame(float r, float g, float b)
     //
     // PresentVsync=0 asks for the immediate present. Expect tearing - that is
     // the trade, and it is the user's to make, not ours to make silently.
+    // R375: PresentLatency1 absent = one relaxed load. The wait sits directly before Present so every wait is
+    // followed by a Present (the object is signalled once per freed slot; a wait with no Present after it would
+    // cost the next one its 100 ms). It runs on THIS thread - the bridge thread or the FG pacing thread - with
+    // no lock held, and never on a game thread.
+    if (mgpu::pwait::on()) mgpu::pwait::before_present();
     const UINT pi_interval = (g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u;
     const double r313_p0 = mgpu::strace::now_ms();   // R313: 0.0 when off
     hr = sc->Present(pi_interval, 0);
     if (mgpu::strace::on()) mgpu::strace::note_bridge_present((unsigned)hr, mgpu::strace::now_ms() - r313_p0);   // R313
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
+    if (mgpu::fginstr::on()) mgpu::fginstr::after_present(sc);   // R371: FGInstr absent = one relaxed load. Read-only (frame statistics)
 
     // ---- R111: THE SUCCESS CODES PRESENT RETURNS, WHICH WERE INVISIBLE ----
     //
@@ -2554,6 +2591,7 @@ void shutdown()
                 backbuffer[i]->Release();
         heap->Release();
         sc->Release();
+        mgpu::pwait::release();   // R375: the chain is gone; closes the waitable object if there was one (PresentLatency1 absent: two stores)
         queue->Release();
         mgpu::diag::info("[MGPU][T5] present chain released (GPU drained, reverse creation order)");
     }
@@ -9085,6 +9123,8 @@ namespace
         // is stride-invariant and the controller cannot chase its own tail.
         static const unsigned long long STRIDE_WINDOW = 120;
         unsigned stride_max = 0;          // 0 = off; 2..8 = enabled, this is the cap
+        unsigned stride_even = 0;         // R374: StrideEven=1 (needs Stride): the stride goes to AT OR ABOVE the ratio, for an even source
+        unsigned stride_even_hold = 0;    // R374: windows spent at the same stride since the last probe down
         unsigned cur_stride = 1;
         unsigned stride_phase = 0;
         unsigned long long game_frames = 0;      // events seen, including strided ones
@@ -9594,6 +9634,15 @@ namespace
         // full bound on a normal exit. drain_on: DrainGpu0 in mgpu.ini, absent
         // = 1; the add-on writes it to 0 itself if the drain ever hits its bound.
         unsigned long long gsignaled = 0;
+        // R409: the SignalAt=2 doors (finish_present, the DX11 after-submit) take NO s.cs - the game thread must never wait
+        // behind the bridge (Marcelo 20:05: Dawnwalker on an external SSD stuttered with R404's second per-frame s.cs).
+        // sig_fence is the gate: gfence, published at the arm when SignalAt=2, cleared at the bound and at teardown.
+        // sig_inflight counts doors inside; teardown clears the gate, then waits for it to reach 0 before the drain and
+        // the Release (seq_cst on both sides: a door either sees the gate closed or teardown sees it inside).
+        // sig_gsignaled is the doors' last value, folded into the drain target.
+        std::atomic<ID3D12Fence *> sig_fence{nullptr};
+        std::atomic<unsigned> sig_inflight{0};
+        std::atomic<unsigned long long> sig_gsignaled{0};
         bool drain_on = true;
         // R267b: the two agreed record writes (arm, summary) no longer happen
         // where they were decided - the arm is the GAME thread under s.cs
@@ -9911,6 +9960,11 @@ namespace
         // changes pass 1's effective hint recreates pass 1's feature on the bridge thread (one CreateFeature,
         // ~100-200 ms, Reset on its first evaluate) - the same path N01950's NRScale live recreate takes.
         int  nr_preset1_x2 = -1;
+        // R414 (BestQuality=1, Marcelo 2026-11-15 22:11): Best Quality-Performance as a mode. While on, pass 1's
+        // resolution follows the pass count: x1 Native, x2+ Residual (the networks come from the keys the panel
+        // wrote: Light-FP8 on pass 1 at both counts, Full-FP8 on the last pass). Any manual change turns it off.
+        bool best_mode = false;
+        bool best_checked = false;   // the one check after the first evaluate (the arm's pass count vs NRS)
         int  nr_preset_built[MAX_PASSES] = {};   // the hint each live handle was CREATED with (Running now)
         bool nr_p1_recreate_req = false;         // ui_set_passes -> bridge thread (pass 1, the x1 <-> x2 rule)
         bool nr_p1_reset_next = false;           // the recreated pass 1's first evaluate: Reset=1
@@ -10268,6 +10322,8 @@ namespace
         // Made atomic, they need no lock at all, and the small mutex below is
         // left with exactly one job.
         std::atomic<unsigned char> mvec_slot_valid[RING] = {};
+        // R382 (N01950's [R139b]; written only with NgxHook / FfxHook): the buffer of the last copy into the vector lane.
+        std::atomic<unsigned long long> mvec_last_src{0};
         // ---- R331 (MVecSealValid=1): VALIDITY DECIDED WITH THE SEAL, NOT READ LIVE ----
         //
         // After davidm71's FIX5 / OPT4 (his fork, 2026-10). The live flags above
@@ -10588,6 +10644,9 @@ namespace
         // verifier cross-checks the two, so a disagreement is counted rather
         // than silently resolved in favour of whichever was read first.
         unsigned char depth_slot_valid[RING] = {};
+        // R376: set by stream_depth_from_game when a copy of the game's own depth landed in the slot (DepthSource
+        // only; never set with the key absent). Read at the seal, cleared for the next frame beside mvec_slot_valid.
+        std::atomic<unsigned char> depth_eval_valid[RING] = {};
 
         unsigned long long depth_unpacks = 0;
         unsigned long long depth_bound = 0, depth_skipped = 0;
@@ -10736,6 +10795,7 @@ namespace
         bool  tuning_on = false;
         float tone_strength      = 1.0f;
         float structure_strength = 1.0f;
+        float structure_cap      = 1.0f;   // R406 / R406a (ini StructureCap; 0 = no cap): see r406_structure
         float skin_strength      = 1.0f;
         float style              = 0.0f;
         bool  auto_mask          = false;
@@ -10804,12 +10864,29 @@ namespace
                                           D3D12_RESOURCE_STATES &rest)
     {
         stream_state &s = str();
+        // R387 (FGPresentFree=1 only; absent: one thread-local test and one relaxed load on a paced present, nothing
+        // on any other): the paced frame without the stream lock, from the geometry read under it earlier in this arm.
+        if (t_fg_src != nullptr && g_r387_on.load(std::memory_order_relaxed) && g_r387_have.load(std::memory_order_acquire))
+        {
+            w = g_r387_w.load(std::memory_order_relaxed); h = g_r387_h.load(std::memory_order_relaxed);
+            fmt = (DXGI_FORMAT)g_r387_fmt.load(std::memory_order_relaxed);
+            rest = t_fg_rest;
+            return t_fg_src;
+        }
+        const long long r386_t0 = mgpu::fginstr::lock_t0();   // R386: 0 unless FGInstr=1 is armed (one relaxed load)
         std::lock_guard<std::mutex> lk(s.cs);
+        if (r386_t0 != 0) mgpu::fginstr::lock_waited_present(r386_t0);
         if (!s.nr_ok || s.profile) return nullptr;
         if (t_fg_src != nullptr)   // R341: the pacing thread's frame (a copy of nr_final, or the generated one)
         {
             w = s.width; h = s.height; fmt = nr_linear_format(s.format);
             rest = t_fg_rest;
+            if (g_r387_on.load(std::memory_order_relaxed))
+            {   // R387: kept for the rest of this arm
+                g_r387_w.store((unsigned)w, std::memory_order_relaxed); g_r387_h.store((unsigned)h, std::memory_order_relaxed);
+                g_r387_fmt.store((unsigned)fmt, std::memory_order_relaxed);
+                g_r387_have.store(true, std::memory_order_release);
+            }
             return t_fg_src;
         }
         // R229: the format of the TEXTURE returned, which stream_nr_create made as
@@ -10857,7 +10934,11 @@ namespace
     ID3D12Resource *stream_present_split_left(D3D12_RESOURCE_STATES &rest, float &pos)
     {
         stream_state &s = str();
+        // R387: a paced frame is never split (the R341 line below) - with FGPresentFree=1 that answer needs no lock.
+        if (t_fg_src != nullptr && g_r387_on.load(std::memory_order_relaxed) && g_r387_have.load(std::memory_order_acquire)) return nullptr;
+        const long long r386_t0 = mgpu::fginstr::lock_t0();   // R386
         std::lock_guard<std::mutex> lk(s.cs);
+        if (r386_t0 != 0) mgpu::fginstr::lock_waited_present(r386_t0);
         if (s.present_mode != 2) return nullptr;
         if (!s.nr_ok || s.profile) return nullptr;
         if (t_fg_src != nullptr) return nullptr;   // R341: no split on a paced frame
@@ -11710,7 +11791,7 @@ namespace
         if (k == nullptr) return 0;
         if (*k < '0' || *k > '9') return 0;
         const int v = atoi(k);
-        return (v == 0 || v == 1) ? v : 0;
+        return (v == 0 || v == 1 || v == 2) ? v : 0;   // R404: 2 = at finish_present of the same frame
     }
 
     int ini_read_sr_int(const char *key, int dflt, int lo, int hi)
@@ -12167,6 +12248,14 @@ namespace {
         // and if it ever hits the bound the add-on writes DrainGpu0=0 and
         // DrainGpu0Off=<reason> to mgpu.ini and skips the drain on later
         // launches - one slow exit, then never again, with the reason on file.
+        // R409: close the SignalAt=2 gate and let a door already inside leave - before the drain reads the last value
+        // and before gfence is released. Microseconds at most; the game thread never waits here.
+        s.sig_fence.store(nullptr, std::memory_order_seq_cst);
+        while (s.sig_inflight.load(std::memory_order_seq_cst) != 0u) std::this_thread::yield();
+        {
+            const unsigned long long sig_last = s.sig_gsignaled.exchange(0ull);
+            if (sig_last > s.gsignaled) s.gsignaled = sig_last;
+        }
         {
             const unsigned long long drain_to = s.gsignaled;
             if (!s.drain_on)
@@ -12233,6 +12322,7 @@ namespace {
             std::lock_guard<std::mutex> mlk(s.mvec_cs);
             s.mvec_live.store(false, std::memory_order_release);
         }
+        mgpu::latsplit::release();   // R402: stops its two watcher threads (they wait on the stage / produced fences)
         mgpu::stage::release();   // R333: drains the GPU 0 copy queue that writes gxfer, before gxfer goes
         if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
         if (s.gheap != nullptr) { s.gheap->Release(); s.gheap = nullptr; }
@@ -13993,6 +14083,31 @@ namespace
         return s.nr_preset_pass[i];
     }
 
+    // R406 (Marcelo 2026-11-15 16:15): with two or more passes and a last pass that is NOT on the full network (network
+    // hint 1), a structure above 1.50 strobes on his rig and reads as a frame-generation fault. The structure handed to
+    // the model is held at the cap in that combination only. This is the ONE place the value passes on its way to the
+    // model, so the slider, the hotkeys and the ini line are all covered. StructureCap=0 switches the cap off; the
+    // stored value is not changed, so leaving the combination gives the user's own value back.
+    static float r406_structure(const stream_state &s)
+    {
+        const float v = s.structure_strength;
+        if (!(s.structure_cap > 0.0f) || v <= s.structure_cap) return v;
+        // R406a (Marcelo 16:27): "even at 1 pass the small network start to strob above structure 1.00" - the cap is 1.00 and
+        // it holds whenever the FINAL pass (of 1, 2 or 3) is on the small network, whatever the pass count.
+        if (s.passes < 1u || s.passes > stream_state::MAX_PASSES) return v;
+        const int r406_hint = r361_eff_preset(s, s.passes - 1u, s.passes);
+        if (r406_hint == 1) return v;   // the last pass on the full network: no cap
+        if (r406_hint != 2)
+        {   // R406b (Marcelo 16:32): hint 0 is the DLL's default network. It is the small one only from 310.9.16; an
+            // older DLL has one network, the full one, and is not capped. A version that cannot be read is not capped.
+            unsigned va = 0, vb = 0, vc = 0, vd = 0;
+            if (sscanf_s(g_r351_version, "%u.%u.%u.%u", &va, &vb, &vc, &vd) != 4) return v;
+            const bool has_small = (va > 310u || (va == 310u && (vb > 9u || (vb == 9u && vc >= 16u))));
+            if (!has_small) return v;
+        }
+        return s.structure_cap;
+    }
+
     // R361: recreate pass 1's feature on the bridge thread (inside the open consume list, before the
     // frame's evaluates), when a live x1 <-> x2 switch changed its effective network. The old handle is
     // PARKED behind the stream fence (nrs_park_now's list, handle only) and released by nrs_tick_retired
@@ -14794,6 +14909,7 @@ namespace
         s.tuning_on          = ini_read_flag("Tuning");
         s.tone_strength      = ini_read_float("ToneStrength",      1.0f);
         s.structure_strength = ini_read_float("StructureStrength", 1.0f);
+        s.structure_cap      = ini_read_float("StructureCap",      1.0f);   // R406a: 0 = no cap
         s.skin_strength      = ini_read_float("SkinStrength",      1.0f);
         s.style              = ini_read_float("Style",             0.0f);
         s.auto_mask          = ini_read_flag("AutoMask");
@@ -15877,7 +15993,8 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     const double r313_rb0 = mgpu::strace::now_ms();
     UINT rcount = 2u;   // BB1: the count the chain was made with
     { std::lock_guard<std::mutex> lk(S.cs); rcount = S.present_buffers; }
-    const HRESULT rb = sc->ResizeBuffers(rcount, buf_w, buf_h, want_fmt, 0);
+    const HRESULT rb = sc->ResizeBuffers(rcount, buf_w, buf_h, want_fmt, mgpu::pwait::resize_flags());   // R375: 0 unless the chain was made waitable (the flags must repeat)
+    if (SUCCEEDED(rb) && mgpu::pwait::on()) mgpu::pwait::after_resize(sc);
     if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "%ux%u fmt=%d, %.2f ms", buf_w, buf_h, (int)want_fmt, mgpu::strace::now_ms() - r313_rb0); mgpu::strace::ev(mgpu::strace::R_BT, "ResizeBuffers", d, (unsigned)rb); }
 
     // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
@@ -17054,8 +17171,8 @@ namespace dispcfg
         // rather than letting a reader conclude a third card exists.
         snprintf(line + w, sizeof line - w,
             ". HOW TO READ IT. BRIDGE card 0 means no monitor is attached to the second card - "
-            "it works, and [P7.10] records that a monitor there was worth +33%% throughput on "
-            "the rig that was measured. DUPLICATE is the arrangement [V55] refuses DcompOverlay "
+            "it works, and [P7.10] records that the latency measured about 9-11%% higher than "
+            "with a monitor there. DUPLICATE is the arrangement [V55] refuses DcompOverlay "
             "for. \"other/unmatched\" is not a third GPU: the CCD adapter id is the display "
             "adapter's and does not have to equal the DXGI LUID on every driver, so a non-zero "
             "count there means the match failed, not that a card appeared. TWO CABLES INTO ONE "
@@ -19039,6 +19156,7 @@ void ui_read(ui_state &out)
     out.tuning_on          = s.tuning_on;
     out.tone_strength      = s.tone_strength;
     out.structure_strength = s.structure_strength;
+    out.structure_in_use   = r406_structure(s);   // R406: what the model is handed (lower than the slider when the cap acts)
     out.skin_strength      = s.skin_strength;
     out.style              = s.style;
     out.auto_mask          = s.auto_mask;
@@ -19294,6 +19412,7 @@ void ui_set_passes(unsigned n)
     if (n > stream_state::MAX_PASSES) n = stream_state::MAX_PASSES;
     stream_state &s = str();
     unsigned was;
+    bool r414_flip = false;
     {
         std::lock_guard<std::mutex> lk(s.cs);
         if (n > s.nr_built) n = s.nr_built;   // R350: only passes with a feature
@@ -19302,6 +19421,13 @@ void ui_set_passes(unsigned n)
         s.passes = n;
         if (n > was && s.pass2_reset_on != 0u) s.r332_p2_reset = true;   // R332 (E12)
         if (s.nr_preset1_x2 >= 0 && (was >= 2u) != (n >= 2u)) s.nr_p1_recreate_req = true;   // R361
+        if (s.best_mode && !s.nrs_on && (was >= 2u) != (n >= 2u))
+        {   // R414: pass 1 Native at x1, Residual at x2+ - the R364 request, applied before the next evaluates
+            if (n >= 2u) s.nr_res_want_mask |= 1u; else s.nr_res_want_mask &= ~1u;
+            s.nr_res_req_mask |= 1u;
+            s.best_checked = true;
+            r414_flip = true;
+        }
         // Every handle exists from arm time, so this is a count change and
         // nothing is created or destroyed here. nr_final is recomputed on the
         // next consumed frame.
@@ -19320,6 +19446,21 @@ void ui_set_passes(unsigned n)
              was, n, s.nr_built);
     mgpu::diag::info(l);
     if (mgpu::t119::panel_persist()) ui_ini_write("Passes", (int)n);   // T1.17
+    if (r414_flip)
+    {   // R414: the file follows, so the next launch arms in the same shape
+        ui_ini_write("NRS", (n >= 2u) ? 1 : 0);
+        mgpu::diag::info((n >= 2u) ? "[MGPU][R414] Best Quality-Performance: x2+ - pass 1 to Residual (NRS=1)."
+                                   : "[MGPU][R414] Best Quality-Performance: x1 - pass 1 to Native (NRS=0).");
+    }
+}
+
+// R414: the panel's Best Quality-Performance toggle (and any manual change, which turns it off).
+void ui_set_best(bool on)
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    s.best_mode = on;
+    s.best_checked = true;
 }
 
 // P7.9. Live, from the panel. Values are clamped only where the guide gives a
@@ -19884,6 +20025,14 @@ void stream_request()
                 s.sr_on = 0u;
             }
             s.signal_at    = (unsigned)ini_read_signal_at();
+            if (s.signal_at == 1u && mgpu::dx11producer::on())
+            {   // R408: SignalAt=1 signals from the PRESENT event, whose queue on a DX11 title is a D3D11 context.
+                mgpu::diag::info("[MGPU][R408] SignalAt=1 is for D3D12 games; this is the DX11 producer - SignalAt=0 for this arm.");
+                s.signal_at = 0u;
+            }
+            else if (s.signal_at == 2u && mgpu::dx11producer::on())
+                mgpu::diag::info("[MGPU][R408a] SignalAt=2 on the DX11 producer: each frame is signalled right after the producer "
+                                 "submits its own copy list, in the same frame (stream_signal_after_submit).");
             s.present_vsync = (unsigned)ini_read_sr_int("PresentVsync", 1, 0, 1);
             s.sr_snippet    = (unsigned)ini_read_sr_int("SRSnippet", 1, 0, 1);
             s.rw_on         = (unsigned)ini_read_sr_int("RingWindow", 0, 0, 1);
@@ -20090,6 +20239,8 @@ void stream_request()
             s.nr_preset_pass[i] = v;
             if (v != 0) s.nr_preset_any = true;
         }
+        s.best_mode = (ini_read_sr_int("BestQuality", 0, 0, 1) == 1);   // R414
+        s.best_checked = false;
         s.nr_preset1_x2 = -1;   // R361
         if (ini_has_key("NRPreset1x2"))
         {
@@ -20215,6 +20366,16 @@ void stream_request()
                 "every frame.");
         }
         s.stride_max = (sv < 0) ? 0u : (unsigned)sv;
+        // R374 (0.5.1 discovery): read only when Stride is on. Absent = the shipped rule, byte for byte.
+        s.stride_even = (s.stride_max != 0u && ini_read_sr_int("StrideEven", 0, 0, 1) != 0) ? 1u : 0u;
+        s.stride_even_hold = 0u;
+        if (s.stride_even != 0u)
+            mgpu::diag::info("[MGPU][R374] StrideEven=1: the stride controller aims AT OR ABOVE the measured ratio of game frames "
+                             "per evaluated frame (the shipped rule stays below it, to save transport). The neural card then "
+                             "evaluates every sealed frame, so each one is the same number of game frames after the last: an "
+                             "even source for frame generation. Cost: evaluated rate = game rate / stride. Every 32 windows the "
+                             "stride tries one step lower for one window, to notice a neural card that has become faster. "
+                             "Read [R87]: it should sit on one value.");
         s.cur_stride = 1;
         if (s.stride_max != 0)
         {
@@ -20334,6 +20495,48 @@ void stream_on_present(void *cmd_queue_v)
     if (gq == nullptr) return;
 
     if (mgpu::stage::signal(gq, s.gfence, s.produced)) s.gsignaled = s.produced;   // R275; R333: routed, the old call when off
+}
+
+// R409: the SignalAt=2 door, shared by finish_present (D3D12) and the DX11 after-submit. NO s.cs: the game thread never
+// waits behind the bridge here. Everything it reads was written on this same game thread moments earlier, inside
+// the same present call: produced_a by stream_on_finish_effects (under s.cs, as in 0.5.1), the gate at the arm. The
+// only other thread is teardown, which closes the gate and waits for sig_inflight before gfence goes. stage::signal's
+// own state is touched only by this door while SignalAt=2 (the effects-time call is SignalAt=0 only).
+static void r409_signal_door(void *queue_v)
+{
+    stream_state &s = str();
+    if (s.sig_fence.load(std::memory_order_relaxed) == nullptr) return;   // off / not armed: one load
+    s.sig_inflight.fetch_add(1u, std::memory_order_seq_cst);
+    ID3D12Fence *f = s.sig_fence.load(std::memory_order_seq_cst);
+    const unsigned long long n = s.produced_a.load(std::memory_order_acquire);
+    ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(queue_v);
+    if (f != nullptr && n != 0ull && gq != nullptr && mgpu::stage::signal(gq, f, n))
+        s.sig_gsignaled.store(n, std::memory_order_relaxed);   // R275: the drain target
+    s.sig_inflight.fetch_sub(1u, std::memory_order_seq_cst);
+}
+
+// R404 (SignalAt=2, 0.5.1 discovery). The game's thread, at FINISH_PRESENT of the game's chain.
+//
+// LatSplit (R402) measured the default: one whole game frame (14-16 ms) lies between the record of frame N and its
+// produced-count signal, because that signal is issued from frame N+1's effects event. SignalAt=1 (the PRESENT
+// event) was run on 2026-11-15 with StageCopy on: 47 REORDERED seals in two minutes and the same 14 ms - on this rig
+// that event is not after the list. finish_present is raised after the Present call of frame N has returned, and
+// ReShade submits its list before it makes that call: the signal for N is issued in N's own frame.
+//
+// The guard is the same as L3's: if the list were not submitted yet, the seal checker fires on the first frames.
+// Absent / 0 / 1: this returns at its first test.
+void stream_on_finish_present(void *cmd_queue_v)
+{
+    r409_signal_door(cmd_queue_v);
+}
+
+// R408a (SignalAt=2 on the DX11 producer). The game's thread, right after dx11_producer has executed the list that
+// stream_on_finish_effects recorded this frame's copies into, on its own D3D12 queue: the list IS submitted here, so
+// frame N is signalled in N's own frame - the DX11 twin of stream_on_finish_present. `queue` is the producer's D3D12
+// queue, the same one the effects-time signal uses. A plain read and a return unless SignalAt is 2.
+void stream_signal_after_submit(void *queue_v)
+{
+    r409_signal_door(queue_v);
 }
 
 // ================= REFLEX: FORCE LOW LATENCY ON GPU 0 =====================
@@ -21032,8 +21235,10 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // R309 (MVecStepAside=1 only): how long THIS thread waited for s.cs - R168 below times the
     // hold, never the wait. Key off: one relaxed load, nothing else.
     const LONGLONG r309_w0 = r309::time_game.load(std::memory_order_relaxed) ? sfdiag::qpc() : 0;
+    const long long r386_g0 = mgpu::fginstr::lock_t0();   // R386: the same wait for the [R371] line. 0 unless FGInstr=1 is armed (one relaxed load)
     std::lock_guard<std::mutex> lk(s.cs);
     if (r309_w0 != 0) r309::note_game_wait(r309_w0);
+    if (r386_g0 != 0) mgpu::fginstr::lock_waited_game(r386_g0);
     // R168. THE MEASUREMENT THAT MATTERS FOR THE GATE'S LOCK BUCKET.
     //
     // This is the GAME'S RENDER THREAD holding s.cs, and it is the only other
@@ -21641,6 +21846,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // R333 (StageCopy=1 only): the GPU 0 staging ring + copy queue. Never fails the arm; turns itself
         // off on its own failure. Off: nothing is built, dst() is gxfer, signal() is the old call.
         if (SUCCEEDED(h)) (void)mgpu::stage::arm(gdev, gq, s.gxfer, heap_bytes, s.slot_bytes, stream_state::RING);
+        mgpu::latsplit::arm();   // R402 (LatSplit=1, read-only): reads its key; nothing is built without it
         // R300h (T1.16a, Gpu0Timers=1 only): GPU 0 timestamps on the game's device. A failure only turns
         // the measurement off. Read from the key here, not from a module configured later (Dom's T1.16 defect).
         if (SUCCEEDED(h) && mgpu::t119::gpu0_timers()) (void)mgpu::p0t::init(gdev, gq);
@@ -21915,6 +22121,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             return;
         }
         s.armed = true;
+        if (s.signal_at == 2u && s.gfence != nullptr) s.sig_fence.store(s.gfence, std::memory_order_seq_cst);   // R409: open the gate
         // R270b. Off unless mgpu.ini says LaunchRecord=1 (the launcher writes it).
         QueryPerformanceCounter(&s.ll_t0); s.ll_p0 = s.produced; s.ll_c0 = s.consumed;
         s.rec_on = ini_read_flag("LaunchRecord");
@@ -22022,6 +22229,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // storage being zero is the kind of assumption this file pays for.
         for (unsigned q = 0; q < stream_state::RING; ++q)
             s.mvec_slot_valid[q].store(0u, std::memory_order_relaxed);
+        for (unsigned q = 0; q < stream_state::RING; ++q)   // R376
+            s.depth_eval_valid[q].store(0u, std::memory_order_relaxed);
         for (unsigned q = 0; q < stream_state::TAG_RING; ++q)   // R331 / R331b
         {
             s.mvec_slot_frame[q].store(0ull, std::memory_order_relaxed);
@@ -22209,6 +22418,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // Bound reached. Stop touching the game's list; the bridge thread
         // prints the summary once the last frames have been consumed.
         s.finished = true;
+        s.sig_fence.store(nullptr, std::memory_order_seq_cst);   // R409: the SignalAt=2 doors stop with it
         // ---- HANGFIX 2026-09-12: STOP THE MID-FRAME MVec RECORDER TOO ----
         //
         // This return stops stream_on_finish_effects touching the game's list,
@@ -22291,11 +22501,25 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 // case - a ratio of exactly 2.0 gives 1.75 and stays at 1,
                 // which is right, because stride 2 there would have zero
                 // headroom.
-                const unsigned long long r = (gf * 7ull) / (ev * 8ull);
+                // R374: StrideEven=1 rounds UP (ratio - 0.06, so a ratio that is an integer plus noise does not flip);
+                // absent = the shipped 7/8 floor, the same expression as before.
+                const unsigned long long r = (s.stride_even != 0u) ? ((gf * 100ull + ev * 94ull) / (ev * 100ull))
+                                                                   : ((gf * 7ull) / (ev * 8ull));
                 want = (r < 1ull) ? 1u
                      : ((r > (unsigned long long)s.stride_max) ? s.stride_max
                                                                : (unsigned)r);
                 ++s.ratio_hist[(r > 8ull) ? 8u : (unsigned)r];
+                if (s.stride_even != 0u)
+                {
+                    // R374: at or above the ratio the measurement saturates (the consumer is limited by the stride
+                    // itself), so a faster neural card would never be noticed. One window in 32 asks for one step
+                    // less; if the consumer keeps up there the ratio reads that lower value and the stride stays.
+                    if (want == s.cur_stride && s.cur_stride > 1u)
+                    {
+                        if (++s.stride_even_hold >= 32u) { s.stride_even_hold = 0u; want = s.cur_stride - 1u; }
+                    }
+                    else s.stride_even_hold = 0u;
+                }
             }
             // One step per window. Floor division is already conservative -
             // a ratio of 1.9 asks for stride 1 - so the damping here is about
@@ -22389,6 +22613,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         s.slot_dlss[slot].store((signed char)g_game_dlss.load(std::memory_order_relaxed), std::memory_order_release);
     // D2.0 NR step one: record what this seal says about vectors. Read only. Off: one load.
     if (mgpu::fgmap::on()) mgpu::fgmap::on_seal(fi, slot, seal.mvec_valid, rtv_handle);
+    if (mgpu::slcam::on()) mgpu::slcam::on_seal(fi);   // R379: FGCamera absent = one relaxed load. A try-lock; this thread never waits
 
     // ---- THE DEPTH DECISION IS MADE HERE, BEFORE THE SEAL IS STAGED ----
     //
@@ -22402,7 +22627,14 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     bool depth_ok = false;
     if (s.depth_mode != 0)
     {
-        if (depth_handle != 0 && s.depth_bytes != 0)
+        // R376: the game's own depth already landed in this slot (DepthSource; with the key absent the flag is
+        // never set and this is one load). Sealed with it; the tap's copy below is skipped for this frame.
+        if (s.depth_bytes != 0 && s.depth_eval_valid[slot].load(std::memory_order_acquire) != 0u)
+        {
+            depth_ok = true;
+            mgpu::depthsrc::note_sealed();
+        }
+        else if (depth_handle != 0 && s.depth_bytes != 0)
         {
             dsrc = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)depth_handle);
             const D3D12_RESOURCE_DESC dd = dsrc->GetDesc();
@@ -22549,6 +22781,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // Frame fi used slot (fi-1) % RING, so frame fi+1 uses fi % RING. Cleared
     // here, under this mutex, BEFORE the next frame's scene can be drawn.
     s.mvec_slot_valid[(unsigned)(fi % stream_state::RING)].store(0u, std::memory_order_release);
+    s.depth_eval_valid[(unsigned)(fi % stream_state::RING)].store(0u, std::memory_order_release);   // R376: the same rule for the game's depth
     if (s.mvec2_off != 0) s.r315_both[(unsigned)(fi % stream_state::RING)].store(0u, std::memory_order_release);   // R315b
 }
 
@@ -22734,6 +22967,7 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
         else ++s.mvec_copies_own;                     // R289: counted directly - no subtraction, no fake delivery
     }
     s.mvec_slot_valid[slot].store(1u, std::memory_order_release);
+    if (mgpu::altngx::wanted() || mgpu::altffx::wanted()) s.mvec_last_src.store(mvec_handle, std::memory_order_relaxed);   // R382: two relaxed loads when the path is off
     // D2.0 NR step one: record that this slot got its copy. Off: one load.
     if (mgpu::fgmap::on()) mgpu::fgmap::on_mvec_copy(slot);
 }
@@ -22756,6 +22990,40 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
 //   - These copies are not made by the tap, so R289 counts them as the game's own route
 //     (mvec_copies_own). They are the game's declared vectors, so that reading holds; recorded here
 //     because it changes what R289 sees when the key is on.
+// R381 (0.5.1 discovery; FfxHook=1 only): see gpu1_context.hpp. The thread-locals are R300d's.
+void stream_mvec_copy_declared(void *cmd_list_v, unsigned long long mvec_handle, unsigned declared_state)
+{
+    if (cmd_list_v == nullptr || mvec_handle == 0ull) return;
+    t_t119_tag_state = declared_state;
+    t_t119_tag_barrier = (declared_state != (unsigned)D3D12_RESOURCE_STATE_COPY_SOURCE);
+    stream_mvec_copy(cmd_list_v, mvec_handle);
+    t_t119_tag_barrier = false;
+}
+
+// R376 (0.5.1 discovery): the door depth_src.cpp records the game's own depth through. The guard is
+// stream_mvec_copy's, for the same reasons (R88): mvec_live is cleared under mvec_cs before gxfer is freed, so
+// while this holds the lock with the flag set the buffer and the lane geometry are final. Nothing here waits.
+bool stream_depth_from_game(bool (*fn)(void *ctx, const depth_lane_t &lane), void *ctx)
+{
+    stream_state &s = str();
+    if (fn == nullptr || !s.mvec_live.load(std::memory_order_acquire)) return false;
+    std::unique_lock<std::mutex> lk(s.mvec_cs, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+    if (!s.mvec_live.load(std::memory_order_relaxed)) return false;
+    if (s.gxfer == nullptr || s.depth_mode == 0 || s.depth_bytes == 0) return false;
+    const unsigned slot = (unsigned)(s.produced_a.load(std::memory_order_acquire) % stream_state::RING);
+    if (s.depth_eval_valid[slot].load(std::memory_order_relaxed) != 0u) return false;   // one copy per frame: the first
+    depth_lane_t ln{};
+    ln.dst = mgpu::stage::dst(s.gxfer);   // R333: same layout either way
+    ln.offset = (UINT64)slot * s.slot_bytes + s.depth_off;
+    ln.width = s.depth_w; ln.height = s.depth_h; ln.format = s.depth_format;
+    ln.row_pitch = (unsigned)s.depth_fp.Footprint.RowPitch;
+    ln.slot = slot;
+    if (!fn(ctx, ln)) return false;
+    s.depth_eval_valid[slot].store(1u, std::memory_order_release);
+    return true;
+}
+
 void stream_mvec_copy_tagged(void *cmd_list_v, unsigned long long mvec_handle,
                              unsigned declared_state, int lifecycle)
 {
@@ -24034,6 +24302,20 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         s.mvec_scale_x, s.mvec_scale_y,
                         (mtot != 0) ? (100.0 * (double)s.mvec_seen_valid / (double)mtot) : 0.0);
                     mgpu::diag::info(ml);
+                    if (mgpu::altngx::wanted() || mgpu::altffx::wanted())
+                    {   // R382 (N01950's [R139b], on the contract path only): which buffer wrote the lane last
+                        mgpu::calibrator::table r139{};
+                        const bool r139_have = mgpu::calibrator::read(r139) && (r139.have & mgpu::calibrator::KEY_MVEC) != 0u;
+                        const unsigned long long r139_decl = r139_have ? r139.mvec : 0ull;
+                        const unsigned long long r139_last = s.mvec_last_src.load(std::memory_order_relaxed);
+                        char bl[520];
+                        snprintf(bl, sizeof bl,
+                                 "[MGPU][R139b] MVEC SOURCES: last-copy-src=0x%llx | declared contract mvec=0x%llx | SAME=%s. NO means "
+                                 "the lane's last writer is not the field the game handed its upscaler: another route copied "
+                                 "after the contract copy in the same frame.",
+                                 r139_last, r139_decl, (r139_decl == 0ull) ? "no table" : ((r139_decl == r139_last) ? "yes" : "NO"));
+                        mgpu::diag::info(bl);
+                    }
 
                     // ---- R182 / R184: OCCUPANCY, FOOTPRINT, AND RECREATION ----
                     //
@@ -24371,6 +24653,16 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 if (lat > s.lat_max) { s.lat_max = lat; s.lat_max_frame = got.frame_index; }
                 if (s.lat_n == 0) s.first_lat = lat;
                 s.lat_sum += lat; ++s.lat_n;
+                // R394 (FGInstr=1 only; absent: one relaxed load): how old the frame is when the bridge takes it, split
+                // by where it waited. Read-only: two counters this thread already owns and the fence's value.
+                if (mgpu::fginstr::on())
+                    mgpu::fginstr::note_consume(lat, (unsigned long long)got.frame_index,
+                                                s.produced_a.load(std::memory_order_relaxed),
+                                                (s.nfence != nullptr) ? (unsigned long long)s.nfence->GetCompletedValue() : 0ull,
+                                                (unsigned long long)got.qpc_submit);
+                // R402 (LatSplit=1; absent: one relaxed load): the same frame's times, split by step. Read-only.
+                mgpu::latsplit::consumed((unsigned long long)got.frame_index, (unsigned long long)got.qpc_submit,
+                                         (unsigned long long)s.seen_fence_at, (long long)now.QuadPart);
 
                 // L2: from the fence sighting, not from the record.
                 if (s.seen_fence_at != 0 && s.freq.QuadPart > 0)
@@ -24382,6 +24674,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         if (rl < s.ready_min) s.ready_min = rl;
                         if (rl > s.ready_max) s.ready_max = rl;
                         s.ready_sum += rl; ++s.ready_n;
+                        if (mgpu::fginstr::on()) mgpu::fginstr::note_ready(rl);   // R394: L2, per window instead of only in the run summary
                     }
                 }
                 if (slot < stream_state::RING) ++s.slot_hits[slot];
@@ -24499,6 +24792,16 @@ void stream_poll()
 
     // unique_lock, not lock_guard, so the wait can happen with it released.
     std::unique_lock<std::mutex> lk(s.cs);
+    // R388 (FGInstr=1 only; absent: lock_t0() is one relaxed load and returns 0, nothing is timed): how long THIS
+    // thread holds s.cs, by where the hold ends. Declared after lk, so it closes before lk does on every return.
+    struct r388_hold_t
+    {
+        long long t0 = 0;
+        void begin() { t0 = mgpu::fginstr::lock_t0(); }
+        void end(int site) { if (t0 != 0) { mgpu::fginstr::bridge_held(t0, site); t0 = 0; } }
+        ~r388_hold_t() { end(2); }
+    } r388_hold;
+    r388_hold.begin();
     // R168. Bridge-side scope timer. See the sfdiag block above. This is the
     // SCOPE, not the strict hold: the unique_lock above is released around the
     // fence wait by design, and that released window is inside this bracket.
@@ -24992,9 +25295,11 @@ void stream_poll()
                 // DEFECT E's discipline, unchanged: the one blocking call runs
                 // with the mutex RELEASED, so the game's render thread is free
                 // to record and signal while we are here.
+                r388_hold.end(0);   // R388
                 lk.unlock();
                 const DWORD bwr = WaitForSingleObject(s.nev, 5000);
                 lk.lock();
+                r388_hold.begin();
                 if (bwr != WAIT_OBJECT_0)
                 {
                     bh = E_FAIL;
@@ -25848,6 +26153,19 @@ void stream_poll()
                                  vr.mean_ax, vr.max_ax, vr.mean_ay, vr.max_ay, 100.0 * vr.pos_x, 100.0 * vr.pos_y,
                                  hx[0] ? hx : "-", vr.n ? 100.0 * (double)vr.same_as_first / (double)vr.n : 0.0, vr.verdict);
                         mgpu::diag::info(vl);
+                        if (mgpu::altngx::wanted() || mgpu::altffx::wanted())
+                        {   // R382 (N01950's [R257e], on the contract path only): what the model reprojects with
+                            const float ax = fabsf(s.mvec_scale_x), ay = fabsf(s.mvec_scale_y);
+                            const float adx = fabsf(s.mvec_dx), ady = fabsf(s.mvec_dy);
+                            char el[360];
+                            snprintf(el, sizeof el,
+                                     "[MGPU][R257e] effective = raw * (%.6f, %.6f) + (%.3f, %.3f): "
+                                     "|x| mean=%.4f max=%.4f | |y| mean=%.4f max=%.4f (pixels the history moves)",
+                                     s.mvec_scale_x, s.mvec_scale_y, s.mvec_dx, s.mvec_dy,
+                                     vr.mean_ax * ax + adx, vr.max_ax * ax + adx,
+                                     vr.mean_ay * ay + ady, vr.max_ay * ay + ady);
+                            mgpu::diag::info(el);
+                        }
                     }
                 }
                 // ---- R315b (MVecBarrierSource=2): the judge ----
@@ -26537,6 +26855,18 @@ void stream_poll()
                     }
                     s.gate_break = no_dlss;
                 }
+                if (s.best_mode && !s.best_checked && s.nr_evals >= 1ull)
+                {   // R414: once, after the first evaluate - the file may hold the other count's pass-1 resolution
+                    s.best_checked = true;
+                    const bool want = (s.passes >= 2u);
+                    if (!s.nrs_on && want != mgpu::residual::carries(0u))
+                    {
+                        if (want) s.nr_res_want_mask |= 1u; else s.nr_res_want_mask &= ~1u;
+                        s.nr_res_req_mask |= 1u;
+                        mgpu::diag::info(want ? "[MGPU][R414] Best Quality-Performance: x2+ at arm - pass 1 to Residual."
+                                              : "[MGPU][R414] Best Quality-Performance: x1 at arm - pass 1 to Native.");
+                    }
+                }
                 if (s.nr_p1_recreate_req) r361_recreate_pass1(s);   // R361: before this frame's evaluates
                 if (s.nr_res_req_mask != 0u)                        // R364: the panel's Residual / Native buttons
                 {
@@ -26889,7 +27219,7 @@ void stream_poll()
                     if (s.tuning_on)
                     {
                         s.nr_params->Set("DLSSNR.LocalToneStrength",      s.tone_strength);
-                        s.nr_params->Set("DLSSNR.LocalStructureStrength", s.structure_strength);
+                        s.nr_params->Set("DLSSNR.LocalStructureStrength", r406_structure(s));   // R406: capped with x2+ and a light last pass
                         s.nr_params->Set("DLSSNR.SkinStructureStrength",  s.skin_strength);
                         s.nr_params->Set("DLSSNR.Style",                  s.style);
                         s.nr_params->Set("DLSSNR.UseAutoMask", s.auto_mask ? 1u : 0u);
@@ -26929,6 +27259,29 @@ void stream_poll()
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     if (tdec.reset) rst = 1u;   // R300a1: TemporalResetK, off unless set
                     if (gate_rst) rst = 1u;     // R323: no history across frames the game's DLSS did not evaluate
+                    if (mgpu::altngx::wanted() || mgpu::altffx::wanted())
+                    {   // R382 (N01950's [R825], on the contract path only): the provider's own "history invalid" for
+                        // this frame - a cut, a teleport, a new scene - reaches the neural pass. Not on the stock route.
+                        mgpu::calibrator::table rt{};
+                        if (mgpu::calibrator::read(rt) && (rt.have & mgpu::calibrator::KEY_RESET) != 0u && rt.reset != 0u)
+                        {
+                            rst = 1u;
+                            if (pi == 0u)
+                            {
+                                static std::atomic<int> said_cr{0};
+                                const int ncr = said_cr.fetch_add(1, std::memory_order_relaxed);
+                                if (ncr < 5 || (ncr % 1000) == 0)   // R385: N01950's cap was every 100th - about a line a second while a title holds its reset flag
+                                {
+                                    char crl[320];
+                                    snprintf(crl, sizeof crl,
+                                             "[MGPU][R825] NR reset from the CONTRACT's reset flag at f=%llu (#%d): the "
+                                             "game told the upscaler this frame's history is invalid (cut/teleport/new scene).",
+                                             f, ncr + 1);
+                                    mgpu::diag::info(crl);
+                                }
+                            }
+                        }
+                    }
                     if (pi == 1u && s.r332_p2_reset) { rst = 1u; s.r332_p2_reset = false;   // R332 (E12)
                         mgpu::diag::info("[MGPU][R332] Pass2Reset: live x1 -> x2, pass 2's first evaluate runs with "
                                          "DLSSNR.Reset=1 (its history predates the switch)."); }
@@ -27670,10 +28023,27 @@ void stream_poll()
                 // R341: the in-between frame, from this frame's final output and its bound vectors / depth
                 // (both still NON_PIXEL_SHADER_RESOURCE here). One relaxed load when FrameGen is not 4.
                 if (mgpu::fg::on() && final_pass_ok && s.nr_final != nullptr)
+                {
+                    // R396 (FrameGen=5): this frame's vectors, depth and input colour are bound now, one evaluate before
+                    // its neural output exists - the previous neural frame is pushed along them. Returns at once for
+                    // every other generator. The fence is the copy queue's for this frame (null with the inline unpack).
+                    mgpu::fg::stream_scale(s.mvec_scale_x, s.mvec_scale_y);   // R397: two stores; used only with FGMvScaleNow=1
+                    mgpu::fg::forward_take(mvec_here ? s.tex_mvec_r[ii] : nullptr,
+                                           depth_here ? s.tex_depth[ii] : nullptr, s.tex_in[ii], mv_el_frame, f,
+                                           (use_cq && s.cqf != nullptr) ? s.cqf : nullptr, (unsigned long long)f);
+                    // R399 (FGAhead, FrameGen 3 / 4): the same moment - the in-between frame of the neural frame on screen and
+                    // this picked frame's own picture is made now, on the neural queue ahead of this list. One relaxed load
+                    // with the key absent.
+                    mgpu::fg::ahead_take(s.nq, mvec_here ? s.tex_mvec_r[ii] : nullptr,
+                                         depth_here ? s.tex_depth[ii] : nullptr, s.tex_in[ii], mv_el_frame, f,
+                                         (use_cq && s.cqf != nullptr) ? s.cqf : nullptr, (unsigned long long)f);
+                    const long long r388_f0 = mgpu::fginstr::lock_t0();   // R388: frame generation's share of this hold
                     mgpu::fg::record(s.nl, s.nr_final,
                                      mvec_here ? s.tex_mvec_r[ii] : nullptr,
                                      depth_here ? s.tex_depth[ii] : nullptr,
                                      mv_el_frame, f);
+                    if (r388_f0 != 0) mgpu::fginstr::fg_recorded(r388_f0);
+                }
                 if (!s.profile)
                 {
                 // P6.0: sample the LAST pass's output, not tex_out. With
@@ -27819,12 +28189,18 @@ void stream_poll()
                 // blocking the game to avoid it never was.
                 DWORD wr;
                 if (s.ll_on != 0u && run_nr && use_cq && s.cq != nullptr)
+                {
+                    r388_hold.end(1);   // R388 (the short re-lock inside R343's wait is not counted)
                     wr = r343_wait_and_latch(s, lk, f);   // R343: the same wait, with the next frame's copy latched near its end
+                    r388_hold.begin();
+                }
                 else
                 {
+                    r388_hold.end(1);   // R388
                     lk.unlock();
                     wr = WaitForSingleObject(s.nev, 5000);
                     lk.lock();
+                    r388_hold.begin();
                 }
                 if (mgpu::t119::perf_active()) mgpu::perf::job_done();   // R300e1
                 if (wr != WAIT_OBJECT_0)
@@ -28452,9 +28828,11 @@ void stream_poll()
                               "non-zero one names its own failure and they have different "
                               "causes. Do not average them into a verdict.");
         }
+        r388_hold.end(2);     // R388
         lk.unlock();          // R341a (F4): the pacing thread's present_frame takes s.cs; join it with the lock released
         mgpu::fg::stop();
         lk.lock();
+        r388_hold.begin();
         stream_release();
     }
 
@@ -28472,6 +28850,7 @@ void stream_poll()
         const bool arm = s.ll_due_arm, sum = s.ll_due_summary;
         s.ll_due_arm = false; s.ll_due_summary = false;
         const ll_snapshot snap = ll_take(s);
+        r388_hold.end(2);   // R388
         lk.unlock();
         if (arm && !sum) write_last_launch("arm", &snap);
         if (sum)         write_last_launch("summary", &snap);
@@ -28481,6 +28860,7 @@ void stream_poll()
     {
         s.rec_next = s.consumed + 300ull;
         const ll_snapshot snap = ll_take(s);
+        r388_hold.end(2);   // R388
         lk.unlock();
         LARGE_INTEGER t0{}, t1{}, fq{};
         QueryPerformanceCounter(&t0);

@@ -91,6 +91,17 @@ namespace mgpu::sltags
                                      unsigned state, int lifecycle);
     void set_mvec_capture(mvec_capture_fn fn);
 
+    // R376 (0.5.1 discovery). The same for the depth the game tags (kBufferTypeDepth): run synchronously from
+    // the game's tagging call with its command buffer and the state it declared. Installed by dllmain only when
+    // DepthSource is in mgpu.ini; none = one load per depth tag, nothing else.
+    void set_depth_capture(mvec_capture_fn fn);
+
+    // R379 (0.5.1 discovery; sl_camera.cpp, FGCamera=1 only). The import-slot swap this file uses for its own
+    // two thunks, for one more Streamline export: every slot in the game's modules (sl.* and the bridge skipped)
+    // whose value is `find` gets `repl`. Returns the number of slots written. Called with the pair reversed to
+    // put them back.
+    unsigned swap_import_external(void *find, void *repl);
+
     // The same for the colour buffers that matter to HDR work:
     // kBufferTypeHUDLessColor, then kBufferTypeScalingInputColor. Zero when
     // neither was ever tagged.

@@ -12,6 +12,7 @@
 
 #include "diag.hpp"
 #include "mgpu_ini_parser.hpp"
+#include "lat_split.hpp"   // R402: LatSplit=1, read-only (one relaxed load when off)
 
 namespace mgpu::stage
 {
@@ -268,6 +269,7 @@ bool signal(ID3D12CommandQueue *gq, ID3D12Fence *gfence, unsigned long long f)
         return SUCCEEDED(gq->Signal(gfence, f));
     }
     if (FAILED(g_cq->Wait(g_sf, f))) ++g_fail;
+    mgpu::latsplit::sig(f, g_sf, gfence);   // R402: the time of this hand-over; nothing else
     ID3D12CommandList *ls[MAX_RING];
     UINT n = 0;
     for (unsigned long long k = from; k <= f; ++k) ls[n++] = g_cl[(unsigned)((k - 1ull) % g_ring)];

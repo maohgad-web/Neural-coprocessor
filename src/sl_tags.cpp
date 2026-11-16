@@ -138,6 +138,7 @@ namespace
     std::atomic<unsigned long long> g_h_scale_in{0};
     std::atomic<mvec_capture_fn> g_mvec_capture{nullptr};       // R300d
     std::atomic<unsigned long long> g_mvec_capture_calls{0};    // R300d
+    std::atomic<mvec_capture_fn> g_depth_capture{nullptr};      // R376
 
     // One "said" bit per buffer type we name, plus a catch-all.
     bool g_said[24] = {};
@@ -241,6 +242,13 @@ namespace
                 cb(cmd, native, f.state, life);
                 g_mvec_capture_calls.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+
+        // R376 (DepthSource only: the callback is installed by dllmain only with the key). The depth twin.
+        if (type == BT_DEPTH && native != 0ull && cmd != nullptr)
+        {
+            const mvec_capture_fn dcb = g_depth_capture.load(std::memory_order_acquire);
+            if (dcb != nullptr) dcb(cmd, native, f.state, life);
         }
 
         g_tags_read.fetch_add(1, std::memory_order_relaxed);
@@ -542,6 +550,14 @@ void report()
 
 unsigned long long mvec_handle()          { return g_h_mvec.load(std::memory_order_relaxed); }
 void set_mvec_capture(mvec_capture_fn fn) { g_mvec_capture.store(fn, std::memory_order_release); }   // R300d
+void set_depth_capture(mvec_capture_fn fn) { g_depth_capture.store(fn, std::memory_order_release); }   // R376
+unsigned swap_import_external(void *find, void *repl)   // R379
+{
+    if (g_self == nullptr)
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&swap_import_external, &g_self);
+    return swap_everywhere(find, repl);
+}
 unsigned long long hudless_handle()       { return g_h_hudless.load(std::memory_order_relaxed); }
 unsigned long long scaling_input_handle() { return g_h_scale_in.load(std::memory_order_relaxed); }
 

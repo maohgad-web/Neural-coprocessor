@@ -729,6 +729,7 @@ void on_finish_effects(void *context, void *back_buffer, void *depth)
     if (FAILED(hr)) { fail("D3D12 command list Close", hr); return; }
     ID3D12CommandList *ls[1] = { g_list };
     g_queue->ExecuteCommandLists(1, ls);
+    mgpu::gpu1::stream_signal_after_submit(g_queue);   // R408a: SignalAt=2 - this frame, now that its list is submitted
     ++g_done_value;
     g_queue->Signal(g_done, g_done_value);
     ++g_frames;
