@@ -62,6 +62,16 @@ add_library(mgpu_bridge SHARED
     src/gpu0_stage.cpp
     src/chain_colour_space.cpp
     src/fg_gpu1.cpp
+    src/fg_instr.cpp
+    src/present_wait.cpp          # R375: waitable present chain, frame latency 1 (PresentLatency1; off by default)
+    src/depth_src.cpp             # R376: the game's own depth as a lane source (DepthSource; off by default)
+    src/alt_ngx_hook.cpp          # R377: N01950's inline NGX hook as an alternative route (NgxHook; off by default). A stub unless SafetyHook was fetched (below)
+    src/alt_ffx_hook.cpp          # R381: N01950's FidelityFX hook as the FSR contract route (FfxHook; off by default). A stub unless SafetyHook was fetched
+    src/sl_camera.cpp             # R379: the game's camera block for frame generation, from slSetConstants (FGCamera; off by default)
+    src/fg_fsr.cpp                # R380: AMD FSR frame generation as the generator (FrameGen=3); the DLL is the game's own
+    src/fg_forward.cpp            # R396: the forward warp as the generator (FrameGen=5): the newest neural frame pushed along the next game frame's vectors
+    src/fg_ahead.cpp              # R399: FGAhead - the list of the generator call for the picked game frame (FrameGen=3 / 4)
+    src/lat_split.cpp             # R402: LatSplit=1 - read-only split of the time from the game's record to the bridge's consume
     # D1 (0.3.0 R&D): the discovery calibrator. OFF unless Discovery=1 in
     # mgpu.ini. Holds no ReShade type and no gpu1_context type.
     src/discovery.cpp
@@ -165,6 +175,89 @@ if(EXISTS "${MGPU_IMGUI_DIR}/imgui.h" AND EXISTS "${MGPU_IMGUI_DIR}/imconfig.h")
     message(STATUS "MGPU: overlay panel ENABLED - ImGui headers at ${MGPU_IMGUI_DIR}")
 else()
     message(STATUS "MGPU: overlay panel DISABLED - no ImGui headers; hotkeys only.")
+endif()
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# R377 (0.5.1 discovery): SafetyHook + Zydis for the alternative NGX route
+# (src/alt_ngx_hook.cpp, NgxHook=1; method and code by N01950).
+#
+# NOT COMMITTED, like every third-party dependency of this repository
+# (THIRD_PARTY.md): the amalgamated release is fetched into the BUILD tree,
+# pinned: the archive must have the SHA-256 GitHub shows for the release asset.
+# (Until R389 the four files also had to equal N01950's vendored copy; that copy
+# turned out to be another build of SafetyHook - see the block below.)
+#
+# If the check fails, or the fetch fails, THE BUILD STILL SUCCEEDS:
+# alt_ngx_hook.cpp compiles as a stub, NgxHook=1 is refused at run time in one
+# log line, and the configure output below says which of the two you are
+# getting. Nothing else in the add-on depends on these files.
+#
+# What it costs the standard build when it IS enabled: the C language is turned
+# on (Zydis.c), three files compile as C++ latest (SafetyHook needs
+# std::expected), and their code is linked in. None of it runs without NgxHook=1.
+set(MGPU_SAFETYHOOK_TAG "v0.7.0")
+set(MGPU_SAFETYHOOK_ZIP_SHA256 "505d4c07ec1c5b94a17f3906ca86afbe1264e738d8becaa244866694c6200c2c")
+set(MGPU_SAFETYHOOK_DIR "${CMAKE_BINARY_DIR}/ext/safetyhook")
+set(MGPU_SAFETYHOOK_ZIP "${MGPU_SAFETYHOOK_DIR}/safetyhook-amalgamated-zydis.zip")
+set(_mgpu_sh_ok FALSE)
+set(_mgpu_sh_why "the archive could not be fetched")
+if(NOT EXISTS "${MGPU_SAFETYHOOK_ZIP}")
+    foreach(_try 1 2 3)
+        file(DOWNLOAD
+             "https://github.com/cursey/safetyhook/releases/download/${MGPU_SAFETYHOOK_TAG}/safetyhook-amalgamated-zydis.zip"
+             "${MGPU_SAFETYHOOK_ZIP}"
+             STATUS _mgpu_sh_dl TLS_VERIFY ON)
+        list(GET _mgpu_sh_dl 0 _mgpu_sh_code)
+        if(_mgpu_sh_code EQUAL 0)
+            break()
+        endif()
+        message(STATUS "MGPU: SafetyHook fetch attempt ${_try}/3 failed")
+        file(REMOVE "${MGPU_SAFETYHOOK_ZIP}")
+        execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 2)
+    endforeach()
+endif()
+if(EXISTS "${MGPU_SAFETYHOOK_ZIP}")
+    file(SHA256 "${MGPU_SAFETYHOOK_ZIP}" _mgpu_sh_zip_hash)
+    if(NOT _mgpu_sh_zip_hash STREQUAL MGPU_SAFETYHOOK_ZIP_SHA256)
+        set(_mgpu_sh_why "the archive's SHA-256 is ${_mgpu_sh_zip_hash}, not the pinned one")
+        file(REMOVE "${MGPU_SAFETYHOOK_ZIP}")
+    else()
+        file(ARCHIVE_EXTRACT INPUT "${MGPU_SAFETYHOOK_ZIP}" DESTINATION "${MGPU_SAFETYHOOK_DIR}/src")
+        set(_mgpu_sh_ok TRUE)
+        # R389: the four files are taken as they are in the PINNED OFFICIAL archive (its SHA-256 was checked above).
+        # Until R389 each had to equal N01950's vendored copy; the first CI configure (2026-11-15) showed that copy
+        # is another build of SafetyHook (safetyhook.hpp there a3222b02..., in v0.7.0 6f8499aa...), so the route was
+        # switched off. The hook code uses only the documented API (InlineHook::create with StartDisabled, original,
+        # enable, reset), which v0.7.0 declares the same way (include/safetyhook/inline_hook.hpp at the tag).
+        foreach(_fname safetyhook.hpp safetyhook.cpp Zydis.h Zydis.c)
+            file(GLOB_RECURSE _found "${MGPU_SAFETYHOOK_DIR}/src/${_fname}")
+            list(LENGTH _found _nfound)
+            if(NOT _nfound EQUAL 1)
+                set(_mgpu_sh_ok FALSE)
+                set(_mgpu_sh_why "${_fname} was found ${_nfound} time(s) in the archive")
+                break()
+            endif()
+            list(GET _found 0 _fpath)
+            string(MAKE_C_IDENTIFIER "${_fname}" _fid)
+            set(_mgpu_sh_${_fid} "${_fpath}")
+        endforeach()
+    endif()
+endif()
+if(_mgpu_sh_ok)
+    enable_language(C)
+    get_filename_component(_mgpu_sh_inc "${_mgpu_sh_safetyhook_hpp}" DIRECTORY)
+    target_sources(mgpu_bridge PRIVATE "${_mgpu_sh_safetyhook_cpp}" "${_mgpu_sh_Zydis_c}")
+    get_filename_component(_mgpu_sh_zinc "${_mgpu_sh_Zydis_h}" DIRECTORY)   # R389: the same folder in N01950's layout; asked, not assumed, for the archive's
+    target_include_directories(mgpu_bridge PRIVATE "${_mgpu_sh_inc}" "${_mgpu_sh_zinc}")
+    target_compile_definitions(mgpu_bridge PRIVATE MGPU_ALT_HOOKS=1 ZYDIS_STATIC_BUILD)
+    if (MSVC)
+        set_source_files_properties("${_mgpu_sh_safetyhook_cpp}" src/alt_ngx_hook.cpp src/alt_ffx_hook.cpp
+            PROPERTIES COMPILE_OPTIONS "/std:c++latest")
+    endif()
+    message(STATUS "MGPU: alternative NGX route ENABLED - SafetyHook ${MGPU_SAFETYHOOK_TAG} at ${_mgpu_sh_inc} (the pinned official release; R389)")
+else()
+    message(STATUS "MGPU: alternative NGX route DISABLED - ${_mgpu_sh_why}. NgxHook=1 will be refused at run time; everything else is unchanged.")
 endif()
 # ---------------------------------------------------------------------------
 
