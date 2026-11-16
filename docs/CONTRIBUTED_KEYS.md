@@ -56,6 +56,10 @@ the bridge thread spun on a frame that had already arrived. No new key: it is pa
 | `NRSetAtCreate` | `1` | Applies the `Set.*` lines of `mgpu.ini` to DLSS-NR before its CreateFeature as well as at each evaluate (P6.2c), for keys that size the network. Does nothing without `Set.*` lines. Separate from `NRScale` | Only through the `Set.*` keys |
 | `PanelSimple` | `1` | Shows the simple panel (Chinese labels, layout in `panel_simple.txt` beside the add-on) instead of the full panel. CTRL+ALT+F4 flips this key in game. Without `panel_simple.txt` the simple panel shows nothing and the full panel stays (R330) | Panel only |
 
+| `NgxHook` | `1` (use with `Calib=0`) | The alternative route to the game's DLSS call: an inline hook on NGX (R377). Off by default | No |
+| `FfxHook` | `1` | The FSR contract route: an inline hook on the game's FidelityFX API (R381). Off by default | No |
+| `FGPace` | `3` | A free-running clock for frame generation, NO1950's display-paced shape (R372). For comparison | Frame timing only |
+
 The simple panel is R330 (`src/panel_simple.cpp`, `src/panel_simple.hpp`, `assets/panel_simple.txt`, the hotkey in
 `src/worker.cpp`). Every later commit on it takes the next letter, one letter per squashed commit: R330a, R330b, ...
 Labels inside the controls are `ui.<name> | label` lines in `panel_simple.txt`; a missing line shows the English text.
@@ -78,6 +82,7 @@ No keys. Both contributions (adapter selection, `mgpu.ini` parsing) are fixes to
 | Key | Values | What it does | Changes the picture |
 |---|---|---|---|
 | `PresentBuffers` | `2`-`6` (absent or `2`: unchanged) | How many buffers the bridge's swap chain rotates through. Measured clean at `6`, with frame generation at 2X and 4X | Yes: removes the bands |
+| `PresentLatency1` | `1` (shipped `mgpu.ini` from 0.6.0: `1`) | The bridge's swap chain is waitable with a frame latency of 1: at most one frame waits behind the one on screen (R375) | Frame timing only |
 | `PresentRaceProbe` | `1` | Diagnostic. Every frame's back buffer is cleared to magenta first, so a screen reading a buffer mid-write shows a magenta band | Yes, on purpose |
 
 ## davidm71
@@ -91,6 +96,8 @@ Written here from his designs. Absent = off, except `StageCopy`, which is on in 
 | `MVecSealValid` | `1` | Vector and depth validity decided by the frame tag written with the frame (R331) | No |
 | `LateLatch`, `LateLatchAge` | `1`; age `2` | The neural card evaluates the newest frame that has arrived (R343) | Frame timing only |
 | `DcompMultiDisplay` | `1` | The multi-display composition behaviour from his fork (R267 / R273) | No |
+| `FrameGen` | `3` | FSR frame generation on the neural card (R380). Experimental | Yes: generated frames |
+| `FGPace` | `2` | One steady clock for frame generation that shows each frame by its scene time (R372) | Frame timing only |
 
 ## Knownmind
 
