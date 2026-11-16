@@ -28,7 +28,29 @@ The Super Resolution options in the panel reduce that cost. They create a second
 
 Turn it on in the panel, or edit `mgpu.ini` yourself. You can find example `mgpu.ini` files [here](https://github.com/maohgad-web/Neural-coprocessor/tree/main/reference) - [DLSS Quality](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuQUALITY.ini) and [DLSS Performance](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuPERFORMANCE.ini).
 
-**Residual NRS** is on by default since 0.5.0 and also reduces the cost. In the panel's Pass settings, each pass can run Residual Neural or Native, and Light-FP8 or Full-FP8. Light-FP8 is faster, and needs `nvngx_dlssnr.dll` 310.9.16 or newer.
+**Residual NRS** also reduces the cost. Since 0.6.0, pass 1 runs Native at x1 and Residual NRS at x2 (Best Quality-Performance). In the panel's Pass settings, each pass can run Residual Neural or Native, and Light-FP8 or Full-FP8. Light-FP8 is faster, and needs `nvngx_dlssnr.dll` 310.9.16 or newer.
+
+* * *
+
+## New in 0.6.0
+
+**Improved camera responsiveness and even frame pacing.** The camera responds much faster, and frames are shown more evenly across all hardware even at lower framerates. Help the most on 60 Hz displays and  games like Elden ring that natively locks its frame rate to 60 FPS.
+
+**Improved stability for DLSS Frame Generation**. Performance, frame pacing and image stability in motion are significantly improved. Thanks to everyone who uploaded logs. If you still see stutter or flicker, please report it. Turn it on in the panel: DLSS Frame Generation 2x, or set FrameGen=4 in mgpu.ini. The game does not need to support DLSS: Tested it in Skyrim (DirectX 11) and Resident Evil 4 (it has no DLSS). Turn off the game’s own frame generation first. 
+
+**Dynamic mode** keeps frame generation from going over your display's maximum refresh rate. It also helps in games with 30 fps cutscenes. It is off by default. Leave it off on G-Sync or FreeSync displays.
+
+**Workaround for the path tracing flicker.** Path tracing and Ray Reconstruction add flicker to the neural output. For now, the only workaround is two passes, with the second pass on NVIDIA's full network at native resolution. The Path Tracing button sets this for you. If the flicker does not bother you, or you need the speed of one pass, you can still use one pass until this known issue is fixed.
+
+**Experimental frame generation modes.** FSR Frame Generation, in the panel. 3x and 4x, only in `mgpu.ini`: they add much more delay than 2x.
+
+**Improved one-button presets.** The preset buttons in the panel now give the best result across the games tested for 0.6.0.
+
+**VSync** is off by default, for lower latency. If you see tearing and your display has no G-Sync or FreeSync, turn on VSync in the panel and restart the game.
+
+**Launcher.** The same settings and names as the panel.
+
+Take the new `mgpu.ini`.
 
 * * *
 
@@ -174,6 +196,17 @@ Also in 0.2.0:
 **Key Finding:** Moving neural post-processing to a second GPU restores 86% of available performance gains from upscaling, compared to 39% when running on the render card.
 
 * * *
+
+## Titles run on 0.6.0
+
+| Title | API |
+| --- | --- |
+| Cyberpunk 2077 | DirectX 12 |
+| Resident Evil 4 | DirectX 12 |
+| Rise of the Tomb Raider | DirectX 12 |
+| The Blood of Dawnwalker | DirectX 12 |
+| DragonSword Awakening | DirectX 12 |
+| Skyrim Special Edition | DirectX 11 |
 
 ## Titles run on 0.5.0
 
@@ -347,9 +380,13 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `DX11=1` | DirectX 11 support. On by default. New in 0.3.0 |
 | `NgxProbeAfterScene` | Absent by default, which means `1`: the add-on starts its DLSS 5 after the game's own DLSS is running. `0` starts it at the game's first frame, as in 0.3.0. New in 0.3.1 |
 | `DepthHoldMax` | Absent by default, which means 180 seconds: how long the bridge waits for the game's depth while the game's DLSS is running, before it starts without depth. `0` waits without a limit. New in 0.3.1 |
-| `NRS=1` | Residual NRS on the first pass. On by default since 0.5.0. `0` runs Native, as in 0.4.0 |
-| `NRPreset1=1` / `NRPreset2=1` | Which NVIDIA model each pass uses. `1` Full-FP8, `2` Light-FP8, `0` as in 0.4.0. Light-FP8 needs `nvngx_dlssnr.dll` 310.9.16 or newer. New in 0.5.0 |
-| `FrameGen=0` | Frame generation on the second GPU. `4` turns it on. Experimental. New in 0.5.0 |
+| `NRS=0` | Residual NRS on the first pass. `0` (Native) by default since 0.6.0. Best Quality-Performance sets `1` at x2. `1` was the 0.5.x default |
+| `NRPreset1=0` / `NRPreset2=1` | Which NVIDIA model each pass uses. `1` Full-FP8, `2` Light-FP8, `0` the DLL default (Light-FP8 on 310.9.16 or newer). Light-FP8 needs `nvngx_dlssnr.dll` 310.9.16 or newer. New in 0.5.0 |
+| `BestQuality=1` | The panel's Best Quality-Performance switch. On by default. `0` keeps your own pass settings. New in 0.6.0 |
+| `FrameGen=0` | Frame generation on the second GPU. Off by default. `4` DLSS Frame Generation, `3` FSR Frame Generation (experimental). New in 0.5.0 |
+| `FGMulti=2` | Frames shown per rendered frame. `3` and `4` are experimental, with much higher latency. New in 0.6.0 |
+| `PresentVsync=0` | `1` waits for VSync on the bridge window: no tearing, more latency. `0` by default since 0.6.0 |
+| `SignalAt=2` | The second GPU gets each frame one game frame earlier. On by default since 0.6.0 |
 | `ChainColorSpace=auto` | The picture follows the game's HDR setting. Experimental. New in 0.5.0 |
 | `Passes=1` | How many passes run. `3` and `4` are experimental. New in 0.5.0 |
 | `NRFrameFilter=0` | The frame-generation vector filter, in the panel's Experimental settings. Off in the shipped file since 0.3.1 |
@@ -411,6 +448,7 @@ N is the number of the card that should render the game: the card with no monito
 - **No resolution/DLSS changes while armed** (requires swapchain rebuild)
 - **The game's frame generation:** Not recommended. It still flickers, as in 0.3.x; use the bridge's frame generation instead (experimental, new in 0.5.0). Some games with the game's frame generation on can crash at startup. Workaround: set `AutoArm=0` in `mgpu.ini`, get into gameplay, and press `CTRL+ALT+F10` to arm by hand.
 - **Colour handling:** Not fully implemented; tone adjustment may be needed. Motion vectors for UI and HUD elements are still missing
+- **Path tracing and Ray Reconstruction add flicker to the neural output.** Workaround: the Path Tracing button in the panel (two passes, the second on the full network at native resolution).
 - **External overlays:** Tools like RivaTuner/MSI Afterburner misbehave; use ReShade's built-in FPS display instead
 - **Unreal Engine titles can ignore Windows Graphics settings** and render on the wrong card. See Choosing the render card on Unreal Engine titles
 - **No Vulkan support.** DirectX 12 and DirectX 11 only. Some Unity titles can be forced to D3D12, optional since 0.3.0 - see Forcing D3D12 on Unity titles
