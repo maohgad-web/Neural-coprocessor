@@ -3,8 +3,8 @@
 // Version information only. The manifest is embedded by the linker
 // (CMakeLists: /MANIFESTINPUT); a second manifest here is CVT1100.
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    0,4,0,0
- PRODUCTVERSION 0,4,0,0
+ FILEVERSION    0,6,0,0
+ PRODUCTVERSION 0,6,0,0
  FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
  FILEFLAGS      0
  FILEOS         VOS_NT_WINDOWS32
@@ -17,12 +17,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Marcelo Guibout"
             VALUE "FileDescription",  "MGPU Bridge Launcher - installs and configures the MGPU Bridge ReShade add-on"
-            VALUE "FileVersion",      "0.4.0.0"
+            VALUE "FileVersion",      "0.6.0.0"
             VALUE "InternalName",     "MGPU Bridge Launcher"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Marcelo Guibout. See LICENSE."
             VALUE "OriginalFilename", "MGPU Bridge Launcher.exe"
             VALUE "ProductName",      "MGPU Bridge"
-            VALUE "ProductVersion",   "0.4.0"
+            VALUE "ProductVersion",   "0.6.0"
         END
     END
     BLOCK "VarFileInfo"

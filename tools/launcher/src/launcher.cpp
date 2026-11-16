@@ -257,6 +257,7 @@ namespace
         { L"INTENSITY", { L"INTENSIDADE", L"INTENSIDAD", L"\u5F3A\u5EA6", L"\u5F37\u5EA6", L"\uAC15\uB3C4" } },
         { L"PASSES", { L"PASSAGENS", L"PASADAS", L"\u904D\u6570", L"\u30D1\u30B9\u6570", L"\uD328\uC2A4 \uC218" } },
         { L"FRAME GENERATION", { L"GERA\u00C7\u00C3O DE QUADROS", L"GENERACI\u00D3N DE FOTOGRAMAS", L"\u5E27\u751F\u6210", L"\u30D5\u30EC\u30FC\u30E0\u751F\u6210", L"\uD504\uB808\uC784 \uC0DD\uC131" } },
+        { L"GAME'S FRAME GENERATION (FILTER)", { L"GERA\u00C7\u00C3O DE QUADROS DO JOGO (FILTRO)", L"GENERACI\u00D3N DE FOTOGRAMAS DEL JUEGO (FILTRO)", L"\u6E38\u620F\u81EA\u5E26\u5E27\u751F\u6210\uFF08\u8FC7\u6EE4\uFF09", L"\u30B2\u30FC\u30E0\u306E\u30D5\u30EC\u30FC\u30E0\u751F\u6210\uFF08\u30D5\u30A3\u30EB\u30BF\u30FC\uFF09", L"\uAC8C\uC784 \uC790\uCCB4 \uD504\uB808\uC784 \uC0DD\uC131 (\uD544\uD130)" } },
         { L"KEEP 1 GENERATED FRAME IN", { L"MANTER 1 GERADO A CADA", L"CONSERVAR 1 GENERADO CADA", L"\u6BCF\u51E0\u5E27\u4FDD\u7559 1 \u4E2A\u751F\u6210\u5E27", L"\u751F\u6210\u30D5\u30EC\u30FC\u30E0\u3092\u6B8B\u3059\u9593\u9694", L"\uC0DD\uC131 \uD504\uB808\uC784 1\uAC1C \uC720\uC9C0 \uAC04\uACA9" } },
         { L"DLSS ON GPU 1", { L"DLSS NA GPU 1", L"DLSS EN LA GPU 1", L"GPU 1 \u4E0A\u7684 DLSS", L"GPU 1 \u306E DLSS", L"GPU 1\uC758 DLSS" } },
         { L"UPSCALING", { L"UPSCALING", L"REESCALADO", L"\u8D85\u5206\u8FA8\u7387", L"\u30A2\u30C3\u30D7\u30B9\u30B1\u30FC\u30EA\u30F3\u30B0", L"\uC5C5\uC2A4\uCF00\uC77C\uB9C1" } },
@@ -383,7 +384,7 @@ namespace
         { L"PASS 2 NETWORK", { L"REDE DA 2\u00AA PASSAGEM", L"RED DE LA 2\u00AA PASADA", L"\u7B2C\u4E8C\u904D\u7F51\u7EDC", L"\u7B2C2\u30D1\u30B9\u306E\u30CD\u30C3\u30C8\u30EF\u30FC\u30AF", L"2\uCC28 \uD328\uC2A4 \uB124\uD2B8\uC6CC\uD06C" } },
         { L"PASS 1 RESOLUTION", { L"RESOLU\u00C7\u00C3O DA 1\u00AA PASSAGEM", L"RESOLUCI\u00D3N DE LA 1\u00AA PASADA", L"\u7B2C\u4E00\u904D\u5206\u8FA8\u7387", L"\u7B2C1\u30D1\u30B9\u306E\u89E3\u50CF\u5EA6", L"1\uCC28 \uD328\uC2A4 \uD574\uC0C1\uB3C4" } },
         { L"PASS 2 RESOLUTION", { L"RESOLU\u00C7\u00C3O DA 2\u00AA PASSAGEM", L"RESOLUCI\u00D3N DE LA 2\u00AA PASADA", L"\u7B2C\u4E8C\u904D\u5206\u8FA8\u7387", L"\u7B2C2\u30D1\u30B9\u306E\u89E3\u50CF\u5EA6", L"2\uCC28 \uD328\uC2A4 \uD574\uC0C1\uB3C4" } },
-        { L"DLSS 5 CARD FRAME GEN", { L"GERA\u00C7\u00C3O DE QUADROS (PLACA DLSS 5)", L"GENERACI\u00D3N DE FOTOGRAMAS (TARJETA DLSS 5)", L"DLSS 5 \u663E\u5361\u5E27\u751F\u6210", L"DLSS 5 \u30AB\u30FC\u30C9\u3067\u30D5\u30EC\u30FC\u30E0\u751F\u6210", L"DLSS 5 \uCE74\uB4DC \uD504\uB808\uC784 \uC0DD\uC131" } },
+        { L"DLSS FRAME GENERATION 2X", { L"GERA\u00C7\u00C3O DE QUADROS DLSS 2X", L"GENERACI\u00D3N DE FOTOGRAMAS DLSS 2X", L"DLSS \u5E27\u751F\u6210 2X", L"DLSS \u30D5\u30EC\u30FC\u30E0\u751F\u6210 2X", L"DLSS \uD504\uB808\uC784 \uC0DD\uC131 2X" } },
         { L"DEFAULTS", { L"PADR\u00C3O", L"PREDETERMINADO", L"\u9ED8\u8BA4", L"\u65E2\u5B9A", L"\uAE30\uBCF8\uAC12" } },
         { L"RESIDUAL NEURAL FPS+", { L"NEURAL RESIDUAL FPS+", L"NEURAL RESIDUAL FPS+", L"\u6B8B\u5DEE\u795E\u7ECF FPS+", L"\u6B8B\u5DEE\u30CB\u30E5\u30FC\u30E9\u30EB FPS+", L"\uC794\uCC28 \uB274\uB7F4 FPS+" } },
         { L"NATIVE FPS-", { L"NATIVA FPS-", L"NATIVA FPS-", L"\u539F\u751F FPS-", L"\u30CD\u30A4\u30C6\u30A3\u30D6 FPS-", L"\uB124\uC774\uD2F0\uBE0C FPS-" } },
@@ -1243,6 +1244,7 @@ namespace
         int res1 = 0, res2 = 0;     // 1 Residual Neural, 0 Native
         bool fg1 = false;           // FrameGen=4
         int net1x2 = 0;             // R361: NRPreset1x2 (absent = net1)
+        bool best = false;          // R414: BestQuality=1 (the panel's Best Quality-Performance mode)
     };
     adv_view g_adv;
 
@@ -1286,6 +1288,7 @@ namespace
             a.res2 = (nrs1 && !p2.empty()) ? ((p2[0] == 'n' || p2[0] == 'N') ? 1 : 0) : ((gi("ResidualPass", -1) == 2) ? 1 : 0);
             a.fg1 = gi("FrameGen", 0) == 4;
             a.net1x2 = (gi("NRPreset1x2", a.net1) == 1) ? 1 : 0;   // R361
+            a.best = gi("BestQuality", 0) == 1;   // R414
         }
         g_adv = a;
     }
@@ -1349,8 +1352,9 @@ namespace
         case ID_ADV_MASK_ON:  kv.push_back({ "AutoMask", "1" }); break;
         case ID_ADV_INT_M: kv.push_back({ "Intensity", f2(step(a.intensity, -0.1, 0, 2)) }); break;
         case ID_ADV_INT_P: kv.push_back({ "Intensity", f2(step(a.intensity, +0.1, 0, 2)) }); break;
-        case ID_ADV_PASSES_1: kv.push_back({ "Passes", "1" }); break;
-        case ID_ADV_PASSES_2: kv.push_back({ "Passes", "2" }); break;
+        // R414: with Best Quality-Performance on, pass 1's resolution follows the pass count (x1 Native, x2 Residual)
+        case ID_ADV_PASSES_1: kv.push_back({ "Passes", "1" }); if (a.best) kv.push_back({ "NRS", "0" }); break;
+        case ID_ADV_PASSES_2: kv.push_back({ "Passes", "2" }); if (a.best) kv.push_back({ "NRS", "1" }); break;
         case ID_ADV_FG_OFF:  kv.push_back({ "NRFrameFilter", "0" }); break;
         case ID_ADV_FG_MAP:  kv.push_back({ "NRFrameFilter", "1" }); break;
         case ID_ADV_FG_FIX:  kv.push_back({ "NRFrameFilter", "2" }); break;
@@ -1385,27 +1389,37 @@ namespace
         case ID_ADV_NRS_ON:  kv.push_back({ "NRS", "1" }); kv.push_back({ "NRScale", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R357: our path; R329: one at a time
         case ID_ADV_NRS_OFF: kv.push_back({ "NRS", "0" }); kv.push_back({ "NRScale", "0" }); break;   // R358: OPTIMIZATION OFF
         // R356: the same keys the panel's "Pass settings" writes
-        case ID_ADV_P1N_LIGHT: kv.push_back({ "NRPreset1", "0" }); break;
-        case ID_ADV_P1N_FULL:  kv.push_back({ "NRPreset1", "1" }); break;
-        case ID_ADV_P2N_LIGHT: kv.push_back({ "NRPreset2", "0" }); break;
-        case ID_ADV_P2N_FULL:  kv.push_back({ "NRPreset2", "1" }); break;
-        case ID_ADV_P1R_RES:    kv.push_back({ "NRS", "1" }); kv.push_back({ "NRScale", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R357: = OPTIMIZATION's NRS
-        case ID_ADV_P1R_NATIVE: kv.push_back({ "NRS", "0" }); break;
+        case ID_ADV_P1N_LIGHT: kv.push_back({ "BestQuality", "0" }); kv.push_back({ "NRPreset1", "0" }); break;
+        case ID_ADV_P1N_FULL: kv.push_back({ "BestQuality", "0" });  kv.push_back({ "NRPreset1", "1" }); break;
+        case ID_ADV_P2N_LIGHT: kv.push_back({ "BestQuality", "0" }); kv.push_back({ "NRPreset2", "0" }); break;
+        case ID_ADV_P2N_FULL: kv.push_back({ "BestQuality", "0" });  kv.push_back({ "NRPreset2", "1" }); break;
+        case ID_ADV_P1R_RES: kv.push_back({ "BestQuality", "0" });    kv.push_back({ "NRS", "1" }); kv.push_back({ "NRScale", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R357: = OPTIMIZATION's NRS
+        case ID_ADV_P1R_NATIVE: kv.push_back({ "BestQuality", "0" }); kv.push_back({ "NRS", "0" }); break;
         case ID_ADV_P2R_RES:
+            kv.push_back({ "BestQuality", "0" });   // R414
             if (a.res1) kv.push_back({ "Pass2", "nrs" });
             else { kv.push_back({ "ResidualPass", "2" }); kv.push_back({ "ResidualScale", "0.75" }); kv.push_back({ "ResidualRender", "0" }); }
             break;
         case ID_ADV_P2R_NATIVE:
+            kv.push_back({ "BestQuality", "0" });   // R414
             if (a.res1) kv.push_back({ "Pass2", "full" });
             else kv.push_back({ "ResidualPass", "0" });
             break;
         case ID_ADV_FG1_OFF: kv.push_back({ "FrameGen", "0" }); break;
-        case ID_ADV_FG1_ON:  kv.push_back({ "FrameGen", "4" }); break;
-        case ID_ADV_P1X2_LIGHT: kv.push_back({ "NRPreset1x2", "0" }); break;   // R361
-        case ID_ADV_P1X2_FULL:  kv.push_back({ "NRPreset1x2", "1" }); break;
-        case ID_ADV_BEST:    // Marcelo's default (R360/R361): Full-FP8 + Residual on pass 1 at x1 and on the last pass; Light-FP8 on pass 1 at x2+
-            kv.push_back({ "NRS", "1" }); kv.push_back({ "NRPreset1", "1" }); kv.push_back({ "NRPreset1x2", "0" }); kv.push_back({ "NRPreset2", "1" });
-            kv.push_back({ "Pass2", "nrs" }); kv.push_back({ "FrameGen", "0" });
+        case ID_ADV_FG1_ON:  // R411 (0.6.0): DLSS Frame Generation 2x - FrameGen=4 and the settings settled on Cyberpunk, as the panel
+            kv.push_back({ "FrameGen", "4" }); kv.push_back({ "FGMulti", "2" }); kv.push_back({ "FGPhase", "75" });
+            kv.push_back({ "FGMvScaleNow", "1" }); kv.push_back({ "FGMvUnit", "1" }); kv.push_back({ "FGSkipCarry", "1" });
+            kv.push_back({ "FGPace", "1" }); kv.push_back({ "FGSkipJump", "0" });
+            break;
+        case ID_ADV_P1X2_LIGHT: kv.push_back({ "BestQuality", "0" }); kv.push_back({ "NRPreset1x2", "0" }); break;   // R361
+        case ID_ADV_P1X2_FULL: kv.push_back({ "BestQuality", "0" });  kv.push_back({ "NRPreset1x2", "1" }); break;
+        case ID_ADV_BEST:    // R414 (Marcelo 2026-11-15 22:11): the panel's mode - BestQuality=1; pass 1 Light-FP8 at x1 and x2, Native
+                             // at x1 and Residual at x2 (the bridge flips it on every switch); the 2nd pass Full-FP8 Residual.
+                             // R405 parity: no FrameGen write - frame generation is its own switch.
+            kv.push_back({ "BestQuality", "1" });
+            kv.push_back({ "NRS", a.passes == 2 ? "1" : "0" }); kv.push_back({ "NRPreset1", "0" }); kv.push_back({ "NRPreset1x2", "0" }); kv.push_back({ "NRPreset2", "1" });
+            kv.push_back({ "ResidualPass", "2" }); kv.push_back({ "ResidualScale", "0.75" }); kv.push_back({ "ResidualRender", "0" });
+            kv.push_back({ "Pass2", "nrs" });
             kv.push_back({ "NRScale", "0" }); kv.push_back({ "SRUpscale", "0" });   // R357: one optimization at a time
             break;
         default: return;
@@ -2051,8 +2065,8 @@ namespace
         // R356 (rows 8-13): the panel's "Pass settings"
         { L"PASS 1 NETWORK", 2, AV_NONE },  { L"PASS 1 RESOLUTION", 2, AV_NONE },   // R362: no "AT X2" row (noisy); Best writes NRPreset1x2
         { L"PASS 2 NETWORK", 2, AV_NONE },  { L"PASS 2 RESOLUTION", 2, AV_NONE },
-        { L"DLSS 5 CARD FRAME GEN", 2, AV_NONE }, { L"DEFAULTS", 1, AV_NONE },
-        { L"FRAME GENERATION", 4, AV_NONE },
+        { L"DLSS FRAME GENERATION 2X", 2, AV_NONE }, { L"DEFAULTS", 1, AV_NONE },
+        { L"GAME'S FRAME GENERATION (FILTER)", 4, AV_NONE },   // R415: the game's own frame generation filter (NRFrameFilter), not the bridge's
         // R329: the 2nd pass choice is the panel's Experimental setting only. R358: OPTIMIZATION = our NRS pass;
         // DLSS ON GPU 1 (OLD) is its own row again. Picking one of the DLSS choices writes NRS=0 (the residual
         // refuses SRUpscale), PERFORMANCE writes SRUpscale=0: one optimization at a time, as R329.
@@ -2669,6 +2683,7 @@ namespace
             g_active_ids.push_back(a.style == 0 ? ID_ADV_STYLE_A : a.style == 1 ? ID_ADV_STYLE_B : ID_ADV_STYLE_C);
             g_active_ids.push_back(a.mask ? ID_ADV_MASK_ON : ID_ADV_MASK_OFF);
             g_active_ids.push_back(a.passes == 2 ? ID_ADV_PASSES_2 : ID_ADV_PASSES_1);
+            if (a.best) g_active_ids.push_back(ID_ADV_BEST);   // R414: lit while the mode is on
             g_active_ids.push_back(a.net1 ? ID_ADV_P1N_FULL : ID_ADV_P1N_LIGHT);   // R356
             g_active_ids.push_back(a.res1 ? ID_ADV_P1R_RES : ID_ADV_P1R_NATIVE);
             g_active_ids.push_back(a.net2 ? ID_ADV_P2N_FULL : ID_ADV_P2N_LIGHT);
